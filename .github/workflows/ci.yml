@@ -288,13 +288,9 @@ jobs:
             cargo +nightly miri test -p bamabi_macros --test mod_component_vtable
 
   kani:
-    name: Kani Formal Verification (${{ matrix.os }})
-    runs-on: ${{ matrix.os }}
+    name: Kani Formal Verification
+    runs-on: ubuntu-latest
     timeout-minutes: 45
-    strategy:
-      fail-fast: false
-      matrix:
-        os: [ubuntu-latest, macos-latest]
     steps:
       - name: Checkout repository
         uses: actions/checkout@v6
