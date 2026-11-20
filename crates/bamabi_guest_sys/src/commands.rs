@@ -216,6 +216,27 @@ impl<'a> SpawnBatchColumn<'a> {
     pub const fn elem_align(&self) -> Option<usize> {
         self.elem_align
     }
+
+    /// Constructs a [`SpawnBatchColumn`] from raw parts for Kani bounds harnesses so symbolic
+    /// null pointers and `isize::MAX` byte-length overflows can be exercised directly.
+    #[cfg(kani)]
+    #[inline]
+    pub(crate) const unsafe fn from_parts_for_kani(
+        component: BamComponent,
+        column_ptr: *const u8,
+        entity_count: usize,
+        elem_size: Option<usize>,
+        elem_align: Option<usize>,
+    ) -> Self {
+        Self {
+            component,
+            column_ptr,
+            entity_count,
+            elem_size,
+            elem_align,
+            _marker: PhantomData,
+        }
+    }
 }
 
 /// Validates a [`SpawnBatchColumn`] against `host.component_layout_info(col.component)` and
@@ -224,7 +245,7 @@ impl<'a> SpawnBatchColumn<'a> {
 /// Verifies that `col.component` is valid, `col.entity_count >= entity_count`, layout `(size,
 /// align)` matches the host's registered metadata when statically known, non-empty columns are
 /// non-null, and `entity_count * expected_size` does not overflow `isize::MAX`.
-fn validate_spawn_batch_column(
+pub(crate) fn validate_spawn_batch_column(
     host: &Host,
     col: &SpawnBatchColumn<'_>,
     entity_count: usize,

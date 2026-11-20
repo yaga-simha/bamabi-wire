@@ -2,6 +2,7 @@
 //! lifecycle helpers with zero process-global mutable state.
 
 use core::ffi::{CStr, c_char, c_void};
+#[cfg(not(kani))]
 use std::collections::HashMap;
 use std::ffi::CString;
 
@@ -59,14 +60,24 @@ unsafe fn drop_boxed<T>(ptr: *mut c_void) {
 /// `bamabi_init` (such as `ValidatedCommands::observe`), owned by [`GuestInstance`] and
 /// drained in LIFO order during `bamabi_shutdown` prior to init-time allocations.
 pub(crate) struct RuntimeAllocTracker {
+    #[cfg(not(kani))]
     allocations: std::sync::Mutex<Vec<ErasedAllocation>>,
+    #[cfg(kani)]
+    allocations: core::cell::RefCell<Vec<ErasedAllocation>>,
 }
+
+#[cfg(kani)]
+// SAFETY: Kani verification is single-threaded; `RefCell` enforces dynamic borrow safety.
+unsafe impl Sync for RuntimeAllocTracker {}
 
 impl RuntimeAllocTracker {
     /// Creates an empty mutex-guarded [`RuntimeAllocTracker`].
     fn new() -> Self {
         Self {
+            #[cfg(not(kani))]
             allocations: std::sync::Mutex::new(Vec::new()),
+            #[cfg(kani)]
+            allocations: core::cell::RefCell::new(Vec::new()),
         }
     }
 
@@ -74,10 +85,13 @@ impl RuntimeAllocTracker {
     /// mutex (recovering from poison if a prior thread panicked), and returns the raw pointer.
     pub(crate) fn track<T: Send + 'static>(&self, boxed: Box<T>) -> *mut T {
         let raw = Box::into_raw(boxed);
+        #[cfg(not(kani))]
         let mut guard = self
             .allocations
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
+        #[cfg(kani)]
+        let mut guard = self.allocations.borrow_mut();
         guard.push(ErasedAllocation {
             ptr: raw.cast::<c_void>(),
             drop_fn: drop_boxed::<T>,
@@ -87,10 +101,17 @@ impl RuntimeAllocTracker {
 
     /// Returns the number of runtime allocations currently tracked.
     fn len(&self) -> usize {
-        self.allocations
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .len()
+        #[cfg(not(kani))]
+        {
+            self.allocations
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .len()
+        }
+        #[cfg(kani)]
+        {
+            self.allocations.borrow().len()
+        }
     }
 
     /// Drains and drops all tracked runtime allocations in reverse (LIFO) registration order.
@@ -99,10 +120,13 @@ impl RuntimeAllocTracker {
     /// re-acquiring the lock.
     fn drain_lifo(&self) {
         let mut drained = {
+            #[cfg(not(kani))]
             let mut guard = self
                 .allocations
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
+            #[cfg(kani)]
+            let mut guard = self.allocations.borrow_mut();
             core::mem::take(&mut *guard)
         };
         while let Some(alloc) = drained.pop() {
@@ -225,7 +249,10 @@ pub struct GuestInstance {
     shutdown_hooks: Vec<Box<dyn FnOnce() + Send + 'static>>,
     save_state_hook: Option<ReentrantCell<SaveStateHook>>,
     restore_state_hook: Option<ReentrantCell<RestoreStateHook>>,
+    #[cfg(not(kani))]
     symbols: HashMap<String, GuestSymbolPtr>,
+    #[cfg(kani)]
+    symbols: Vec<(String, GuestSymbolPtr)>,
     // Declared last so field drop runs strictly after `GuestInstance::drop` tears down every
     // closure/hook holding a copy of `host`.
     _runtime_allocs: OwnedRuntimeAllocs,
@@ -252,7 +279,10 @@ impl GuestInstance {
             shutdown_hooks: Vec::new(),
             save_state_hook: None,
             restore_state_hook: None,
+            #[cfg(not(kani))]
             symbols: HashMap::new(),
+            #[cfg(kani)]
+            symbols: Vec::new(),
             _runtime_allocs: runtime_allocs,
             _manifest_bytes: manifest_bytes,
         }
@@ -325,14 +355,34 @@ impl GuestInstance {
     /// Registers a `"bam.v0.*"` symbol address in this instance's symbol table.
     pub fn register_symbol(&mut self, name: impl Into<String>, ptr: *const c_void) {
         if !ptr.is_null() {
+            #[cfg(not(kani))]
             self.symbols.insert(name.into(), GuestSymbolPtr(ptr));
+            #[cfg(kani)]
+            {
+                let key = name.into();
+                if let Some(entry) = self.symbols.iter_mut().find(|(k, _)| *k == key) {
+                    entry.1 = GuestSymbolPtr(ptr);
+                } else {
+                    self.symbols.push((key, GuestSymbolPtr(ptr)));
+                }
+            }
         }
     }
 
     /// Resolves a `"bam.v0.*"` symbol previously registered on this instance.
     #[inline]
     pub fn resolve_symbol(&self, name: &str) -> Option<*const c_void> {
-        self.symbols.get(name).map(|entry| entry.0)
+        #[cfg(not(kani))]
+        {
+            self.symbols.get(name).map(|entry| entry.0)
+        }
+        #[cfg(kani)]
+        {
+            self.symbols
+                .iter()
+                .find(|(k, _)| k == name)
+                .map(|(_, entry)| entry.0)
+        }
     }
 }
 
@@ -351,6 +401,28 @@ impl Drop for GuestInstance {
         while let Some(alloc) = self.allocations.pop() {
             drop(alloc);
         }
+    }
+}
+
+/// Pure-Rust NUL-terminated `CStr` wrapper for Kani verification (avoids libc `strlen`).
+///
+/// # Safety
+/// `ptr` must be non-null and point to a valid NUL-terminated byte sequence.
+#[cfg(kani)]
+unsafe fn manifest_cstr_from_ptr<'a>(ptr: *const c_char) -> &'a CStr {
+    let mut len = 0usize;
+    loop {
+        // SAFETY: Caller guarantees `ptr` points to a NUL-terminated C string.
+        if unsafe { *ptr.add(len) } == 0 {
+            // SAFETY: Slice `0..=len` ends with a single NUL terminator at `len`.
+            return unsafe {
+                CStr::from_bytes_with_nul_unchecked(core::slice::from_raw_parts(
+                    ptr.cast::<u8>(),
+                    len + 1,
+                ))
+            };
+        }
+        len += 1;
     }
 }
 
@@ -392,9 +464,15 @@ where
         if !manifest_status.is_ok() {
             return manifest_status;
         }
+        #[cfg(not(kani))]
         // SAFETY: `manifest.validate()` confirmed `manifest.name` is non-null, and caller guarantees
         // it points to a NUL-terminated C string.
-        let Ok(manifest_name) = unsafe { CStr::from_ptr(manifest.name) }.to_str() else {
+        let manifest_cstr = unsafe { CStr::from_ptr(manifest.name) };
+        #[cfg(kani)]
+        // SAFETY: `manifest.validate()` confirmed `manifest.name` is non-null, and caller guarantees
+        // it points to a NUL-terminated C string.
+        let manifest_cstr = unsafe { manifest_cstr_from_ptr(manifest.name) };
+        let Ok(manifest_name) = manifest_cstr.to_str() else {
             return FfiResult::INVALID_UTF8;
         };
         if manifest_name.is_empty() {
