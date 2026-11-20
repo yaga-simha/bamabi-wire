@@ -204,6 +204,17 @@ impl FfiUiRect {
     pub const fn px(v: f32) -> Self {
         Self::all(FfiVal::px(v))
     }
+
+    /// Constructs a [`FfiUiRect`] from explicit `(left, right, top, bottom)` edge values.
+    #[inline]
+    pub const fn new(left: FfiVal, right: FfiVal, top: FfiVal, bottom: FfiVal) -> Self {
+        Self {
+            left,
+            right,
+            top,
+            bottom,
+        }
+    }
 }
 
 impl Default for FfiUiRect {
@@ -317,6 +328,29 @@ impl FfiBorderRadius {
     pub const fn px(radius: f32) -> Self {
         Self::all(FfiCornerRadius::px(radius))
     }
+
+    /// Sets all four corners to the same elliptical `(x, y)` radius.
+    #[inline]
+    pub const fn elliptical_all(x: FfiVal, y: FfiVal) -> Self {
+        Self::all(FfiCornerRadius::elliptical(x, y))
+    }
+
+    /// Sets each corner to a distinct circular logical-pixel radius
+    /// `(top_left, top_right, bottom_right, bottom_left)`.
+    #[inline]
+    pub const fn corners_px(
+        top_left: f32,
+        top_right: f32,
+        bottom_right: f32,
+        bottom_left: f32,
+    ) -> Self {
+        Self {
+            top_left: FfiCornerRadius::px(top_left),
+            top_right: FfiCornerRadius::px(top_right),
+            bottom_right: FfiCornerRadius::px(bottom_right),
+            bottom_left: FfiCornerRadius::px(bottom_left),
+        }
+    }
 }
 
 impl Default for FfiBorderRadius {
@@ -396,7 +430,7 @@ impl FfiRgba {
 impl Default for FfiRgba {
     #[inline]
     fn default() -> Self {
-        Self::TRANSPARENT
+        Self::WHITE
     }
 }
 
@@ -417,7 +451,7 @@ impl From<FfiRgba> for FfiColor {
 /// Zero-padding `#[repr(C)]` projection of Bevy `0.20`'s 4-edge `BorderColor`
 /// (`"bamabi::ui::FfiBorderColor"`, 64 bytes, align 4).
 #[repr(C)]
-#[derive(Clone, Copy, Debug, Default, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub struct FfiBorderColor {
     /// Top border color.
     pub top: FfiRgba,
@@ -454,8 +488,15 @@ impl FfiBorderColor {
     }
 }
 
+impl Default for FfiBorderColor {
+    #[inline]
+    fn default() -> Self {
+        Self::all(FfiRgba::TRANSPARENT)
+    }
+}
+
 /// Fixed-layout `#[repr(transparent)]` wire projection of Bevy `0.20`'s `RemSize` root font-size
-/// resource (in logical pixels, default `16.0`).
+/// resource (in logical pixels, default `20.0` matching `bevy_text::DEFAULT_REM_SIZE_PX`).
 #[repr(transparent)]
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct FfiRemSize(pub f32);
@@ -465,12 +506,12 @@ impl_wire_abi_pod!(FfiRemSize, size = 4, align = 4, fields = [f32]);
 impl Default for FfiRemSize {
     #[inline]
     fn default() -> Self {
-        Self(16.0)
+        Self(20.0)
     }
 }
 
 /// Fixed-layout `#[repr(transparent)]` wire projection of Bevy `0.20`'s `EmSize` per-node
-/// font-size component (in logical pixels, default `16.0`).
+/// font-size component (in logical pixels, default `20.0` matching `bevy_text::DEFAULT_REM_SIZE_PX`).
 #[repr(transparent)]
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct FfiEmSize(pub f32);
@@ -480,7 +521,7 @@ impl_wire_abi_pod!(FfiEmSize, size = 4, align = 4, fields = [f32]);
 impl Default for FfiEmSize {
     #[inline]
     fn default() -> Self {
-        Self(16.0)
+        Self(20.0)
     }
 }
 
@@ -847,7 +888,7 @@ impl Default for FfiUiTextStyle {
         Self {
             font_handle: FfiAssetHandle::NONE,
             color: FfiRgba::WHITE,
-            font_size: FfiFontSize::default(),
+            font_size: FfiFontSize::rem(1.0),
             weight: 400,
             justify: Self::JUSTIFY_LEFT,
             linebreak: Self::LINEBREAK_WORD_BOUNDARY,
@@ -925,7 +966,7 @@ impl Default for FfiEditableTextConfig {
     #[inline]
     fn default() -> Self {
         Self {
-            cursor_margin: [0.0, 0.0],
+            cursor_margin: [0.2, 0.2],
             cursor_width: 0.2,
             cursor_blink_period_secs: 1.0,
             visible_lines: 1.0,
@@ -935,7 +976,7 @@ impl Default for FfiEditableTextConfig {
             allow_newlines: FfiBool::FALSE,
             read_write_mode: Self::MODE_EDITABLE,
             has_max_characters: FfiBool::FALSE,
-            has_visible_lines: FfiBool::FALSE,
+            has_visible_lines: FfiBool::TRUE,
             has_visible_width: FfiBool::FALSE,
             reserved0: [0; 2],
         }
@@ -945,7 +986,7 @@ impl Default for FfiEditableTextConfig {
 /// Zero-padding `#[repr(C)]` projection of Bevy `0.20`'s `InlineBox` (`"bamabi::ui::FfiInlineBox"`,
 /// 12 bytes, align 4).
 #[repr(C)]
-#[derive(Clone, Copy, Debug, Default, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub struct FfiInlineBox {
     /// Size of the inline box in logical pixels `[width, height]`.
     pub size: [f32; 2],
@@ -971,6 +1012,33 @@ impl FfiInlineBox {
     pub const KIND_OUT_OF_FLOW: u8 = 0;
     /// `InlineBoxKind::InFlow` (`1`).
     pub const KIND_IN_FLOW: u8 = 1;
+
+    /// Constructs an in-flow [`FfiInlineBox`] with logical pixel dimensions `(width, height)`.
+    #[inline]
+    pub const fn in_flow(width: f32, height: f32) -> Self {
+        Self {
+            size: [width, height],
+            kind: Self::KIND_IN_FLOW,
+            reserved0: [0; 3],
+        }
+    }
+
+    /// Constructs an out-of-flow [`FfiInlineBox`] with logical pixel dimensions `(width, height)`.
+    #[inline]
+    pub const fn out_of_flow(width: f32, height: f32) -> Self {
+        Self {
+            size: [width, height],
+            kind: Self::KIND_OUT_OF_FLOW,
+            reserved0: [0; 3],
+        }
+    }
+}
+
+impl Default for FfiInlineBox {
+    #[inline]
+    fn default() -> Self {
+        Self::out_of_flow(0.0, 0.0)
+    }
 }
 
 /// Zero-padding `#[repr(C)]` projection of Bevy `0.20`'s `InlineImage`
@@ -1102,6 +1170,23 @@ impl_wire_abi_pod!(
 );
 
 impl FfiSelectedTab {
+    /// Constructs a [`FfiSelectedTab`] from an optional [`FfiEntity`] (`None` -> `FfiEntity::NULL`).
+    #[inline]
+    pub const fn from_option(entity: Option<FfiEntity>) -> Self {
+        Self {
+            selected: match entity {
+                Some(e) => e,
+                None => FfiEntity::NULL,
+            },
+        }
+    }
+
+    /// Converts this descriptor into an `Option<FfiEntity>` (`FfiEntity::NULL` -> `None`).
+    #[inline]
+    pub const fn to_option(self) -> Option<FfiEntity> {
+        self.selected_opt()
+    }
+
     /// Returns `Some(entity)` when a tab is selected, or `None` when [`FfiEntity::NULL`].
     #[inline]
     pub const fn selected_opt(&self) -> Option<FfiEntity> {
@@ -1116,7 +1201,7 @@ impl FfiSelectedTab {
 /// Zero-padding `#[repr(C)]` unified `EntityEvent` bridging `bevy_ui_widgets::ValueChange<T>`
 /// (`"bamabi::ui::FfiValueChange"`, 56 bytes, align 8 on 64-bit / 4 on i686).
 #[repr(C)]
-#[derive(Clone, Copy, Debug, Default, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub struct FfiValueChange {
     /// Source widget entity that emitted this `ValueChange` (`EntityEvent::event_target`).
     pub source: FfiEntity,
@@ -1168,6 +1253,167 @@ impl FfiValueChange {
     pub const KIND_I32: u8 = 5;
     pub const KIND_I64: u8 = 6;
     pub const KIND_COLOR: u8 = 7;
+
+    /// Constructs a [`FfiValueChange`] carrying an `Entity` payload (`KIND_ENTITY`).
+    #[inline]
+    pub const fn from_entity(source: FfiEntity, value: FfiEntity, is_final: bool) -> Self {
+        Self {
+            source,
+            entity_value: value,
+            f64_value: 0.0,
+            i64_value: 0,
+            color_value: FfiRgba::TRANSPARENT,
+            f32_value: 0.0,
+            kind: Self::KIND_ENTITY,
+            bool_value: FfiBool::FALSE,
+            is_final: FfiBool::from_bool(is_final),
+            reserved0: 0,
+        }
+    }
+
+    /// Constructs a [`FfiValueChange`] carrying an `Option<Entity>` payload (`KIND_OPTIONAL_ENTITY`).
+    #[inline]
+    pub const fn from_optional_entity(
+        source: FfiEntity,
+        value: Option<FfiEntity>,
+        is_final: bool,
+    ) -> Self {
+        Self {
+            source,
+            entity_value: match value {
+                Some(e) => e,
+                None => FfiEntity::NULL,
+            },
+            f64_value: 0.0,
+            i64_value: 0,
+            color_value: FfiRgba::TRANSPARENT,
+            f32_value: 0.0,
+            kind: Self::KIND_OPTIONAL_ENTITY,
+            bool_value: FfiBool::FALSE,
+            is_final: FfiBool::from_bool(is_final),
+            reserved0: 0,
+        }
+    }
+
+    /// Constructs a [`FfiValueChange`] carrying an `f32` payload (`KIND_F32`).
+    #[inline]
+    pub const fn from_f32(source: FfiEntity, value: f32, is_final: bool) -> Self {
+        Self {
+            source,
+            entity_value: FfiEntity::NULL,
+            f64_value: value as f64,
+            i64_value: 0,
+            color_value: FfiRgba::TRANSPARENT,
+            f32_value: value,
+            kind: Self::KIND_F32,
+            bool_value: FfiBool::FALSE,
+            is_final: FfiBool::from_bool(is_final),
+            reserved0: 0,
+        }
+    }
+
+    /// Constructs a [`FfiValueChange`] carrying a `bool` payload (`KIND_BOOL`).
+    #[inline]
+    pub const fn from_bool(source: FfiEntity, value: bool, is_final: bool) -> Self {
+        Self {
+            source,
+            entity_value: FfiEntity::NULL,
+            f64_value: 0.0,
+            i64_value: 0,
+            color_value: FfiRgba::TRANSPARENT,
+            f32_value: 0.0,
+            kind: Self::KIND_BOOL,
+            bool_value: FfiBool::from_bool(value),
+            is_final: FfiBool::from_bool(is_final),
+            reserved0: 0,
+        }
+    }
+
+    /// Constructs a [`FfiValueChange`] carrying an `f64` payload (`KIND_F64`).
+    #[inline]
+    pub const fn from_f64(source: FfiEntity, value: f64, is_final: bool) -> Self {
+        Self {
+            source,
+            entity_value: FfiEntity::NULL,
+            f64_value: value,
+            i64_value: 0,
+            color_value: FfiRgba::TRANSPARENT,
+            f32_value: value as f32,
+            kind: Self::KIND_F64,
+            bool_value: FfiBool::FALSE,
+            is_final: FfiBool::from_bool(is_final),
+            reserved0: 0,
+        }
+    }
+
+    /// Constructs a [`FfiValueChange`] carrying an `i32` payload (`KIND_I32`).
+    #[inline]
+    pub const fn from_i32(source: FfiEntity, value: i32, is_final: bool) -> Self {
+        Self {
+            source,
+            entity_value: FfiEntity::NULL,
+            f64_value: value as f64,
+            i64_value: value as i64,
+            color_value: FfiRgba::TRANSPARENT,
+            f32_value: value as f32,
+            kind: Self::KIND_I32,
+            bool_value: FfiBool::FALSE,
+            is_final: FfiBool::from_bool(is_final),
+            reserved0: 0,
+        }
+    }
+
+    /// Constructs a [`FfiValueChange`] carrying an `i64` payload (`KIND_I64`).
+    #[inline]
+    pub const fn from_i64(source: FfiEntity, value: i64, is_final: bool) -> Self {
+        Self {
+            source,
+            entity_value: FfiEntity::NULL,
+            f64_value: value as f64,
+            i64_value: value,
+            color_value: FfiRgba::TRANSPARENT,
+            f32_value: value as f32,
+            kind: Self::KIND_I64,
+            bool_value: FfiBool::FALSE,
+            is_final: FfiBool::from_bool(is_final),
+            reserved0: 0,
+        }
+    }
+
+    /// Constructs a [`FfiValueChange`] carrying an sRGBA [`FfiRgba`] color payload (`KIND_COLOR`).
+    #[inline]
+    pub const fn from_color(source: FfiEntity, color: FfiRgba, is_final: bool) -> Self {
+        Self {
+            source,
+            entity_value: FfiEntity::NULL,
+            f64_value: 0.0,
+            i64_value: 0,
+            color_value: color,
+            f32_value: 0.0,
+            kind: Self::KIND_COLOR,
+            bool_value: FfiBool::FALSE,
+            is_final: FfiBool::from_bool(is_final),
+            reserved0: 0,
+        }
+    }
+}
+
+impl Default for FfiValueChange {
+    #[inline]
+    fn default() -> Self {
+        Self {
+            source: FfiEntity::NULL,
+            entity_value: FfiEntity::NULL,
+            f64_value: 0.0,
+            i64_value: 0,
+            color_value: FfiRgba::TRANSPARENT,
+            f32_value: 0.0,
+            kind: Self::KIND_ENTITY,
+            bool_value: FfiBool::FALSE,
+            is_final: FfiBool::TRUE,
+            reserved0: 0,
+        }
+    }
 }
 
 /// Zero-padding `#[repr(C)]` projection of Bevy `0.20`'s `bevy_feathers::theme::ThemeContext`
@@ -1259,7 +1505,7 @@ impl Default for FfiFeathersColorInput {
     fn default() -> Self {
         Self {
             color: FfiRgba::WHITE,
-            opaque_color_percentage: 50.0,
+            opaque_color_percentage: 0.0,
             mode: Self::MODE_WHEEL,
             apply_mode_to_settings: FfiBool::FALSE,
             disabled: FfiBool::FALSE,
@@ -1481,6 +1727,68 @@ impl FfiFeathersNumberInput {
     pub const FORMAT_F64: u8 = 1;
     pub const FORMAT_I32: u8 = 2;
     pub const FORMAT_I64: u8 = 3;
+
+    /// Constructs an `f32` scrubbable number-input descriptor matching `bamabi_bridges::ui`.
+    #[inline]
+    pub fn f32(value: f32) -> Self {
+        Self {
+            value_f64: f64::from(value),
+            format: Self::FORMAT_F32,
+            ..Self::default()
+        }
+    }
+
+    /// Constructs an `f64` scrubbable number-input descriptor matching `bamabi_bridges::ui`.
+    #[inline]
+    pub fn f64(value: f64) -> Self {
+        Self {
+            value_f64: value,
+            format: Self::FORMAT_F64,
+            ..Self::default()
+        }
+    }
+
+    /// Constructs an `i32` scrubbable number-input descriptor (`precision = 0`).
+    #[inline]
+    pub fn i32(value: i32) -> Self {
+        Self {
+            value_i64: i64::from(value),
+            format: Self::FORMAT_I32,
+            precision: 0,
+            ..Self::default()
+        }
+    }
+
+    /// Constructs an `i64` scrubbable number-input descriptor (`precision = 0`).
+    #[inline]
+    pub fn i64(value: i64) -> Self {
+        Self {
+            value_i64: value,
+            format: Self::FORMAT_I64,
+            precision: 0,
+            ..Self::default()
+        }
+    }
+
+    /// Configures a scrub-drag `SoftLimit` range `(min, max)`.
+    #[inline]
+    #[must_use]
+    pub const fn with_soft_limit(mut self, min: f64, max: f64) -> Self {
+        self.soft_min = min;
+        self.soft_max = max;
+        self.has_soft_limit = FfiBool::TRUE;
+        self
+    }
+
+    /// Configures a hard clamp/wrap `HardLimit` range `(min, max)`.
+    #[inline]
+    #[must_use]
+    pub const fn with_hard_limit(mut self, min: f64, max: f64) -> Self {
+        self.hard_min = min;
+        self.hard_max = max;
+        self.has_hard_limit = FfiBool::TRUE;
+        self
+    }
 }
 
 impl Default for FfiFeathersNumberInput {
@@ -1490,10 +1798,10 @@ impl Default for FfiFeathersNumberInput {
             value_f64: 0.0,
             value_i64: 0,
             soft_min: 0.0,
-            soft_max: 1.0,
+            soft_max: 0.0,
             hard_min: 0.0,
-            hard_max: 1.0,
-            step: 0.1,
+            hard_max: 0.0,
+            step: 1.0,
             precision: 2,
             format: Self::FORMAT_F32,
             has_soft_limit: FfiBool::FALSE,

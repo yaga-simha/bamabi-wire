@@ -8,6 +8,7 @@ Isolates all guest-side `unsafe` code (`#![deny(unsafe_op_in_unsafe_fn, clippy::
 - **`GuestInstance`**: Per-World heap state owner with deterministic LIFO closure teardown and hot-reload `save_state` / `restore_state` trampolines.
 - **`panic` & `ReentrantCell`**: `extern "C"` (`nounwind`) panic guards (`catch_guest_result`, `catch_guest_bool`, `catch_guest_unit`) paired with lock-free `UnsafeCell` + `AtomicBool` re-entrancy guards so unwind payloads are dropped strictly on the guest heap.
 - **Validated Iterators, Commands & Migrations**: Layout-, alignment-, UUID-, and length-checked wrappers for dense columns, sparse rows, `iter_count`, `iter_up_cascade`, `par_for_each_chunk_readonly`, `GuestRes` change ticks, deferred commands & checkpoints (`cmd_checkpoint` / `cmd_rollback`, `cmd_insert_relation` / `cmd_remove_relation`), panic-guarded `migrate_component_column` (`BamRowMigrateFn`), dynamic component drop/hook trampolines, and observers.
+- **Unconditional Bevy `0.20` Wire Projections (`wire_types`)**: Zero-Bevy `#[repr(C)]` `AbiPod` wire mirrors with schema hashes matching all 48 `bamabi_bridges` `ModComponent` types (including all 194 named Bevy `0.20` `FfiKeyCode` indices `0..=193`, `FfiUiRect` / elliptical `FfiBorderRadius` helpers, picking, camera/light, audio, UI/Feathers, `ModStateSlab`, and `"BAMT"` `SystemTelemetryDigest64`).
 
 Mod authors should depend on [`bamabi_guest`](../bamabi_guest) rather than calling this `-sys` crate directly.
 

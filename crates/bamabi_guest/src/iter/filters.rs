@@ -131,7 +131,14 @@ impl<'a> SystemContext<'a> {
             }
         }
         match self.query_mut(0) {
-            Some(q0) => q0.read_removed::<T>(term_index),
+            Some(q0) => match q0.read_removed::<T>(term_index) {
+                Ok(removed) => Ok(removed),
+                Err(q_err) => Err(if res_err == Some(FfiResult::TYPE_MISMATCH) {
+                    FfiResult::TYPE_MISMATCH
+                } else {
+                    q_err
+                }),
+            },
             None => Err(res_err.unwrap_or(FfiResult::OUT_OF_RANGE)),
         }
     }
@@ -153,7 +160,14 @@ impl<'a> SystemContext<'a> {
             }
         }
         match self.query_mut(0) {
-            Some(q0) => q0.read_removed_batch_typed::<T>(term_index, out_entities),
+            Some(q0) => match q0.read_removed_batch_typed::<T>(term_index, out_entities) {
+                Ok(n) => Ok(n),
+                Err(q_err) => Err(if res_err == Some(FfiResult::TYPE_MISMATCH) {
+                    FfiResult::TYPE_MISMATCH
+                } else {
+                    q_err
+                }),
+            },
             None => Err(res_err.unwrap_or(FfiResult::OUT_OF_RANGE)),
         }
     }

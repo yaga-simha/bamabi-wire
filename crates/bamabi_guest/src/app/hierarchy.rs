@@ -111,9 +111,14 @@ impl<'b> QueryBuilder<'b> {
     /// scheduler-verified shared read permission.
     pub fn read_children(mut self) -> Self {
         let uuid = ComponentUuid::from_canonical_name(BAM_CHILDREN_NAME);
-        match resolve_component(self.host, Some(CHILDREN_NAME_CSTR), Some(uuid))
-            .or_else(|_| resolve_component(self.host, Some(CHILDREN_ALIAS_CSTR), None))
-        {
+        let resolved = match resolve_component(self.host, Some(CHILDREN_NAME_CSTR), Some(uuid)) {
+            Ok(comp) => Ok(comp),
+            Err(FfiResult::NOT_FOUND) => {
+                resolve_component(self.host, Some(CHILDREN_ALIAS_CSTR), Some(uuid))
+            }
+            Err(err) => Err(err),
+        };
+        match resolved {
             Ok(comp) => self.push_term(comp, AccessMode::READ),
             Err(err) => self.record_error(err),
         }
@@ -149,12 +154,20 @@ impl<'a> GuestCommands<'a> {
         parent: FfiEntity,
         extra_entries: &[SpawnEntry<'_>],
     ) -> Result<FfiEntity, FfiResult> {
+        if !self.is_valid() {
+            return Err(FfiResult::NULL_POINTER);
+        }
         if parent.is_null() {
             return Err(FfiResult::INVALID_ENTITY);
         }
-        let child_of_handle = self
-            .resolve_component(Some(CHILD_OF_NAME_CSTR), Some(FfiChildOf::UUID))
-            .or_else(|_| self.resolve_component(Some(c"ChildOf"), None))?;
+        let child_of_handle =
+            match self.resolve_component(Some(CHILD_OF_NAME_CSTR), Some(FfiChildOf::UUID)) {
+                Ok(handle) => handle,
+                Err(FfiResult::NOT_FOUND) => {
+                    self.resolve_component(Some(c"ChildOf"), Some(FfiChildOf::UUID))?
+                }
+                Err(err) => return Err(err),
+            };
         let child_of = FfiChildOf::new(parent);
         let mut entries = Vec::with_capacity(1 + extra_entries.len());
         entries.push(SpawnEntry::new(child_of_handle, &child_of));

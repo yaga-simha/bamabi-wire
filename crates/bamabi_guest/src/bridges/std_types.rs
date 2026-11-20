@@ -23,7 +23,7 @@ pub use bamabi_guest_sys::wire_types::{
     FfiViewVisibility, FfiVisibility,
 };
 
-use crate::app::{QueryBuilder, SystemContext};
+use crate::app::{QueryBuilder, SystemBuilder, SystemContext};
 use crate::commands::GuestCommands;
 use crate::component::GuestComponent;
 use crate::iter::{Chunk, ChunkIter};
@@ -741,6 +741,86 @@ impl GuestStdCommandsExt for GuestCommands<'_> {
     #[inline]
     fn insert_default_name(&mut self, entity: FfiEntity, handles: &GuestStdHandles) -> FfiResult {
         self.insert_default(entity, handles.name)
+    }
+}
+
+/// Extension trait on [`SystemBuilder`] declaring Bevy `0.20` extended input message writers
+/// (`ModInputExtBridgePlugin`'s `Messages<FfiGamepadRumble>`).
+pub trait GuestStdSystemBuilderExt {
+    /// Declares an [`FfiGamepadRumble`] message writer (`MESSAGE_WRITE`) so the system can emit
+    /// haptic rumble requests to Bevy's `GamepadRumbleRequest` stream.
+    fn write_gamepad_rumble(self) -> Self;
+}
+
+impl GuestStdSystemBuilderExt for SystemBuilder<'_, '_> {
+    #[inline]
+    fn write_gamepad_rumble(self) -> Self {
+        self.message_write::<FfiGamepadRumble>()
+    }
+}
+
+/// Extension trait on [`SystemContext`] for emitting Bevy `0.20` haptic [`FfiGamepadRumble`]
+/// requests through a declared [`GuestStdSystemBuilderExt::write_gamepad_rumble`] stream.
+pub trait GuestGamepadRumbleExt {
+    /// Sends a raw [`FfiGamepadRumble`] request on the `MESSAGE_WRITE` stream at `decl_index`.
+    fn send_gamepad_rumble(&mut self, decl_index: usize, request: FfiGamepadRumble) -> FfiResult;
+
+    /// Batch-sends a slice of [`FfiGamepadRumble`] requests on the `MESSAGE_WRITE` stream at
+    /// `decl_index`.
+    fn send_gamepad_rumbles(
+        &mut self,
+        decl_index: usize,
+        requests: &[FfiGamepadRumble],
+    ) -> Result<(), FfiResult>;
+
+    /// Sends an [`FfiGamepadRumble::add`] haptic rumble request targeting `gamepad` on
+    /// `decl_index`.
+    fn send_gamepad_rumble_add(
+        &mut self,
+        decl_index: usize,
+        gamepad: FfiEntity,
+        duration_secs: f32,
+        strong_motor: f32,
+        weak_motor: f32,
+    ) -> FfiResult;
+
+    /// Sends an [`FfiGamepadRumble::stop`] request halting active rumble on `gamepad` via
+    /// `decl_index`.
+    fn send_gamepad_rumble_stop(&mut self, decl_index: usize, gamepad: FfiEntity) -> FfiResult;
+}
+
+impl GuestGamepadRumbleExt for SystemContext<'_> {
+    #[inline]
+    fn send_gamepad_rumble(&mut self, decl_index: usize, request: FfiGamepadRumble) -> FfiResult {
+        self.send_message(decl_index, &request)
+    }
+
+    #[inline]
+    fn send_gamepad_rumbles(
+        &mut self,
+        decl_index: usize,
+        requests: &[FfiGamepadRumble],
+    ) -> Result<(), FfiResult> {
+        self.send_messages(decl_index, requests)
+    }
+
+    #[inline]
+    fn send_gamepad_rumble_add(
+        &mut self,
+        decl_index: usize,
+        gamepad: FfiEntity,
+        duration_secs: f32,
+        strong_motor: f32,
+        weak_motor: f32,
+    ) -> FfiResult {
+        let req = FfiGamepadRumble::add(gamepad, duration_secs, strong_motor, weak_motor);
+        self.send_message(decl_index, &req)
+    }
+
+    #[inline]
+    fn send_gamepad_rumble_stop(&mut self, decl_index: usize, gamepad: FfiEntity) -> FfiResult {
+        let req = FfiGamepadRumble::stop(gamepad);
+        self.send_message(decl_index, &req)
     }
 }
 

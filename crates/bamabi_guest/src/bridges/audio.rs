@@ -3,7 +3,7 @@
 //! `AudioSource` asset handles) matching `bamabi_bridges::audio` (`ModAudioBridgePlugin`)
 //! bit-for-bit.
 
-use bamabi_guest_sys::{Host, resolve_component};
+use bamabi_guest_sys::{Host, SpawnEntry, resolve_component};
 use bamabi_sys::{AccessMode, BamComponent, FfiAssetHandle, FfiEntity, FfiResult};
 use core::ffi::CStr;
 
@@ -124,7 +124,8 @@ impl GuestAudioQueryBuilderExt for QueryBuilder<'_> {
 
 /// Extension trait on [`GuestCommands`] for spawning and controlling Bevy `0.20` audio playback.
 pub trait GuestCommandsAudioExt {
-    /// Spawns a new mod-scoped audio entity carrying [`FfiAudioPlayerSpec`].
+    /// Resolves [`FfiAudioPlayerSpec`] on the host and atomically spawns a new mod-scoped audio
+    /// entity carrying it (without leaving an orphan entity queued if resolution or spawning fails).
     fn spawn_audio(
         &mut self,
         source: FfiAssetHandle,
@@ -152,13 +153,29 @@ impl GuestCommandsAudioExt for GuestCommands<'_> {
         source: FfiAssetHandle,
         settings: FfiAudioPlaybackSettings,
     ) -> Result<FfiEntity, FfiResult> {
-        let entity = self.spawn_empty()?;
+        if !self.is_valid() {
+            return Err(FfiResult::NULL_POINTER);
+        }
+        let comp = self.resolve_component(
+            Some(FfiAudioPlayerSpec::NAME),
+            Some(FfiAudioPlayerSpec::UUID),
+        )?;
         let spec = FfiAudioPlayerSpec::new(source, settings);
-        let status = self.insert_component(entity, &spec);
-        if status.is_ok() {
-            Ok(entity)
-        } else {
-            Err(status)
+        match self.spawn(&[SpawnEntry::new(comp, &spec)]) {
+            Ok(entity) => Ok(entity),
+            Err(FfiResult::UNSUPPORTED) => {
+                // ABI 0.2.0 host without `component_layout_info`: fall back to `spawn_empty` +
+                // `insert`, despawning the entity on error so no orphan entity leaks.
+                let entity = self.spawn_empty()?;
+                let status = self.insert(entity, comp, &spec);
+                if status.is_ok() {
+                    Ok(entity)
+                } else {
+                    let _ = self.despawn(entity);
+                    Err(status)
+                }
+            }
+            Err(err) => Err(err),
         }
     }
 

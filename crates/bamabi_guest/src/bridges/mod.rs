@@ -88,21 +88,22 @@ pub use std_types::{
     FfiColor, FfiGamepadButton, FfiGamepadRumble, FfiGamepadState, FfiGlobalTransform,
     FfiInheritedVisibility, FfiKeyCode, FfiKeyboardInput, FfiMouseButton, FfiMouseInput,
     FfiMouseMotion, FfiMouseScroll, FfiTimeFixed, FfiTimeReal, FfiTimeVirtual, FfiTransform,
-    FfiViewVisibility, FfiVisibility, GuestDisabledBridge, GuestGlobalTransformBridge,
-    GuestInheritedVisibilityBridge, GuestKeyboardInputBridge, GuestMouseInputBridge,
-    GuestNameBridge, GuestStdCommandsExt, GuestStdHandles, GuestStdQueryBuilderExt, GuestStdTypes,
-    GuestTimeFixedBridge, GuestTimeRealBridge, GuestTimeVirtualBridge, GuestTransformBridge,
-    GuestViewVisibilityBridge, GuestVisibilityBridge, GuestWireBridge,
+    FfiViewVisibility, FfiVisibility, GuestDisabledBridge, GuestGamepadRumbleExt,
+    GuestGlobalTransformBridge, GuestInheritedVisibilityBridge, GuestKeyboardInputBridge,
+    GuestMouseInputBridge, GuestNameBridge, GuestStdCommandsExt, GuestStdHandles,
+    GuestStdQueryBuilderExt, GuestStdSystemBuilderExt, GuestStdTypes, GuestTimeFixedBridge,
+    GuestTimeRealBridge, GuestTimeVirtualBridge, GuestTransformBridge, GuestViewVisibilityBridge,
+    GuestVisibilityBridge, GuestWireBridge,
 };
 pub use ui::{
-    FfiBorderColor, FfiBorderRadius, FfiCornerRadius, FfiEditableTextConfig, FfiEmSize,
-    FfiFeathersColorInput, FfiFeathersDropdown, FfiFeathersListRow, FfiFeathersListView,
+    ACTIVATE_EVENT_UUID, FfiBorderColor, FfiBorderRadius, FfiCornerRadius, FfiEditableTextConfig,
+    FfiEmSize, FfiFeathersColorInput, FfiFeathersDropdown, FfiFeathersListRow, FfiFeathersListView,
     FfiFeathersNumberInput, FfiFeathersScrollableList, FfiFeathersSelect, FfiFontSize,
     FfiInlineBox, FfiInlineImage, FfiRemSize, FfiRgba, FfiSelectedTab, FfiTab, FfiTabList,
     FfiThemeContext, FfiUiNode, FfiUiRect, FfiUiTextStyle, FfiVal, FfiValueChange, GuestAppUiExt,
     GuestBackgroundColorBridge, GuestBorderColorBridge, GuestCommandsUiExt, GuestEmSizeBridge,
     GuestMappedStringBridge, GuestRemSizeBridge, GuestTextSpanBridge, GuestThemeContextBridge,
-    GuestUiQueryBuilderExt, GuestUiTextBridge,
+    GuestUiHandles, GuestUiQueryBuilderExt, GuestUiTextBridge,
 };
 pub use window::{
     FfiAppExit, FfiWindow, FfiWindowCloseRequested, FfiWindowMode, FfiWindowResized,
@@ -136,6 +137,8 @@ pub trait GuestBridgesHostExt {
     fn em_size_bridge(&self) -> Result<GuestEmSizeBridge, FfiResult>;
     /// Resolves `ModUiBridgePlugin`'s `ThemeContext` wire bridge.
     fn theme_context_bridge(&self) -> Result<GuestThemeContextBridge, FfiResult>;
+    /// Resolves `ModUiBridgePlugin`'s pre-resolved bridged component and `Activate` event handles.
+    fn ui_handles(&self) -> Result<GuestUiHandles, FfiResult>;
     /// Resolves a host-opt-in `Window` wire bridge.
     fn window_bridge(&self) -> Result<GuestWindowBridge, FfiResult>;
     /// Resolves a host-opt-in `Sprite` wire bridge.
@@ -201,6 +204,11 @@ impl GuestBridgesHostExt for Host {
     #[inline]
     fn theme_context_bridge(&self) -> Result<GuestThemeContextBridge, FfiResult> {
         GuestThemeContextBridge::resolve_theme_context(self)
+    }
+
+    #[inline]
+    fn ui_handles(&self) -> Result<GuestUiHandles, FfiResult> {
+        GuestUiHandles::resolve(self)
     }
 
     #[inline]
@@ -276,6 +284,11 @@ impl GuestBridgesHostExt for GuestApp<'_> {
     }
 
     #[inline]
+    fn ui_handles(&self) -> Result<GuestUiHandles, FfiResult> {
+        self.host().ui_handles()
+    }
+
+    #[inline]
     fn window_bridge(&self) -> Result<GuestWindowBridge, FfiResult> {
         self.host().window_bridge()
     }
@@ -345,6 +358,11 @@ impl GuestBridgesHostExt for SystemContext<'_> {
     #[inline]
     fn theme_context_bridge(&self) -> Result<GuestThemeContextBridge, FfiResult> {
         self.host().theme_context_bridge()
+    }
+
+    #[inline]
+    fn ui_handles(&self) -> Result<GuestUiHandles, FfiResult> {
+        self.host().ui_handles()
     }
 
     #[inline]

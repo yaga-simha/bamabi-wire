@@ -741,6 +741,9 @@ unsafe extern "C" fn mock_resolve_component(
             unsafe { *out = c.handle };
             return FfiResult::OK;
         }
+        if target_name.is_some() && name_ok && !uuid_ok {
+            return FfiResult::TYPE_MISMATCH;
+        }
     }
     FfiResult::NOT_FOUND
 }
@@ -2642,9 +2645,9 @@ fn ui_mapped_string_and_wire_bridges_and_disabled_bridge_roundtrip() {
     );
     host.add_comp(
         "bevy_ui_widgets::Activate",
-        ComponentUuid::from_canonical_name("bevy_ui_widgets::Activate"),
-        0,
-        1,
+        ACTIVATE_EVENT_UUID,
+        core::mem::size_of::<FfiEntity>(),
+        core::mem::align_of::<FfiEntity>(),
         0,
     );
 
@@ -3584,4 +3587,1438 @@ fn all_48_host_mod_components_match_derive_uuid_size_and_align() {
     assert_parity::<FfiFeathersScrollableList, HFeathersScrollableList>();
     assert_parity::<FfiFeathersListRow, HFeathersListRow>();
     assert_parity::<FfiFeathersNumberInput, HFeathersNumberInput>();
+}
+
+/// Scenario: Verifies complete 194-key `FfiKeyCode` parity (`0..=193` matching
+/// `bamabi_bridges::std_types::FfiKeyCode::from_bevy`), full 4-word bitset coverage on
+/// `FfiKeyboardInput`, and `FfiUiRect` / `FfiBorderRadius` / `FfiRgba` / `FfiBorderColor` /
+/// `FfiValueChange` constructor and `Default` parity with `bamabi_bridges::ui`.
+#[test]
+fn ffi_key_code_all_194_indices_and_ui_wire_constructors_match_bridges() {
+    assert_eq!(FfiKeyCode::COUNT, 194);
+    assert_eq!(FfiKeyCode::ALL.len(), 194);
+    for (idx, &code) in FfiKeyCode::ALL.iter().enumerate() {
+        assert_eq!(code.0 as usize, idx);
+        assert!(code.is_valid());
+    }
+    assert!(!FfiKeyCode(194).is_valid());
+    assert!(!FfiKeyCode(255).is_valid());
+    assert!(!FfiKeyCode(256).is_valid());
+
+    // Spot-check key boundary indices across every group against `bamabi_bridges::std_types`.
+    assert_eq!(FfiKeyCode::BACKQUOTE.0, 0);
+    assert_eq!(FfiKeyCode::INTL_BACKSLASH.0, 16);
+    assert_eq!(FfiKeyCode::INTL_RO.0, 17);
+    assert_eq!(FfiKeyCode::INTL_YEN.0, 18);
+    assert_eq!(FfiKeyCode::KEY_A.0, 19);
+    assert_eq!(FfiKeyCode::KEY_Z.0, 44);
+    assert_eq!(FfiKeyCode::CONTEXT_MENU.0, 54);
+    assert_eq!(FfiKeyCode::CONVERT.0, 64);
+    assert_eq!(FfiKeyCode::KANA_MODE.0, 65);
+    assert_eq!(FfiKeyCode::LANG_1.0, 66);
+    assert_eq!(FfiKeyCode::LANG_5.0, 70);
+    assert_eq!(FfiKeyCode::NON_CONVERT.0, 71);
+    assert_eq!(FfiKeyCode::HELP.0, 74);
+    assert_eq!(FfiKeyCode::NUM_LOCK.0, 83);
+    assert_eq!(FfiKeyCode::NUMPAD_0.0, 84);
+    assert_eq!(FfiKeyCode::NUMPAD_9.0, 93);
+    assert_eq!(FfiKeyCode::NUMPAD_ADD.0, 94);
+    assert_eq!(FfiKeyCode::NUMPAD_ENTER.0, 101);
+    assert_eq!(FfiKeyCode::NUMPAD_SUBTRACT.0, 113);
+    assert_eq!(FfiKeyCode::ESCAPE.0, 114);
+    assert_eq!(FfiKeyCode::FN.0, 115);
+    assert_eq!(FfiKeyCode::FN_LOCK.0, 116);
+    assert_eq!(FfiKeyCode::PRINT_SCREEN.0, 117);
+    assert_eq!(FfiKeyCode::SCROLL_LOCK.0, 118);
+    assert_eq!(FfiKeyCode::PAUSE.0, 119);
+    assert_eq!(FfiKeyCode::BROWSER_BACK.0, 120);
+    assert_eq!(FfiKeyCode::BROWSER_STOP.0, 126);
+    assert_eq!(FfiKeyCode::EJECT.0, 127);
+    assert_eq!(FfiKeyCode::LAUNCH_APP_1.0, 128);
+    assert_eq!(FfiKeyCode::LAUNCH_APP_2.0, 129);
+    assert_eq!(FfiKeyCode::LAUNCH_MAIL.0, 130);
+    assert_eq!(FfiKeyCode::MEDIA_PLAY_PAUSE.0, 131);
+    assert_eq!(FfiKeyCode::MEDIA_TRACK_PREVIOUS.0, 135);
+    assert_eq!(FfiKeyCode::POWER.0, 136);
+    assert_eq!(FfiKeyCode::SLEEP.0, 137);
+    assert_eq!(FfiKeyCode::AUDIO_VOLUME_DOWN.0, 138);
+    assert_eq!(FfiKeyCode::AUDIO_VOLUME_MUTE.0, 139);
+    assert_eq!(FfiKeyCode::AUDIO_VOLUME_UP.0, 140);
+    assert_eq!(FfiKeyCode::WAKE_UP.0, 141);
+    assert_eq!(FfiKeyCode::META.0, 142);
+    assert_eq!(FfiKeyCode::HYPER.0, 143);
+    assert_eq!(FfiKeyCode::TURBO.0, 144);
+    assert_eq!(FfiKeyCode::ABORT.0, 145);
+    assert_eq!(FfiKeyCode::UNDO.0, 156);
+    assert_eq!(FfiKeyCode::HIRAGANA.0, 157);
+    assert_eq!(FfiKeyCode::KATAKANA.0, 158);
+    assert_eq!(FfiKeyCode::F1.0, 159);
+    assert_eq!(FfiKeyCode::F12.0, 170);
+    assert_eq!(FfiKeyCode::F13.0, 171);
+    assert_eq!(FfiKeyCode::F35.0, 193);
+
+    // Exercise every single one of the 194 named keys across all 4 `u64` words of `FfiKeyboardInput`.
+    let mut kb = FfiKeyboardInput::default();
+    for &code in &FfiKeyCode::ALL {
+        kb.press(code);
+        assert!(kb.pressed(code));
+        assert!(kb.just_pressed(code));
+        assert!(!kb.just_released(code));
+    }
+    assert!(kb.all_pressed(FfiKeyCode::ALL));
+    assert!(kb.all_just_pressed([
+        FfiKeyCode::NUM_LOCK,
+        FfiKeyCode::NUMPAD_5,
+        FfiKeyCode::PRINT_SCREEN,
+        FfiKeyCode::PAUSE,
+        FfiKeyCode::MEDIA_PLAY_PAUSE,
+        FfiKeyCode::F35,
+    ]));
+    kb.clear();
+    assert!(!kb.any_just_pressed(FfiKeyCode::ALL));
+    assert!(kb.all_pressed(FfiKeyCode::ALL));
+
+    for &code in &FfiKeyCode::ALL {
+        kb.release(code);
+        assert!(!kb.pressed(code));
+        assert!(kb.just_released(code));
+    }
+    assert!(kb.all_just_released(FfiKeyCode::ALL));
+    // Out-of-range key indices (`>= 256`) fail closed without panicking or mutating bits.
+    kb.press(FfiKeyCode(256));
+    assert!(!kb.pressed(FfiKeyCode(256)));
+    assert!(!kb.just_pressed(FfiKeyCode(256)));
+    assert!(!kb.just_released(FfiKeyCode(256)));
+
+    // UI wire constructors & `Default` parity with `bamabi_bridges::ui`.
+    let rect = FfiUiRect::new(
+        FfiVal::px(1.0),
+        FfiVal::percent(2.0),
+        FfiVal::em(3.0),
+        FfiVal::rem(4.0),
+    );
+    assert_eq!(rect.left, FfiVal::px(1.0));
+    assert_eq!(rect.right, FfiVal::percent(2.0));
+    assert_eq!(rect.top, FfiVal::em(3.0));
+    assert_eq!(rect.bottom, FfiVal::rem(4.0));
+
+    let ell = FfiBorderRadius::elliptical_all(FfiVal::px(12.0), FfiVal::percent(25.0));
+    let expected_corner = FfiCornerRadius::elliptical(FfiVal::px(12.0), FfiVal::percent(25.0));
+    assert_eq!(ell.top_left, expected_corner);
+    assert_eq!(ell.top_right, expected_corner);
+    assert_eq!(ell.bottom_right, expected_corner);
+    assert_eq!(ell.bottom_left, expected_corner);
+
+    let corners = FfiBorderRadius::corners_px(2.0, 4.0, 6.0, 8.0);
+    assert_eq!(corners.top_left, FfiCornerRadius::px(2.0));
+    assert_eq!(corners.top_right, FfiCornerRadius::px(4.0));
+    assert_eq!(corners.bottom_right, FfiCornerRadius::px(6.0));
+    assert_eq!(corners.bottom_left, FfiCornerRadius::px(8.0));
+
+    assert_eq!(FfiRgba::default(), FfiRgba::WHITE);
+    assert_eq!(
+        FfiBorderColor::default(),
+        FfiBorderColor::all(FfiRgba::TRANSPARENT)
+    );
+    let vc = FfiValueChange::default();
+    assert_eq!(vc.source, FfiEntity::NULL);
+    assert_eq!(vc.entity_value, FfiEntity::NULL);
+    assert_eq!(vc.color_value, FfiRgba::TRANSPARENT);
+    assert_eq!(vc.kind, FfiValueChange::KIND_ENTITY);
+    assert_eq!(vc.bool_value, FfiBool::FALSE);
+    assert_eq!(vc.is_final, FfiBool::TRUE);
+}
+
+/// Regression: Verifies `GuestCommandsAudioExt::spawn_audio` resolves `FfiAudioPlayerSpec` before
+/// reserving any entity (zero orphan entities when unregistered), spawns atomically on ABI `0.3.0`,
+/// and handles ABI `0.2.0` fallback + `insert`-error despawn cleanup without leaking orphans.
+#[test]
+fn spawn_audio_resolves_before_spawn_no_orphan_entity_and_v02_fallback() {
+    let source = FfiAssetHandle::from_index(BamComponent::from_raw(9), 77, 1);
+    let settings = FfiAudioPlaybackSettings {
+        volume: 0.75,
+        speed: 1.25,
+        ..FfiAudioPlaybackSettings::default()
+    };
+
+    // 1. Unregistered `FfiAudioPlayerSpec`: returns `NOT_FOUND` and queues ZERO commands (no orphan).
+    {
+        let mut host = MockHost::new();
+        let api = MockHost::api();
+        let load_ctx = core::ptr::from_mut(host.as_mut()).cast::<BamLoadCtx>();
+        let mut inst: *mut BamInstance = core::ptr::null_mut();
+        let manifest = BamManifest::new(c"audio_unreg_mod".as_ptr(), c"0.3.0".as_ptr());
+
+        static SAW_UNREG_ERR: AtomicBool = AtomicBool::new(false);
+        let status = unsafe {
+            init_guest_instance(&api, load_ctx, &mut inst, &manifest, |instance, lctx| {
+                build_guest_fn(instance, lctx, |app| {
+                    app.system(c"try_unreg_audio").build(move |ctx| {
+                        let res = ctx.commands().spawn_audio(source, settings);
+                        assert_eq!(res, Err(FfiResult::NOT_FOUND));
+                        // Also check disabled/null command buffer fails closed with `NULL_POINTER`.
+                        let mut null_cmds = GuestCommands::from_validated(
+                            bamabi_guest_sys::ValidatedCommands::empty(ctx.host()),
+                        );
+                        assert_eq!(
+                            null_cmds.spawn_audio(source, settings),
+                            Err(FfiResult::NULL_POINTER)
+                        );
+                        SAW_UNREG_ERR.store(true, Ordering::SeqCst);
+                    })
+                })
+            })
+        };
+        assert_eq!(status, FfiResult::OK);
+        let cb = host.systems[0].callback;
+        let ud = host.systems[0].user_data;
+        let host_ptr = core::ptr::from_mut(host.as_mut());
+        let mut sys_ctx = MockSysCtxState {
+            host: host_ptr,
+            iters: Vec::new(),
+            cmds: Vec::new(),
+            next_entity: 100,
+            entity_data: HashMap::new(),
+            children: HashMap::new(),
+        };
+        assert_eq!(
+            unsafe { cb(core::ptr::from_mut(&mut sys_ctx).cast(), ud) },
+            FfiResult::OK
+        );
+        assert!(SAW_UNREG_ERR.load(Ordering::SeqCst));
+        assert!(
+            sys_ctx.cmds.is_empty(),
+            "orphan entity leaked into command buffer: {:?}",
+            sys_ctx.cmds
+        );
+        assert_eq!(sys_ctx.next_entity, 100);
+        unsafe { shutdown_guest_instance(inst) };
+    }
+
+    // 2. Registered `FfiAudioPlayerSpec` on ABI 0.3.0: single atomic `cmd_spawn` with exact payload.
+    {
+        let mut host = MockHost::new();
+        let spec_handle = host.add_comp(
+            "bamabi::audio::FfiAudioPlayerSpec",
+            <FfiAudioPlayerSpec as GuestComponent>::UUID,
+            core::mem::size_of::<FfiAudioPlayerSpec>(),
+            core::mem::align_of::<FfiAudioPlayerSpec>(),
+            0,
+        );
+        let api = MockHost::api();
+        let load_ctx = core::ptr::from_mut(host.as_mut()).cast::<BamLoadCtx>();
+        let mut inst: *mut BamInstance = core::ptr::null_mut();
+        let manifest = BamManifest::new(c"audio_ok_mod".as_ptr(), c"0.3.0".as_ptr());
+
+        static SPAWNED_BITS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+        let status = unsafe {
+            init_guest_instance(&api, load_ctx, &mut inst, &manifest, |instance, lctx| {
+                build_guest_fn(instance, lctx, |app| {
+                    app.system(c"spawn_audio_ok").build(move |ctx| {
+                        let ent = ctx.commands().spawn_audio(source, settings).unwrap();
+                        SPAWNED_BITS.store(ent.to_bits(), Ordering::SeqCst);
+                    })
+                })
+            })
+        };
+        assert_eq!(status, FfiResult::OK);
+        let cb = host.systems[0].callback;
+        let ud = host.systems[0].user_data;
+        let host_ptr = core::ptr::from_mut(host.as_mut());
+        let mut sys_ctx = MockSysCtxState {
+            host: host_ptr,
+            iters: Vec::new(),
+            cmds: Vec::new(),
+            next_entity: 200,
+            entity_data: HashMap::new(),
+            children: HashMap::new(),
+        };
+        assert_eq!(
+            unsafe { cb(core::ptr::from_mut(&mut sys_ctx).cast(), ud) },
+            FfiResult::OK
+        );
+        let ent = FfiEntity::from_bits(SPAWNED_BITS.load(Ordering::SeqCst));
+        assert_eq!(ent, FfiEntity::from_bits(200));
+        let expected_spec = FfiAudioPlayerSpec::new(source, settings);
+        let expected_bytes = unsafe {
+            core::slice::from_raw_parts(
+                core::ptr::from_ref(&expected_spec).cast::<u8>(),
+                core::mem::size_of::<FfiAudioPlayerSpec>(),
+            )
+            .to_vec()
+        };
+        assert_eq!(
+            sys_ctx.cmds,
+            vec![
+                MockCmd::SpawnEmpty(ent),
+                MockCmd::Insert(ent, spec_handle, expected_bytes),
+            ]
+        );
+        unsafe { shutdown_guest_instance(inst) };
+    }
+
+    // 3. ABI 0.2.0 host (`component_layout_info = None`): fallback succeeds when insert succeeds,
+    //    and queues `Despawn` cleanup if `insert` fails (`PERMISSION_DENIED`).
+    for allow_raw_insert in [true, false] {
+        let mut host = MockHost::new();
+        let spec_handle = host.add_comp(
+            "bamabi::audio::FfiAudioPlayerSpec",
+            <FfiAudioPlayerSpec as GuestComponent>::UUID,
+            core::mem::size_of::<FfiAudioPlayerSpec>(),
+            core::mem::align_of::<FfiAudioPlayerSpec>(),
+            0,
+        );
+        host.comps
+            .iter_mut()
+            .find(|c| c.handle == spec_handle)
+            .unwrap()
+            .raw_insert_allowed = allow_raw_insert;
+
+        let mut api = MockHost::api();
+        api.component_layout_info = None; // Triggers `FfiResult::UNSUPPORTED` in `spawn`
+        let load_ctx = core::ptr::from_mut(host.as_mut()).cast::<BamLoadCtx>();
+        let mut inst: *mut BamInstance = core::ptr::null_mut();
+        let manifest = BamManifest::new(c"audio_v02_mod".as_ptr(), c"0.3.0".as_ptr());
+
+        let status = unsafe {
+            init_guest_instance(&api, load_ctx, &mut inst, &manifest, |instance, lctx| {
+                build_guest_fn(instance, lctx, |app| {
+                    app.system(c"spawn_audio_v02").build(move |ctx| {
+                        let res = ctx.commands().spawn_audio(source, settings);
+                        if allow_raw_insert {
+                            assert_eq!(res, Ok(FfiEntity::from_bits(300)));
+                        } else {
+                            assert_eq!(res, Err(FfiResult::PERMISSION_DENIED));
+                        }
+                    })
+                })
+            })
+        };
+        assert_eq!(status, FfiResult::OK);
+        let cb = host.systems[0].callback;
+        let ud = host.systems[0].user_data;
+        let host_ptr = core::ptr::from_mut(host.as_mut());
+        let mut sys_ctx = MockSysCtxState {
+            host: host_ptr,
+            iters: Vec::new(),
+            cmds: Vec::new(),
+            next_entity: 300,
+            entity_data: HashMap::new(),
+            children: HashMap::new(),
+        };
+        assert_eq!(
+            unsafe { cb(core::ptr::from_mut(&mut sys_ctx).cast(), ud) },
+            FfiResult::OK
+        );
+        let ent = FfiEntity::from_bits(300);
+        if allow_raw_insert {
+            assert_eq!(sys_ctx.cmds.len(), 2);
+            assert_eq!(sys_ctx.cmds[0], MockCmd::SpawnEmpty(ent));
+            assert!(
+                matches!(sys_ctx.cmds[1], MockCmd::Insert(e, h, _) if e == ent && h == spec_handle)
+            );
+        } else {
+            assert_eq!(
+                sys_ctx.cmds,
+                vec![MockCmd::SpawnEmpty(ent), MockCmd::Despawn(ent)]
+            );
+        }
+        unsafe { shutdown_guest_instance(inst) };
+    }
+}
+
+/// Scenario: Exercises `GuestUiHandles`, `GuestUiQueryBuilderExt::{read_text_span, write_text_span}`,
+/// `GuestCommandsUiExt::{insert_default_*, trigger_activate, trigger_activate_with}`,
+/// `GuestStdSystemBuilderExt::write_gamepad_rumble`, and `GuestGamepadRumbleExt` end-to-end
+/// (including optional `ThemeContext` absent vs present, alias fallback, `TYPE_MISMATCH` rejection,
+/// and `FfiEntity::NULL` validation).
+#[test]
+fn ui_handles_text_span_default_inserters_trigger_activate_and_gamepad_rumble_end_to_end() {
+    use bamabi_guest::raw::MappedStringVTable;
+
+    unsafe extern "C" fn mock_string_get(ptr: *const c_void) -> StrView {
+        let s = unsafe { &*ptr.cast::<String>() };
+        StrView::from_str(s.as_str())
+    }
+    unsafe extern "C" fn mock_string_set(ptr: *mut c_void, view: StrView) -> FfiResult {
+        let s = unsafe { &mut *ptr.cast::<String>() };
+        let Ok(slice) = (unsafe { view.try_as_str() }) else {
+            return FfiResult::INVALID_UTF8;
+        };
+        s.clear();
+        s.push_str(slice);
+        FfiResult::OK
+    }
+
+    // Part A: Full UI handles WITHOUT optional `bridge-feathers` (`ThemeContext` absent) +
+    // `TextSpan` query/bridge + `trigger_activate` + `FfiGamepadRumble` messages.
+    {
+        let mut host = MockHost::new();
+        let text_uuid = ComponentUuid::from_canonical_name("bevy_ui::widget::text::Text");
+        let span_uuid = ComponentUuid::from_canonical_name("bevy_text::text::TextSpan");
+        let bg_uuid = ComponentUuid::from_canonical_name("bevy_ui::ui_node::BackgroundColor");
+        let border_uuid = ComponentUuid::from_canonical_name("bevy_ui::ui_node::BorderColor");
+        let em_uuid = ComponentUuid::from_canonical_name("bevy_text::text::EmSize");
+
+        let text_h = host.add_comp("bevy_ui::widget::text::Text", text_uuid, 24, 8, 0);
+        let span_h = host.add_comp(
+            "bevy_text::text::TextSpan",
+            span_uuid,
+            core::mem::size_of::<String>(),
+            core::mem::align_of::<String>(),
+            0,
+        );
+        let bg_h = host.add_comp("bevy_ui::ui_node::BackgroundColor", bg_uuid, 16, 4, 0);
+        let border_h = host.add_comp("bevy_ui::ui_node::BorderColor", border_uuid, 64, 4, 0);
+        let em_h = host.add_comp("bevy_text::text::EmSize", em_uuid, 4, 4, 0);
+        let act_h = host.add_comp(
+            "bevy_ui_widgets::Activate",
+            ACTIVATE_EVENT_UUID,
+            core::mem::size_of::<FfiEntity>(),
+            core::mem::align_of::<FfiEntity>(),
+            0,
+        );
+        let _rumble_h = host.add_comp(
+            "bevy_input::gamepad::GamepadRumbleRequest",
+            <FfiGamepadRumble as GuestComponent>::UUID,
+            core::mem::size_of::<FfiGamepadRumble>(),
+            core::mem::align_of::<FfiGamepadRumble>(),
+            BAM_STORAGE_FLAG_MESSAGE,
+        );
+
+        let span_vt = MappedStringVTable {
+            header: VTableHeader::new::<MappedStringVTable, String>(span_uuid),
+            get: Some(mock_string_get),
+            set: Some(mock_string_set),
+        };
+        host.symbols.insert(
+            "bam.v0.TextSpan.vtable".to_owned(),
+            core::ptr::from_ref(&span_vt).cast::<c_void>(),
+        );
+
+        let api = MockHost::api();
+        let load_ctx = core::ptr::from_mut(host.as_mut()).cast::<BamLoadCtx>();
+        let mut inst: *mut BamInstance = core::ptr::null_mut();
+        let manifest = BamManifest::new(c"ui_input_parity_mod".as_ptr(), c"0.3.0".as_ptr());
+
+        static PARITY_RAN: AtomicBool = AtomicBool::new(false);
+        let target_ent = FfiEntity::from_bits(42);
+        let gp_ent = FfiEntity::from_bits(77);
+
+        let status = unsafe {
+            init_guest_instance(&api, load_ctx, &mut inst, &manifest, |instance, lctx| {
+                build_guest_fn(instance, lctx, |app| {
+                    let handles = app.ui_handles().unwrap();
+                    assert_eq!(handles.text, text_h);
+                    assert_eq!(handles.text_span, span_h);
+                    assert_eq!(handles.background_color, bg_h);
+                    assert_eq!(handles.border_color, border_h);
+                    assert_eq!(handles.em_size, em_h);
+                    assert_eq!(handles.theme_context, None);
+                    assert_eq!(handles.activate, act_h);
+
+                    let span_bridge = app.text_span_bridge().unwrap();
+
+                    app.system(c"ui_and_rumble_sys")
+                        .query(|q| q.write_text_span())
+                        .query(|q| q.read_text_span())
+                        .write_gamepad_rumble()
+                        .build(move |ctx| {
+                            // 1. Read & mutate `TextSpan` via `GuestTextSpanBridge`.
+                            while let Some(mut chunk) = ctx.iter().next_chunk_view() {
+                                let before = span_bridge.read_chunk_row(&mut chunk, 0, 0)?.unwrap();
+                                assert_eq!(before, "span-before");
+                                assert_eq!(
+                                    span_bridge.write_chunk_row(&mut chunk, 0, 0, "span-after"),
+                                    FfiResult::OK
+                                );
+                            }
+
+                            // 2. Emit `FfiGamepadRumble` messages (add, stop, raw, batch, bad idx).
+                            assert_eq!(
+                                ctx.send_gamepad_rumble_add(0, gp_ent, 0.5, 0.8, 0.25),
+                                FfiResult::OK
+                            );
+                            assert_eq!(ctx.send_gamepad_rumble_stop(0, gp_ent), FfiResult::OK);
+                            let raw_req = FfiGamepadRumble::add(gp_ent, 0.25, 0.4, 0.6);
+                            assert_eq!(ctx.send_gamepad_rumble(0, raw_req), FfiResult::OK);
+                            ctx.send_gamepad_rumbles(
+                                0,
+                                &[
+                                    FfiGamepadRumble::add(gp_ent, 0.1, 1.0, 0.0),
+                                    FfiGamepadRumble::stop(gp_ent),
+                                ],
+                            )?;
+                            assert_eq!(
+                                ctx.send_gamepad_rumble_stop(9, gp_ent),
+                                FfiResult::OUT_OF_RANGE
+                            );
+
+                            // 3. Insert all host-defaulted UI components + trigger `Activate`.
+                            let cmds = ctx.commands();
+                            assert_eq!(
+                                cmds.insert_default_ui_text(target_ent, &handles),
+                                FfiResult::OK
+                            );
+                            assert_eq!(
+                                cmds.insert_default_text_span(target_ent, &handles),
+                                FfiResult::OK
+                            );
+                            assert_eq!(
+                                cmds.insert_default_background_color(target_ent, &handles),
+                                FfiResult::OK
+                            );
+                            assert_eq!(
+                                cmds.insert_default_border_color(target_ent, &handles),
+                                FfiResult::OK
+                            );
+                            assert_eq!(
+                                cmds.insert_default_em_size(target_ent, &handles),
+                                FfiResult::OK
+                            );
+                            assert_eq!(
+                                cmds.insert_default_theme_context(target_ent, &handles),
+                                FfiResult::NOT_FOUND
+                            );
+                            assert_eq!(
+                                cmds.trigger_activate(FfiEntity::NULL),
+                                Err(FfiResult::INVALID_ENTITY)
+                            );
+                            assert_eq!(
+                                cmds.trigger_activate_with(&handles, FfiEntity::NULL),
+                                Err(FfiResult::INVALID_ENTITY)
+                            );
+                            cmds.trigger_activate(target_ent)?;
+                            cmds.trigger_activate_with(&handles, target_ent)?;
+
+                            PARITY_RAN.store(true, Ordering::SeqCst);
+                            Ok(())
+                        })
+                })
+            })
+        };
+        assert_eq!(status, FfiResult::OK);
+        // Verify `write_text_span` / `read_text_span` query terms and `MESSAGE_WRITE` term.
+        assert_eq!(host.systems[0].queries[0][0].component, span_h);
+        assert_eq!(host.systems[0].queries[0][0].mode, AccessMode::WRITE);
+        assert_eq!(host.systems[0].queries[1][0].component, span_h);
+        assert_eq!(host.systems[0].queries[1][0].mode, AccessMode::READ);
+        assert_eq!(
+            host.systems[0].queries[2][0].mode,
+            AccessMode::MESSAGE_WRITE
+        );
+
+        // Allocate aligned backing storage for `String` in `TextSpan` column 0.
+        let str_words = core::mem::size_of::<String>().div_ceil(8);
+        let mut span_buf = vec![0u64; str_words];
+        unsafe {
+            core::ptr::write(
+                span_buf.as_mut_ptr().cast::<String>(),
+                String::from("span-before"),
+            );
+        }
+        let mut cols = HashMap::new();
+        cols.insert(0, span_buf);
+
+        let q0 = host.systems[0].queries[0].clone();
+        let q1 = host.systems[0].queries[1].clone();
+        let q2 = host.systems[0].queries[2].clone();
+        let cb = host.systems[0].callback;
+        let ud = host.systems[0].user_data;
+
+        let host_ptr = core::ptr::from_mut(host.as_mut());
+        let iter0 = Box::new(MockIterState {
+            host: host_ptr,
+            terms: q0,
+            entities: vec![target_ent],
+            columns: cols,
+            removed: HashMap::new(),
+            resources: HashMap::new(),
+            messages: HashMap::new(),
+            chunks: core::iter::once(0..1).collect(),
+            cursor: 0,
+            active_chunk: None,
+        });
+        let iter1 = Box::new(MockIterState {
+            host: host_ptr,
+            terms: q1,
+            entities: Vec::new(),
+            columns: HashMap::new(),
+            removed: HashMap::new(),
+            resources: HashMap::new(),
+            messages: HashMap::new(),
+            chunks: Vec::new(),
+            cursor: 0,
+            active_chunk: None,
+        });
+        let iter_res = Box::new(MockIterState {
+            host: host_ptr,
+            terms: q2,
+            entities: Vec::new(),
+            columns: HashMap::new(),
+            removed: HashMap::new(),
+            resources: HashMap::new(),
+            messages: HashMap::new(),
+            chunks: Vec::new(),
+            cursor: 0,
+            active_chunk: None,
+        });
+        let mut sys_ctx = MockSysCtxState {
+            host: host_ptr,
+            iters: vec![iter0, iter1, iter_res],
+            cmds: Vec::new(),
+            next_entity: 50,
+            entity_data: HashMap::new(),
+            children: HashMap::new(),
+        };
+        assert_eq!(
+            unsafe { cb(core::ptr::from_mut(&mut sys_ctx).cast(), ud) },
+            FfiResult::OK
+        );
+        assert!(PARITY_RAN.load(Ordering::SeqCst));
+
+        // Reclaim `String` so Miri verifies zero memory leaks and exact text mutation.
+        let final_span_words = sys_ctx.iters[0].columns.remove(&0).unwrap();
+        let final_span: String =
+            unsafe { core::ptr::read(final_span_words.as_ptr().cast::<String>()) };
+        assert_eq!(final_span, "span-after");
+
+        // Verify all 5 emitted `FfiGamepadRumble` messages.
+        let sent_msgs = &sys_ctx.iters[2].messages[&0];
+        assert_eq!(sent_msgs.len(), 5);
+        let decode_rumble = |item: &MockMsgItem| -> FfiGamepadRumble {
+            let MockMsgItem::Bytes(bytes) = item else {
+                panic!("expected POD bytes");
+            };
+            assert_eq!(bytes.len(), core::mem::size_of::<FfiGamepadRumble>());
+            let aligned = aligned_buf_from_bytes(bytes);
+            unsafe { core::ptr::read(aligned.as_ptr().cast::<FfiGamepadRumble>()) }
+        };
+        assert_eq!(
+            decode_rumble(&sent_msgs[0]),
+            FfiGamepadRumble::add(gp_ent, 0.5, 0.8, 0.25)
+        );
+        assert_eq!(decode_rumble(&sent_msgs[1]), FfiGamepadRumble::stop(gp_ent));
+        assert_eq!(
+            decode_rumble(&sent_msgs[2]),
+            FfiGamepadRumble::add(gp_ent, 0.25, 0.4, 0.6)
+        );
+        assert_eq!(
+            decode_rumble(&sent_msgs[3]),
+            FfiGamepadRumble::add(gp_ent, 0.1, 1.0, 0.0)
+        );
+        assert_eq!(decode_rumble(&sent_msgs[4]), FfiGamepadRumble::stop(gp_ent));
+
+        // Verify all 5 `InsertDefault` commands + 2 `Activate` triggers (with target `FfiEntity` payload).
+        let target_bytes = target_ent.to_bits().to_ne_bytes().to_vec();
+        assert_eq!(
+            sys_ctx.cmds,
+            vec![
+                MockCmd::InsertDefault(target_ent, text_h),
+                MockCmd::InsertDefault(target_ent, span_h),
+                MockCmd::InsertDefault(target_ent, bg_h),
+                MockCmd::InsertDefault(target_ent, border_h),
+                MockCmd::InsertDefault(target_ent, em_h),
+                MockCmd::Trigger(act_h, target_ent, target_bytes.clone(), 0),
+                MockCmd::Trigger(act_h, target_ent, target_bytes, 0),
+            ]
+        );
+        unsafe { shutdown_guest_instance(inst) };
+    }
+
+    // Part B: With `ThemeContext` present + short-alias fallback ("Activate") + `TYPE_MISMATCH` guard.
+    {
+        let mut host = MockHost::new();
+        host.add_comp(
+            "Text",
+            ComponentUuid::from_canonical_name("bevy_ui::widget::text::Text"),
+            24,
+            8,
+            0,
+        );
+        host.add_comp(
+            "TextSpan",
+            ComponentUuid::from_canonical_name("bevy_text::text::TextSpan"),
+            24,
+            8,
+            0,
+        );
+        host.add_comp(
+            "BackgroundColor",
+            ComponentUuid::from_canonical_name("bevy_ui::ui_node::BackgroundColor"),
+            16,
+            4,
+            0,
+        );
+        host.add_comp(
+            "BorderColor",
+            ComponentUuid::from_canonical_name("bevy_ui::ui_node::BorderColor"),
+            64,
+            4,
+            0,
+        );
+        host.add_comp(
+            "EmSize",
+            ComponentUuid::from_canonical_name("bevy_text::text::EmSize"),
+            4,
+            4,
+            0,
+        );
+        let theme_h = host.add_comp(
+            "ThemeContext",
+            ComponentUuid::from_canonical_name("bevy_feathers::theme::ThemeContext"),
+            4,
+            1,
+            0,
+        );
+        let act_h = host.add_comp(
+            "Activate",
+            ACTIVATE_EVENT_UUID,
+            core::mem::size_of::<FfiEntity>(),
+            core::mem::align_of::<FfiEntity>(),
+            0,
+        );
+
+        let api = MockHost::api();
+        let load_ctx = core::ptr::from_mut(host.as_mut()).cast::<BamLoadCtx>();
+        let mut inst: *mut BamInstance = core::ptr::null_mut();
+        let manifest = BamManifest::new(c"ui_feathers_alias_mod".as_ptr(), c"0.3.0".as_ptr());
+
+        let status = unsafe {
+            init_guest_instance(&api, load_ctx, &mut inst, &manifest, |instance, lctx| {
+                build_guest_fn(instance, lctx, |app| {
+                    let handles = app.ui_handles().unwrap();
+                    assert_eq!(handles.theme_context, Some(theme_h));
+                    assert_eq!(handles.activate, act_h);
+
+                    app.system(c"insert_theme_default").build(move |ctx| {
+                        let e = FfiEntity::from_bits(88);
+                        assert_eq!(
+                            ctx.commands().insert_default_theme_context(e, &handles),
+                            FfiResult::OK
+                        );
+                    })
+                })
+            })
+        };
+        assert_eq!(status, FfiResult::OK);
+        let cb = host.systems[0].callback;
+        let ud = host.systems[0].user_data;
+        let host_ptr = core::ptr::from_mut(host.as_mut());
+        let mut sys_ctx = MockSysCtxState {
+            host: host_ptr,
+            iters: Vec::new(),
+            cmds: Vec::new(),
+            next_entity: 90,
+            entity_data: HashMap::new(),
+            children: HashMap::new(),
+        };
+        assert_eq!(
+            unsafe { cb(core::ptr::from_mut(&mut sys_ctx).cast(), ud) },
+            FfiResult::OK
+        );
+        assert_eq!(
+            sys_ctx.cmds,
+            vec![MockCmd::InsertDefault(FfiEntity::from_bits(88), theme_h)]
+        );
+        unsafe { shutdown_guest_instance(inst) };
+    }
+
+    // Part C: Spoofed/mismatched UUID on `bevy_ui_widgets::Activate` fails closed with `TYPE_MISMATCH`.
+    {
+        let mut host = MockHost::new();
+        host.add_comp(
+            "bevy_ui_widgets::Activate",
+            ComponentUuid::from_canonical_name("bevy_ui_widgets::Activate"), // wrong UUID (size=0)
+            0,
+            1,
+            0,
+        );
+        let api = MockHost::api();
+        let load_ctx = core::ptr::from_mut(host.as_mut()).cast::<BamLoadCtx>();
+        let mut inst: *mut BamInstance = core::ptr::null_mut();
+        let manifest = BamManifest::new(c"ui_bad_uuid_mod".as_ptr(), c"0.3.0".as_ptr());
+
+        let status = unsafe {
+            init_guest_instance(&api, load_ctx, &mut inst, &manifest, |instance, lctx| {
+                build_guest_fn(instance, lctx, |app| {
+                    assert_eq!(
+                        GuestUiHandles::resolve_activate(app.host()),
+                        Err(FfiResult::TYPE_MISMATCH)
+                    );
+                    assert_eq!(
+                        app.observe_activate("bad_act").build(|_t, _e, _c| {}).err(),
+                        Some(FfiResult::TYPE_MISMATCH)
+                    );
+                    FfiResult::OK
+                })
+            })
+        };
+        assert_eq!(status, FfiResult::OK);
+        unsafe { shutdown_guest_instance(inst) };
+    }
+}
+
+/// Scenario: Verifies exact `Default` parity and constructor parity with `bamabi_bridges` /
+/// Bevy `0.20` across `FfiRemSize`, `FfiEmSize`, `FfiUiTextStyle`, `FfiEditableTextConfig`,
+/// `FfiInlineBox`, `FfiSelectedTab`, `FfiValueChange`, `FfiFeathersColorInput`,
+/// `FfiFeathersNumberInput`, `FfiSpatialAudioSinkControl`, and `FfiGamepadButton::bit`.
+#[test]
+fn wire_defaults_and_constructors_match_bamabi_bridges_and_bevy_020() {
+    // 1. Bevy 0.20 `DEFAULT_REM_SIZE_PX = 20.0` (`RemSize` & `EmSize`).
+    assert_eq!(FfiRemSize::default(), FfiRemSize(20.0));
+    assert_eq!(FfiEmSize::default(), FfiEmSize(20.0));
+
+    // 2. `FfiUiTextStyle::default()` uses `FontSize::Rem(1.0)` (not `Px(20.0)`).
+    let text_style = FfiUiTextStyle::default();
+    assert_eq!(text_style.font_size, FfiFontSize::rem(1.0));
+    assert_eq!(text_style.weight, 400);
+    assert_eq!(text_style.color, FfiRgba::WHITE);
+
+    // 3. `FfiEditableTextConfig::default()` matches `bamabi_bridges::ui`.
+    let edit_cfg = FfiEditableTextConfig::default();
+    assert_eq!(edit_cfg.cursor_margin, [0.2, 0.2]);
+    assert_eq!(edit_cfg.has_visible_lines, FfiBool::TRUE);
+    assert_eq!(edit_cfg.visible_lines, 1.0);
+    assert_eq!(edit_cfg.interactive, FfiBool::TRUE);
+
+    // 4. `FfiInlineBox::{in_flow, out_of_flow, default}`.
+    let in_flow = FfiInlineBox::in_flow(24.0, 12.0);
+    assert_eq!(in_flow.size, [24.0, 12.0]);
+    assert_eq!(in_flow.kind, FfiInlineBox::KIND_IN_FLOW);
+    let out_flow = FfiInlineBox::out_of_flow(8.0, 16.0);
+    assert_eq!(out_flow.size, [8.0, 16.0]);
+    assert_eq!(out_flow.kind, FfiInlineBox::KIND_OUT_OF_FLOW);
+    assert_eq!(FfiInlineBox::default(), FfiInlineBox::out_of_flow(0.0, 0.0));
+
+    // 5. `FfiSelectedTab::{from_option, to_option}`.
+    let tab_ent = FfiEntity::from_bits(77);
+    assert_eq!(FfiSelectedTab::from_option(None).to_option(), None);
+    assert_eq!(
+        FfiSelectedTab::from_option(Some(tab_ent)).to_option(),
+        Some(tab_ent)
+    );
+
+    // 6. All 8 `FfiValueChange::from_*` constructors.
+    let src = FfiEntity::from_bits(10);
+    let val_ent = FfiEntity::from_bits(20);
+    let vc_ent = FfiValueChange::from_entity(src, val_ent, true);
+    assert_eq!(vc_ent.kind, FfiValueChange::KIND_ENTITY);
+    assert_eq!(vc_ent.source, src);
+    assert_eq!(vc_ent.entity_value, val_ent);
+    assert!(vc_ent.is_final.get());
+
+    let vc_opt = FfiValueChange::from_optional_entity(src, None, false);
+    assert_eq!(vc_opt.kind, FfiValueChange::KIND_OPTIONAL_ENTITY);
+    assert!(vc_opt.entity_value.is_null());
+    assert!(!vc_opt.is_final.get());
+
+    let vc_f32 = FfiValueChange::from_f32(src, 3.5, true);
+    assert_eq!(vc_f32.kind, FfiValueChange::KIND_F32);
+    assert_eq!(vc_f32.f32_value, 3.5);
+    assert_eq!(vc_f32.f64_value, 3.5_f64);
+
+    let vc_bool = FfiValueChange::from_bool(src, true, true);
+    assert_eq!(vc_bool.kind, FfiValueChange::KIND_BOOL);
+    assert!(vc_bool.bool_value.get());
+
+    let vc_f64 = FfiValueChange::from_f64(src, 12.25, false);
+    assert_eq!(vc_f64.kind, FfiValueChange::KIND_F64);
+    assert_eq!(vc_f64.f64_value, 12.25);
+    assert_eq!(vc_f64.f32_value, 12.25_f32);
+
+    let vc_i32 = FfiValueChange::from_i32(src, -42, true);
+    assert_eq!(vc_i32.kind, FfiValueChange::KIND_I32);
+    assert_eq!(vc_i32.i64_value, -42);
+    assert_eq!(vc_i32.f64_value, -42.0);
+    assert_eq!(vc_i32.f32_value, -42.0);
+
+    let vc_i64 = FfiValueChange::from_i64(src, 9001, true);
+    assert_eq!(vc_i64.kind, FfiValueChange::KIND_I64);
+    assert_eq!(vc_i64.i64_value, 9001);
+    assert_eq!(vc_i64.f64_value, 9001.0);
+
+    let rgba = FfiRgba::new(0.25, 0.5, 0.75, 1.0);
+    let vc_col = FfiValueChange::from_color(src, rgba, true);
+    assert_eq!(vc_col.kind, FfiValueChange::KIND_COLOR);
+    assert_eq!(vc_col.color_value, rgba);
+
+    // 7. `FfiFeathersColorInput` & `FfiFeathersNumberInput` defaults and builders.
+    let color_in = FfiFeathersColorInput::default();
+    assert_eq!(color_in.color, FfiRgba::WHITE);
+    assert_eq!(color_in.opaque_color_percentage, 0.0);
+
+    let num_def = FfiFeathersNumberInput::default();
+    assert_eq!(num_def.soft_min, 0.0);
+    assert_eq!(num_def.soft_max, 0.0);
+    assert_eq!(num_def.hard_min, 0.0);
+    assert_eq!(num_def.hard_max, 0.0);
+    assert_eq!(num_def.step, 1.0);
+    assert_eq!(num_def.precision, 2);
+    assert_eq!(num_def.format, FfiFeathersNumberInput::FORMAT_F32);
+
+    let num_f32 = FfiFeathersNumberInput::f32(12.5)
+        .with_soft_limit(0.0, 100.0)
+        .with_hard_limit(-50.0, 200.0);
+    assert_eq!(num_f32.format, FfiFeathersNumberInput::FORMAT_F32);
+    assert_eq!(num_f32.value_f64, 12.5);
+    assert!(num_f32.has_soft_limit.get());
+    assert_eq!((num_f32.soft_min, num_f32.soft_max), (0.0, 100.0));
+    assert!(num_f32.has_hard_limit.get());
+    assert_eq!((num_f32.hard_min, num_f32.hard_max), (-50.0, 200.0));
+
+    let num_f64 = FfiFeathersNumberInput::f64(2.5);
+    assert_eq!(num_f64.format, FfiFeathersNumberInput::FORMAT_F64);
+    assert_eq!(num_f64.value_f64, 2.5);
+
+    let num_i32 = FfiFeathersNumberInput::i32(-7);
+    assert_eq!(num_i32.format, FfiFeathersNumberInput::FORMAT_I32);
+    assert_eq!(num_i32.value_i64, -7);
+    assert_eq!(num_i32.precision, 0);
+
+    let num_i64 = FfiFeathersNumberInput::i64(42);
+    assert_eq!(num_i64.format, FfiFeathersNumberInput::FORMAT_I64);
+    assert_eq!(num_i64.value_i64, 42);
+    assert_eq!(num_i64.precision, 0);
+
+    // 8. `FfiSpatialAudioSinkControl` defaults (4m ear gap matching `SpatialListener::new(4.0)`)
+    // and full command helper parity.
+    let mut sink = FfiSpatialAudioSinkControl::default();
+    assert_eq!(sink.left_ear_position, [-2.0, 0.0, 0.0]);
+    assert_eq!(sink.right_ear_position, [2.0, 0.0, 0.0]);
+    assert!(!sink.has_pending_command());
+
+    sink.request_toggle_playback();
+    assert_eq!(sink.playback_command, SINK_CMD_TOGGLE_PLAYBACK);
+    sink.request_mute();
+    assert_eq!(sink.mute_command, MUTE_CMD_MUTE);
+    sink.request_unmute();
+    assert_eq!(sink.mute_command, MUTE_CMD_UNMUTE);
+    sink.request_toggle_mute();
+    assert_eq!(sink.mute_command, MUTE_CMD_TOGGLE);
+    sink.set_linear_volume(0.75);
+    assert_eq!(sink.volume_mode, VOLUME_LINEAR);
+    assert_eq!(sink.volume, 0.75);
+    assert_ne!(sink.apply_flags & APPLY_VOLUME, 0);
+    sink.set_decibel_volume(-6.0);
+    assert_eq!(sink.volume_mode, VOLUME_DECIBELS);
+    assert_eq!(sink.volume, -6.0);
+    sink.set_ear_positions([-1.5, 0.0, 0.0], [1.5, 0.0, 0.0]);
+    assert_eq!(sink.left_ear_position, [-1.5, 0.0, 0.0]);
+    assert_eq!(sink.right_ear_position, [1.5, 0.0, 0.0]);
+    assert_ne!(sink.apply_flags & APPLY_EAR_POSITIONS, 0);
+    assert!(sink.has_pending_command());
+
+    // 9. `FfiGamepadButton::bit` alias matches `bit_mask`.
+    assert_eq!(FfiGamepadButton::SOUTH.bit(), 1u64 << 0);
+    assert_eq!(FfiGamepadButton::DPAD_RIGHT.bit(), 1u64 << 18);
+    assert_eq!(FfiGamepadButton(64).bit(), 0);
+}
+
+/// Regression: Verifies fail-closed edge cases across UI, hierarchy, and `read_removed`:
+/// 1. `GuestUiHandles::resolve` fails closed with `TYPE_MISMATCH` when optional `ThemeContext`
+///    has a spoofed/mismatched UUID (never silently collapsing to `None`).
+/// 2. `GuestUiHandles::resolve_rem_size` resolves `RemSize` (and alias fallback).
+/// 3. `trigger_activate` returns `NOT_FOUND` when `Activate` is unregistered, and both
+///    `trigger_activate` / `trigger_activate_with` return `NULL_POINTER` on invalid commands.
+/// 4. `QueryBuilder::read_children` and `GuestCommands::spawn_child` fail closed with
+///    `TYPE_MISMATCH` when canonical `Children`/`ChildOf` has a mismatched UUID even if short
+///    aliases `"Children"`/`"ChildOf"` are also present.
+/// 5. `SystemContext::read_removed` / `read_removed_batch` preserve `TYPE_MISMATCH` when a user
+///    query ALSO exists alongside `.removed::<T>()`.
+#[test]
+fn fail_closed_ui_theme_mismatch_unregistered_activate_hierarchy_and_removed_with_user_query() {
+    // Part A: `GuestUiHandles::resolve` must propagate `TYPE_MISMATCH` on `ThemeContext`, and
+    // `resolve_rem_size` resolves `RemSize`.
+    {
+        let mut host = MockHost::new();
+        host.add_comp(
+            "bevy_ui::widget::text::Text",
+            ComponentUuid::from_canonical_name("bevy_ui::widget::text::Text"),
+            24,
+            8,
+            0,
+        );
+        host.add_comp(
+            "bevy_text::text::TextSpan",
+            ComponentUuid::from_canonical_name("bevy_text::text::TextSpan"),
+            24,
+            8,
+            0,
+        );
+        host.add_comp(
+            "bevy_ui::ui_node::BackgroundColor",
+            ComponentUuid::from_canonical_name("bevy_ui::ui_node::BackgroundColor"),
+            16,
+            4,
+            0,
+        );
+        host.add_comp(
+            "bevy_ui::ui_node::BorderColor",
+            ComponentUuid::from_canonical_name("bevy_ui::ui_node::BorderColor"),
+            64,
+            4,
+            0,
+        );
+        let rem_h = host.add_comp(
+            "RemSize",
+            ComponentUuid::from_canonical_name("bevy_text::text::RemSize"),
+            4,
+            4,
+            BAM_STORAGE_FLAG_RESOURCE,
+        );
+        host.add_comp(
+            "bevy_text::text::EmSize",
+            ComponentUuid::from_canonical_name("bevy_text::text::EmSize"),
+            4,
+            4,
+            0,
+        );
+        // Spoofed UUID on `ThemeContext` (size=4 instead of canonical 0-size bridged UUID)
+        host.add_comp(
+            "bevy_feathers::theme::ThemeContext",
+            ComponentUuid::from_parts("bevy_feathers::theme::ThemeContext", 4, 1, 0),
+            4,
+            1,
+            0,
+        );
+        host.add_comp(
+            "bevy_ui_widgets::Activate",
+            ACTIVATE_EVENT_UUID,
+            core::mem::size_of::<FfiEntity>(),
+            core::mem::align_of::<FfiEntity>(),
+            0,
+        );
+
+        let api = MockHost::api();
+        let load_ctx = core::ptr::from_mut(host.as_mut()).cast::<BamLoadCtx>();
+        let mut inst: *mut BamInstance = core::ptr::null_mut();
+        let manifest = BamManifest::new(c"theme_mismatch_mod".as_ptr(), c"0.3.0".as_ptr());
+
+        let status = unsafe {
+            init_guest_instance(&api, load_ctx, &mut inst, &manifest, |instance, lctx| {
+                build_guest_fn(instance, lctx, |app| {
+                    assert_eq!(GuestUiHandles::resolve_rem_size(app.host()), Ok(rem_h));
+                    assert_eq!(app.ui_handles(), Err(FfiResult::TYPE_MISMATCH));
+                    FfiResult::OK
+                })
+            })
+        };
+        assert_eq!(status, FfiResult::OK);
+        unsafe { shutdown_guest_instance(inst) };
+    }
+
+    // Part B: `trigger_activate` with unregistered `Activate` -> `NOT_FOUND`, and invalid
+    // `GuestCommands` -> `NULL_POINTER` (both `trigger_activate` and `trigger_activate_with`).
+    {
+        let mut host = MockHost::new();
+        let api = MockHost::api();
+        let load_ctx = core::ptr::from_mut(host.as_mut()).cast::<BamLoadCtx>();
+        let mut inst: *mut BamInstance = core::ptr::null_mut();
+        let manifest = BamManifest::new(c"unreg_activate_mod".as_ptr(), c"0.3.0".as_ptr());
+
+        static CHECKED: AtomicBool = AtomicBool::new(false);
+        let status = unsafe {
+            init_guest_instance(&api, load_ctx, &mut inst, &manifest, |instance, lctx| {
+                build_guest_fn(instance, lctx, |app| {
+                    app.system(c"check_activate_errors").build(|ctx| {
+                        // Valid commands + unregistered `Activate` -> `NOT_FOUND`.
+                        assert_eq!(
+                            ctx.commands().trigger_activate(FfiEntity::from_bits(5)),
+                            Err(FfiResult::NOT_FOUND)
+                        );
+                        // Invalid/null commands -> `NULL_POINTER` even for null target.
+                        let mut empty_cmds = GuestCommands::from_validated(
+                            bamabi_guest::raw::ValidatedCommands::empty(ctx.host()),
+                        );
+                        assert_eq!(
+                            empty_cmds.trigger_activate(FfiEntity::NULL),
+                            Err(FfiResult::NULL_POINTER)
+                        );
+                        assert_eq!(
+                            empty_cmds.trigger_activate(FfiEntity::from_bits(5)),
+                            Err(FfiResult::NULL_POINTER)
+                        );
+                        let fake_handles = GuestUiHandles {
+                            text: BamComponent::from_raw(1),
+                            text_span: BamComponent::from_raw(2),
+                            background_color: BamComponent::from_raw(3),
+                            border_color: BamComponent::from_raw(4),
+                            em_size: BamComponent::from_raw(5),
+                            theme_context: None,
+                            activate: BamComponent::from_raw(6),
+                        };
+                        assert_eq!(
+                            empty_cmds.trigger_activate_with(&fake_handles, FfiEntity::NULL),
+                            Err(FfiResult::NULL_POINTER)
+                        );
+                        assert_eq!(
+                            empty_cmds.spawn_child(FfiEntity::from_bits(5), &[]),
+                            Err(FfiResult::NULL_POINTER)
+                        );
+                        CHECKED.store(true, Ordering::SeqCst);
+                        Ok(())
+                    })
+                })
+            })
+        };
+        assert_eq!(status, FfiResult::OK);
+        let cb = host.systems[0].callback;
+        let ud = host.systems[0].user_data;
+        let host_ptr = core::ptr::from_mut(host.as_mut());
+        let mut sys_ctx = MockSysCtxState {
+            host: host_ptr,
+            iters: Vec::new(),
+            cmds: Vec::new(),
+            next_entity: 10,
+            entity_data: HashMap::new(),
+            children: HashMap::new(),
+        };
+        assert_eq!(
+            unsafe { cb(core::ptr::from_mut(&mut sys_ctx).cast(), ud) },
+            FfiResult::OK
+        );
+        assert!(CHECKED.load(Ordering::SeqCst));
+        assert!(sys_ctx.cmds.is_empty());
+        unsafe { shutdown_guest_instance(inst) };
+    }
+
+    // Part C: Spoofed canonical `Children` / `ChildOf` UUID fails closed with `TYPE_MISMATCH`
+    // even when short aliases `"Children"` / `"ChildOf"` are also present.
+    {
+        let mut host = MockHost::new();
+        host.comps.clear();
+        host.add_comp(
+            "bevy_ecs::hierarchy::Children",
+            ComponentUuid::from_parts("bevy_ecs::hierarchy::Children", 99, 1, 0), // wrong UUID
+            99,
+            1,
+            0,
+        );
+        host.add_comp(
+            "Children",
+            ComponentUuid::from_canonical_name("bevy_ecs::hierarchy::Children"),
+            0,
+            1,
+            0,
+        );
+        host.add_comp(
+            "bevy_ecs::hierarchy::ChildOf",
+            ComponentUuid::from_parts("bevy_ecs::hierarchy::ChildOf", 16, 8, 0), // wrong UUID
+            16,
+            8,
+            0,
+        );
+        host.add_comp("ChildOf", FfiChildOf::UUID, 8, 8, 0);
+
+        let api = MockHost::api();
+        let load_ctx = core::ptr::from_mut(host.as_mut()).cast::<BamLoadCtx>();
+        let mut inst: *mut BamInstance = core::ptr::null_mut();
+        let manifest = BamManifest::new(c"hierarchy_spoof_mod".as_ptr(), c"0.3.0".as_ptr());
+
+        static SPAWN_CHECKED: AtomicBool = AtomicBool::new(false);
+        let status = unsafe {
+            init_guest_instance(&api, load_ctx, &mut inst, &manifest, |instance, lctx| {
+                build_guest_fn(instance, lctx, |app| {
+                    assert_eq!(
+                        app.system(c"spoofed_children")
+                            .query(|q| q.read_children())
+                            .build(|_ctx| {}),
+                        FfiResult::TYPE_MISMATCH
+                    );
+                    app.system(c"spoofed_child_of").build(|ctx| {
+                        assert_eq!(
+                            ctx.commands().spawn_child(FfiEntity::from_bits(1), &[]),
+                            Err(FfiResult::TYPE_MISMATCH)
+                        );
+                        SPAWN_CHECKED.store(true, Ordering::SeqCst);
+                        Ok(())
+                    })
+                })
+            })
+        };
+        assert_eq!(status, FfiResult::OK);
+        let cb = host.systems[0].callback;
+        let ud = host.systems[0].user_data;
+        let host_ptr = core::ptr::from_mut(host.as_mut());
+        let mut sys_ctx = MockSysCtxState {
+            host: host_ptr,
+            iters: Vec::new(),
+            cmds: Vec::new(),
+            next_entity: 10,
+            entity_data: HashMap::new(),
+            children: HashMap::new(),
+        };
+        assert_eq!(
+            unsafe { cb(core::ptr::from_mut(&mut sys_ctx).cast(), ud) },
+            FfiResult::OK
+        );
+        assert!(SPAWN_CHECKED.load(Ordering::SeqCst));
+        assert!(sys_ctx.cmds.is_empty());
+        unsafe { shutdown_guest_instance(inst) };
+    }
+
+    // Part D: `SystemContext::read_removed` & `read_removed_batch` preserve `TYPE_MISMATCH` even
+    // when a user query ALSO exists alongside `.removed::<T>()` (and `q0` has fewer terms than
+    // `term_index`, which previously clobbered `TYPE_MISMATCH` with `OUT_OF_RANGE`).
+    {
+        let mut host = MockHost::new();
+        let api = MockHost::api();
+        let load_ctx = core::ptr::from_mut(host.as_mut()).cast::<BamLoadCtx>();
+        let mut inst: *mut BamInstance = core::ptr::null_mut();
+        let manifest = BamManifest::new(c"removed_with_q0_mod".as_ptr(), c"0.3.0".as_ptr());
+
+        static CHECKED: AtomicBool = AtomicBool::new(false);
+        let status = unsafe {
+            init_guest_instance(&api, load_ctx, &mut inst, &manifest, |instance, lctx| {
+                build_guest_fn(instance, lctx, |app| {
+                    app.system(c"q0_plus_removed")
+                        .query_typed::<(&FfiChildOf,)>() // 1 term at index 0
+                        .removed::<FfiChildOf>() // res term 0
+                        .removed::<FfiCamera2d>() // res term 1
+                        .build(|ctx| {
+                            // Wrong type at res term 1 (out of range for q0!) -> must stay TYPE_MISMATCH.
+                            assert_eq!(
+                                ctx.read_removed::<FfiChildOf>(1),
+                                Err(FfiResult::TYPE_MISMATCH)
+                            );
+                            let mut buf = [FfiEntity::NULL; 4];
+                            assert_eq!(
+                                ctx.read_removed_batch::<FfiChildOf>(1, &mut buf),
+                                Err(FfiResult::TYPE_MISMATCH)
+                            );
+                            // Correct type at res term 1 succeeds!
+                            assert_eq!(
+                                ctx.read_removed::<FfiCamera2d>(1),
+                                Ok(vec![FfiEntity::from_bits(77)])
+                            );
+                            CHECKED.store(true, Ordering::SeqCst);
+                            Ok(())
+                        })
+                })
+            })
+        };
+        assert_eq!(status, FfiResult::OK);
+        let q0_terms = host.systems[0].queries[0].clone();
+        let res_terms = host.systems[0].queries[1].clone();
+        let cb = host.systems[0].callback;
+        let ud = host.systems[0].user_data;
+        let host_ptr = core::ptr::from_mut(host.as_mut());
+        let q0_iter = Box::new(MockIterState {
+            host: host_ptr,
+            terms: q0_terms,
+            entities: Vec::new(),
+            columns: HashMap::new(),
+            removed: HashMap::new(),
+            resources: HashMap::new(),
+            messages: HashMap::new(),
+            chunks: Vec::new(),
+            cursor: 0,
+            active_chunk: None,
+        });
+        let mut removed_map = HashMap::new();
+        removed_map.insert(1usize, vec![FfiEntity::from_bits(77)]);
+        let res_iter = Box::new(MockIterState {
+            host: host_ptr,
+            terms: res_terms,
+            entities: Vec::new(),
+            columns: HashMap::new(),
+            removed: removed_map,
+            resources: HashMap::new(),
+            messages: HashMap::new(),
+            chunks: Vec::new(),
+            cursor: 0,
+            active_chunk: None,
+        });
+        let mut sys_ctx = MockSysCtxState {
+            host: host_ptr,
+            iters: vec![q0_iter, res_iter],
+            cmds: Vec::new(),
+            next_entity: 10,
+            entity_data: HashMap::new(),
+            children: HashMap::new(),
+        };
+        assert_eq!(
+            unsafe { cb(core::ptr::from_mut(&mut sys_ctx).cast(), ud) },
+            FfiResult::OK
+        );
+        assert!(CHECKED.load(Ordering::SeqCst));
+        unsafe { shutdown_guest_instance(inst) };
+    }
+}
+
+/// Regression: Verifies that every camera, lighting, controller, and Solari wire `Default`
+/// implementation in `bamabi_guest::bridges::camera_light` matches Bevy `0.20.1` and
+/// `bamabi_bridges::camera_light` field-for-field.
+#[test]
+fn camera_light_wire_defaults_match_bevy_020_bridges() {
+    use bamabi_guest::bridges::camera_light::{
+        CLEAR_COLOR_DEFAULT, DEPTH_LOAD_OP_CLEAR, FfiCamera2d, FfiCamera3d, FfiDirectionalLight,
+        FfiPanOrbitCamera, FfiPointLight, FfiSolariLighting, FfiSpotLight, ORBIT_CONSTRAINT_FIXED,
+        TONEMAPPING_TONY_MC_MAPFACE, TRANSMISSION_QUALITY_MEDIUM,
+    };
+
+    let cam2d = FfiCamera2d::default();
+    assert_eq!(cam2d.order, 0);
+    assert_eq!(cam2d.clear_color, [0.0, 0.0, 0.0, 1.0]);
+    assert_eq!(cam2d.is_active, FfiBool::TRUE);
+    assert_eq!(cam2d.clear_color_mode, CLEAR_COLOR_DEFAULT);
+    assert_eq!(cam2d.invert_culling, FfiBool::FALSE);
+    assert_eq!(cam2d.hdr, FfiBool::FALSE);
+
+    let cam3d = FfiCamera3d::default();
+    assert_eq!(cam3d.order, 0);
+    assert_eq!(cam3d.clear_color, [0.0, 0.0, 0.0, 1.0]);
+    assert_eq!(cam3d.depth_clear_value.to_bits(), 0.0f32.to_bits());
+    assert_eq!(cam3d.depth_texture_usages, 16);
+    assert_eq!(cam3d.exposure_ev100.to_bits(), 9.7f32.to_bits());
+    assert_eq!(cam3d.transmission_steps, 1);
+    assert_eq!(cam3d.is_active, FfiBool::TRUE);
+    assert_eq!(cam3d.clear_color_mode, CLEAR_COLOR_DEFAULT);
+    assert_eq!(cam3d.invert_culling, FfiBool::FALSE);
+    assert_eq!(cam3d.hdr, FfiBool::FALSE);
+    assert_eq!(cam3d.depth_load_op, DEPTH_LOAD_OP_CLEAR);
+    assert_eq!(cam3d.tonemapping, TONEMAPPING_TONY_MC_MAPFACE);
+    assert_eq!(cam3d.deband_dither, FfiBool::FALSE);
+    assert_eq!(cam3d.transmission_enabled, FfiBool::FALSE);
+    assert_eq!(cam3d.transmission_quality, TRANSMISSION_QUALITY_MEDIUM);
+    assert_eq!(cam3d.reserved0, [0; 3]);
+
+    let point = FfiPointLight::default();
+    assert_eq!(point.color, [1.0, 1.0, 1.0, 1.0]);
+    assert_eq!(point.intensity.to_bits(), 1_000_000.0f32.to_bits());
+    assert_eq!(point.range.to_bits(), 20.0f32.to_bits());
+    assert_eq!(point.radius.to_bits(), 0.0f32.to_bits());
+    assert_eq!(point.shadow_depth_bias.to_bits(), 0.08f32.to_bits());
+    assert_eq!(point.shadow_normal_bias.to_bits(), 0.6f32.to_bits());
+    assert_eq!(point.shadow_map_near_z.to_bits(), 0.1f32.to_bits());
+    assert_eq!(point.shadow_maps_enabled, FfiBool::FALSE);
+    assert_eq!(point.contact_shadows_enabled, FfiBool::FALSE);
+    assert_eq!(point.affects_lightmapped_mesh_diffuse, FfiBool::TRUE);
+    assert_eq!(point.reserved0, 0);
+
+    let spot = FfiSpotLight::default();
+    assert_eq!(spot.color, [1.0, 1.0, 1.0, 1.0]);
+    assert_eq!(spot.intensity.to_bits(), 1_000_000.0f32.to_bits());
+    assert_eq!(spot.range.to_bits(), 20.0f32.to_bits());
+    assert_eq!(spot.radius.to_bits(), 0.0f32.to_bits());
+    assert_eq!(spot.shadow_depth_bias.to_bits(), 0.02f32.to_bits());
+    assert_eq!(spot.shadow_normal_bias.to_bits(), 1.8f32.to_bits());
+    assert_eq!(spot.shadow_map_near_z.to_bits(), 0.1f32.to_bits());
+    assert_eq!(
+        spot.outer_angle.to_bits(),
+        core::f32::consts::FRAC_PI_4.to_bits()
+    );
+    assert_eq!(spot.inner_angle.to_bits(), 0.0f32.to_bits());
+    assert_eq!(spot.shadow_maps_enabled, FfiBool::FALSE);
+    assert_eq!(spot.contact_shadows_enabled, FfiBool::FALSE);
+    assert_eq!(spot.affects_lightmapped_mesh_diffuse, FfiBool::TRUE);
+    assert_eq!(spot.reserved0, 0);
+
+    let dir = FfiDirectionalLight::default();
+    assert_eq!(dir.color, [1.0, 1.0, 1.0, 1.0]);
+    assert_eq!(dir.illuminance.to_bits(), 10_000.0f32.to_bits());
+    assert_eq!(dir.shadow_depth_bias.to_bits(), 0.02f32.to_bits());
+    assert_eq!(dir.shadow_normal_bias.to_bits(), 1.8f32.to_bits());
+    assert_eq!(dir.shadow_maps_enabled, FfiBool::FALSE);
+    assert_eq!(dir.contact_shadows_enabled, FfiBool::FALSE);
+    assert_eq!(dir.affects_lightmapped_mesh_diffuse, FfiBool::TRUE);
+    assert_eq!(dir.reserved0, 0);
+
+    let pan = FfiPanOrbitCamera::default();
+    assert_eq!(pan.last_anchor_depth.to_bits(), (-2.0f64).to_bits());
+    assert_eq!(pan.zoom_min_size_per_pixel.to_bits(), 1e-6f64.to_bits());
+    assert_eq!(pan.zoom_max_size_per_pixel.to_bits(), 1e27f64.to_bits());
+    assert_eq!(pan.orbit_up, [0.0, 1.0, 0.0]);
+    assert_eq!(pan.momentum_pan_friction.to_bits(), 0.2f64.to_bits());
+    assert_eq!(pan.momentum_orbit_friction.to_bits(), 0.2f64.to_bits());
+    assert_eq!(
+        pan.smoothing_pan_secs.to_bits(),
+        core::time::Duration::from_millis(10)
+            .as_secs_f32()
+            .to_bits()
+    );
+    assert_eq!(
+        pan.smoothing_orbit_secs.to_bits(),
+        core::time::Duration::from_millis(30)
+            .as_secs_f32()
+            .to_bits()
+    );
+    assert_eq!(
+        pan.smoothing_zoom_secs.to_bits(),
+        core::time::Duration::from_millis(60)
+            .as_secs_f32()
+            .to_bits()
+    );
+    assert_eq!(pan.sensitivity_orbit, [1.0, 1.0]);
+    assert_eq!(pan.sensitivity_zoom.to_bits(), 1.0f32.to_bits());
+    assert_eq!(
+        pan.momentum_init_pan_secs.to_bits(),
+        core::time::Duration::from_millis(40)
+            .as_secs_f32()
+            .to_bits()
+    );
+    assert_eq!(
+        pan.momentum_init_orbit_secs.to_bits(),
+        core::time::Duration::from_millis(60)
+            .as_secs_f32()
+            .to_bits()
+    );
+    assert_eq!(
+        pan.input_debounce_secs.to_bits(),
+        core::time::Duration::from_millis(80)
+            .as_secs_f32()
+            .to_bits()
+    );
+    assert_eq!(pan.perspective_near_clip_min.to_bits(), 1e-9f32.to_bits());
+    assert_eq!(
+        pan.perspective_near_clip_max.to_bits(),
+        f32::INFINITY.to_bits()
+    );
+    assert_eq!(
+        pan.perspective_near_clip_multiplier.to_bits(),
+        0.05f32.to_bits()
+    );
+    assert_eq!(
+        pan.ortho_scale_to_near_clip.to_bits(),
+        1_000_000.0f32.to_bits()
+    );
+    assert_eq!(pan.ortho_near_clip_min.to_bits(), 1.0f32.to_bits());
+    assert_eq!(pan.ortho_near_clip_max.to_bits(), 1_000_000.0f32.to_bits());
+    assert_eq!(pan.ortho_far_clip_multiplier.to_bits(), 1.0f32.to_bits());
+    assert_eq!(pan.enabled_pan, FfiBool::TRUE);
+    assert_eq!(pan.enabled_orbit, FfiBool::TRUE);
+    assert_eq!(pan.enabled_zoom, FfiBool::TRUE);
+    assert_eq!(pan.orbit_constraint_mode, ORBIT_CONSTRAINT_FIXED);
+    assert_eq!(pan.orbit_can_pass_tdc, FfiBool::FALSE);
+    assert_eq!(pan.zoom_through_objects, FfiBool::FALSE);
+    assert_eq!(pan.momentum_pan_damping, 160);
+    assert_eq!(pan.momentum_orbit_damping, 160);
+
+    let solari = FfiSolariLighting::default();
+    assert_eq!(solari.confidence_weight_cap.to_bits(), 8.0f32.to_bits());
+    assert_eq!(solari.primary_di_samples, 8);
+    assert_eq!(solari.secondary_di_samples, 4);
+    assert_eq!(solari.max_bounces, 3);
+    assert_eq!(
+        solari.world_cache_max_temporal_samples.to_bits(),
+        32.0f32.to_bits()
+    );
+    assert_eq!(solari.world_cache_direct_light_sample_count, 32);
+    assert_eq!(
+        solari.world_cache_max_gi_ray_distance.to_bits(),
+        50.0f32.to_bits()
+    );
+    assert_eq!(solari.world_cache_cell_updates_soft_target, 40_000);
+    assert_eq!(
+        solari.world_cache_position_base_cell_size.to_bits(),
+        0.15f32.to_bits()
+    );
+    assert_eq!(
+        solari.world_cache_position_lod_scale.to_bits(),
+        15.0f32.to_bits()
+    );
+    assert_eq!(solari.restir, FfiBool::FALSE);
+    assert_eq!(solari.reset, FfiBool::TRUE);
+    assert_eq!(solari.reserved0, [0; 2]);
 }

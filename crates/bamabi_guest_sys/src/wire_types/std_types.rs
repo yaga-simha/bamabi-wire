@@ -1008,7 +1008,7 @@ impl FfiTimeReal {
     }
 }
 
-/// Compact deterministic bit-index key code (`0..194`) mirroring Bevy's `KeyCode`.
+/// Compact deterministic bit-index key code (`0..194`) mirroring every named Bevy `0.20` `KeyCode`.
 #[repr(transparent)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct FfiKeyCode(pub u16);
@@ -1017,6 +1017,9 @@ impl_wire_abi_pod!(FfiKeyCode, size = 2, align = 2, fields = [u16]);
 
 #[allow(missing_docs)]
 impl FfiKeyCode {
+    /// Total number of named Bevy `0.20` `KeyCode` indices (`0..194`).
+    pub const COUNT: usize = 194;
+
     pub const BACKQUOTE: Self = Self(0);
     pub const BACKSLASH: Self = Self(1);
     pub const BRACKET_LEFT: Self = Self(2);
@@ -1033,6 +1036,9 @@ impl FfiKeyCode {
     pub const DIGIT_8: Self = Self(13);
     pub const DIGIT_9: Self = Self(14);
     pub const EQUAL: Self = Self(15);
+    pub const INTL_BACKSLASH: Self = Self(16);
+    pub const INTL_RO: Self = Self(17);
+    pub const INTL_YEN: Self = Self(18);
     pub const KEY_A: Self = Self(19);
     pub const KEY_B: Self = Self(20);
     pub const KEY_C: Self = Self(21);
@@ -1068,6 +1074,7 @@ impl FfiKeyCode {
     pub const ALT_RIGHT: Self = Self(51);
     pub const BACKSPACE: Self = Self(52);
     pub const CAPS_LOCK: Self = Self(53);
+    pub const CONTEXT_MENU: Self = Self(54);
     pub const CONTROL_LEFT: Self = Self(55);
     pub const CONTROL_RIGHT: Self = Self(56);
     pub const ENTER: Self = Self(57);
@@ -1077,8 +1084,17 @@ impl FfiKeyCode {
     pub const SHIFT_RIGHT: Self = Self(61);
     pub const SPACE: Self = Self(62);
     pub const TAB: Self = Self(63);
+    pub const CONVERT: Self = Self(64);
+    pub const KANA_MODE: Self = Self(65);
+    pub const LANG_1: Self = Self(66);
+    pub const LANG_2: Self = Self(67);
+    pub const LANG_3: Self = Self(68);
+    pub const LANG_4: Self = Self(69);
+    pub const LANG_5: Self = Self(70);
+    pub const NON_CONVERT: Self = Self(71);
     pub const DELETE: Self = Self(72);
     pub const END: Self = Self(73);
+    pub const HELP: Self = Self(74);
     pub const HOME: Self = Self(75);
     pub const INSERT: Self = Self(76);
     pub const PAGE_DOWN: Self = Self(77);
@@ -1087,7 +1103,82 @@ impl FfiKeyCode {
     pub const ARROW_LEFT: Self = Self(80);
     pub const ARROW_RIGHT: Self = Self(81);
     pub const ARROW_UP: Self = Self(82);
+    pub const NUM_LOCK: Self = Self(83);
+    pub const NUMPAD_0: Self = Self(84);
+    pub const NUMPAD_1: Self = Self(85);
+    pub const NUMPAD_2: Self = Self(86);
+    pub const NUMPAD_3: Self = Self(87);
+    pub const NUMPAD_4: Self = Self(88);
+    pub const NUMPAD_5: Self = Self(89);
+    pub const NUMPAD_6: Self = Self(90);
+    pub const NUMPAD_7: Self = Self(91);
+    pub const NUMPAD_8: Self = Self(92);
+    pub const NUMPAD_9: Self = Self(93);
+    pub const NUMPAD_ADD: Self = Self(94);
+    pub const NUMPAD_BACKSPACE: Self = Self(95);
+    pub const NUMPAD_CLEAR: Self = Self(96);
+    pub const NUMPAD_CLEAR_ENTRY: Self = Self(97);
+    pub const NUMPAD_COMMA: Self = Self(98);
+    pub const NUMPAD_DECIMAL: Self = Self(99);
+    pub const NUMPAD_DIVIDE: Self = Self(100);
+    pub const NUMPAD_ENTER: Self = Self(101);
+    pub const NUMPAD_EQUAL: Self = Self(102);
+    pub const NUMPAD_HASH: Self = Self(103);
+    pub const NUMPAD_MEMORY_ADD: Self = Self(104);
+    pub const NUMPAD_MEMORY_CLEAR: Self = Self(105);
+    pub const NUMPAD_MEMORY_RECALL: Self = Self(106);
+    pub const NUMPAD_MEMORY_STORE: Self = Self(107);
+    pub const NUMPAD_MEMORY_SUBTRACT: Self = Self(108);
+    pub const NUMPAD_MULTIPLY: Self = Self(109);
+    pub const NUMPAD_PAREN_LEFT: Self = Self(110);
+    pub const NUMPAD_PAREN_RIGHT: Self = Self(111);
+    pub const NUMPAD_STAR: Self = Self(112);
+    pub const NUMPAD_SUBTRACT: Self = Self(113);
     pub const ESCAPE: Self = Self(114);
+    pub const FN: Self = Self(115);
+    pub const FN_LOCK: Self = Self(116);
+    pub const PRINT_SCREEN: Self = Self(117);
+    pub const SCROLL_LOCK: Self = Self(118);
+    pub const PAUSE: Self = Self(119);
+    pub const BROWSER_BACK: Self = Self(120);
+    pub const BROWSER_FAVORITES: Self = Self(121);
+    pub const BROWSER_FORWARD: Self = Self(122);
+    pub const BROWSER_HOME: Self = Self(123);
+    pub const BROWSER_REFRESH: Self = Self(124);
+    pub const BROWSER_SEARCH: Self = Self(125);
+    pub const BROWSER_STOP: Self = Self(126);
+    pub const EJECT: Self = Self(127);
+    pub const LAUNCH_APP_1: Self = Self(128);
+    pub const LAUNCH_APP_2: Self = Self(129);
+    pub const LAUNCH_MAIL: Self = Self(130);
+    pub const MEDIA_PLAY_PAUSE: Self = Self(131);
+    pub const MEDIA_SELECT: Self = Self(132);
+    pub const MEDIA_STOP: Self = Self(133);
+    pub const MEDIA_TRACK_NEXT: Self = Self(134);
+    pub const MEDIA_TRACK_PREVIOUS: Self = Self(135);
+    pub const POWER: Self = Self(136);
+    pub const SLEEP: Self = Self(137);
+    pub const AUDIO_VOLUME_DOWN: Self = Self(138);
+    pub const AUDIO_VOLUME_MUTE: Self = Self(139);
+    pub const AUDIO_VOLUME_UP: Self = Self(140);
+    pub const WAKE_UP: Self = Self(141);
+    pub const META: Self = Self(142);
+    pub const HYPER: Self = Self(143);
+    pub const TURBO: Self = Self(144);
+    pub const ABORT: Self = Self(145);
+    pub const RESUME: Self = Self(146);
+    pub const SUSPEND: Self = Self(147);
+    pub const AGAIN: Self = Self(148);
+    pub const COPY: Self = Self(149);
+    pub const CUT: Self = Self(150);
+    pub const FIND: Self = Self(151);
+    pub const OPEN: Self = Self(152);
+    pub const PASTE: Self = Self(153);
+    pub const PROPS: Self = Self(154);
+    pub const SELECT: Self = Self(155);
+    pub const UNDO: Self = Self(156);
+    pub const HIRAGANA: Self = Self(157);
+    pub const KATAKANA: Self = Self(158);
     pub const F1: Self = Self(159);
     pub const F2: Self = Self(160);
     pub const F3: Self = Self(161);
@@ -1100,7 +1191,242 @@ impl FfiKeyCode {
     pub const F10: Self = Self(168);
     pub const F11: Self = Self(169);
     pub const F12: Self = Self(170);
+    pub const F13: Self = Self(171);
+    pub const F14: Self = Self(172);
+    pub const F15: Self = Self(173);
+    pub const F16: Self = Self(174);
+    pub const F17: Self = Self(175);
+    pub const F18: Self = Self(176);
+    pub const F19: Self = Self(177);
+    pub const F20: Self = Self(178);
+    pub const F21: Self = Self(179);
+    pub const F22: Self = Self(180);
+    pub const F23: Self = Self(181);
+    pub const F24: Self = Self(182);
+    pub const F25: Self = Self(183);
+    pub const F26: Self = Self(184);
+    pub const F27: Self = Self(185);
+    pub const F28: Self = Self(186);
+    pub const F29: Self = Self(187);
+    pub const F30: Self = Self(188);
+    pub const F31: Self = Self(189);
+    pub const F32: Self = Self(190);
+    pub const F33: Self = Self(191);
+    pub const F34: Self = Self(192);
+    pub const F35: Self = Self(193);
+
+    /// Complete ordered table of all 194 named Bevy `0.20` `KeyCode` indices (`0..=193`).
+    pub const ALL: [Self; Self::COUNT] = [
+        Self::BACKQUOTE,
+        Self::BACKSLASH,
+        Self::BRACKET_LEFT,
+        Self::BRACKET_RIGHT,
+        Self::COMMA,
+        Self::DIGIT_0,
+        Self::DIGIT_1,
+        Self::DIGIT_2,
+        Self::DIGIT_3,
+        Self::DIGIT_4,
+        Self::DIGIT_5,
+        Self::DIGIT_6,
+        Self::DIGIT_7,
+        Self::DIGIT_8,
+        Self::DIGIT_9,
+        Self::EQUAL,
+        Self::INTL_BACKSLASH,
+        Self::INTL_RO,
+        Self::INTL_YEN,
+        Self::KEY_A,
+        Self::KEY_B,
+        Self::KEY_C,
+        Self::KEY_D,
+        Self::KEY_E,
+        Self::KEY_F,
+        Self::KEY_G,
+        Self::KEY_H,
+        Self::KEY_I,
+        Self::KEY_J,
+        Self::KEY_K,
+        Self::KEY_L,
+        Self::KEY_M,
+        Self::KEY_N,
+        Self::KEY_O,
+        Self::KEY_P,
+        Self::KEY_Q,
+        Self::KEY_R,
+        Self::KEY_S,
+        Self::KEY_T,
+        Self::KEY_U,
+        Self::KEY_V,
+        Self::KEY_W,
+        Self::KEY_X,
+        Self::KEY_Y,
+        Self::KEY_Z,
+        Self::MINUS,
+        Self::PERIOD,
+        Self::QUOTE,
+        Self::SEMICOLON,
+        Self::SLASH,
+        Self::ALT_LEFT,
+        Self::ALT_RIGHT,
+        Self::BACKSPACE,
+        Self::CAPS_LOCK,
+        Self::CONTEXT_MENU,
+        Self::CONTROL_LEFT,
+        Self::CONTROL_RIGHT,
+        Self::ENTER,
+        Self::SUPER_LEFT,
+        Self::SUPER_RIGHT,
+        Self::SHIFT_LEFT,
+        Self::SHIFT_RIGHT,
+        Self::SPACE,
+        Self::TAB,
+        Self::CONVERT,
+        Self::KANA_MODE,
+        Self::LANG_1,
+        Self::LANG_2,
+        Self::LANG_3,
+        Self::LANG_4,
+        Self::LANG_5,
+        Self::NON_CONVERT,
+        Self::DELETE,
+        Self::END,
+        Self::HELP,
+        Self::HOME,
+        Self::INSERT,
+        Self::PAGE_DOWN,
+        Self::PAGE_UP,
+        Self::ARROW_DOWN,
+        Self::ARROW_LEFT,
+        Self::ARROW_RIGHT,
+        Self::ARROW_UP,
+        Self::NUM_LOCK,
+        Self::NUMPAD_0,
+        Self::NUMPAD_1,
+        Self::NUMPAD_2,
+        Self::NUMPAD_3,
+        Self::NUMPAD_4,
+        Self::NUMPAD_5,
+        Self::NUMPAD_6,
+        Self::NUMPAD_7,
+        Self::NUMPAD_8,
+        Self::NUMPAD_9,
+        Self::NUMPAD_ADD,
+        Self::NUMPAD_BACKSPACE,
+        Self::NUMPAD_CLEAR,
+        Self::NUMPAD_CLEAR_ENTRY,
+        Self::NUMPAD_COMMA,
+        Self::NUMPAD_DECIMAL,
+        Self::NUMPAD_DIVIDE,
+        Self::NUMPAD_ENTER,
+        Self::NUMPAD_EQUAL,
+        Self::NUMPAD_HASH,
+        Self::NUMPAD_MEMORY_ADD,
+        Self::NUMPAD_MEMORY_CLEAR,
+        Self::NUMPAD_MEMORY_RECALL,
+        Self::NUMPAD_MEMORY_STORE,
+        Self::NUMPAD_MEMORY_SUBTRACT,
+        Self::NUMPAD_MULTIPLY,
+        Self::NUMPAD_PAREN_LEFT,
+        Self::NUMPAD_PAREN_RIGHT,
+        Self::NUMPAD_STAR,
+        Self::NUMPAD_SUBTRACT,
+        Self::ESCAPE,
+        Self::FN,
+        Self::FN_LOCK,
+        Self::PRINT_SCREEN,
+        Self::SCROLL_LOCK,
+        Self::PAUSE,
+        Self::BROWSER_BACK,
+        Self::BROWSER_FAVORITES,
+        Self::BROWSER_FORWARD,
+        Self::BROWSER_HOME,
+        Self::BROWSER_REFRESH,
+        Self::BROWSER_SEARCH,
+        Self::BROWSER_STOP,
+        Self::EJECT,
+        Self::LAUNCH_APP_1,
+        Self::LAUNCH_APP_2,
+        Self::LAUNCH_MAIL,
+        Self::MEDIA_PLAY_PAUSE,
+        Self::MEDIA_SELECT,
+        Self::MEDIA_STOP,
+        Self::MEDIA_TRACK_NEXT,
+        Self::MEDIA_TRACK_PREVIOUS,
+        Self::POWER,
+        Self::SLEEP,
+        Self::AUDIO_VOLUME_DOWN,
+        Self::AUDIO_VOLUME_MUTE,
+        Self::AUDIO_VOLUME_UP,
+        Self::WAKE_UP,
+        Self::META,
+        Self::HYPER,
+        Self::TURBO,
+        Self::ABORT,
+        Self::RESUME,
+        Self::SUSPEND,
+        Self::AGAIN,
+        Self::COPY,
+        Self::CUT,
+        Self::FIND,
+        Self::OPEN,
+        Self::PASTE,
+        Self::PROPS,
+        Self::SELECT,
+        Self::UNDO,
+        Self::HIRAGANA,
+        Self::KATAKANA,
+        Self::F1,
+        Self::F2,
+        Self::F3,
+        Self::F4,
+        Self::F5,
+        Self::F6,
+        Self::F7,
+        Self::F8,
+        Self::F9,
+        Self::F10,
+        Self::F11,
+        Self::F12,
+        Self::F13,
+        Self::F14,
+        Self::F15,
+        Self::F16,
+        Self::F17,
+        Self::F18,
+        Self::F19,
+        Self::F20,
+        Self::F21,
+        Self::F22,
+        Self::F23,
+        Self::F24,
+        Self::F25,
+        Self::F26,
+        Self::F27,
+        Self::F28,
+        Self::F29,
+        Self::F30,
+        Self::F31,
+        Self::F32,
+        Self::F33,
+        Self::F34,
+        Self::F35,
+    ];
+
+    /// Returns `true` if this key code lies within the named Bevy `0.20` key table (`0..194`).
+    #[inline]
+    pub const fn is_valid(self) -> bool {
+        (self.0 as usize) < Self::COUNT
+    }
 }
+
+const _: () = {
+    let mut i = 0;
+    while i < FfiKeyCode::COUNT {
+        assert!(FfiKeyCode::ALL[i].0 as usize == i);
+        i += 1;
+    }
+};
 
 /// 256-bit keyboard state snapshot (`pressed`, `just_pressed`, `just_released`) projecting
 /// Bevy's `ButtonInput<KeyCode>`.
@@ -1552,6 +1878,12 @@ impl FfiGamepadButton {
     #[inline]
     pub const fn bit_mask(self) -> u64 {
         if self.0 < 64 { 1u64 << self.0 } else { 0 }
+    }
+
+    /// Alias for [`Self::bit_mask`] matching `bamabi_bridges::input_ext::FfiGamepadButton::bit`.
+    #[inline]
+    pub const fn bit(self) -> u64 {
+        self.bit_mask()
     }
 }
 

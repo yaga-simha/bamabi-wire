@@ -3,7 +3,7 @@
 //! (`ModUiBridgePlugin`) bit-for-bit.
 
 use bamabi_guest_sys::{Host, ValidatedIter, ValidatedStringVTable, resolve_component};
-use bamabi_sys::{AccessMode, ComponentUuid, FfiEntity, FfiResult};
+use bamabi_sys::{AccessMode, BamComponent, ComponentUuid, FfiEntity, FfiResult};
 use core::ffi::CStr;
 
 pub use bamabi_guest_sys::wire_types::{
@@ -36,6 +36,15 @@ pub const CANONICAL_REM_SIZE_NAME: &str = "bevy_text::text::RemSize";
 pub const CANONICAL_EM_SIZE_NAME: &str = "bevy_text::text::EmSize";
 /// Canonical ABI name for bridged `Activate` entity event (`"bevy_ui_widgets::Activate"`).
 pub const CANONICAL_ACTIVATE_EVENT_NAME: &str = "bevy_ui_widgets::Activate";
+/// Deterministic [`ComponentUuid`] matching `ModUiBridgePlugin`'s
+/// `register_bridged_entity_event_with::<Activate>` registration
+/// (`size = size_of::<FfiEntity>()`, `align = align_of::<FfiEntity>()`, `schema = 0`).
+pub const ACTIVATE_EVENT_UUID: ComponentUuid = ComponentUuid::from_parts(
+    CANONICAL_ACTIVATE_EVENT_NAME,
+    core::mem::size_of::<FfiEntity>(),
+    core::mem::align_of::<FfiEntity>(),
+    0,
+);
 /// Canonical ABI name for direct POD `FfiValueChange` entity event (`"bamabi::ui::FfiValueChange"`).
 pub const CANONICAL_VALUE_CHANGE_EVENT_NAME: &str = "bamabi::ui::FfiValueChange";
 /// Canonical ABI name for bridged `ThemeContext` (`HostWireBridge<FfiThemeContext>`, alias `"ThemeContext"`).
@@ -362,6 +371,158 @@ impl GuestThemeContextBridge {
     }
 }
 
+#[inline]
+fn resolve_bridged_ui_handle(
+    host: &Host,
+    canonical_cstr: &CStr,
+    alias_cstr: &CStr,
+    uuid: ComponentUuid,
+) -> Result<BamComponent, FfiResult> {
+    match resolve_component(host, Some(canonical_cstr), Some(uuid)) {
+        Ok(handle) => Ok(handle),
+        Err(FfiResult::NOT_FOUND) => resolve_component(host, Some(alias_cstr), Some(uuid)),
+        Err(err) => Err(err),
+    }
+}
+
+/// Pre-resolved [`BamComponent`] handles for host-bridged Bevy `0.20` UI components and events
+/// registered by `ModUiBridgePlugin` (`default_inserter_for` + `bevy_ui_widgets::Activate`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct GuestUiHandles {
+    /// Handle for bridged `bevy_ui::widget::text::Text` (`default_inserter` supported).
+    pub text: BamComponent,
+    /// Handle for bridged `bevy_text::text::TextSpan` (`default_inserter` supported).
+    pub text_span: BamComponent,
+    /// Handle for bridged `bevy_ui::ui_node::BackgroundColor` (`default_inserter` supported).
+    pub background_color: BamComponent,
+    /// Handle for bridged `bevy_ui::ui_node::BorderColor` (`default_inserter` supported).
+    pub border_color: BamComponent,
+    /// Handle for bridged `bevy_text::text::EmSize` (`default_inserter` supported).
+    pub em_size: BamComponent,
+    /// Optional handle for bridged `bevy_feathers::theme::ThemeContext` (`default_inserter`
+    /// supported; `None` when the host is built without `bridge-feathers`).
+    pub theme_context: Option<BamComponent>,
+    /// Handle for bridged `bevy_ui_widgets::Activate` entity event.
+    pub activate: BamComponent,
+}
+
+impl GuestUiHandles {
+    /// Resolves all bridged UI component handles and the `Activate` entity event from `host`.
+    ///
+    /// `theme_context` is resolved optionally (`None` if the host did not enable `bridge-feathers`),
+    /// while non-`NOT_FOUND` errors (such as `TYPE_MISMATCH`) propagate immediately.
+    pub fn resolve(host: &Host) -> Result<Self, FfiResult> {
+        let text = Self::resolve_text(host)?;
+        let text_span = Self::resolve_text_span(host)?;
+        let background_color = Self::resolve_background_color(host)?;
+        let border_color = Self::resolve_border_color(host)?;
+        let em_size = Self::resolve_em_size(host)?;
+        let theme_context = match Self::resolve_theme_context(host) {
+            Ok(handle) => Some(handle),
+            Err(FfiResult::NOT_FOUND) => None,
+            Err(err) => return Err(err),
+        };
+        let activate = Self::resolve_activate(host)?;
+        Ok(Self {
+            text,
+            text_span,
+            background_color,
+            border_color,
+            em_size,
+            theme_context,
+            activate,
+        })
+    }
+
+    /// Resolves `ModUiBridgePlugin`'s `bevy_ui::widget::text::Text` handle.
+    #[inline]
+    pub fn resolve_text(host: &Host) -> Result<BamComponent, FfiResult> {
+        resolve_bridged_ui_handle(
+            host,
+            c"bevy_ui::widget::text::Text",
+            c"Text",
+            ComponentUuid::from_canonical_name(CANONICAL_UI_TEXT_NAME),
+        )
+    }
+
+    /// Resolves `ModUiBridgePlugin`'s `bevy_text::text::TextSpan` handle.
+    #[inline]
+    pub fn resolve_text_span(host: &Host) -> Result<BamComponent, FfiResult> {
+        resolve_bridged_ui_handle(
+            host,
+            c"bevy_text::text::TextSpan",
+            c"TextSpan",
+            ComponentUuid::from_canonical_name(CANONICAL_TEXT_SPAN_NAME),
+        )
+    }
+
+    /// Resolves `ModUiBridgePlugin`'s `bevy_ui::ui_node::BackgroundColor` handle.
+    #[inline]
+    pub fn resolve_background_color(host: &Host) -> Result<BamComponent, FfiResult> {
+        resolve_bridged_ui_handle(
+            host,
+            c"bevy_ui::ui_node::BackgroundColor",
+            c"BackgroundColor",
+            ComponentUuid::from_canonical_name(CANONICAL_BACKGROUND_COLOR_NAME),
+        )
+    }
+
+    /// Resolves `ModUiBridgePlugin`'s `bevy_ui::ui_node::BorderColor` handle.
+    #[inline]
+    pub fn resolve_border_color(host: &Host) -> Result<BamComponent, FfiResult> {
+        resolve_bridged_ui_handle(
+            host,
+            c"bevy_ui::ui_node::BorderColor",
+            c"BorderColor",
+            ComponentUuid::from_canonical_name(CANONICAL_BORDER_COLOR_NAME),
+        )
+    }
+
+    /// Resolves `ModUiBridgePlugin`'s `bevy_text::text::RemSize` resource handle.
+    #[inline]
+    pub fn resolve_rem_size(host: &Host) -> Result<BamComponent, FfiResult> {
+        resolve_bridged_ui_handle(
+            host,
+            c"bevy_text::text::RemSize",
+            c"RemSize",
+            ComponentUuid::from_canonical_name(CANONICAL_REM_SIZE_NAME),
+        )
+    }
+
+    /// Resolves `ModUiBridgePlugin`'s `bevy_text::text::EmSize` handle.
+    #[inline]
+    pub fn resolve_em_size(host: &Host) -> Result<BamComponent, FfiResult> {
+        resolve_bridged_ui_handle(
+            host,
+            c"bevy_text::text::EmSize",
+            c"EmSize",
+            ComponentUuid::from_canonical_name(CANONICAL_EM_SIZE_NAME),
+        )
+    }
+
+    /// Resolves `ModUiBridgePlugin`'s optional `bevy_feathers::theme::ThemeContext` handle.
+    #[inline]
+    pub fn resolve_theme_context(host: &Host) -> Result<BamComponent, FfiResult> {
+        resolve_bridged_ui_handle(
+            host,
+            c"bevy_feathers::theme::ThemeContext",
+            c"ThemeContext",
+            ComponentUuid::from_canonical_name(CANONICAL_THEME_CONTEXT_NAME),
+        )
+    }
+
+    /// Resolves `ModUiBridgePlugin`'s `bevy_ui_widgets::Activate` entity event handle.
+    #[inline]
+    pub fn resolve_activate(host: &Host) -> Result<BamComponent, FfiResult> {
+        resolve_bridged_ui_handle(
+            host,
+            c"bevy_ui_widgets::Activate",
+            c"Activate",
+            ACTIVATE_EVENT_UUID,
+        )
+    }
+}
+
 /// Extension trait on [`GuestApp`] registering Bevy `0.20` UI widget observers (`FfiValueChange`
 /// and `Activate`).
 pub trait GuestAppUiExt<'a> {
@@ -392,10 +553,7 @@ impl<'a> GuestAppUiExt<'a> for GuestApp<'a> {
         &mut self,
         name: impl Into<String>,
     ) -> TypedObserverBuilder<'_, 'a, FfiEntity> {
-        let uuid = ComponentUuid::from_canonical_name(CANONICAL_ACTIVATE_EVENT_NAME);
-        match resolve_component(self.host(), Some(c"bevy_ui_widgets::Activate"), Some(uuid))
-            .or_else(|_| resolve_component(self.host(), Some(c"Activate"), None))
-        {
+        match GuestUiHandles::resolve_activate(self.host()) {
             Ok(handle) => self.observe_event_handle::<FfiEntity>(name, handle),
             Err(err) => TypedObserverBuilder::with_error(self, name, err),
         }
@@ -416,6 +574,10 @@ pub trait GuestUiQueryBuilderExt {
     fn read_ui_text(self) -> Self;
     /// Appends an exclusive write (`&mut Text` string-bridged) term.
     fn write_ui_text(self) -> Self;
+    /// Appends a shared read (`&TextSpan` string-bridged) term.
+    fn read_text_span(self) -> Self;
+    /// Appends an exclusive write (`&mut TextSpan` string-bridged) term.
+    fn write_text_span(self) -> Self;
     /// Appends a shared read (`&BackgroundColor` wire-bridged) term.
     fn read_background_color(self) -> Self;
     /// Appends an exclusive write (`&mut BackgroundColor` wire-bridged) term.
@@ -483,6 +645,24 @@ impl GuestUiQueryBuilderExt for QueryBuilder<'_> {
         self.term_named(
             c"bevy_ui::widget::text::Text",
             Some(ComponentUuid::from_canonical_name(CANONICAL_UI_TEXT_NAME)),
+            AccessMode::WRITE,
+        )
+    }
+
+    #[inline]
+    fn read_text_span(self) -> Self {
+        self.term_named(
+            c"bevy_text::text::TextSpan",
+            Some(ComponentUuid::from_canonical_name(CANONICAL_TEXT_SPAN_NAME)),
+            AccessMode::READ,
+        )
+    }
+
+    #[inline]
+    fn write_text_span(self) -> Self {
+        self.term_named(
+            c"bevy_text::text::TextSpan",
+            Some(ComponentUuid::from_canonical_name(CANONICAL_TEXT_SPAN_NAME)),
             AccessMode::WRITE,
         )
     }
@@ -660,6 +840,43 @@ pub trait GuestCommandsUiExt {
         entity: FfiEntity,
         widget: &FfiFeathersNumberInput,
     ) -> FfiResult;
+    /// Queues host-defaulted `bevy_ui::widget::text::Text::default()` insertion onto `entity`.
+    fn insert_default_ui_text(&mut self, entity: FfiEntity, handles: &GuestUiHandles) -> FfiResult;
+    /// Queues host-defaulted `bevy_text::text::TextSpan::default()` insertion onto `entity`.
+    fn insert_default_text_span(
+        &mut self,
+        entity: FfiEntity,
+        handles: &GuestUiHandles,
+    ) -> FfiResult;
+    /// Queues host-defaulted `bevy_ui::ui_node::BackgroundColor::default()` insertion onto `entity`.
+    fn insert_default_background_color(
+        &mut self,
+        entity: FfiEntity,
+        handles: &GuestUiHandles,
+    ) -> FfiResult;
+    /// Queues host-defaulted `bevy_ui::ui_node::BorderColor::default()` insertion onto `entity`.
+    fn insert_default_border_color(
+        &mut self,
+        entity: FfiEntity,
+        handles: &GuestUiHandles,
+    ) -> FfiResult;
+    /// Queues host-defaulted `bevy_text::text::EmSize::default()` insertion onto `entity`.
+    fn insert_default_em_size(&mut self, entity: FfiEntity, handles: &GuestUiHandles) -> FfiResult;
+    /// Queues host-defaulted `bevy_feathers::theme::ThemeContext::default()` insertion onto `entity`,
+    /// returning [`FfiResult::NOT_FOUND`] if `handles.theme_context` is `None`.
+    fn insert_default_theme_context(
+        &mut self,
+        entity: FfiEntity,
+        handles: &GuestUiHandles,
+    ) -> FfiResult;
+    /// Resolves `ModUiBridgePlugin`'s `bevy_ui_widgets::Activate` event and triggers it on `target`.
+    fn trigger_activate(&mut self, target: FfiEntity) -> Result<(), FfiResult>;
+    /// Triggers `bevy_ui_widgets::Activate` on `target` using pre-resolved `handles.activate`.
+    fn trigger_activate_with(
+        &mut self,
+        handles: &GuestUiHandles,
+        target: FfiEntity,
+    ) -> Result<(), FfiResult>;
 }
 
 impl GuestCommandsUiExt for GuestCommands<'_> {
@@ -764,5 +981,81 @@ impl GuestCommandsUiExt for GuestCommands<'_> {
         widget: &FfiFeathersNumberInput,
     ) -> FfiResult {
         self.insert_component(entity, widget)
+    }
+
+    #[inline]
+    fn insert_default_ui_text(&mut self, entity: FfiEntity, handles: &GuestUiHandles) -> FfiResult {
+        self.insert_default(entity, handles.text)
+    }
+
+    #[inline]
+    fn insert_default_text_span(
+        &mut self,
+        entity: FfiEntity,
+        handles: &GuestUiHandles,
+    ) -> FfiResult {
+        self.insert_default(entity, handles.text_span)
+    }
+
+    #[inline]
+    fn insert_default_background_color(
+        &mut self,
+        entity: FfiEntity,
+        handles: &GuestUiHandles,
+    ) -> FfiResult {
+        self.insert_default(entity, handles.background_color)
+    }
+
+    #[inline]
+    fn insert_default_border_color(
+        &mut self,
+        entity: FfiEntity,
+        handles: &GuestUiHandles,
+    ) -> FfiResult {
+        self.insert_default(entity, handles.border_color)
+    }
+
+    #[inline]
+    fn insert_default_em_size(&mut self, entity: FfiEntity, handles: &GuestUiHandles) -> FfiResult {
+        self.insert_default(entity, handles.em_size)
+    }
+
+    #[inline]
+    fn insert_default_theme_context(
+        &mut self,
+        entity: FfiEntity,
+        handles: &GuestUiHandles,
+    ) -> FfiResult {
+        match handles.theme_context {
+            Some(handle) => self.insert_default(entity, handle),
+            None => FfiResult::NOT_FOUND,
+        }
+    }
+
+    #[inline]
+    fn trigger_activate(&mut self, target: FfiEntity) -> Result<(), FfiResult> {
+        if !self.is_valid() {
+            return Err(FfiResult::NULL_POINTER);
+        }
+        if target.is_null() {
+            return Err(FfiResult::INVALID_ENTITY);
+        }
+        let handle = GuestUiHandles::resolve_activate(self.host())?;
+        self.trigger_handle(handle, target, &target)
+    }
+
+    #[inline]
+    fn trigger_activate_with(
+        &mut self,
+        handles: &GuestUiHandles,
+        target: FfiEntity,
+    ) -> Result<(), FfiResult> {
+        if !self.is_valid() {
+            return Err(FfiResult::NULL_POINTER);
+        }
+        if target.is_null() {
+            return Err(FfiResult::INVALID_ENTITY);
+        }
+        self.trigger_handle(handles.activate, target, &target)
     }
 }

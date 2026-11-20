@@ -312,8 +312,8 @@ impl Default for FfiSpatialAudioSinkControl {
             speed: 1.0,
             position_secs: 0.0,
             emitter_position: [0.0; 3],
-            left_ear_position: [-0.5, 0.0, 0.0],
-            right_ear_position: [0.5, 0.0, 0.0],
+            left_ear_position: [-2.0, 0.0, 0.0],
+            right_ear_position: [2.0, 0.0, 0.0],
             playback_command: SINK_CMD_NONE,
             mute_command: MUTE_CMD_NONE,
             volume_mode: VOLUME_LINEAR,
@@ -353,20 +353,56 @@ impl FfiSpatialAudioSinkControl {
         self.playback_command = SINK_CMD_STOP;
     }
 
-    /// Requests setting linear volume on the next host sync (`APPLY_VOLUME`).
+    /// Requests toggling play/pause state (`SINK_CMD_TOGGLE_PLAYBACK`).
     #[inline]
-    pub fn set_volume_linear(&mut self, gain: f32) {
-        self.volume = gain;
+    pub fn request_toggle_playback(&mut self) {
+        self.playback_command = SINK_CMD_TOGGLE_PLAYBACK;
+    }
+
+    /// Requests muting playback (`MUTE_CMD_MUTE`).
+    #[inline]
+    pub fn request_mute(&mut self) {
+        self.mute_command = MUTE_CMD_MUTE;
+    }
+
+    /// Requests unmuting playback (`MUTE_CMD_UNMUTE`).
+    #[inline]
+    pub fn request_unmute(&mut self) {
+        self.mute_command = MUTE_CMD_UNMUTE;
+    }
+
+    /// Requests toggling mute state (`MUTE_CMD_TOGGLE`).
+    #[inline]
+    pub fn request_toggle_mute(&mut self) {
+        self.mute_command = MUTE_CMD_TOGGLE;
+    }
+
+    /// Requests setting linear volume on the next host sync (`APPLY_VOLUME`, `VOLUME_LINEAR`).
+    #[inline]
+    pub fn set_linear_volume(&mut self, linear: f32) {
         self.volume_mode = VOLUME_LINEAR;
+        self.volume = linear;
         self.apply_flags |= APPLY_VOLUME;
     }
 
-    /// Requests setting decibel volume on the next host sync (`APPLY_VOLUME`).
+    /// Alias for [`Self::set_linear_volume`].
+    #[inline]
+    pub fn set_volume_linear(&mut self, gain: f32) {
+        self.set_linear_volume(gain);
+    }
+
+    /// Requests setting decibel volume on the next host sync (`APPLY_VOLUME`, `VOLUME_DECIBELS`).
+    #[inline]
+    pub fn set_decibel_volume(&mut self, decibels: f32) {
+        self.volume_mode = VOLUME_DECIBELS;
+        self.volume = decibels;
+        self.apply_flags |= APPLY_VOLUME;
+    }
+
+    /// Alias for [`Self::set_decibel_volume`].
     #[inline]
     pub fn set_volume_decibels(&mut self, db: f32) {
-        self.volume = db;
-        self.volume_mode = VOLUME_DECIBELS;
-        self.apply_flags |= APPLY_VOLUME;
+        self.set_decibel_volume(db);
     }
 
     /// Requests setting playback speed on the next host sync (`APPLY_SPEED`).
@@ -385,9 +421,15 @@ impl FfiSpatialAudioSinkControl {
 
     /// Requests setting spatial left/right ear positions (`APPLY_EAR_POSITIONS`).
     #[inline]
-    pub fn set_ears_position(&mut self, left: [f32; 3], right: [f32; 3]) {
+    pub fn set_ear_positions(&mut self, left: [f32; 3], right: [f32; 3]) {
         self.left_ear_position = left;
         self.right_ear_position = right;
         self.apply_flags |= APPLY_EAR_POSITIONS;
+    }
+
+    /// Alias for [`Self::set_ear_positions`].
+    #[inline]
+    pub fn set_ears_position(&mut self, left: [f32; 3], right: [f32; 3]) {
+        self.set_ear_positions(left, right);
     }
 }
