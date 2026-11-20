@@ -26,3 +26,4 @@ proc-macro-crate = { workspace = true }
 [dev-dependencies]
 bamabi_sys = { workspace = true }
 trybuild = { workspace = true }
+proptest = { workspace = true }

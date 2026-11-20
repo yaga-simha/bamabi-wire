@@ -16,3 +16,6 @@ workspace = true
 
 [dependencies]
 bamabi_sys = { workspace = true }
+
+[dev-dependencies]
+proptest = { workspace = true }
