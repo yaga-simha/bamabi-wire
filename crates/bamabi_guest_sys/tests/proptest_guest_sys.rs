@@ -187,28 +187,28 @@ fn intervals_overlap(a_start: usize, a_end: usize, b_start: usize, b_end: usize)
 }
 
 fn borrow_op_strategy() -> impl Strategy<Value = BorrowOp> {
-    let kind_strat = prop_oneof![
+    let kind_strategy = prop_oneof![
         Just(ElemKind::U8),
         Just(ElemKind::U32),
         Just(ElemKind::U64),
         Just(ElemKind::Zst),
     ];
     prop_oneof![
-        3 => (1u32..=12, 0usize..=16, kind_strat.clone()).prop_map(|(comp, slot, kind)| {
+        3 => (1u32..=12, 0usize..=16, kind_strategy.clone()).prop_map(|(comp, slot, kind)| {
             BorrowOp::Read {
                 comp,
                 byte_offset: slot * 8,
                 kind,
             }
         }),
-        3 => (1u32..=12, 0usize..=16, kind_strat.clone()).prop_map(|(comp, slot, kind)| {
+        3 => (1u32..=12, 0usize..=16, kind_strategy.clone()).prop_map(|(comp, slot, kind)| {
             BorrowOp::Write {
                 comp,
                 byte_offset: slot * 8,
                 kind,
             }
         }),
-        2 => (1u32..=12, 0usize..=16, kind_strat.clone(), any::<bool>()).prop_map(
+        2 => (1u32..=12, 0usize..=16, kind_strategy.clone(), any::<bool>()).prop_map(
             |(comp, slot, kind, is_null)| BorrowOp::OptionalRead {
                 comp,
                 byte_offset: slot * 8,
@@ -216,7 +216,7 @@ fn borrow_op_strategy() -> impl Strategy<Value = BorrowOp> {
                 is_null,
             }
         ),
-        2 => (1u32..=12, 0usize..=16, kind_strat, any::<bool>()).prop_map(
+        2 => (1u32..=12, 0usize..=16, kind_strategy, any::<bool>()).prop_map(
             |(comp, slot, kind, is_null)| BorrowOp::OptionalWrite {
                 comp,
                 byte_offset: slot * 8,

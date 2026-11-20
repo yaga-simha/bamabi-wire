@@ -2589,8 +2589,8 @@ fn po_g8_system_and_run_if_trampolines() {
         .wrapping_add(misalign)
         .cast::<c_void>();
     // SAFETY: Alignment guard rejects `bad_ud` before dereferencing.
-    let mis_sys_res = unsafe { sys_trampoline(sys_ctx, bad_ud) };
-    assert_eq!(mis_sys_res, FfiResult::INVALID_ARGUMENT);
+    let misaligned_sys_res = unsafe { sys_trampoline(sys_ctx, bad_ud) };
+    assert_eq!(misaligned_sys_res, FfiResult::INVALID_ARGUMENT);
 
     // Valid invocation -> OK or closure error.
     // SAFETY: `sys_ctx` and `sys_ud` are non-null, aligned, and initialized for this call.
@@ -2614,7 +2614,7 @@ fn po_g8_system_and_run_if_trampolines() {
     assert_eq!(reent_sys_res, FfiResult::ACCESS_CONFLICT);
 
     kani::cover!(null_sys_res == FfiResult::NULL_POINTER);
-    kani::cover!(mis_sys_res == FfiResult::INVALID_ARGUMENT);
+    kani::cover!(misaligned_sys_res == FfiResult::INVALID_ARGUMENT);
     kani::cover!(valid_sys_res == FfiResult::OK);
     kani::cover!(valid_sys_res == FfiResult::INVALID_ARGUMENT);
     kani::cover!(reent_sys_res == FfiResult::ACCESS_CONFLICT);
@@ -2714,8 +2714,9 @@ fn po_g8_lifecycle_observer_trampoline() {
         .wrapping_add(misalign)
         .cast::<c_void>();
     // SAFETY: Alignment guard rejects `bad_ud` before dereferencing.
-    let mis_res = unsafe { lifecycle_trampoline(target, core::ptr::null(), raw_cmds, bad_ud) };
-    assert_eq!(mis_res, FfiResult::INVALID_ARGUMENT);
+    let misaligned_res =
+        unsafe { lifecycle_trampoline(target, core::ptr::null(), raw_cmds, bad_ud) };
+    assert_eq!(misaligned_res, FfiResult::INVALID_ARGUMENT);
 
     // Valid invocation -> OK or closure error.
     // SAFETY: `ud` is non-null, aligned, and `raw_cmds` is either null or valid stack storage.
@@ -2739,7 +2740,7 @@ fn po_g8_lifecycle_observer_trampoline() {
     assert_eq!(reent_res, FfiResult::ACCESS_CONFLICT);
 
     kani::cover!(null_res == FfiResult::NULL_POINTER);
-    kani::cover!(mis_res == FfiResult::INVALID_ARGUMENT);
+    kani::cover!(misaligned_res == FfiResult::INVALID_ARGUMENT);
     kani::cover!(valid_res == FfiResult::OK);
     kani::cover!(valid_res == FfiResult::INVALID_ARGUMENT);
     kani::cover!(reent_res == FfiResult::ACCESS_CONFLICT);
@@ -3037,7 +3038,7 @@ fn po_g8_non_pod_message_witness_callbacks() {
     };
     assert_eq!(fwd_null, FfiResult::INVALID_ARGUMENT);
     // SAFETY: Alignment guard rejects `bad_sink_ctx` before dereferencing.
-    let fwd_mis = unsafe {
+    let fwd_misaligned = unsafe {
         forward_field(
             bad_sink_ctx,
             StrView::from_str("v"),
@@ -3045,7 +3046,7 @@ fn po_g8_non_pod_message_witness_callbacks() {
             FfiSlice::from_slice(&[1, 2, 3, 4]),
         )
     };
-    assert_eq!(fwd_mis, FfiResult::INVALID_ARGUMENT);
+    assert_eq!(fwd_misaligned, FfiResult::INVALID_ARGUMENT);
 
     let fwd_want_err: bool = kani::any();
     let fwd_name = if fwd_want_err { "" } else { "v" };
