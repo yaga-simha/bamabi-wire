@@ -1,0 +1,61 @@
+name: Nightly Deep Verification (Big-Endian Miri, Randomize-Layout)
+
+on:
+  schedule:
+    - cron: "15 3 * * *"
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  miri-big-endian:
+    name: Miri Big-Endian (s390x-unknown-linux-gnu)
+    runs-on: ubuntu-latest
+    env:
+      MIRIFLAGS: "-Zmiri-tree-borrows"
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+
+      - name: Install nightly Rust with Miri & `rust-src`
+        uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: miri, rust-src
+
+      - name: Setup Miri sysroot for `s390x-unknown-linux-gnu`
+        run: cargo +nightly miri setup --target s390x-unknown-linux-gnu
+
+      - name: Cache Miri s390x artifacts
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: miri-s390x
+
+      - name: Run Layer 0 ABI and guest endianness parity tests on `s390x`
+        run: |
+          cargo +nightly miri test --target s390x-unknown-linux-gnu \
+            -p bamabi_sys -p bamabi_guest_sys -p bamabi_guest
+
+  randomize-layout-and-proptest:
+    name: Randomized Rust Layout & Extended Differential Proptest
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+
+      - name: Install nightly Rust toolchain
+        uses: dtolnay/rust-toolchain@nightly
+
+      - name: Cache Cargo artifacts
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: nightly-randomize-layout
+
+      - name: Run Layer 0 macro, SDK-gen, and ABI suites under `-Zrandomize-layout`
+        env:
+          RUSTFLAGS: "-Zrandomize-layout"
+          PROPTEST_CASES: "2048"
+        run: |
+          cargo +nightly test -p bamabi_sys -p bamabi_guest_sys -p bamabi_guest
+          cargo +nightly test -p bamabi_macros --lib --test mod_component_vtable
+          cargo +nightly test -p bamabi_sdk_gen

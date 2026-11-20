@@ -1,0 +1,18 @@
+[package]
+name = "bamabi_guest_sys"
+version.workspace = true
+edition.workspace = true
+rust-version = "1.87"
+license.workspace = true
+authors.workspace = true
+description = "Low-level zero-Bevy guest FFI trampolines, panic guards, and validated wrappers for `bamabi`"
+readme = "README.md"
+repository.workspace = true
+keywords.workspace = true
+categories.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+bamabi_sys = { workspace = true }

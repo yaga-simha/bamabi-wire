@@ -1,0 +1,40 @@
+# `typos` spellchecker configuration for `bamabi`
+
+[files]
+extend-exclude = [
+    "target/",
+    "**/target/",
+    "Cargo.lock",
+    "**/Cargo.lock",
+    "fuzz/corpus/",
+    "*.dylib",
+    "*.so",
+    "*.dll",
+]
+
+[default]
+extend-ignore-re = [
+    "0x[0-9a-fA-F_]+",
+    "[-/]Iinclude",
+    "[-/]F[oed]\\b",
+    "\\bSEH\\b",
+]
+
+[default.extend-identifiers]
+# Intentional C-ABI / Rust / domain identifiers
+nd = "nd"
+ro = "ro"
+ot = "ot"
+ba = "ba"
+pn = "pn"
+
+[default.extend-words]
+# Domain acronyms & technical terms
+lod = "lod"
+soa = "soa"
+ratatui = "ratatui"
+winit = "winit"
+avian = "avian"
+valgrind = "valgrind"
+callgrind = "callgrind"
+gungraun = "gungraun"

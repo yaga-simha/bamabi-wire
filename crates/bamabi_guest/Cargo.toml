@@ -1,0 +1,24 @@
+[package]
+name = "bamabi_guest"
+version.workspace = true
+edition.workspace = true
+rust-version = "1.87"
+license.workspace = true
+authors.workspace = true
+description = "Safe (`#![forbid(unsafe_code)]`), zero-Bevy Rust guest SDK for native `.cdylib` mods targeting `bamabi`"
+readme = "README.md"
+repository.workspace = true
+keywords.workspace = true
+categories.workspace = true
+
+[lints]
+workspace = true
+
+[features]
+default = []
+derive = ["dep:bamabi_macros"]
+
+[dependencies]
+bamabi_sys = { workspace = true }
+bamabi_guest_sys = { workspace = true }
+bamabi_macros = { workspace = true, optional = true }

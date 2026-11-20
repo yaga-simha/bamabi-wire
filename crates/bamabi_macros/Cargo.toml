@@ -1,0 +1,28 @@
+[package]
+name = "bamabi_macros"
+version.workspace = true
+edition.workspace = true
+rust-version = "1.87"
+license.workspace = true
+authors.workspace = true
+description = "Procedural macros (`#[derive(ModComponent, AbiPod)]`) generating C-ABI VTables, UUIDs, and C/Zig declarations"
+readme = "README.md"
+repository.workspace = true
+keywords.workspace = true
+categories.workspace = true
+
+[lib]
+proc-macro = true
+
+[lints]
+workspace = true
+
+[dependencies]
+syn = { workspace = true }
+quote = { workspace = true }
+proc-macro2 = { workspace = true }
+proc-macro-crate = { workspace = true }
+
+[dev-dependencies]
+bamabi_sys = { workspace = true }
+trybuild = { workspace = true }

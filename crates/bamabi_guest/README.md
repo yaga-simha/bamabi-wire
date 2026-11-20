@@ -1,0 +1,82 @@
+# `bamabi_guest`
+
+Safe (`#![forbid(unsafe_code)]`), **zero-Bevy-dependency** Rust SDK for authoring native `.cdylib` mods targeting `bamabi` (`ABI 0.3.0`, `v0.3.0`, Layer 0 in [`bamabi-wire`](../../README.md)).
+
+## Features
+
+- **`default = []`**: Core safe SDK with zero proc-macro dependencies.
+- **`derive`**: Re-exports `#[derive(AbiPod, GuestComponent, ModComponent)]` from [`bamabi_macros`](../bamabi_macros).
+
+## Standalone `Cargo.toml` Usage
+
+```toml
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+bamabi_guest = { git = "https://github.com/yaga-simha/bamabi-wire.git", branch = "main", features = ["derive"] }
+```
+
+## Quickstart (Zero-Boilerplate Derive & Typed Queries)
+
+```rust,no_run
+use bamabi_guest::prelude::*;
+use core::ffi::CStr;
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, AbiPod, GuestComponent)]
+#[guest_component(name = "example::Position")]
+pub struct Position {
+    pub x: f32,
+    pub y: f32,
+    pub z: f32,
+}
+
+#[derive(Default)]
+pub struct MyGuestMod;
+
+impl GuestPlugin for MyGuestMod {
+    const NAME: &'static CStr = c"my_guest_mod";
+    const VERSION: &'static CStr = c"0.3.0";
+
+    fn build(&mut self, app: &mut GuestApp<'_>) -> FfiResult {
+        app.system(c"nudge_positions")
+            .query_typed::<&mut Position>()
+            .schedule(ScheduleId::UPDATE)
+            .build(|ctx| {
+                ctx.single_query::<&mut Position>().for_each(|positions| {
+                    for pos in positions {
+                        pos.x += 1.0;
+                    }
+                })
+            })
+    }
+}
+
+export_mod!(plugin: MyGuestMod);
+```
+
+## Highlights
+
+- **Zero-Boilerplate Component Derives:** `#[derive(AbiPod, GuestComponent)]` with `#[guest_component(name = "...", sparse_set, immutable, summary_tick)]` eliminates manual `impl GuestComponent` implementations (and `#[mod_component(name = "...", guest)]` offers a single-attribute shorthand when sharing a `ModComponent`).
+- **Per-World Isolation (`export_mod!` & `GuestPlugin`):** Allocates an independent `GuestInstance` per Bevy `World` on the guest heap—zero process-global mutable state.
+- **Full 18-Slot ABI `0.3.0` Coverage:** Safe wrappers for structured logging (`log_diagnostic`, `guest_log!`), fault reporting (`report_fault`), strict UUID resolution (`resolve_component_by_uuid`), layout/field inspection (`component_layout_info`, `verify_component_layout`), monotonic symbol interning (`intern_symbol`), persistent named objects (`bind_named_object`), non-destructive query counting (`ChunkIter::count`), ancestor cascades (`ChunkIter::up_cascade` / `TypedChunkIter::up_cascade`), zero-arena read-only parallel chunks (`par_for_each_chunk_readonly` / `par_chunks_readonly` with compile-time `Q::IS_READ_ONLY` enforcement), typed relationships (`RelationDescBuilder`, `register_relation`, `insert_relation`, `remove_relation`), decoupled scheduling (`SystemBuilder::register_handle`, `ScheduleSetBuilder`, `configure_schedule_set`, `mount_system`), RAII command transactions (`GuestTransaction` / `commands.transaction(...)`), and live schema migration (`migrate_component_column` / `migrate_pod_component_column`).
+- **Unified `GuestApp::system` Builder & Expanded Typed Queries:** Declares up to 8 typed tuple queries (`query_typed` / `ctx.single_query`) with **1..=16 query terms** (`QueryTuple`) and tuple-generic **`Or<(T0..T7)>`** (2..=8 branches, preserving `Or2`/`Or3` aliases), `Allow<T>`, `Has<T>`, `RemovedComponents` cursors, singleton `GuestRes<R>` / `GuestResMut<R>` with `is_added()` / `is_changed()` ticks, schedules, `.in_set()` / `.before()` / `.after()` / `.after_weak()` / `.ambiguous_with*()` ordering (including `"host::<name>"`), `.main_thread()`, and composable `.run_if(...)` / `.run_if_fn(...)` predicates.
+- **Deferred Commands, Dynamic Components, Messages & Observers:** `GuestCommands` (`spawn`, `spawn_persistent`, `spawn_batch`, `FfiChildOf`, `insert`, `insert_if_new`, `insert_default`, `remove`, `despawn`, `despawn_all`, `trigger`, `trigger_ex`, `begin_transaction`, `insert_relation`, `remove_relation`), `entity_children`, batch `Messages<M>` read/write (POD and witness-backed non-POD), `GuestComponentOptions` (5 hooks, `clone`, `require`, `schema_fingerprint`, `BAM_FIELDS`), and global/`EntityEvent`/lifecycle/`Ready`/propagating `ObserverBuilder` observers with composable `.run_if(...)` / `.run_if_fn(...)` run conditions.
+- **Subsystem Bridges (`bridges`):** Ergonomic wrappers for Bevy standard types (`std_types`), `mod://<ns>/...` assets (`GuestAssetServer`), `States` (`GuestStateBridge`), reflection/BRP/settings (`reflect`), and BSN scenes (`GuestScene`).
+- **Parallel Chunk Processing & Hot Reload:** Work-stealing `SystemContext::par_chunks` / `par_chunks_readonly` plus optional `GuestPlugin::save_state` / `restore_state` byte-snapshot callbacks.
+
+## Verification
+
+```bash
+cargo clippy -p bamabi_guest --all-targets -- -D warnings
+cargo clippy -p bamabi_guest --all-targets --all-features -- -D warnings
+cargo test -p bamabi_guest --no-default-features
+cargo test -p bamabi_guest --all-features
+RUSTDOCFLAGS="-D warnings" cargo doc -p bamabi_guest --no-deps --all-features
+MIRIFLAGS="-Zmiri-tree-borrows -Zmiri-strict-provenance" cargo +nightly miri test -p bamabi_guest
+```
+
+## License
+
+Dual-licensed under `MIT OR Apache-2.0` ([`LICENSE-MIT`](../../LICENSE-MIT) and [`LICENSE-APACHE`](../../LICENSE-APACHE)).

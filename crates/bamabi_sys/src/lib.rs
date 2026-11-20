@@ -1,0 +1,116 @@
+#![no_std]
+#![warn(missing_docs)]
+#![deny(clippy::undocumented_unsafe_blocks, clippy::missing_safety_doc)]
+
+//! # `bamabi_sys`: Zero-Dependency C-ABI `0.3.0` Wire Contract for `bamabi`
+//!
+//! This crate defines the `#![no_std]`, zero-dependency C-ABI `0.3.0` wire specification connecting
+//! Bevy ECS host applications to native dynamic guest mods (`.so`, `.dylib`, `.dll`) written in
+//! Rust, C99, C++, or Zig.
+//!
+//! ## Core Architectural Invariants
+//!
+//! 1. **Zero Shared Rust ABI Assumptions:** Every wire struct is `#[repr(C)]` or
+//!    `#[repr(transparent)]`, every foreign callback slot is `Option<unsafe extern "C" fn(...)>`,
+//!    and arrays/strings cross the boundary via [`FfiSlice`] / [`StrView`] or NUL-terminated C
+//!    strings rather than Rust fat pointers.
+//! 2. **Strict Memory & Allocator Isolation:** Host-allocated memory is freed exclusively by the
+//!    host, and guest-allocated memory (such as per-World [`BamInstance`] state) is freed
+//!    exclusively by the guest in `bamabi_shutdown`.
+//! 3. **Pre-Resolved Handles & Zero-Allocation Hot Paths:** Components and resources resolve once
+//!    at load time into 1-based [`BamComponent`] handles; hot-path commands and declaration-indexed
+//!    resource accessors perform zero string parsing or hashing.
+//! 4. **Nounwind `extern "C"` Boundary:** Unwinding across `extern "C"` is forbidden. Unwinding
+//!    Rust guests catch panics inside their own runtime and return [`FfiResult::PANIC_CAUGHT`].
+//!
+//! ## Why `#![no_std]` and Zero External Dependencies?
+//!
+//! Keeping `bamabi_sys` strictly `#![no_std]` with zero external dependencies (no `bevy`,
+//! no `alloc`, no `std`) guarantees that guest mods, proc-macro expansions, and the host engine
+//! share the exact same wire types without pulling in Bevy's ECS internals or coupling to any
+//! specific heap allocator.
+
+mod access;
+mod commands;
+mod component;
+mod extensible;
+pub mod host_api;
+mod iter;
+mod primitives;
+mod system;
+mod traits;
+mod version;
+
+#[cfg(test)]
+mod tests;
+
+pub use access::{
+    AccessMode, BAM_TERM_KNOWN_FLAGS, BamTermDesc, MAX_QUERIES_PER_SYSTEM, MAX_TERMS_PER_QUERY,
+    ScheduleId,
+};
+pub use commands::{
+    BAM_TRIGGER_FLAG_PROPAGATE, BAM_TRIGGER_KNOWN_FLAGS, BamCmdDespawnAllFn, BamCmdDespawnFn,
+    BamCmdInsertDefaultFn, BamCmdInsertFn, BamCmdObserveFn, BamCmdRemoveFn, BamCmdSpawnBatchFn,
+    BamCmdSpawnEmptyFn, BamCmdSpawnFn, BamCmdSpawnSceneFn, BamCmdTriggerExFn, BamCmdTriggerFn,
+    BamCommands, BamTriggerDesc,
+};
+pub use component::{
+    BAM_COMPONENT_FLAG_IMMUTABLE, BAM_COMPONENT_FLAG_SPARSE_SET, BAM_COMPONENT_FLAG_SUMMARY_TICK,
+    BAM_COMPONENT_KNOWN_FLAGS, BAM_RELATION_FLAG_ACYCLIC, BAM_RELATION_FLAG_CASCADE_DELETE,
+    BAM_RELATION_FLAG_CASCADE_DESPAWN, BAM_RELATION_FLAG_CLEANUP_REMOVE,
+    BAM_RELATION_FLAG_EXCLUSIVE, BAM_RELATION_FLAG_SYMMETRIC, BAM_RELATION_KNOWN_FLAGS,
+    BAM_REQUIRED_FLAG_CUSTOM_BYTES, BAM_REQUIRED_FLAG_INIT_FN, BAM_REQUIRED_FLAG_RESOLVE_BY_UUID,
+    BAM_REQUIRED_KNOWN_FLAGS, BAM_SCHEDULE_SET_FLAG_AFTER_WEAK, BAM_SCHEDULE_SET_FLAG_BEFORE_WEAK,
+    BAM_SCHEDULE_SET_FLAG_PARALLEL, BAM_SCHEDULE_SET_FLAG_SEQUENCE,
+    BAM_SCHEDULE_SET_FLAG_SEQUENCE_WEAK, BAM_SCHEDULE_SET_KNOWN_FLAGS, BamFieldDesc, BamFieldKind,
+    BamLayoutInfo, BamRelationDesc, BamRequiredComponent, BamRequiredInitFn, BamRowMigrateFn,
+    BamScheduleSetDesc, ComponentCloneFn, ComponentDesc, ComponentDropFn, ComponentHookFn,
+    MappedStringGetFn, MappedStringSetFn, MappedStringVTable, MappedWireGetFn, MappedWireSetFn,
+    MappedWireVTable, VTableHeader,
+};
+pub use extensible::{ExtensibleStruct, read_descriptor, read_extensible_struct};
+pub use host_api::{
+    BAM_HOST_API_SLOT_COUNT, BAM_LOG_DEBUG, BAM_LOG_ERROR, BAM_LOG_INFO, BAM_LOG_TRACE,
+    BAM_LOG_WARN, BAM_MANIFEST_KNOWN_FLAGS, BamAssetGetLoadStateFn, BamAssetLoadFn,
+    BamAssetReleaseFn, BamBindNamedObjectFn, BamCmdCheckpointFn, BamCmdInsertRelationFn,
+    BamCmdRemoveRelationFn, BamCmdRollbackFn, BamComponentLayoutInfoFn, BamConfigureScheduleSetFn,
+    BamGetProcAddressFn, BamHostApi, BamInitFn, BamInstance, BamInternSymbolFn, BamIterCountFn,
+    BamIterUpCascadeFn, BamLastErrorFn, BamLoadHostCtxFn, BamLogDiagnosticFn, BamManifest,
+    BamManifestFn, BamMigrateComponentColumnFn, BamMountSystemInScheduleFn, BamRegisterComponentFn,
+    BamRegisterObserverFn, BamRegisterRelationFn, BamRegisterSystemFn, BamRegisterSystemHandleFn,
+    BamReportGuestFaultFn, BamResolveComponentByUuidFn, BamResolveComponentFn, BamRestoreStateFn,
+    BamSaveStateFn, BamShutdownFn, BamStateWriterFn, BamSysCommandsFn, BamSysEntityChildrenFn,
+    BamSysEntityGetFn, BamSysEntityGetMutFn, BamSysHostCtxFn, BamSysQueryFn, BamSysResMutPtrFn,
+    BamSysResPtrFn, offsets,
+};
+pub use iter::{
+    BAM_MAX_CHANGE_AGE, BAM_STORAGE_FLAG_ENTITY_EVENT, BAM_STORAGE_FLAG_EVENT,
+    BAM_STORAGE_FLAG_IMMUTABLE, BAM_STORAGE_FLAG_MESSAGE, BAM_STORAGE_FLAG_RESOURCE,
+    BAM_STORAGE_FLAG_SPARSE_SET, BAM_STORAGE_FLAG_SUMMARY_TICK, BamChangeTicks, BamChunkTaskFn,
+    BamColumnInfo, BamIter, BamIterColumnInfoFn, BamIterColumnMutableFn,
+    BamIterColumnMutableUntrackedFn, BamIterColumnReadonlyFn, BamIterColumnRowsMutableFn,
+    BamIterColumnRowsReadonlyFn, BamIterEntitiesFn, BamIterMarkChangedRangeFn, BamIterNextChunkFn,
+    BamIterReadRemovedFn, BamIterResetFn, BamMsgReadBatchFn, BamMsgSendFn, BamMsgWriteBatchFn,
+    BamParForEachChunkFn, BamResMutPtrFn, BamResPtrFn, BamResTicksFn,
+};
+pub use primitives::{
+    BAM_CHILD_OF_NAME, BAM_CHILDREN_NAME, BamComponent, BamSymbol, BamSystem, BamSystemSet,
+    ComponentUuid, FNV1A_64_OFFSET_BASIS, FNV1A_64_PRIME, FfiAssetHandle, FfiAssetLoadState,
+    FfiBool, FfiChildOf, FfiEntity, FfiOption, FfiResult, FfiSlice, SIPHASH_KEY_0, SIPHASH_KEY_1,
+    StrView, fnv1a_64_init, fnv1a_64_str, fnv1a_64_update_bytes, fnv1a_64_update_u64,
+    siphash24_128,
+};
+pub use system::{
+    BAM_OBSERVER_FLAG_PROPAGATE, BAM_OBSERVER_KNOWN_FLAGS, BAM_QUERY_KNOWN_FLAGS,
+    BAM_SYSTEM_FLAG_AMBIGUOUS_WITH_ALL, BAM_SYSTEM_FLAG_MAIN_THREAD, BAM_SYSTEM_KNOWN_FLAGS,
+    BamEventKind, BamHostCtx, BamLoadCtx, BamObserverDesc, BamObserverFn, BamObserverMutFn,
+    BamQueryDesc, BamRunIfFn, BamSystemCtx, BamSystemDesc, BamSystemFn,
+};
+pub use traits::{
+    AbiPod, ModComponent, RawInsertable, SymbolEntry, assert_abi_pod, assert_raw_insertable,
+};
+pub use version::{
+    ABI_VERSION, ABI_VERSION_MAJOR, ABI_VERSION_MINOR, ABI_VERSION_PATCH,
+    abi_version_is_compatible, abi_version_major, abi_version_minor, abi_version_patch,
+    pack_abi_version, unpack_abi_version,
+};

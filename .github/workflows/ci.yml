@@ -1,0 +1,288 @@
+name: CI
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  quality-and-tests:
+    name: Quality, Wire Targets & Tests (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    env:
+      CARGO_PROFILE_DEV_DEBUG: "line-tables-only"
+      CARGO_PROFILE_TEST_DEBUG: "line-tables-only"
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Initialize MSVC Developer Environment
+        if: runner.os == 'Windows'
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+
+      - name: Install stable Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+
+      - name: Cache Cargo artifacts
+        uses: Swatinem/rust-cache@v2
+
+      - name: Formatting, clippy, rustdoc, forbid(unsafe_code) & zero-Bevy isolation
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ -n "${VCToolsInstallDir:-}" ] && command -v cygpath >/dev/null 2>&1; then
+            MSVC_BIN="$(cygpath -u "${VCToolsInstallDir}bin/Hostx64/x64")"
+            if [ -x "${MSVC_BIN}/link.exe" ]; then
+              export PATH="${MSVC_BIN}:${PATH}"
+            fi
+          fi
+          cargo fmt --all -- --check
+          for crate_lib in \
+            crates/bamabi_guest/src/lib.rs \
+            crates/bamabi_macros/src/lib.rs \
+            crates/bamabi_sdk_gen/src/lib.rs; do
+            if ! grep -q '#!\[forbid(unsafe_code)\]' "$crate_lib"; then
+              echo "ERROR: $crate_lib is missing required #![forbid(unsafe_code)] declaration!"
+              exit 1
+            fi
+          done
+          if cargo tree --workspace | sed 's/ (.*//' | grep -v bamabi | grep -i bevy; then
+            echo "ERROR: Unexpected Bevy dependency found in bamabi-wire!"
+            exit 1
+          fi
+          cargo clippy --workspace --all-targets -- -D warnings
+          cargo clippy --workspace --all-targets --all-features -- -D warnings
+          RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps
+          RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps --all-features
+
+      - name: Run Layer 0 test suites & `bamabi_sdk_gen` header parity
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ -n "${VCToolsInstallDir:-}" ] && command -v cygpath >/dev/null 2>&1; then
+            MSVC_BIN="$(cygpath -u "${VCToolsInstallDir}bin/Hostx64/x64")"
+            if [ -x "${MSVC_BIN}/link.exe" ]; then
+              export PATH="${MSVC_BIN}:${PATH}"
+            fi
+          fi
+          test -f include/bamabi.h
+          test -f include/generated/testbed_components.h
+          cargo test --workspace --no-default-features
+          cargo test --workspace --all-features
+          cargo test --doc --all-features
+
+      - name: Verify standalone C99 header & layout suite (Unix)
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p target
+          cc -std=c99 -Wall -Wextra -Werror -pedantic -fsyntax-only -x c include/bamabi.h
+          cc -std=c99 -Wall -Wextra -Werror -pedantic -fsyntax-only -x c include/generated/testbed_components.h
+          cc -std=c99 -Wall -Wextra -Werror -pedantic -I include tests/standalone_c_test.c -o target/standalone_c_test
+          ./target/standalone_c_test
+
+      - name: Verify standalone C11 header & layout suite (Windows MSVC)
+        if: runner.os == 'Windows'
+        shell: bash
+        env:
+          MSYS_NO_PATHCONV: "1"
+        run: |
+          set -euo pipefail
+          if [ -n "${VCToolsInstallDir:-}" ] && command -v cygpath >/dev/null 2>&1; then
+            MSVC_BIN="$(cygpath -u "${VCToolsInstallDir}bin/Hostx64/x64")"
+            if [ -x "${MSVC_BIN}/link.exe" ]; then
+              export PATH="${MSVC_BIN}:${PATH}"
+            fi
+          fi
+          mkdir -p target
+          cl.exe /nologo /Zs /TC /std:c11 /W4 /WX include/bamabi.h
+          cl.exe /nologo /Zs /TC /std:c11 /W4 /WX include/generated/testbed_components.h
+          cl.exe /nologo /TC /std:c11 /W4 /WX /I include /Fo:target/standalone_c_test.obj /Fe:target/standalone_c_test.exe tests/standalone_c_test.c
+          ./target/standalone_c_test.exe
+
+  static-wire-and-audit:
+    name: 32-bit/Wasm Wire, Typos, Deny, SemVer & C99 Sanitizers
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Install stable Rust toolchain + i686 & wasm32 targets
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+          targets: i686-unknown-linux-gnu, wasm32-unknown-unknown
+
+      - name: Cache Cargo artifacts
+        uses: Swatinem/rust-cache@v2
+
+      - name: Spellcheck repository (`typos`)
+        uses: crate-ci/typos@v1.31.1
+
+      - name: Install `cargo-deny`
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-deny
+
+      - name: Audit advisories, licenses, bans & sources (`cargo-deny`)
+        run: cargo deny --all-features check advisories licenses bans sources
+
+      - name: 32-bit (`i686`) & `wasm32` ABI contract layout checks
+        run: |
+          cargo check -p bamabi_sys --target i686-unknown-linux-gnu
+          cargo check -p bamabi_sys --target wasm32-unknown-unknown
+
+      - name: Strict C99 `-fsyntax-only` check on `include/bamabi.h` & `testbed_components.h`
+        run: |
+          cc -std=c99 -Wall -Wextra -Werror -pedantic -fsyntax-only -x c include/bamabi.h
+          cc -std=c99 -Wall -Wextra -Werror -pedantic -fsyntax-only -x c include/generated/testbed_components.h
+
+      - name: Run `standalone_c_test` under ASan + UBSan
+        env:
+          ASAN_OPTIONS: "detect_leaks=1:strict_string_checks=1:halt_on_error=1"
+          UBSAN_OPTIONS: "print_stacktrace=1:halt_on_error=1"
+        run: |
+          mkdir -p target
+          clang -std=c99 -Wall -Wextra -Werror -pedantic -O1 -g -fno-omit-frame-pointer \
+            -fsanitize=address,undefined -fno-sanitize-recover=all \
+            -I include tests/standalone_c_test.c -o target/standalone_c_test_san
+          ./target/standalone_c_test_san
+
+      - name: Install `cargo-semver-checks`
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-semver-checks
+
+      - name: SemVer compatibility check on `bamabi_sys`
+        shell: bash
+        env:
+          PR_BASE: ${{ github.event.pull_request.base.sha }}
+        run: |
+          set -euo pipefail
+
+          extract_toml_version() {
+            local section="$1"
+            awk -v sec="$section" '
+              /^\[/ {
+                hdr = $0
+                sub(/[[:space:]]*(#.*)?$/, "", hdr)
+                in_sec = (hdr == "[" sec "]")
+                next
+              }
+              in_sec && !done && /^[[:space:]]*version[[:space:]]*=[[:space:]]*"/ {
+                line = $0
+                sub(/^[^"]*"/, "", line)
+                sub(/".*$/, "", line)
+                print line
+                done = 1
+              }
+            '
+          }
+
+          read_sys_ver() {
+            local rev="$1"
+            local pkg_toml ws_toml
+            if [ "$rev" = "WORKTREE" ]; then
+              pkg_toml="$(cat crates/bamabi_sys/Cargo.toml)"
+              ws_toml="$(cat Cargo.toml)"
+            else
+              pkg_toml="$(git show "${rev}:crates/bamabi_sys/Cargo.toml" 2>/dev/null || true)"
+              ws_toml="$(git show "${rev}:Cargo.toml" 2>/dev/null || true)"
+            fi
+            [ -n "$pkg_toml" ] || return 0
+            if printf '%s\n' "$pkg_toml" | awk '
+              /^\[/ {
+                hdr = $0
+                sub(/[[:space:]]*(#.*)?$/, "", hdr)
+                in_pkg = (hdr == "[package]")
+                next
+              }
+              in_pkg && ( \
+                /^[[:space:]]*version\.workspace[[:space:]]*=[[:space:]]*true/ || \
+                /^[[:space:]]*version[[:space:]]*=[[:space:]]*\{[^}]*workspace[[:space:]]*=[[:space:]]*true/ \
+              ) {
+                found = 1
+              }
+              END { exit(found ? 0 : 1) }
+            '; then
+              printf '%s\n' "$ws_toml" | extract_toml_version "workspace.package"
+            else
+              printf '%s\n' "$pkg_toml" | extract_toml_version "package"
+            fi
+          }
+
+          CUR_VER="$(read_sys_ver WORKTREE)"
+          if [ -z "$CUR_VER" ]; then
+            echo "ERROR: could not read current bamabi_sys version." >&2
+            exit 1
+          fi
+          CUR_MM="$(printf '%s' "$CUR_VER" | cut -d. -f1,2)"
+          LATEST_TAG="$(git describe --tags --abbrev=0 --match 'v[0-9]*' 2>/dev/null || true)"
+
+          if [ -n "$LATEST_TAG" ]; then
+            TAG_VER="$(read_sys_ver "$LATEST_TAG")"
+            TAG_MM="$(printf '%s' "$TAG_VER" | cut -d. -f1,2)"
+            if [ -n "$TAG_VER" ] && [ "$TAG_MM" = "$CUR_MM" ]; then
+              echo "Running cargo-semver-checks against release tag $LATEST_TAG ($TAG_VER) for $CUR_VER."
+              cargo semver-checks check-release -p bamabi_sys --baseline-rev "$LATEST_TAG"
+              exit 0
+            fi
+            echo "Skipping release-tag baseline $LATEST_TAG (${TAG_VER:-unknown}, major.minor=${TAG_MM:-unknown}): intentional bump to $CUR_VER (major.minor=$CUR_MM)."
+          else
+            echo "No reachable v* release tag found yet; skipping tag-based SemVer baseline for $CUR_VER."
+          fi
+
+          if [ -n "${PR_BASE:-}" ] && git cat-file -e "${PR_BASE}^{commit}" 2>/dev/null; then
+            BASE_VER="$(read_sys_ver "$PR_BASE")"
+            if [ "$BASE_VER" = "$CUR_VER" ]; then
+              echo "Running cargo-semver-checks against PR base $PR_BASE ($BASE_VER)."
+              cargo semver-checks check-release -p bamabi_sys --baseline-rev "$PR_BASE"
+            else
+              echo "Skipping PR base $PR_BASE (${BASE_VER:-unknown}): bamabi_sys version changed ($BASE_VER -> $CUR_VER)."
+            fi
+          else
+            echo "No matching release tag or PR base baseline applies on this push; SemVer check complete."
+          fi
+
+  miri:
+    name: Miri (-Zmiri-tree-borrows -Zmiri-strict-provenance)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+
+      - name: Install nightly Rust with Miri
+        uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: miri
+
+      - name: Setup Miri sysroot
+        run: cargo +nightly miri setup
+
+      - name: Cache Cargo & Miri artifacts
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: miri-wire
+
+      - name: Run Miri on `bamabi_sys`, `bamabi_guest_sys`, `bamabi_guest`, and `bamabi_macros`
+        run: |
+          MIRIFLAGS="-Zmiri-tree-borrows -Zmiri-strict-provenance" \
+            cargo +nightly miri test -p bamabi_sys -p bamabi_guest_sys -p bamabi_guest
+          MIRIFLAGS="-Zmiri-tree-borrows" \
+            cargo +nightly miri test -p bamabi_macros --test mod_component_vtable

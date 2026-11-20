@@ -1,0 +1,46 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/bamabi_sys",
+    "crates/bamabi_macros",
+    "crates/bamabi_sdk_gen",
+    "crates/bamabi_guest_sys",
+    "crates/bamabi_guest",
+]
+
+[workspace.package]
+version = "0.3.0"
+edition = "2024"
+rust-version = "1.95"
+license = "MIT OR Apache-2.0"
+authors = ["bamabi authors"]
+repository = "https://github.com/yaga-simha/bamabi-wire"
+keywords = ["bevy", "ecs", "ffi", "modding", "plugin"]
+categories = ["game-development", "api-bindings"]
+
+[workspace.lints.rust]
+unsafe_op_in_unsafe_fn = "deny"
+improper_ctypes_definitions = "deny"
+unreachable_pub = "warn"
+
+[workspace.lints.clippy]
+undocumented_unsafe_blocks = "warn"
+ptr_as_ptr = "warn"
+cast_ptr_alignment = "warn"
+transmute_ptr_to_ptr = "warn"
+needless_pass_by_ref_mut = "warn"
+redundant_clone = "warn"
+match_same_arms = "warn"
+
+[workspace.dependencies]
+bamabi_sys = { version = "0.3.0", path = "crates/bamabi_sys" }
+bamabi_macros = { version = "0.3.0", path = "crates/bamabi_macros" }
+bamabi_sdk_gen = { version = "0.3.0", path = "crates/bamabi_sdk_gen" }
+bamabi_guest_sys = { version = "0.3.0", path = "crates/bamabi_guest_sys" }
+bamabi_guest = { version = "0.3.0", path = "crates/bamabi_guest" }
+proptest = "1"
+syn = { version = "2.0", features = ["full"] }
+quote = "1.0"
+proc-macro2 = "1.0"
+proc-macro-crate = "3"
+trybuild = "1.0"

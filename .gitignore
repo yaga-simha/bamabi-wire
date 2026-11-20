@@ -1,0 +1,14 @@
+target/
+**/target/
+**/*.rs.bk
+*.dylib
+*.so
+*.dll
+*.dSYM/
+**/*.dSYM/
+.DS_Store
+.agents/
+**/.zig-cache/
+**/zig-out/
+zig-pkg/
+**/zig-pkg/

@@ -1,0 +1,18 @@
+[package]
+name = "bamabi_sdk_gen"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "Deterministic C99, C++17, and Zig SDK and component header generator (#![forbid(unsafe_code)], zero Bevy deps) for `bamabi`"
+readme = "README.md"
+repository.workspace = true
+keywords.workspace = true
+categories.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+bamabi_sys = { workspace = true }
