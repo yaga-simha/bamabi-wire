@@ -350,6 +350,8 @@ impl ScheduleSetBuilder {
     }
 }
 
+/// Queries `BamHostApi::component_layout_info` for `component` and checks that `size`, `align`,
+/// and non-zero `SCHEMA_FINGERPRINT` match `T: ModComponent`, returning `TYPE_MISMATCH` on drift.
 #[inline]
 fn verify_layout_for_host<T: ModComponent>(
     host: &Host,
@@ -365,6 +367,8 @@ fn verify_layout_for_host<T: ModComponent>(
     Ok(info)
 }
 
+/// Resolves `T: ModComponent` by UUID (falling back to name-based resolution on pre-0.3.0 hosts)
+/// and verifies its registered layout and schema fingerprint via [`verify_layout_for_host`].
 #[inline]
 fn resolve_and_verify_layout<T: ModComponent>(host: &Host) -> Result<BamLayoutInfo, FfiResult> {
     let (_qualified_name, qualified_uuid) =
@@ -572,6 +576,9 @@ impl<'a> GuestApp<'a> {
     }
 }
 
+/// Generates ABI `0.3.0` host-forwarding convenience methods (`bind_named_object`,
+/// `intern_symbol`, `resolve_component_by_uuid`, `component_layout_info`, `log_diagnostic`,
+/// `report_fault`) for context types exposing `fn host(&self) -> &Host`.
 macro_rules! impl_v03_host_forwarders {
     ($($ty:ty),+ $(,)?) => {
         $(

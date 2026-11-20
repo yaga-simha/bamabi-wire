@@ -21,8 +21,17 @@ use common::make_mock_api;
 // S1 & S3: Layout & UUID validation in handle-based resource lookups
 // ============================================================================
 
+/// Verifies fail-closed layout, alignment, immutability, and UUID validation for handle-based
+/// singleton resource lookups (`res_ptr_by_handle*`, `read/write_mapped_wire_resource_by_handle`).
+///
+/// Scenario:
+/// 1. When `component_layout_info` is absent (ABI `0.2`), all handle-based lookups fail closed.
+/// 2. When `component_layout_info` is present, oversized reads (`[u8; 4096]` vs `u32`), wrong
+///    alignment (`[u8; 4]` vs `u32`), wrong UUIDs, immutable mutable borrows, and mismatched wire
+///    VTable handles are rejected while exact matches succeed.
 #[test]
 fn s1_and_s3_resource_handle_validation_fails_closed() {
+    /// Mock host state storing a 4-byte `u32` resource and a 16-byte wire-bridged `[u64; 2]`.
     #[repr(C)]
     #[derive(Clone, Copy)]
     struct WireHostState {
@@ -34,6 +43,7 @@ fn s1_and_s3_resource_handle_validation_fails_closed() {
     static WIRE_UUID: ComponentUuid = ComponentUuid::from_parts("s3::WireHost", 16, 8, 2);
     static IMMUT_UUID: ComponentUuid = ComponentUuid::from_parts("s1::ImmutU32", 4, 4, 3);
 
+    /// Mock wire getter summing `[u64; 2]` into a `u64`.
     unsafe extern "C" fn wire_get(host_ptr: *const c_void, out_wire: *mut u64) -> FfiResult {
         // SAFETY: Test passes aligned `[u64; 2]` and writable `u64`.
         unsafe {
@@ -43,6 +53,7 @@ fn s1_and_s3_resource_handle_validation_fails_closed() {
         FfiResult::OK
     }
 
+    /// Mock wire setter updating `pair[0]`.
     unsafe extern "C" fn wire_set(host_ptr: *mut c_void, value: *const u64) -> FfiResult {
         // SAFETY: Test passes aligned `[u64; 2]` and readable `u64`.
         unsafe {
@@ -63,6 +74,7 @@ fn s1_and_s3_resource_handle_validation_fails_closed() {
         set: Some(wire_set),
     };
 
+    /// Mock `get_proc_address` exporting `WIRE_VTABLE`.
     unsafe extern "C" fn mock_get_proc(
         _ctx: *const BamHostCtx,
         name: *const c_char,
@@ -75,6 +87,7 @@ fn s1_and_s3_resource_handle_validation_fails_closed() {
         }
     }
 
+    /// Mock `component_layout_info` describing handles 1 (`SmallU32`), 2 (`WireHost`), 3 (`ImmutU32`).
     unsafe extern "C" fn mock_layout_info(
         _ctx: *const BamHostCtx,
         comp: BamComponent,
@@ -109,6 +122,7 @@ fn s1_and_s3_resource_handle_validation_fails_closed() {
         FfiResult::OK
     }
 
+    /// Mock `sys_res_ptr` returning shared pointers into `WireHostState`.
     unsafe extern "C" fn mock_sys_res_ptr(
         sys_ctx: *const BamSystemCtx,
         comp: BamComponent,
@@ -127,6 +141,7 @@ fn s1_and_s3_resource_handle_validation_fails_closed() {
         }
     }
 
+    /// Mock `sys_res_mut_ptr` returning mutable pointers into `WireHostState`.
     unsafe extern "C" fn mock_sys_res_mut_ptr(
         sys_ctx: *mut BamSystemCtx,
         comp: BamComponent,
@@ -280,6 +295,8 @@ fn s1_and_s3_resource_handle_validation_fails_closed() {
 // S2: `ValidatedSystemRef` uniqueness (non-Copy/non-Clone & single take)
 // ============================================================================
 
+/// Verifies affine single-extraction semantics for [`ValidatedSystemRef`], query slots, and
+/// [`ValidatedCommands`] on [`ValidatedSystemInvocation`], preventing duplicate `&mut` handles.
 #[test]
 fn s2_validated_system_ref_and_slots_cannot_be_duplicated() {
     let api = make_mock_api();
@@ -313,21 +330,29 @@ fn s2_validated_system_ref_and_slots_cannot_be_duplicated() {
 // S4: `insert_moved`, `spawn_moved`, `SpawnEntry`, `SpawnBatchColumn` validation
 // ============================================================================
 
+/// Verifies fail-closed layout and VTable validation across [`SpawnEntry`], [`SpawnBatchColumn`],
+/// `insert_moved`, and `spawn_moved`, ensuring rejected moves drop guest-owned values cleanly.
+///
+/// Covers undersized entries, non-ZST markers, foreign UUIDs with matching `(size, align)`,
+/// invalid extra entries in `spawn_moved`, and ABI `0.2` hosts lacking `component_layout_info`.
 #[test]
 fn s4_spawn_and_moved_commands_validate_component_layout_and_vtable() {
     static DROPS: AtomicUsize = AtomicUsize::new(0);
 
+    /// Non-POD heap-owning component fixture with drop tracking.
     #[derive(Default)]
     struct OwnedDyn {
         payload: String,
     }
     impl Drop for OwnedDyn {
+        /// Increments `DROPS` when reclaimed on error or shutdown.
         fn drop(&mut self) {
             let _ = self.payload.len();
             DROPS.fetch_add(1, Ordering::SeqCst);
         }
     }
 
+    /// Header-only VTable for `OwnedDyn`.
     #[repr(C)]
     #[derive(Clone, Copy)]
     struct OwnedDynVt {
@@ -351,14 +376,17 @@ fn s4_spawn_and_moved_commands_validate_component_layout_and_vtable() {
         const COMPONENT_CSTR: &'static CStr = c"s4::OwnedDyn";
         const UUID: ComponentUuid = OWNED_UUID;
         type VTable = OwnedDynVt;
+        /// Returns `OWNED_VT`.
         fn vtable() -> &'static Self::VTable {
             &OWNED_VT
         }
+        /// Returns `OWNED_SYMS`.
         fn symbols() -> &'static [SymbolEntry] {
             &OWNED_SYMS
         }
     }
 
+    /// Mock `get_proc_address` exporting `OWNED_VT`.
     unsafe extern "C" fn s4_get_proc(
         _ctx: *const BamHostCtx,
         name: *const c_char,
@@ -371,6 +399,7 @@ fn s4_spawn_and_moved_commands_validate_component_layout_and_vtable() {
         }
     }
 
+    /// Mock `component_layout_info` defining 16B POD, ZST marker, same-mod `OwnedDyn`, and foreign UUID.
     unsafe extern "C" fn s4_layout_info(
         _ctx: *const BamHostCtx,
         comp: BamComponent,
@@ -412,6 +441,7 @@ fn s4_spawn_and_moved_commands_validate_component_layout_and_vtable() {
         FfiResult::OK
     }
 
+    /// Mock `cmd_spawn` / `cmd_spawn_persistent` returning entity `99`.
     unsafe extern "C" fn s4_spawn_noop(
         _cmds: *mut BamCommands,
         _comps: *const BamComponent,
@@ -424,6 +454,7 @@ fn s4_spawn_and_moved_commands_validate_component_layout_and_vtable() {
         FfiResult::OK
     }
 
+    /// Mock `cmd_spawn_batch` populating sequential entity IDs `1..=entity_count`.
     unsafe extern "C" fn s4_spawn_batch_noop(
         _cmds: *mut BamCommands,
         _comps: *const BamComponent,
@@ -441,6 +472,7 @@ fn s4_spawn_and_moved_commands_validate_component_layout_and_vtable() {
         FfiResult::OK
     }
 
+    /// Mock `cmd_insert` no-op returning `OK`.
     unsafe extern "C" fn s4_insert_noop(
         _cmds: *mut BamCommands,
         _e: FfiEntity,
@@ -592,13 +624,19 @@ fn s4_spawn_and_moved_commands_validate_component_layout_and_vtable() {
 // S5 & S6: Non-POD message UUID bypass rejection + null/panic-guarded callbacks
 // ============================================================================
 
+/// Verifies that non-POD message read/send enforces `M::UUID` even when `expected_uuid == None`
+/// and that witness sink callbacks (`forward_field`, `append_field`) reject null or misaligned
+/// context pointers with `INVALID_ARGUMENT` without dereferencing them.
 #[test]
 fn s5_and_s6_non_pod_message_uuid_enforced_and_callbacks_panic_and_null_safe() {
+    /// Primary non-POD message fixture.
     #[derive(Default, Debug, PartialEq, Eq)]
     struct MsgA;
+    /// Conflicting non-POD message fixture on term `1`.
     #[derive(Default, Debug, PartialEq, Eq)]
     struct MsgB;
 
+    /// Mock `export_fields` deliberately probing null and misaligned `sink_ctx` before calling real `sink_ctx`.
     unsafe extern "C" fn export_tests_null_and_misaligned_ctx(
         _src_ptr: *const c_void,
         sink: Option<
@@ -649,6 +687,7 @@ fn s5_and_s6_non_pod_message_uuid_enforced_and_callbacks_panic_and_null_safe() {
         }
     }
 
+    /// No-op `import_field` stub returning `OK`.
     unsafe extern "C" fn import_ok(
         _dst: *mut c_void,
         _name: StrView,
@@ -673,9 +712,11 @@ fn s5_and_s6_non_pod_message_uuid_enforced_and_callbacks_panic_and_null_safe() {
         const COMPONENT_CSTR: &'static CStr = c"s5::MsgA";
         const UUID: ComponentUuid = ComponentUuid::from_canonical_name("s5::MsgA");
         type VTable = ();
+        /// Returns unit VTable.
         fn vtable() -> &'static Self::VTable {
             &()
         }
+        /// Returns `SYMS_A`.
         fn symbols() -> &'static [SymbolEntry] {
             &SYMS_A
         }
@@ -685,14 +726,17 @@ fn s5_and_s6_non_pod_message_uuid_enforced_and_callbacks_panic_and_null_safe() {
         const COMPONENT_CSTR: &'static CStr = c"s5::MsgB";
         const UUID: ComponentUuid = ComponentUuid::from_canonical_name("s5::MsgB");
         type VTable = ();
+        /// Returns unit VTable.
         fn vtable() -> &'static Self::VTable {
             &()
         }
+        /// Returns empty symbols.
         fn symbols() -> &'static [SymbolEntry] {
             &[]
         }
     }
 
+    /// Mock `get_proc_address` exporting `MsgA` witness and `MsgA`/`MsgB` non-POD markers.
     unsafe extern "C" fn s5_get_proc(_ctx: *const BamHostCtx, sym: *const c_char) -> *const c_void {
         // SAFETY: Valid CStr.
         match unsafe { CStr::from_ptr(sym) }.to_bytes() {
@@ -706,6 +750,7 @@ fn s5_and_s6_non_pod_message_uuid_enforced_and_callbacks_panic_and_null_safe() {
         }
     }
 
+    /// Mock `iter_column_info` mapping term `0` to `MsgA` and term `1` to `MsgB`.
     unsafe extern "C" fn s5_col_info(
         _iter: *const BamIter,
         term_index: usize,
@@ -733,6 +778,7 @@ fn s5_and_s6_non_pod_message_uuid_enforced_and_callbacks_panic_and_null_safe() {
 
     static DUMMY_MSG: u64 = 42;
 
+    /// Mock `msg_read_batch` returning one dummy message pointer.
     unsafe extern "C" fn s5_read_batch(
         _iter: *mut BamIter,
         _term_index: usize,
@@ -753,6 +799,7 @@ fn s5_and_s6_non_pod_message_uuid_enforced_and_callbacks_panic_and_null_safe() {
         FfiResult::OK
     }
 
+    /// Mock `msg_send` accepting any serialized packet.
     unsafe extern "C" fn s5_send(
         _iter: *mut BamIter,
         _term_index: usize,
@@ -805,8 +852,11 @@ fn s5_and_s6_non_pod_message_uuid_enforced_and_callbacks_panic_and_null_safe() {
 // S7: Stacked/Tree Borrows soundness of `GuestInstance` & `prepare_system_desc`
 // ============================================================================
 
+/// Verifies Miri Stacked/Tree Borrows soundness of `OwnedDescriptorStorage` raw pointers inside
+/// `prepare_system_desc` and `OwnedRuntimeAllocs` after `GuestInstance` is moved into a `Box`.
 #[test]
 fn s7_owned_runtime_allocs_and_system_descriptor_pointers_sound_under_miri() {
+    /// Mock `register_system` dereferencing every string and term pointer inside `BamSystemDesc`.
     unsafe extern "C" fn inspect_desc_register_system(
         _load_ctx: *mut BamLoadCtx,
         desc: *const BamSystemDesc,
@@ -843,6 +893,7 @@ fn s7_owned_runtime_allocs_and_system_descriptor_pointers_sound_under_miri() {
         FfiResult::OK
     }
 
+    /// Mock `cmd_observe` returning entity `123`.
     unsafe extern "C" fn mock_cmd_observe(
         _cmds: *mut BamCommands,
         desc: *const bamabi_sys::BamObserverDesc,
@@ -927,6 +978,10 @@ fn s7_owned_runtime_allocs_and_system_descriptor_pointers_sound_under_miri() {
 // S8: `stride == 0` wildcard rejection, `isize::MAX`, sparse alignment, & overlap
 // ============================================================================
 
+/// Verifies five boundary-hardening guards: (1) `stride == 0` rejects non-ZST slice casts,
+/// (2) `SparseRows`/`SparseRowsMut` reject `len * ptr_size > isize::MAX`, (3) `ChunkColumnDispenser`
+/// rejects `isize::MAX` overflows, (4) misaligned sparse row pointer arrays return `TYPE_MISMATCH`,
+/// and (5) `iter_entities_and_dynamic_slice_mut` rejects overlapping entity and component buffers.
 #[test]
 fn s8_stride_zero_isize_max_sparse_alignment_and_overlap_guards() {
     // 1. `ValidatedSlice` / `ValidatedSliceMut` with `stride == 0` MUST reject non-ZST types!
@@ -956,12 +1011,14 @@ fn s8_stride_zero_isize_max_sparse_alignment_and_overlap_guards() {
     assert!(unsafe { SparseRowsMut::<u32>::from_raw_parts(dummy_mut, huge_len, true) }.is_none());
 
     // 3. `ChunkColumnDispenser` rejects `len * size > isize::MAX` on `entities`, `next_read`, `next_write`!
+    /// Adversarial mock iterator state serving huge chunk lengths, overlapping buffers, and misaligned sparse arrays.
     struct HugeChunkIter {
         len: usize,
         buf: [u64; 2],
         aligned_sparse_storage: [u64; 4],
     }
 
+    /// Mock `iter_next_chunk` reporting `HugeChunkIter::len`.
     unsafe extern "C" fn s8_next_chunk(iter: *mut BamIter, out_len: *mut usize) -> FfiBool {
         // SAFETY: `iter` points to `HugeChunkIter`.
         let st = unsafe { &*iter.cast::<HugeChunkIter>() };
@@ -969,21 +1026,25 @@ fn s8_stride_zero_isize_max_sparse_alignment_and_overlap_guards() {
         unsafe { *out_len = st.len };
         FfiBool::TRUE
     }
+    /// Mock `iter_entities` returning `HugeChunkIter::buf`.
     unsafe extern "C" fn s8_entities(iter: *const BamIter) -> *const FfiEntity {
         // SAFETY: `iter` points to `HugeChunkIter`.
         let st = unsafe { &*iter.cast::<HugeChunkIter>() };
         st.buf.as_ptr().cast::<FfiEntity>()
     }
+    /// Mock `iter_column_readonly` returning `HugeChunkIter::buf`.
     unsafe extern "C" fn s8_col_ro(iter: *const BamIter, _idx: usize) -> *const u8 {
         // SAFETY: `iter` points to `HugeChunkIter`.
         let st = unsafe { &*iter.cast::<HugeChunkIter>() };
         st.buf.as_ptr().cast::<u8>()
     }
+    /// Mock `iter_column_mutable` deliberately aliasing `HugeChunkIter::buf` with `entities`.
     unsafe extern "C" fn s8_col_mut(iter: *mut BamIter, _idx: usize) -> *mut u8 {
         // SAFETY: `iter` points to `HugeChunkIter` (deliberately overlaps `entities`!).
         let st = unsafe { &mut *iter.cast::<HugeChunkIter>() };
         st.buf.as_mut_ptr().cast::<u8>()
     }
+    /// Mock `iter_column_rows_readonly` returning a deliberately 1-byte misaligned pointer array.
     unsafe extern "C" fn s8_rows_ro(iter: *mut BamIter, _idx: usize) -> *const *const u8 {
         // SAFETY: `iter` points to `HugeChunkIter`.
         let st = unsafe { &*iter.cast::<HugeChunkIter>() };
@@ -994,6 +1055,7 @@ fn s8_stride_zero_isize_max_sparse_alignment_and_overlap_guards() {
             unsafe { st.aligned_sparse_storage.as_ptr().cast::<u8>().add(1) }.cast::<*const u8>();
         unaligned
     }
+    /// Mock `iter_column_info` describing dense read/write, sparse wire, and overlapping dynamic columns.
     unsafe extern "C" fn s8_col_info(
         _iter: *const BamIter,
         term_index: usize,
@@ -1043,10 +1105,12 @@ fn s8_stride_zero_isize_max_sparse_alignment_and_overlap_guards() {
         FfiResult::OK
     }
 
+    /// Same-mod dynamic component fixture used to test entity/column overlap rejection.
     #[repr(C)]
     struct OverlapDyn {
         val: u64,
     }
+    /// Header-only VTable for `OverlapDyn`.
     #[repr(C)]
     #[derive(Clone, Copy)]
     struct OverlapDynVt {
@@ -1070,14 +1134,17 @@ fn s8_stride_zero_isize_max_sparse_alignment_and_overlap_guards() {
         const COMPONENT_CSTR: &'static CStr = c"s8::OverlapDyn";
         const UUID: ComponentUuid = OVERLAP_UUID;
         type VTable = OverlapDynVt;
+        /// Returns `OVERLAP_VT`.
         fn vtable() -> &'static Self::VTable {
             &OVERLAP_VT
         }
+        /// Returns `OVERLAP_SYMS`.
         fn symbols() -> &'static [SymbolEntry] {
             &OVERLAP_SYMS
         }
     }
 
+    /// Mock wire getter returning `1`.
     unsafe extern "C" fn s8_wire_get(_p: *const c_void, out: *mut u64) -> FfiResult {
         // SAFETY: Writable `u64`.
         unsafe { *out = 1 };
@@ -1093,6 +1160,7 @@ fn s8_stride_zero_isize_max_sparse_alignment_and_overlap_guards() {
         get: Some(s8_wire_get),
         set: None,
     };
+    /// Mock `get_proc_address` exporting `OVERLAP_VT` and `S8_SPARSE_WIRE_VT`.
     unsafe extern "C" fn s8_get_proc(_ctx: *const BamHostCtx, sym: *const c_char) -> *const c_void {
         // SAFETY: Valid CStr.
         match unsafe { CStr::from_ptr(sym) }.to_bytes() {
@@ -1151,4 +1219,444 @@ fn s8_stride_zero_isize_max_sparse_alignment_and_overlap_guards() {
 
     // 5. `iter_entities_and_dynamic_slice_mut` rejects overlapping `entities` and component bytes!
     assert!(iter_entities_and_dynamic_slice_mut::<OverlapDyn>(&mut iter2, 3).is_none());
+}
+
+// ============================================================================
+// S9: ChunkColumnDispenser overlapping write-then-read (Tree Borrows soundness)
+// ============================================================================
+
+/// Scenario: Verifies that `ChunkColumnDispenser` rejects an overlapping write-then-read borrow on
+/// the same raw address range (`ACCESS_CONFLICT`) while allowing repeated `entities()` calls without
+/// violating Rust aliasing rules.
+#[test]
+fn s9_dispenser_overlapping_write_then_read_and_repeat_entities_are_sound() {
+    #[repr(C)]
+    struct OverlapHostIter {
+        buf: [u32; 4],
+        ent_a: [FfiEntity; 2],
+        ent_b: [FfiEntity; 2],
+        ent_calls: usize,
+        yielded: bool,
+    }
+
+    unsafe extern "C" fn s9_next_chunk(iter: *mut BamIter, out_len: *mut usize) -> FfiBool {
+        // SAFETY: Test binds `iter` to `OverlapHostIter`.
+        let st = unsafe { &mut *iter.cast::<OverlapHostIter>() };
+        if st.yielded {
+            return FfiBool::FALSE;
+        }
+        st.yielded = true;
+        // SAFETY: `out_len` is writable stack storage.
+        unsafe { *out_len = 2 };
+        FfiBool::TRUE
+    }
+
+    unsafe extern "C" fn s9_entities(iter: *const BamIter) -> *const FfiEntity {
+        // SAFETY: Test binds `iter` to `OverlapHostIter` with interior call counter mutation.
+        let st = unsafe { &mut *iter.cast_mut().cast::<OverlapHostIter>() };
+        st.ent_calls += 1;
+        if st.ent_calls == 1 {
+            st.ent_a.as_ptr()
+        } else {
+            st.ent_b.as_ptr()
+        }
+    }
+
+    unsafe extern "C" fn s9_col_info(
+        _: *const BamIter,
+        term: usize,
+        out: *mut BamColumnInfo,
+    ) -> FfiResult {
+        let info = match term {
+            0 => BamColumnInfo {
+                component: BamComponent::from_raw(1),
+                mode: AccessMode::WRITE,
+                uuid: ComponentUuid::from_parts("s9::WriteCol", 4, 4, 0),
+                size: 4,
+                align: 4,
+                storage_flags: 0,
+                reserved0: 0,
+            },
+            1 => BamColumnInfo {
+                component: BamComponent::from_raw(2),
+                mode: AccessMode::READ,
+                uuid: ComponentUuid::from_parts("s9::ReadCol", 4, 4, 0),
+                size: 4,
+                align: 4,
+                storage_flags: 0,
+                reserved0: 0,
+            },
+            _ => return FfiResult::OUT_OF_RANGE,
+        };
+        // SAFETY: `out` is writable stack storage.
+        unsafe { *out = info };
+        FfiResult::OK
+    }
+
+    unsafe extern "C" fn s9_col_mut(iter: *mut BamIter, term: usize) -> *mut u8 {
+        if term != 0 {
+            return core::ptr::null_mut();
+        }
+        // SAFETY: Test binds `iter` to `OverlapHostIter`.
+        let st = unsafe { &mut *iter.cast::<OverlapHostIter>() };
+        st.buf.as_mut_ptr().cast::<u8>()
+    }
+
+    unsafe extern "C" fn s9_col_ro(iter: *const BamIter, term: usize) -> *const u8 {
+        if term != 1 {
+            return core::ptr::null();
+        }
+        // SAFETY: Deliberately return an overlapping pointer (`buf[1..3]` overlaps `buf[0..2]`).
+        let st = unsafe { &*iter.cast::<OverlapHostIter>() };
+        // SAFETY: `buf` has 4 elements; offset 1 leaves 3 elements.
+        unsafe { st.buf.as_ptr().add(1).cast::<u8>() }
+    }
+
+    let mut api = make_mock_api();
+    api.iter_next_chunk = Some(s9_next_chunk);
+    api.iter_entities = Some(s9_entities);
+    api.iter_column_info = Some(s9_col_info);
+    api.iter_column_mutable = Some(s9_col_mut);
+    api.iter_column_readonly = Some(s9_col_ro);
+
+    let mut state = OverlapHostIter {
+        buf: [10, 20, 30, 40],
+        ent_a: [FfiEntity::from_bits(1), FfiEntity::from_bits(2)],
+        ent_b: [FfiEntity::from_bits(3), FfiEntity::from_bits(4)],
+        ent_calls: 0,
+        yielded: false,
+    };
+    // SAFETY: Stack allocations live across `host` and `iter`.
+    let host = unsafe { Host::from_raw(&api, (&raw const state).cast()) }.unwrap();
+    // SAFETY: `state` acts as `BamIter`.
+    let mut iter = unsafe { ValidatedIter::from_raw((&raw mut state).cast(), &host) };
+    assert_eq!(iter.next_chunk(), Some(2));
+
+    let mut disp = ChunkColumnDispenser::new(&mut iter);
+    let w = disp.next_write::<u32>(None).unwrap();
+    w[0] = 111;
+    // Overlapping read MUST fail with ACCESS_CONFLICT BEFORE forming `&[u32]`, so subsequent
+    // writes through `w` remain Tree-Borrows-sound!
+    assert_eq!(
+        disp.next_read::<u32>(AccessMode::READ, None),
+        Err(FfiResult::ACCESS_CONFLICT)
+    );
+    w[1] = 222;
+    assert_eq!(w, &[111, 222]);
+
+    // First `entities()` succeeds; a hostile second `entities()` returning a different range fails!
+    assert_eq!(
+        disp.entities().unwrap(),
+        &[FfiEntity::from_bits(1), FfiEntity::from_bits(2)]
+    );
+    assert_eq!(disp.entities(), Err(FfiResult::ACCESS_CONFLICT));
+}
+
+// ============================================================================
+// S10: State restore `isize::MAX`, re-entrant mutable observer Tree Borrows,
+//      overlapping `pod_clone_trampoline`, and bridged row bounds under Miri
+// ============================================================================
+
+/// Verifies under Miri (`-Zmiri-tree-borrows -Zmiri-strict-provenance`) that:
+/// 1. `guest_restore_state_trampoline` rejects `len > isize::MAX` (`OUT_OF_RANGE`) and misaligned
+///    `instance` pointers (`INVALID_ARGUMENT`) without UB.
+/// 2. Re-entrant `register_observer_mut_closure` invocation with the SAME live `event_data` and
+///    `propagate` pointers rejects with `ACCESS_CONFLICT` BEFORE forming an aliasing `&mut E` or
+///    clobbering `*propagate`.
+/// 3. `pod_clone_trampoline` safely handles identical and partially overlapping `(src, dst)` ranges.
+/// 4. Bridged dense rows reject `current_len * host_size > isize::MAX` (`OUT_OF_RANGE`) and
+///    non-power-of-two `host_align` (`TYPE_MISMATCH`).
+#[test]
+fn s10_restore_state_observer_mut_reentrancy_pod_clone_overlap_and_bridged_bounds() {
+    use bamabi_guest_sys::{
+        GuestInstance, guest_restore_state_trampoline, guest_save_state_trampoline,
+        pod_clone_trampoline, register_observer_mut_closure,
+    };
+    use bamabi_sys::{BamInstance, BamObserverDesc, BamObserverMutFn, FfiBool};
+    use core::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::{Arc, Mutex};
+
+    // 1. `guest_restore_state_trampoline` & `guest_save_state_trampoline` bounds/alignment checks
+    let api = make_mock_api();
+    let mut dummy_ctx = 0u64;
+    // SAFETY: Stack pointers valid for test.
+    let host = unsafe { Host::from_raw(&api, (&raw const dummy_ctx).cast()) }.unwrap();
+    let mut inst = Box::new(GuestInstance::new(host, "s10_mod"));
+    let called = Arc::new(AtomicBool::new(false));
+    let called_clone = Arc::clone(&called);
+    inst.set_restore_state_hook(move |_bytes| {
+        called_clone.store(true, Ordering::SeqCst);
+        FfiResult::OK
+    });
+    let raw_inst = Box::into_raw(inst).cast::<BamInstance>();
+    let byte = 0x5Au8;
+    assert_eq!(
+        // SAFETY: `len > isize::MAX` must fail closed with `OUT_OF_RANGE` before forming a slice!
+        unsafe {
+            guest_restore_state_trampoline(raw_inst, &raw const byte, (isize::MAX as usize) + 1)
+        },
+        FfiResult::OUT_OF_RANGE
+    );
+    assert!(!called.load(Ordering::SeqCst));
+    // Misaligned non-null `instance` must fail closed without dereferencing.
+    let mut align_buf = [0u64; 4];
+    // SAFETY: Adding 1 byte produces a strictly misaligned pointer inside `align_buf`.
+    let misaligned_inst =
+        unsafe { align_buf.as_mut_ptr().cast::<u8>().add(1) }.cast::<BamInstance>();
+    assert_eq!(
+        // SAFETY: Alignment guard rejects `misaligned_inst` before dereferencing.
+        unsafe { guest_restore_state_trampoline(misaligned_inst, &raw const byte, 1) },
+        FfiResult::INVALID_ARGUMENT
+    );
+    unsafe extern "C" fn dummy_writer(_: *mut c_void, _: *const u8, _: usize) -> FfiResult {
+        FfiResult::OK
+    }
+    assert_eq!(
+        // SAFETY: Alignment guard rejects `misaligned_inst` before dereferencing.
+        unsafe {
+            guest_save_state_trampoline(misaligned_inst, Some(dummy_writer), core::ptr::null_mut())
+        },
+        FfiResult::INVALID_ARGUMENT
+    );
+    // Cleanly reclaim `raw_inst`.
+    // SAFETY: Reclaiming the `GuestInstance` boxed above.
+    unsafe { bamabi_guest_sys::shutdown_guest_instance(raw_inst) };
+
+    // 2. Re-entrant mutable observer (`observer_mut_closure_trampoline`) Tree Borrows soundness!
+    #[repr(C)]
+    struct CaptureObsCtx {
+        mut_cb: Option<BamObserverMutFn>,
+        user_data: *mut c_void,
+    }
+    unsafe extern "C" fn capture_register_obs(
+        load_ctx: *mut BamLoadCtx,
+        desc: *const BamObserverDesc,
+    ) -> FfiResult {
+        // SAFETY: Test binds `load_ctx` to `CaptureObsCtx` and `desc` is valid.
+        let cap = unsafe { &mut *load_ctx.cast::<CaptureObsCtx>() };
+        // SAFETY: `desc` is valid.
+        let d = unsafe { &*desc };
+        cap.mut_cb = d.mut_callback;
+        cap.user_data = d.user_data;
+        FfiResult::OK
+    }
+    let mut obs_api = make_mock_api();
+    obs_api.register_observer = Some(capture_register_obs);
+    // SAFETY: Stack pointers valid for test.
+    let obs_host = unsafe { Host::from_raw(&obs_api, (&raw const dummy_ctx).cast()) }.unwrap();
+    let mut obs_inst = GuestInstance::new(obs_host, "s10_obs");
+    let inner_rc_slot = Arc::new(Mutex::new(FfiResult::OK));
+    let inner_rc_clone = Arc::clone(&inner_rc_slot);
+
+    // Raw-pointer holder preserving full Miri strict provenance across the re-entrant call.
+    struct ProvenanceBundle {
+        cb: Option<BamObserverMutFn>,
+        ud: *mut c_void,
+        ev: *mut u8,
+        prop: *mut FfiBool,
+    }
+    // SAFETY: Used strictly on the single test thread.
+    unsafe impl Send for ProvenanceBundle {}
+    let bundle = Arc::new(Mutex::new(ProvenanceBundle {
+        cb: None,
+        ud: core::ptr::null_mut(),
+        ev: core::ptr::null_mut(),
+        prop: core::ptr::null_mut(),
+    }));
+    let bundle_clone = Arc::clone(&bundle);
+    let mut cap2 = CaptureObsCtx {
+        mut_cb: None,
+        user_data: core::ptr::null_mut(),
+    };
+    fn hrtb_mut_obs<
+        F: FnMut(FfiEntity, &mut u64, &mut bool, &mut ValidatedCommands<'_>) -> FfiResult
+            + Send
+            + 'static,
+    >(
+        f: F,
+    ) -> F {
+        f
+    }
+    let mut_obs_closure = hrtb_mut_obs(move |target, ev, prop, _cmds| {
+        *ev = 100;
+        *prop = false;
+        let (cb, ud, ev_ptr, prop_ptr) = {
+            let g = bundle_clone.lock().unwrap();
+            (g.cb.unwrap(), g.ud, g.ev, g.prop)
+        };
+        // Re-enter with the EXACT live `ev_ptr` and `prop_ptr` while `&mut *ev` is active!
+        // Under `-Zmiri-tree-borrows`, forming `&mut *ev_ptr` before `try_with_mut` is UB!
+        // SAFETY: Re-entrant call testing `ReentrantCell` mutual exclusion.
+        let nested = unsafe { cb(target, ev_ptr, prop_ptr, core::ptr::null_mut(), ud) };
+        *inner_rc_clone.lock().unwrap() = nested;
+        // Must still be valid to mutate `*ev` after the rejected re-entry!
+        *ev += 23;
+        FfiResult::OK
+    });
+    // SAFETY: `cap2` acts as `BamLoadCtx`.
+    let reg_rc2 = unsafe {
+        register_observer_mut_closure::<u64, _>(
+            &mut obs_inst,
+            (&raw mut cap2).cast::<BamLoadCtx>(),
+            "s10_mut_obs_reenter",
+            BamComponent::from_raw(1),
+            FfiEntity::NULL,
+            0,
+            BamComponent::INVALID,
+            mut_obs_closure,
+        )
+    };
+    assert_eq!(reg_rc2, FfiResult::OK);
+    let mut event_val: u64 = 1;
+    let mut prop_val = FfiBool::TRUE;
+    {
+        let mut g = bundle.lock().unwrap();
+        g.cb = cap2.mut_cb;
+        g.ud = cap2.user_data;
+        g.ev = (&raw mut event_val).cast::<u8>();
+        g.prop = &raw mut prop_val;
+    }
+    let cb = cap2.mut_cb.unwrap();
+    // SAFETY: Pointers live on stack and `cap2.user_data` lives in `obs_inst`.
+    let outer_rc = unsafe {
+        cb(
+            FfiEntity::from_bits(7),
+            (&raw mut event_val).cast::<u8>(),
+            &raw mut prop_val,
+            core::ptr::null_mut(),
+            cap2.user_data,
+        )
+    };
+    assert_eq!(outer_rc, FfiResult::OK);
+    assert_eq!(*inner_rc_slot.lock().unwrap(), FfiResult::ACCESS_CONFLICT);
+    assert_eq!(event_val, 123);
+    assert!(!prop_val.get());
+
+    // 3. `pod_clone_trampoline` overlapping and identical buffers under Miri
+    let mut overlap_buf: [u8; 12] = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12];
+    assert_eq!(
+        // SAFETY: Identical `src == dst` must be UB-free (`core::ptr::copy`).
+        unsafe {
+            pod_clone_trampoline::<u64>(
+                overlap_buf.as_ptr().cast(),
+                overlap_buf.as_mut_ptr().cast(),
+                core::ptr::null_mut(),
+            )
+        },
+        FfiResult::OK
+    );
+    assert_eq!(
+        // SAFETY: Partial overlap `[0..8)` -> `[4..12)` inside `overlap_buf[0..12]`.
+        unsafe {
+            pod_clone_trampoline::<u64>(
+                overlap_buf.as_ptr().cast(),
+                overlap_buf.as_mut_ptr().add(4).cast(),
+                core::ptr::null_mut(),
+            )
+        },
+        FfiResult::OK
+    );
+    assert_eq!(&overlap_buf[4..12], &[1, 2, 3, 4, 5, 6, 7, 8]);
+
+    // 4. Bridged row `current_len * host_size > isize::MAX` and non-power-of-two `host_align`
+    unsafe extern "C" fn s10_wire_get(_: *const c_void, out: *mut u64) -> FfiResult {
+        // SAFETY: Writable stack `out`.
+        unsafe { *out = 9 };
+        FfiResult::OK
+    }
+    static S10_HUGE_VT: MappedWireVTable<u64> = MappedWireVTable {
+        header: VTableHeader::from_raw_parts(
+            core::mem::size_of::<MappedWireVTable<u64>>() as u32,
+            ComponentUuid::from_parts("s10::Huge", 8, 8, 0),
+            (isize::MAX as usize) & !7,
+            8,
+        ),
+        get: Some(s10_wire_get),
+        set: None,
+    };
+    static S10_BAD_ALIGN_VT: MappedWireVTable<u64> = MappedWireVTable {
+        header: VTableHeader::from_raw_parts(
+            core::mem::size_of::<MappedWireVTable<u64>>() as u32,
+            ComponentUuid::from_parts("s10::BadAlign", 8, 8, 0),
+            9,
+            3,
+        ),
+        get: Some(s10_wire_get),
+        set: None,
+    };
+    unsafe extern "C" fn s10_get_proc(_: *const BamHostCtx, sym: *const c_char) -> *const c_void {
+        // SAFETY: Valid CStr.
+        match unsafe { CStr::from_ptr(sym) }.to_bytes() {
+            b"bam.v0.s10::Huge.vtable" => (&raw const S10_HUGE_VT).cast(),
+            b"bam.v0.s10::BadAlign.vtable" => (&raw const S10_BAD_ALIGN_VT).cast(),
+            _ => core::ptr::null(),
+        }
+    }
+    unsafe extern "C" fn s10_next(_: *mut BamIter, out_len: *mut usize) -> FfiBool {
+        // SAFETY: Writable stack `out_len`.
+        unsafe { *out_len = 2 };
+        FfiBool::TRUE
+    }
+    unsafe extern "C" fn s10_info(
+        _: *const BamIter,
+        term: usize,
+        out: *mut BamColumnInfo,
+    ) -> FfiResult {
+        let info = match term {
+            0 => BamColumnInfo {
+                component: BamComponent::from_raw(1),
+                mode: AccessMode::READ,
+                uuid: S10_HUGE_VT.header.uuid,
+                size: S10_HUGE_VT.header.size,
+                align: S10_HUGE_VT.header.align,
+                storage_flags: 0,
+                reserved0: 0,
+            },
+            1 => BamColumnInfo {
+                component: BamComponent::from_raw(2),
+                mode: AccessMode::READ,
+                uuid: S10_BAD_ALIGN_VT.header.uuid,
+                size: S10_BAD_ALIGN_VT.header.size,
+                align: S10_BAD_ALIGN_VT.header.align,
+                storage_flags: 0,
+                reserved0: 0,
+            },
+            _ => return FfiResult::OUT_OF_RANGE,
+        };
+        // SAFETY: Writable stack `out`.
+        unsafe { *out = info };
+        FfiResult::OK
+    }
+    static S10_COL_BUF: [u64; 2] = [1, 2];
+    unsafe extern "C" fn s10_col_ro(_: *const BamIter, _: usize) -> *const u8 {
+        S10_COL_BUF.as_ptr().cast()
+    }
+
+    let mut b_api = make_mock_api();
+    b_api.get_proc_address = Some(s10_get_proc);
+    b_api.iter_next_chunk = Some(s10_next);
+    b_api.iter_column_info = Some(s10_info);
+    b_api.iter_column_readonly = Some(s10_col_ro);
+    // SAFETY: Stack pointers valid for test.
+    let b_host = unsafe { Host::from_raw(&b_api, (&raw const dummy_ctx).cast()) }.unwrap();
+    let huge_vt = b_host
+        .resolve_mapped_wire_vtable::<u64>(c"bam.v0.s10::Huge.vtable", S10_HUGE_VT.header.uuid)
+        .unwrap();
+    let bad_align_vt = b_host
+        .resolve_mapped_wire_vtable::<u64>(
+            c"bam.v0.s10::BadAlign.vtable",
+            S10_BAD_ALIGN_VT.header.uuid,
+        )
+        .unwrap();
+    // SAFETY: `dummy_ctx` acts as `BamIter`.
+    let mut b_iter = unsafe { ValidatedIter::from_raw((&raw mut dummy_ctx).cast(), &b_host) };
+    assert_eq!(b_iter.next_chunk(), Some(2));
+    assert_eq!(
+        b_iter.read_mapped_wire_row(0, 1, &huge_vt),
+        Err(FfiResult::OUT_OF_RANGE)
+    );
+    assert_eq!(
+        b_iter.read_mapped_wire_row(1, 0, &bad_align_vt),
+        Err(FfiResult::TYPE_MISMATCH)
+    );
 }

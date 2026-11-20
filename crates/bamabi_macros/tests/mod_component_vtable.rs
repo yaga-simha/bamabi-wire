@@ -63,6 +63,9 @@ mod ui {
     }
 }
 
+/// Test scenario: exercises generated `VTableHeader` validation and all primitive, `bool`,
+/// `String`, `Vec<T>`, and nested pointer VTable getters/setters including null/unaligned
+/// receiver rejection (`NULL_POINTER`, `INVALID_ARGUMENT`) and invalid UTF-8 rejection.
 #[test]
 fn vtable_header_and_error_returning_setters() {
     let vt = MixedComponent::vtable();
@@ -321,6 +324,9 @@ fn vtable_header_and_error_returning_setters() {
     );
 }
 
+/// Test scenario: passes a `StrView` or `FfiSlice` borrowed from a component's own `String` or
+/// `Vec<T>` buffer directly back into its `set_*` VTable slot, verifying the intermediate-copy
+/// overlap guard prevents src/dst aliasing UB under Miri.
 #[test]
 fn self_aliasing_string_and_vec_setters() {
     let vt = MixedComponent::vtable();
@@ -402,6 +408,9 @@ pub struct ExplicitUuidComp {
     pub id: u64,
 }
 
+/// Test scenario: verifies `module_path!()::StructName` default namespacing, explicit
+/// `name`/`namespace`/`uuid` overrides, `bam.v0.*` symbol resolution, and schema-sensitive
+/// `ComponentUuid` fingerprints.
 #[test]
 fn namespaced_canonical_names_symbols_and_uuid_fingerprints() {
     // Default canonical name uses `module_path!()::StructName`
@@ -467,6 +476,8 @@ fn namespaced_canonical_names_symbols_and_uuid_fingerprints() {
     );
 }
 
+/// Test scenario: iterates contiguous component arrays via raw byte strides (`ModComponent::size()`)
+/// and exercises VTable slots on tuple structs (`get_0`, `set_0`, etc.).
 #[test]
 fn byte_stride_array_iteration_and_tuple_struct() {
     let vt = MixedComponent::vtable();
@@ -600,6 +611,8 @@ pub struct TransparentEntityId(pub FfiEntity);
 fn require_raw_insertable<T: RawInsertable>() {}
 fn require_abi_pod<T: AbiPod>() {}
 
+/// Test scenario: verifies `IS_ABI_POD`, `IS_RAW_INSERTABLE`, and `COMPONENT_FLAGS` across
+/// mixed heap structs, `#[repr(C)]` POD structs, `no_pod`, and `opaque` components.
 #[test]
 fn pod_vs_raw_insertable_vs_opaque_traits() {
     const {
@@ -712,6 +725,8 @@ mod m06_qualified_paths_and_aliases {
     }
 }
 
+/// Test scenario: verifies qualified paths (`std::string::String`), type aliases, and explicit
+/// `#[mod_field(string|vec|option|nested)]` overrides work alongside shadowed local type names.
 #[test]
 fn m06_qualified_std_types_aliases_and_explicit_mod_field_override() {
     use m06_qualified_paths_and_aliases::{QualifiedAndAliased, String as CustomString};
@@ -784,6 +799,8 @@ mod facade_scope {
     }
 }
 
+/// Test scenario: verifies `#[mod_component(crate = ...)]` works when `bamabi_sys` is
+/// re-exported through an intermediate facade module.
 #[test]
 fn crate_override_and_facade_reexport() {
     require_abi_pod::<facade_scope::FacadePod>();
@@ -834,6 +851,8 @@ mod m02_submodules {
     }
 }
 
+/// Test scenario: verifies two identically named structs in different submodules derive
+/// distinct `module_path!()` canonical names, UUIDs, and non-colliding VTables.
 #[test]
 fn duplicate_struct_names_in_submodules() {
     assert_eq!(m02_submodules::scene_a::DuplicateItem_get_x(), 42);
@@ -871,6 +890,8 @@ fn duplicate_struct_names_in_submodules() {
     assert!(b.enabled);
 }
 
+/// Test scenario: verifies `ModComponent::C_DECL` and `ZIG_DECL` emit full structs + VTables +
+/// static assertions for POD components and opaque forward decls + VTables for non-POD components.
 #[test]
 fn emits_c_decl_and_zig_decl_for_pod_and_non_pod_components() {
     // 1. `#[repr(C)]` `AbiPod` struct emits full C struct + VTable + static layout assertions,
@@ -912,6 +933,9 @@ fn emits_c_decl_and_zig_decl_for_pod_and_non_pod_components() {
     assert!(MixedComponent::ZIG_DECL.contains("pub const MixedComponentView = struct"));
 }
 
+/// Test scenario: exercises all 11 generated `Vec<T>` VTable operations (`get`, `set`, `len`,
+/// `clear`, `push`, `pop`, `remove`, `swap_remove`, `truncate`, `reserve`, `as_mut_slice`)
+/// including out-of-bounds (`OUT_OF_RANGE`) and null out-pointer (`NULL_POINTER`) checks.
 #[test]
 fn full_host_vec_vtable_operations_and_bounds_safety() {
     let vt = MixedComponent::vtable();
@@ -1018,6 +1042,8 @@ pub struct TargetWithOptions {
     pub aliased_opt: OptU64Alias,
 }
 
+/// Test scenario: verifies `FfiOption<T>` VTable `get`/`set`/`clear`, `SUMMARY_TICK` flags,
+/// and `REQUIRED_COMPONENT_NAMES`/`REQUIRED_COMPONENT_UUIDS` metadata.
 #[test]
 fn ffi_option_summary_tick_and_require_metadata() {
     const {
@@ -1112,6 +1138,9 @@ pub enum ActionPayload {
     Cast(String, Vec<u32>, FfiOption<u32>, PodPosition) = 2,
 }
 
+/// Test scenario: exercises `tag`, `set_<variant>`, and `try_get_<variant>_<field>` VTable
+/// slots on fieldless and tagged data-carrying enums, verifying `INVALID_STATE` on variant
+/// mismatch and schema-sensitive enum UUIDs.
 #[test]
 fn repr_c_fieldless_and_tagged_enums_vtable_and_schema_uuid() {
     const {
@@ -1294,6 +1323,9 @@ pub struct NestedHolder {
     pub label: String,
 }
 
+/// Test scenario: exercises `field_info`, `export_fields`, and `import_field` witness symbols
+/// across structs, nested structs, enums, primitive widening (`i16 -> i64`, `f32 -> f64`), and
+/// error paths, verifying Miri soundness and opaque-component witness omission.
 #[test]
 fn witness_field_info_export_and_import_migration_is_miri_clean() {
     // 1. Opaque components omit witness symbols
@@ -1706,6 +1738,8 @@ pub enum UnsignedWideTagged {
     } = 18446744073709551615,
 }
 
+/// Test scenario: verifies VTable accessors and `export_fields`/`import_field` round-trips on
+/// a tuple struct mixing primitive, `bool`, `String`, `Vec`, and `FfiOption` fields.
 #[test]
 fn tuple_struct_mixed_fields_vtable_and_witness_roundtrip() {
     let vt_ref = unsafe { &*<TupleMixed as ModComponent>::vtable_ptr().cast::<TupleMixedVTable>() };
@@ -1852,6 +1886,8 @@ fn tuple_struct_mixed_fields_vtable_and_witness_roundtrip() {
     assert_eq!(dst, src_none);
 }
 
+/// Test scenario: verifies negative `i64::MIN` and full-width `u64::MAX` enum discriminants
+/// round-trip cleanly through `tag`, `set_<variant>`, `C_DECL`/`ZIG_DECL`, and witnesses.
 #[test]
 fn wide_i64_and_u64_enums_discriminants_vtables_and_witness_roundtrip() {
     assert!(SignedWideEnum::resolve_symbol("bam.v0.edge::SignedWideEnum.vtable").is_some());
@@ -2009,6 +2045,9 @@ fn wide_i64_and_u64_enums_discriminants_vtables_and_witness_roundtrip() {
     assert_eq!(u_dst, u_val);
 }
 
+/// Test scenario: verifies ABI `0.3` FNV-1a `SCHEMA_FINGERPRINT`, `BAM_FIELDS` (`BamFieldDesc`
+/// offsets/sizes/kinds), and custom `#[mod_component(require(Comp = expr))]` initializer
+/// callbacks (`BAM_REQUIRED_FLAG_INIT_FN`).
 #[test]
 fn schema_fingerprint_bam_fields_and_custom_require_init_work() {
     use bamabi_sys::{

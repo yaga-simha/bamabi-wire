@@ -13,10 +13,10 @@ use bamabi_sys::{
     ABI_VERSION, ABI_VERSION_MAJOR, ABI_VERSION_MINOR, ABI_VERSION_PATCH, AccessMode,
     BAM_CHILD_OF_NAME, BAM_CHILDREN_NAME, BAM_COMPONENT_FLAG_IMMUTABLE,
     BAM_COMPONENT_FLAG_SPARSE_SET, BAM_COMPONENT_FLAG_SUMMARY_TICK, BAM_COMPONENT_KNOWN_FLAGS,
-    BAM_HOST_API_SLOT_COUNT, BAM_LOG_DEBUG, BAM_LOG_ERROR, BAM_LOG_INFO, BAM_LOG_TRACE,
-    BAM_LOG_WARN, BAM_MANIFEST_KNOWN_FLAGS, BAM_MAX_CHANGE_AGE, BAM_OBSERVER_FLAG_PROPAGATE,
-    BAM_OBSERVER_KNOWN_FLAGS, BAM_QUERY_KNOWN_FLAGS, BAM_RELATION_FLAG_ACYCLIC,
-    BAM_RELATION_FLAG_CASCADE_DELETE, BAM_RELATION_FLAG_CASCADE_DESPAWN,
+    BAM_DISABLED_NAME, BAM_HOST_API_SLOT_COUNT, BAM_LOG_DEBUG, BAM_LOG_ERROR, BAM_LOG_INFO,
+    BAM_LOG_TRACE, BAM_LOG_WARN, BAM_MANIFEST_KNOWN_FLAGS, BAM_MAX_CHANGE_AGE,
+    BAM_OBSERVER_FLAG_PROPAGATE, BAM_OBSERVER_KNOWN_FLAGS, BAM_QUERY_KNOWN_FLAGS,
+    BAM_RELATION_FLAG_ACYCLIC, BAM_RELATION_FLAG_CASCADE_DELETE, BAM_RELATION_FLAG_CASCADE_DESPAWN,
     BAM_RELATION_FLAG_CLEANUP_REMOVE, BAM_RELATION_FLAG_EXCLUSIVE, BAM_RELATION_FLAG_SYMMETRIC,
     BAM_RELATION_KNOWN_FLAGS, BAM_REQUIRED_FLAG_CUSTOM_BYTES, BAM_REQUIRED_FLAG_INIT_FN,
     BAM_REQUIRED_FLAG_RESOLVE_BY_UUID, BAM_REQUIRED_KNOWN_FLAGS, BAM_SCHEDULE_SET_FLAG_AFTER_WEAK,
@@ -35,12 +35,24 @@ use bamabi_sys::{
     SIPHASH_KEY_1, ScheduleId, StrView, VTableHeader, offsets as host_api_offsets,
 };
 
+/// 32-bit target alignment rule for a C-ABI wire struct.
+///
+/// Intended purpose: models the ABI difference between 32-bit targets whose `uint64_t` alignment
+/// is 4 bytes (e.g., `i686-unknown-linux-gnu`) versus 8 bytes (e.g., 32-bit ARM/Wasm) so emitted
+/// `BAM_STATIC_ASSERT` alignment checks stay portable across all 32-bit C compilers.
 #[derive(Clone, Copy)]
 enum Align32 {
+    /// Fixed byte alignment independent of `alignof(uint64_t)`.
     Fixed(usize),
+    /// Alignment governed by `BAM_ALIGNOF(uint64_t)` on the target 32-bit ABI.
     U64,
 }
 
+/// Expected C99 field offset specification for a single wire struct member.
+///
+/// Intended purpose: pairs the canonical C field identifier with its frozen 64-bit and 32-bit
+/// wire offsets and the host Rust compiler's actual `offset_of!` value so [`verify_host_rust_layouts`]
+/// catches any Rust-to-C ABI drift before emitting `include/bamabi.h`.
 struct FieldLayoutSpec {
     c_name: &'static str,
     offset_64: usize,
@@ -48,6 +60,11 @@ struct FieldLayoutSpec {
     rust_host_offset: usize,
 }
 
+/// Expected C99 size, alignment, and field-offset specification for one ABI wire struct.
+///
+/// Intended purpose: acts as the single layout table driving both pre-emission Rust layout
+/// validation ([`verify_host_rust_layouts`]) and the emitted `BAM_STATIC_ASSERT` section of
+/// `include/bamabi.h` for 64-bit (`UINTPTR_MAX == 0xffffffffffffffffULL`) and 32-bit targets.
 struct StructLayoutSpec {
     c_name: &'static str,
     assert_stem: &'static str,
@@ -60,6 +77,17 @@ struct StructLayoutSpec {
     fields: &'static [FieldLayoutSpec],
 }
 
+/// Builds the complete layout specification table for all C-ABI `0.3.0` wire structs.
+///
+/// Intended purpose: centralizes every wire struct's 64-bit and 32-bit sizes, alignments, and
+/// field offsets (including all 68 `BamHostApi` vtable slots from `bamabi_sys::offsets`) so
+/// `render_c99_header` validates Rust layouts and emits matching C99 static assertions from one table.
+///
+/// What it does: constructs and returns a `Vec<StructLayoutSpec>` covering `BamComponentUuid`,
+/// `BamStrView`, `BamManifest`, `BamAssetHandle`, `BamTermDesc`, `BamQueryDesc`, `BamSystemDesc`,
+/// `BamObserverDesc`, `BamTriggerDesc`, `BamChangeTicks`, `BamFieldDesc`, `BamRequiredComponent`,
+/// `BamRelationDesc`, `BamLayoutInfo`, `BamScheduleSetDesc`, `BamComponentDesc`, `BamColumnInfo`,
+/// `BamVTableHeader`, `BamMappedStringVTable`, and `BamHostApi`.
 fn wire_struct_specs() -> Vec<StructLayoutSpec> {
     vec![
         StructLayoutSpec {
@@ -1677,6 +1705,16 @@ fn wire_struct_specs() -> Vec<StructLayoutSpec> {
     ]
 }
 
+/// Verifies that the host Rust compiler's `bamabi_sys` primitive and struct layouts match `specs`.
+///
+/// Intended purpose: enforces the Layer 0 zero-drift invariant before generating `include/bamabi.h`,
+/// guaranteeing that no Rust struct change can silently diverge from the frozen C99 ABI contract.
+///
+/// What it does: checks sizes and offsets of all `bamabi_sys` primitive newtypes (`FfiBool`,
+/// handle types, `FfiEntity`, `FfiResult`, `FfiOption<u32>`, etc.), then compares each
+/// [`StructLayoutSpec`]'s `rust_host_size`, `rust_host_align`, and per-field `rust_host_offset`
+/// against the expected 64-bit or 32-bit values for the current `usize::BITS` target, returning
+/// `Err(String)` on the first mismatch.
 fn verify_host_rust_layouts(specs: &[StructLayoutSpec]) -> Result<(), String> {
     let ptr_bits = usize::BITS as usize;
     if size_of::<FfiBool>() != 1
@@ -1743,7 +1781,17 @@ fn verify_host_rust_layouts(specs: &[StructLayoutSpec]) -> Result<(), String> {
     Ok(())
 }
 
-/// Renders the complete deterministic ISO C99 header from `bamabi_sys` constants and layouts.
+/// Renders the complete deterministic ISO C99 header (`include/bamabi.h`) from `bamabi_sys`.
+///
+/// Intended purpose: provides the single source of truth for polyglot C99/C++17/Zig guest
+/// bindings so `include/bamabi.h` is always byte-for-byte consistent with `bamabi_sys`.
+///
+/// What it does: validates host Rust layouts via `verify_host_rust_layouts`, verifies that
+/// `BamHostApi` contains exactly `BAM_HOST_API_SLOT_COUNT` (68) function-pointer slots, and
+/// emits six ordered sections: portability macros (`BAM_EXPORT`, `BAM_RESTRICT`, `BAM_STATIC_ASSERT`),
+/// ABI version/limits, primitive/flag constants, wire structs and function-pointer typedefs,
+/// inline C99 helpers (`bam_*` including SipHash-2-4-128 UUID computation), and 64-bit/32-bit
+/// compile-time layout assertions.
 pub fn render_c99_header() -> Result<String, String> {
     let specs = wire_struct_specs();
     verify_host_rust_layouts(&specs)?;
@@ -1876,7 +1924,8 @@ pub fn render_c99_header() -> Result<String, String> {
          #define BAM_SIPHASH_KEY_1 0x{SIPHASH_KEY_1:016x}ull\n\
          #define BAM_MAX_CHANGE_AGE 0x{BAM_MAX_CHANGE_AGE:08X}u\n\
          #define BAM_CHILD_OF_NAME \"{BAM_CHILD_OF_NAME}\"\n\
-         #define BAM_CHILDREN_NAME \"{BAM_CHILDREN_NAME}\"\n"
+         #define BAM_CHILDREN_NAME \"{BAM_CHILDREN_NAME}\"\n\
+         #define BAM_DISABLED_NAME \"{BAM_DISABLED_NAME}\"\n"
     );
 
     // 3. Primitives, Result taxonomy, AccessMode, ScheduleId, FieldKind, LogLevel, Flags
@@ -2643,8 +2692,34 @@ pub fn render_c99_header() -> Result<String, String> {
          static BAM_UNUSED inline int bam_entity_is_null(BamEntity entity) {\n\
              return entity == BAM_ENTITY_NULL;\n\
          }\n\n\
+         static BAM_UNUSED inline int bam_entity_is_valid(BamEntity entity) {\n\
+             return entity != BAM_ENTITY_NULL;\n\
+         }\n\n\
          static BAM_UNUSED inline int bam_component_is_valid(BamComponent component) {\n\
              return component != BAM_COMPONENT_INVALID;\n\
+         }\n\n\
+         static BAM_UNUSED inline int bam_asset_load_state_is_not_loaded(BamAssetLoadState state) {\n\
+             return state == BAM_ASSET_LOAD_STATE_NOT_LOADED;\n\
+         }\n\n\
+         static BAM_UNUSED inline int bam_asset_load_state_is_loading(BamAssetLoadState state) {\n\
+             return state == BAM_ASSET_LOAD_STATE_LOADING;\n\
+         }\n\n\
+         static BAM_UNUSED inline int bam_asset_load_state_is_loaded(BamAssetLoadState state) {\n\
+             return state == BAM_ASSET_LOAD_STATE_LOADED;\n\
+         }\n\n\
+         static BAM_UNUSED inline int bam_asset_load_state_is_failed(BamAssetLoadState state) {\n\
+             return state == BAM_ASSET_LOAD_STATE_FAILED;\n\
+         }\n\n\
+         static BAM_UNUSED inline int bam_event_kind_is_lifecycle(BamEventKind kind) {\n\
+             return kind == BAM_EVENT_KIND_ADD || kind == BAM_EVENT_KIND_INSERT ||\n\
+                    kind == BAM_EVENT_KIND_DISCARD || kind == BAM_EVENT_KIND_REMOVE ||\n\
+                    kind == BAM_EVENT_KIND_DESPAWN || kind == BAM_EVENT_KIND_READY;\n\
+         }\n\n\
+         static BAM_UNUSED inline int bam_schedule_is_valid(BamScheduleId schedule) {\n\
+             return schedule <= BAM_SCHEDULE_LAST || schedule >= BAM_SCHEDULE_CUSTOM_BASE;\n\
+         }\n\n\
+         static BAM_UNUSED inline int bam_field_kind_is_valid(BamFieldKind kind) {\n\
+             return kind <= BAM_FIELD_KIND_OPAQUE;\n\
          }\n\n\
          static BAM_UNUSED inline BamTermDesc bam_term_desc(BamComponent component, BamAccessMode mode, uint16_t flags) {\n\
              BamTermDesc t;\n\
@@ -2883,6 +2958,9 @@ pub fn render_c99_header() -> Result<String, String> {
          static BAM_UNUSED inline BamComponentUuid bam_uuid_from_canonical_name(const char* canonical_name) {\n\
              return bam_uuid_from_parts(canonical_name, 0u, 0u, 0ull);\n\
          }\n\n\
+         static BAM_UNUSED inline BamComponentUuid bam_disabled_uuid(void) {\n\
+             return bam_uuid_from_canonical_name(BAM_DISABLED_NAME);\n\
+         }\n\n\
          static BAM_UNUSED inline int bam_uuid_equals(BamComponentUuid a, BamComponentUuid b) {\n\
              return memcmp(a.bytes, b.bytes, 16u) == 0;\n\
          }\n\n\
@@ -3117,7 +3195,14 @@ pub fn render_c99_header() -> Result<String, String> {
     Ok(out)
 }
 
-/// Writes (or verifies with `check_only`) `include/bamabi.h` deterministically.
+/// Writes or parity-checks `<root>/include/bamabi.h` against [`render_c99_header`].
+///
+/// Intended purpose: powers both `cargo xtask header` (regeneration) and CI drift checks
+/// (`check_only = true`) so checked-in C99 headers never lag behind `bamabi_sys`.
+///
+/// What it does: renders the C99 header in memory, normalizes CRLF to LF when reading any
+/// existing file on disk, returns `Err` on mismatch when `check_only` is `true`, and otherwise
+/// creates `<root>/include` if needed and writes the file only when its bytes differ.
 pub fn write_or_check_header(root: &Path, check_only: bool) -> Result<(), String> {
     let rendered = render_c99_header()?;
     let include_dir = root.join("include");
@@ -3154,6 +3239,12 @@ pub fn write_or_check_header(root: &Path, check_only: bool) -> Result<(), String
 }
 
 /// Returns the canonical ordered C field names for all 68 `BamHostApi` function-pointer slots.
+///
+/// Intended purpose: gives SDK parity tests a single authoritative slot list derived from
+/// [`wire_struct_specs`] so C99, C++17, and Zig offset macros are verified exhaustively.
+///
+/// What it does: locates the `BamHostApi` entry in [`wire_struct_specs`] and collects every
+/// field name after the `struct_size` and `abi_version` header fields.
 #[cfg(test)]
 pub(crate) fn host_api_slot_names() -> Vec<&'static str> {
     let specs = wire_struct_specs();
@@ -3173,6 +3264,12 @@ pub(crate) fn host_api_slot_names() -> Vec<&'static str> {
 mod tests {
     use super::*;
 
+    /// Test scenario: verifies that `render_c99_header()` is byte-for-byte deterministic across
+    /// repeated calls, emits `ABI_VERSION = 0x00030000u`, 68 `BAM_HOST_API_OFFSET_*` macros,
+    /// `BAM_EXPORT`/`BAM_RESTRICT` portability definitions, 64-bit/32-bit `BAM_STATIC_ASSERT`
+    /// checks (552 B / 280 B for `BamHostApi`, 176 B / 104 B for `BamComponentDesc`), excludes
+    /// removed v0.1 unprefixed typedefs, and matches the golden SipHash-2-4-128 UUID vectors
+    /// tested identically in `tests/standalone_c_test.c`.
     #[test]
     fn header_generation_is_deterministic_and_bam_prefixed() {
         let first = render_c99_header().expect("first render must succeed");
@@ -3180,6 +3277,13 @@ mod tests {
         assert_eq!(first, second);
         assert!(first.contains("#define BAM_ABI_VERSION 0x00030000u"));
         assert!(first.contains("#define BAM_HOST_API_SLOT_COUNT    68u"));
+        assert!(
+            first.contains("#define BAM_DISABLED_NAME \"bevy_ecs::entity_disabling::Disabled\"")
+        );
+        assert!(first.contains("bam_asset_load_state_is_loading("));
+        assert!(first.contains("bam_event_kind_is_lifecycle("));
+        assert!(first.contains("bam_schedule_is_valid("));
+        assert!(first.contains("bam_disabled_uuid(void)"));
         assert!(first.contains("define BAM_EXPORT"));
         assert!(first.contains("__declspec(dllexport)"));
         assert!(first.contains("#if defined(_MSC_VER)\n#  define BAM_RESTRICT __restrict\n"));

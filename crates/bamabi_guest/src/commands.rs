@@ -398,6 +398,7 @@ impl<'a> GuestTransaction<'a> {
 impl<'a> Deref for GuestTransaction<'a> {
     type Target = GuestCommands<'a>;
 
+    /// Dereferences to the transaction's underlying [`GuestCommands`] handle.
     #[inline]
     fn deref(&self) -> &Self::Target {
         &self.commands
@@ -405,6 +406,8 @@ impl<'a> Deref for GuestTransaction<'a> {
 }
 
 impl DerefMut for GuestTransaction<'_> {
+    /// Mutably dereferences to the transaction's underlying [`GuestCommands`] handle so standard
+    /// command methods enqueue inside the active transaction scope.
     #[inline]
     fn deref_mut(&mut self) -> &mut Self::Target {
         &mut self.commands
@@ -412,6 +415,8 @@ impl DerefMut for GuestTransaction<'_> {
 }
 
 impl Drop for GuestTransaction<'_> {
+    /// Automatically rolls back all commands queued since `begin` if neither [`Self::commit`] nor
+    /// [`Self::rollback`] was called (including on early `?` returns or unwinds).
     #[inline]
     fn drop(&mut self) {
         if !self.settled {
@@ -422,6 +427,7 @@ impl Drop for GuestTransaction<'_> {
 }
 
 impl<'a> From<ValidatedCommands<'a>> for GuestCommands<'a> {
+    /// Wraps a [`ValidatedCommands`] handle in a safe [`GuestCommands`] buffer.
     #[inline]
     fn from(inner: ValidatedCommands<'a>) -> Self {
         Self::from_validated(inner)

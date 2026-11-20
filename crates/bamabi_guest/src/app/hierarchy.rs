@@ -49,6 +49,60 @@ impl<'a> SystemContext<'a> {
         }
         self.sys_ref.entity_children(entity, target_handle)
     }
+
+    /// Collects all recursive descendants of `root` in breadth-first order via Bevy's `Children`
+    /// relationship (mirroring `HierarchyQueryExt::iter_descendants`), guarding against cycles.
+    ///
+    /// Requires read access to `Children` (e.g. [`QueryBuilder::read_children`]). Excludes `root`
+    /// itself from the returned `Vec`.
+    pub fn iter_descendants(&self, root: FfiEntity) -> Result<Vec<FfiEntity>, FfiResult> {
+        if root.is_null() {
+            return Err(FfiResult::INVALID_ENTITY);
+        }
+        let mut visited = std::collections::HashSet::new();
+        visited.insert(root);
+        let mut queue = std::collections::VecDeque::new();
+        queue.push_back(root);
+        let mut descendants = Vec::new();
+        while let Some(curr) = queue.pop_front() {
+            for &child in self.children(curr)? {
+                if !child.is_null() && visited.insert(child) {
+                    descendants.push(child);
+                    queue.push_back(child);
+                }
+            }
+        }
+        Ok(descendants)
+    }
+
+    /// Collects all recursive descendants of `root` in breadth-first order along a custom
+    /// `RelationshipTarget` handle `target_handle`, guarding against cycles.
+    pub fn iter_descendants_of(
+        &self,
+        root: FfiEntity,
+        target_handle: BamComponent,
+    ) -> Result<Vec<FfiEntity>, FfiResult> {
+        if root.is_null() {
+            return Err(FfiResult::INVALID_ENTITY);
+        }
+        if !target_handle.is_valid() {
+            return Err(FfiResult::INVALID_COMPONENT);
+        }
+        let mut visited = std::collections::HashSet::new();
+        visited.insert(root);
+        let mut queue = std::collections::VecDeque::new();
+        queue.push_back(root);
+        let mut descendants = Vec::new();
+        while let Some(curr) = queue.pop_front() {
+            for &child in self.relationship_targets(curr, target_handle)? {
+                if !child.is_null() && visited.insert(child) {
+                    descendants.push(child);
+                    queue.push_back(child);
+                }
+            }
+        }
+        Ok(descendants)
+    }
 }
 
 impl<'b> QueryBuilder<'b> {
@@ -151,6 +205,8 @@ mod tests {
 
     use crate::{GuestApp, GuestCommands, QueryBuilder, SystemContext};
 
+    /// Compile-time signature fixture exercising all safe hierarchy and custom-relationship SDK
+    /// methods under `#![forbid(unsafe_code)]`.
     #[allow(dead_code)]
     fn _verify_hierarchy_sdk_signatures<'a>(
         ctx: &'a SystemContext<'a>,
@@ -171,6 +227,9 @@ mod tests {
             app.register_relationship_pair::<bamabi_sys::FfiChildOf>("test::Targets");
     }
 
+    /// Scenario: Verifies that all hierarchy traversal (`children`, `relationship_targets`),
+    /// command (`add_child`, `remove_parent`, `spawn_child`), and relationship-pair registration
+    /// signatures compile cleanly under `#![forbid(unsafe_code)]`.
     #[test]
     fn hierarchy_guest_sdk_signatures_compile_with_forbid_unsafe() {
         let _f = _verify_hierarchy_sdk_signatures;

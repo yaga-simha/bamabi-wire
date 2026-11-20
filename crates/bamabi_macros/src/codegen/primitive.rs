@@ -1,8 +1,17 @@
+//! Codegen accessor specification for by-value primitive fields (`AbiPod` or `usize`/`isize`).
+
 use crate::codegen::{AccessorSpec, ReceiverKind, SlotSpec};
 use proc_macro2::{Span, TokenStream};
 use quote::{quote, quote_spanned};
 use syn::Type;
 
+/// Builds the [`AccessorSpec`] (`get_<field>`, `set_<field>`) for a by-value primitive field.
+///
+/// Intended purpose: provides direct zero-overhead by-value C-ABI getters and setters for
+/// fixed-width `AbiPod` primitives and same-process `RawInsertable` platform integers (`usize`/`isize`).
+///
+/// What it does: emits compile-time `assert_abi_pod` (or `assert_raw_insertable` when
+/// `is_abi_pod == false`) checks and generates `get` (`-> PrimTy`) and `set` (`PrimTy -> FfiResult`) slots.
 pub(crate) fn spec(
     sys_crate: &TokenStream,
     member_tokens: &TokenStream,

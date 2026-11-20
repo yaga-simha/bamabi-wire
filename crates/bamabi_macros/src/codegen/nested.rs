@@ -1,8 +1,17 @@
+//! Codegen accessor specification for nested compound struct or fixed-array fields.
+
 use crate::codegen::{AccessorSpec, ReceiverKind, SlotSpec};
 use proc_macro2::{Span, TokenStream};
 use quote::{quote, quote_spanned};
 use syn::Type;
 
+/// Builds the [`AccessorSpec`] (`ptr_<field>`, `ptr_mut_<field>`) for a nested struct or array field.
+///
+/// Intended purpose: exposes interior pointers to nested fields across the C-ABI while enforcing
+/// either `ModComponent` (when `opaque = true`) or `RawInsertable` + optional `AbiPod` bounds.
+///
+/// What it does: emits spanned compile-time trait assertions for `nested_ty` and generates
+/// `ptr` (`-> *const c_void`) and `ptr_mut` (`-> *mut c_void`) VTable slots with null/alignment guards.
 pub(crate) fn spec(
     sys_crate: &TokenStream,
     opaque: bool,

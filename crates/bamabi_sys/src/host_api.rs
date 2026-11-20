@@ -1349,6 +1349,11 @@ pub mod offsets {
 mod offset_tests {
     use super::{BAM_HOST_API_SLOT_COUNT, BamHostApi, offsets};
 
+    /// Test scenario (Proof Obligation PO-W6): verifies that `BAM_HOST_API_SLOT_COUNT == 68`,
+    /// `SIZE_64 == 552`, `SIZE_32 == 280`, header offsets sit at `0`/`4`, every slot `k` in
+    /// `0..68` satisfies `OFF64_k == 8 + 8*k` and `OFF32_k == 8 + 4*k` matching native
+    /// `offset_of!`, and `MIN_V0_2_SIZE`/`MIN_V0_3_SIZE` terminate exactly after `cmd_remove`
+    /// and `migrate_component_column` respectively.
     #[test]
     fn host_api_offset_constants_cover_all_68_slots_monotonically() {
         assert_eq!(BAM_HOST_API_SLOT_COUNT, 68);

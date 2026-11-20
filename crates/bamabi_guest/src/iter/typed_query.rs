@@ -19,9 +19,13 @@ use crate::{
 };
 
 mod private {
+    /// Private sealing trait restricting [`super::QueryTerm`] implementations to this crate.
     pub trait TermSealed {}
+    /// Private sealing trait restricting [`super::QueryTuple`] implementations to this crate.
     pub trait TupleSealed {}
+    /// Private sealing trait restricting [`super::OrFilterTerm`] to valid filter markers.
     pub trait OrFilterSealed {}
+    /// Private sealing trait restricting [`super::OrFilterTuple`] to 2..=8 filter tuples.
     pub trait OrFilterTupleSealed {}
 }
 
@@ -120,6 +124,8 @@ pub trait OrFilterTuple: private::OrFilterTupleSealed {
     ) -> Result<(), FfiResult>;
 }
 
+/// Resolves `T: GuestComponent` and appends a [`BamTermDesc`] tagged with `or_group` to `out`,
+/// rejecting queries that exceed `MAX_TERMS_PER_QUERY`.
 #[inline]
 fn push_resolved_filter_term<T: GuestComponent>(
     host: &Host,
@@ -136,6 +142,7 @@ fn push_resolved_filter_term<T: GuestComponent>(
     Ok(())
 }
 
+/// Allocates the next non-zero `or_group` ID (`1..=255`) above any group already present in `out`.
 #[inline]
 fn next_or_group_id(out: &[BamTermDesc]) -> Result<u8, FfiResult> {
     out.iter()
@@ -146,6 +153,7 @@ fn next_or_group_id(out: &[BamTermDesc]) -> Result<u8, FfiResult> {
         .ok_or(FfiResult::CAPACITY_EXCEEDED)
 }
 
+/// Resolves `T: GuestComponent` and appends an ungrouped [`BamTermDesc`] with `mode` to `out`.
 #[inline]
 fn push_resolved_term<T: GuestComponent>(
     host: &Host,
@@ -188,6 +196,7 @@ impl private::TermSealed for FfiEntity {}
 impl QueryTerm for FfiEntity {
     type Slice<'chunk> = &'chunk [FfiEntity];
 
+    /// No-op: entity IDs are always present on every chunk without declaring a component term.
     #[inline]
     fn push_desc(
         _host: &Host,
@@ -197,6 +206,7 @@ impl QueryTerm for FfiEntity {
         Ok(())
     }
 
+    /// Dispenses the chunk's contiguous `&[FfiEntity]` slice.
     #[inline]
     fn fetch_slice<'chunk>(
         dispenser: &mut ChunkColumnDispenser<'chunk, '_>,
@@ -209,6 +219,7 @@ impl<T: GuestComponent> private::TermSealed for &T {}
 impl<T: GuestComponent> QueryTerm for &T {
     type Slice<'chunk> = &'chunk [T];
 
+    /// Appends an [`AccessMode::READ`] descriptor for `T`.
     #[inline]
     fn push_desc(
         host: &Host,
@@ -218,6 +229,7 @@ impl<T: GuestComponent> QueryTerm for &T {
         push_resolved_term::<T>(host, manifest_name, AccessMode::READ, out)
     }
 
+    /// Dispenses the UUID-verified shared `&[T]` column slice.
     #[inline]
     fn fetch_slice<'chunk>(
         dispenser: &mut ChunkColumnDispenser<'chunk, '_>,
@@ -232,6 +244,7 @@ impl<T: GuestComponent> QueryTerm for &mut T {
     type Slice<'chunk> = &'chunk mut [T];
     const IS_READ_ONLY: bool = false;
 
+    /// Appends an [`AccessMode::WRITE`] descriptor for `T`.
     #[inline]
     fn push_desc(
         host: &Host,
@@ -241,6 +254,7 @@ impl<T: GuestComponent> QueryTerm for &mut T {
         push_resolved_term::<T>(host, manifest_name, AccessMode::WRITE, out)
     }
 
+    /// Dispenses the UUID-verified exclusive `&mut [T]` column slice.
     #[inline]
     fn fetch_slice<'chunk>(
         dispenser: &mut ChunkColumnDispenser<'chunk, '_>,
@@ -254,6 +268,7 @@ impl<T: GuestComponent> private::TermSealed for Option<&T> {}
 impl<T: GuestComponent> QueryTerm for Option<&T> {
     type Slice<'chunk> = Option<&'chunk [T]>;
 
+    /// Appends an [`AccessMode::OPTIONAL_READ`] descriptor for `T`.
     #[inline]
     fn push_desc(
         host: &Host,
@@ -263,6 +278,7 @@ impl<T: GuestComponent> QueryTerm for Option<&T> {
         push_resolved_term::<T>(host, manifest_name, AccessMode::OPTIONAL_READ, out)
     }
 
+    /// Dispenses `Some(&[T])` when `T` is present in the chunk, or `None` when absent.
     #[inline]
     fn fetch_slice<'chunk>(
         dispenser: &mut ChunkColumnDispenser<'chunk, '_>,
@@ -277,6 +293,7 @@ impl<T: GuestComponent> QueryTerm for Option<&mut T> {
     type Slice<'chunk> = Option<&'chunk mut [T]>;
     const IS_READ_ONLY: bool = false;
 
+    /// Appends an [`AccessMode::OPTIONAL_WRITE`] descriptor for `T`.
     #[inline]
     fn push_desc(
         host: &Host,
@@ -286,6 +303,7 @@ impl<T: GuestComponent> QueryTerm for Option<&mut T> {
         push_resolved_term::<T>(host, manifest_name, AccessMode::OPTIONAL_WRITE, out)
     }
 
+    /// Dispenses `Some(&mut [T])` when `T` is present in the chunk, or `None` when absent.
     #[inline]
     fn fetch_slice<'chunk>(
         dispenser: &mut ChunkColumnDispenser<'chunk, '_>,
@@ -299,6 +317,7 @@ impl<T: GuestComponent> private::TermSealed for With<T> {}
 impl<T: GuestComponent> QueryTerm for With<T> {
     type Slice<'chunk> = ();
 
+    /// Appends an [`AccessMode::FILTER_ONLY`] (`With<T>`) descriptor.
     #[inline]
     fn push_desc(
         host: &Host,
@@ -308,6 +327,7 @@ impl<T: GuestComponent> QueryTerm for With<T> {
         push_resolved_term::<T>(host, manifest_name, AccessMode::FILTER_ONLY, out)
     }
 
+    /// Validates the `FILTER_ONLY` column descriptor without borrowing data.
     #[inline]
     fn fetch_slice<'chunk>(
         dispenser: &mut ChunkColumnDispenser<'chunk, '_>,
@@ -321,6 +341,7 @@ impl<T: GuestComponent> private::TermSealed for Without<T> {}
 impl<T: GuestComponent> QueryTerm for Without<T> {
     type Slice<'chunk> = ();
 
+    /// Appends an [`AccessMode::WITHOUT`] (`Without<T>`) descriptor.
     #[inline]
     fn push_desc(
         host: &Host,
@@ -330,6 +351,7 @@ impl<T: GuestComponent> QueryTerm for Without<T> {
         push_resolved_term::<T>(host, manifest_name, AccessMode::WITHOUT, out)
     }
 
+    /// Validates the `WITHOUT` column descriptor without borrowing data.
     #[inline]
     fn fetch_slice<'chunk>(
         dispenser: &mut ChunkColumnDispenser<'chunk, '_>,
@@ -343,6 +365,7 @@ impl<T: GuestComponent> private::TermSealed for Changed<T> {}
 impl<T: GuestComponent> QueryTerm for Changed<T> {
     type Slice<'chunk> = &'chunk [T];
 
+    /// Appends an [`AccessMode::CHANGED`] descriptor for `T`.
     #[inline]
     fn push_desc(
         host: &Host,
@@ -352,6 +375,7 @@ impl<T: GuestComponent> QueryTerm for Changed<T> {
         push_resolved_term::<T>(host, manifest_name, AccessMode::CHANGED, out)
     }
 
+    /// Dispenses the shared `&[T]` slice for rows matching `Changed<T>`.
     #[inline]
     fn fetch_slice<'chunk>(
         dispenser: &mut ChunkColumnDispenser<'chunk, '_>,
@@ -365,6 +389,7 @@ impl<T: GuestComponent> private::TermSealed for Added<T> {}
 impl<T: GuestComponent> QueryTerm for Added<T> {
     type Slice<'chunk> = &'chunk [T];
 
+    /// Appends an [`AccessMode::ADDED`] descriptor for `T`.
     #[inline]
     fn push_desc(
         host: &Host,
@@ -374,6 +399,7 @@ impl<T: GuestComponent> QueryTerm for Added<T> {
         push_resolved_term::<T>(host, manifest_name, AccessMode::ADDED, out)
     }
 
+    /// Dispenses the shared `&[T]` slice for rows matching `Added<T>`.
     #[inline]
     fn fetch_slice<'chunk>(
         dispenser: &mut ChunkColumnDispenser<'chunk, '_>,
@@ -387,6 +413,7 @@ impl<T: GuestComponent> private::TermSealed for Allow<T> {}
 impl<T: GuestComponent> QueryTerm for Allow<T> {
     type Slice<'chunk> = ();
 
+    /// Appends an [`AccessMode::ALLOW`] (`Allow<T>`) descriptor.
     #[inline]
     fn push_desc(
         host: &Host,
@@ -396,6 +423,7 @@ impl<T: GuestComponent> QueryTerm for Allow<T> {
         push_resolved_term::<T>(host, manifest_name, AccessMode::ALLOW, out)
     }
 
+    /// Validates the `ALLOW` column descriptor without borrowing data.
     #[inline]
     fn fetch_slice<'chunk>(
         dispenser: &mut ChunkColumnDispenser<'chunk, '_>,
@@ -409,6 +437,7 @@ impl<T: GuestComponent> private::TermSealed for Has<T> {}
 impl<T: GuestComponent> QueryTerm for Has<T> {
     type Slice<'chunk> = bool;
 
+    /// Appends an [`AccessMode::HAS`] (`Has<T>`) descriptor.
     #[inline]
     fn push_desc(
         host: &Host,
@@ -418,6 +447,7 @@ impl<T: GuestComponent> QueryTerm for Has<T> {
         push_resolved_term::<T>(host, manifest_name, AccessMode::HAS, out)
     }
 
+    /// Dispenses the archetypal `bool` presence flag for `T` in this chunk.
     #[inline]
     fn fetch_slice<'chunk>(
         dispenser: &mut ChunkColumnDispenser<'chunk, '_>,
@@ -427,10 +457,12 @@ impl<T: GuestComponent> QueryTerm for Has<T> {
     }
 }
 
+/// Implements [`OrFilterTerm`] for a filter marker type (`With`, `Without`, `Changed`, or `Added`).
 macro_rules! impl_or_filter_term {
     ($target:ty, $mode:expr) => {
         impl<T: GuestComponent> private::OrFilterSealed for $target {}
         impl<T: GuestComponent> OrFilterTerm for $target {
+            /// Appends the filter term descriptor tagged with `or_group`.
             #[inline]
             fn push_filter_desc(
                 host: &Host,
@@ -441,6 +473,7 @@ macro_rules! impl_or_filter_term {
                 push_resolved_filter_term::<T>(host, manifest_name, $mode, or_group, out)
             }
 
+            /// Validates the filter descriptor in the active chunk without borrowing data.
             #[inline]
             fn fetch_filter<'chunk>(
                 dispenser: &mut ChunkColumnDispenser<'chunk, '_>,
@@ -457,6 +490,7 @@ impl_or_filter_term!(Without<T>, AccessMode::WITHOUT);
 impl_or_filter_term!(Changed<T>, AccessMode::CHANGED);
 impl_or_filter_term!(Added<T>, AccessMode::ADDED);
 
+/// Implements [`OrFilterTuple`] for fixed-arity tuples of 2..=8 [`OrFilterTerm`] branches.
 macro_rules! impl_or_filter_tuple {
     ($count:expr => $($term:ident),+ $(,)?) => {
         impl<$($term: OrFilterTerm),+> private::OrFilterTupleSealed for ($($term,)+) {}
@@ -464,6 +498,7 @@ macro_rules! impl_or_filter_tuple {
         impl<$($term: OrFilterTerm),+> OrFilterTuple for ($($term,)+) {
             const BRANCH_COUNT: usize = $count;
 
+            /// Appends all branch filter descriptors sharing `or_group`.
             #[inline]
             fn push_group_descs(
                 host: &Host,
@@ -477,6 +512,7 @@ macro_rules! impl_or_filter_tuple {
                 Ok(())
             }
 
+            /// Validates every branch filter descriptor in the active chunk.
             #[inline]
             fn fetch_group_filters<'chunk>(
                 dispenser: &mut ChunkColumnDispenser<'chunk, '_>,
@@ -502,6 +538,7 @@ impl<T: OrFilterTuple> private::TermSealed for Or<T> {}
 impl<T: OrFilterTuple> QueryTerm for Or<T> {
     type Slice<'chunk> = ();
 
+    /// Allocates a fresh non-zero `or_group` ID and appends every branch descriptor in `T`.
     #[inline]
     fn push_desc(
         host: &Host,
@@ -512,6 +549,7 @@ impl<T: OrFilterTuple> QueryTerm for Or<T> {
         T::push_group_descs(host, manifest_name, group_id, out)
     }
 
+    /// Validates every branch filter descriptor in `T` without borrowing data slices.
     #[inline]
     fn fetch_slice<'chunk>(
         dispenser: &mut ChunkColumnDispenser<'chunk, '_>,
@@ -537,6 +575,7 @@ pub trait QueryTuple: private::TupleSealed {
     ) -> Result<Self::Slices<'chunk>, FfiResult>;
 }
 
+/// Implements [`QueryTuple`] directly on a single [`QueryTerm`] type as a 1-item shorthand.
 macro_rules! impl_single_query_tuple {
     ($($lifetime:lifetime,)? $ty_param:ident : $bound:ident => $target:ty) => {
         impl<$($lifetime,)? $ty_param: $bound> private::TupleSealed for $target {}
@@ -544,6 +583,7 @@ macro_rules! impl_single_query_tuple {
             type Slices<'chunk> = <Self as QueryTerm>::Slice<'chunk>;
             const IS_READ_ONLY: bool = <Self as QueryTerm>::IS_READ_ONLY;
 
+            /// Collects the single term descriptor for this shorthand query.
             #[inline]
             fn collect_descs(
                 host: &Host,
@@ -554,6 +594,7 @@ macro_rules! impl_single_query_tuple {
                 Ok(out)
             }
 
+            /// Dispenses the single term slice from `dispenser`.
             #[inline]
             fn fetch_slices<'chunk>(
                 dispenser: &mut ChunkColumnDispenser<'chunk, '_>,
@@ -569,11 +610,13 @@ impl QueryTuple for FfiEntity {
     type Slices<'chunk> = &'chunk [FfiEntity];
     const IS_READ_ONLY: bool = true;
 
+    /// Returns an empty descriptor list because entity IDs require no component term.
     #[inline]
     fn collect_descs(_host: &Host, _manifest_name: &str) -> Result<Vec<BamTermDesc>, FfiResult> {
         Ok(Vec::new())
     }
 
+    /// Dispenses the chunk's contiguous `&[FfiEntity]` slice.
     #[inline]
     fn fetch_slices<'chunk>(
         dispenser: &mut ChunkColumnDispenser<'chunk, '_>,
@@ -598,6 +641,7 @@ impl<T: OrFilterTuple> QueryTuple for Or<T> {
     type Slices<'chunk> = ();
     const IS_READ_ONLY: bool = true;
 
+    /// Collects all branch filter descriptors in `T` under a single allocated `or_group` ID.
     #[inline]
     fn collect_descs(host: &Host, manifest_name: &str) -> Result<Vec<BamTermDesc>, FfiResult> {
         let mut out = Vec::with_capacity(T::BRANCH_COUNT);
@@ -605,6 +649,7 @@ impl<T: OrFilterTuple> QueryTuple for Or<T> {
         Ok(out)
     }
 
+    /// Validates every branch filter descriptor in `T` without borrowing data slices.
     #[inline]
     fn fetch_slices<'chunk>(
         dispenser: &mut ChunkColumnDispenser<'chunk, '_>,
@@ -613,6 +658,7 @@ impl<T: OrFilterTuple> QueryTuple for Or<T> {
     }
 }
 
+/// Implements [`QueryTuple`] for fixed-arity tuples of 1..=16 [`QueryTerm`] elements.
 macro_rules! impl_query_tuple {
     ($cap:expr => $($term:ident),+ $(,)?) => {
         impl<$($term: QueryTerm),+> private::TupleSealed for ($($term,)+) {}
@@ -621,6 +667,7 @@ macro_rules! impl_query_tuple {
             type Slices<'chunk> = ($($term::Slice<'chunk>,)+);
             const IS_READ_ONLY: bool = true $(&& $term::IS_READ_ONLY)+;
 
+            /// Collects descriptors for every tuple element in declaration order.
             #[inline]
             fn collect_descs(
                 host: &Host,
@@ -633,6 +680,7 @@ macro_rules! impl_query_tuple {
                 Ok(out)
             }
 
+            /// Dispenses each tuple element's slice in declaration order from `dispenser`.
             #[inline]
             fn fetch_slices<'chunk>(
                 dispenser: &mut ChunkColumnDispenser<'chunk, '_>,
@@ -661,6 +709,30 @@ impl_query_tuple!(13 => T0, T1, T2, T3, T4, T5, T6, T7, T8, T9, T10, T11, T12);
 impl_query_tuple!(14 => T0, T1, T2, T3, T4, T5, T6, T7, T8, T9, T10, T11, T12, T13);
 impl_query_tuple!(15 => T0, T1, T2, T3, T4, T5, T6, T7, T8, T9, T10, T11, T12, T13, T14);
 impl_query_tuple!(16 => T0, T1, T2, T3, T4, T5, T6, T7, T8, T9, T10, T11, T12, T13, T14, T15);
+
+/// Error returned by [`TypedChunkIter::single_chunk`] (mirroring Bevy's `QuerySingleError`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum QuerySingleError {
+    /// Zero entities matched the query.
+    NoEntities,
+    /// Two or more entities matched the query.
+    MultipleEntities,
+    /// Underlying FFI validation or layout error occurred while checking/fetching the chunk.
+    Ffi(FfiResult),
+}
+
+impl core::fmt::Display for QuerySingleError {
+    /// Formats the single-entity query error into a concise human-readable diagnostic.
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::NoEntities => f.write_str("no entities matched the query"),
+            Self::MultipleEntities => f.write_str("multiple entities matched the query"),
+            Self::Ffi(err) => write!(f, "FFI query error: {err}"),
+        }
+    }
+}
+
+impl std::error::Error for QuerySingleError {}
 
 /// Typed chunk iterator over a declared [`QueryTuple`] `Q`, dispensing borrow-checked,
 /// UUID-verified column slices without magic column index literals.
@@ -697,6 +769,63 @@ impl<'iter, 'ctx, Q: QueryTuple> TypedChunkIter<'iter, 'ctx, Q> {
     #[inline]
     pub fn count(&mut self) -> Result<usize, FfiResult> {
         self.iter.count()
+    }
+
+    /// Non-destructively returns `true` iff zero entities match this query (mirroring Bevy's
+    /// `Query::is_empty`).
+    #[inline]
+    pub fn is_empty(&mut self) -> Result<bool, FfiResult> {
+        self.iter.is_empty()
+    }
+
+    /// Yields the single-entity chunk slices if **exactly one** entity matches this query
+    /// (mirroring Bevy's `Query::single` / `Query::single_mut`).
+    ///
+    /// Resets the iterator to the beginning, verifies the exact match count (`0` ->
+    /// [`QuerySingleError::NoEntities`], `> 1` -> [`QuerySingleError::MultipleEntities`]), and
+    /// dispenses `Q::Slices<'_>` (whose slice components each have length `1`). On ABI `0.2.0`
+    /// hosts where `iter_count` is unsupported, counts matching entities across all chunks via
+    /// `reset` + `next_chunk` before re-seeking to the unique single-entity chunk.
+    pub fn single_chunk(&mut self) -> Result<Q::Slices<'_>, QuerySingleError> {
+        match self.iter.count() {
+            Ok(0) => return Err(QuerySingleError::NoEntities),
+            Ok(n) if n > 1 => return Err(QuerySingleError::MultipleEntities),
+            Ok(_) => {}
+            Err(FfiResult::UNSUPPORTED) => {
+                let reset_status = self.iter.reset();
+                if !reset_status.is_ok() {
+                    return Err(QuerySingleError::Ffi(reset_status));
+                }
+                let mut total = 0usize;
+                while let Some(chunk_len) = self.iter.inner.next_chunk() {
+                    total = total.saturating_add(chunk_len);
+                    if total > 1 {
+                        return Err(QuerySingleError::MultipleEntities);
+                    }
+                }
+                if total == 0 {
+                    return Err(QuerySingleError::NoEntities);
+                }
+            }
+            Err(err) => return Err(QuerySingleError::Ffi(err)),
+        }
+        let reset_status = self.iter.reset();
+        if !reset_status.is_ok() {
+            return Err(QuerySingleError::Ffi(reset_status));
+        }
+        loop {
+            let Some(len) = self.iter.inner.next_chunk() else {
+                return Err(QuerySingleError::NoEntities);
+            };
+            if len == 0 {
+                continue;
+            }
+            if len != 1 {
+                return Err(QuerySingleError::MultipleEntities);
+            }
+            let mut dispenser = ChunkColumnDispenser::new(&mut self.iter.inner);
+            return Q::fetch_slices(&mut dispenser).map_err(QuerySingleError::Ffi);
+        }
     }
 
     /// Walks an ancestor relationship chain upward along `Rel: GuestComponent` starting from

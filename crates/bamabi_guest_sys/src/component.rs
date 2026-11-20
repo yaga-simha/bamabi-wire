@@ -4,9 +4,9 @@ use core::ffi::{CStr, c_void};
 use std::ffi::CString;
 
 use bamabi_sys::{
-    AbiPod, BamComponent, BamLoadCtx, BamRelationDesc, BamRowMigrateFn, ComponentCloneFn,
-    ComponentDesc, ComponentDropFn, ComponentHookFn, ComponentUuid, FfiEntity, FfiResult,
-    ModComponent,
+    AbiPod, BAM_REQUIRED_FLAG_CUSTOM_BYTES, BamComponent, BamFieldDesc, BamLoadCtx,
+    BamRelationDesc, BamRequiredComponent, BamRowMigrateFn, ComponentCloneFn, ComponentDesc,
+    ComponentDropFn, ComponentHookFn, ComponentUuid, FfiEntity, FfiResult, ModComponent,
 };
 
 use crate::{
@@ -36,9 +36,21 @@ pub struct PodComponentHooks<T: AbiPod> {
     /// Optional 1-based [`BamComponent`] handles automatically inserted (`#[require(...)]`) when
     /// `T` is added to an entity lacking them.
     pub required_components: Vec<BamComponent>,
+    /// Optional ABI `0.3` 64-bit FNV-1a structural schema fingerprint (`0` if unspecified).
+    pub schema_fingerprint: u64,
+    /// Optional ABI `0.3` static field reflection descriptors (`ModComponent::BAM_FIELDS`).
+    pub fields: &'static [BamFieldDesc],
+    /// Optional ABI `0.3` extended required-component descriptors (`ModComponent::REQUIRED_COMPONENTS`).
+    pub required_init_descs: Vec<BamRequiredComponent>,
+    /// Optional owned POD initialization byte buffers paired with target [`BamComponent`] handles,
+    /// pinned inside [`GuestInstance`] during registration and converted into
+    /// [`BamRequiredComponent`] descriptors with `BAM_REQUIRED_FLAG_CUSTOM_BYTES`.
+    pub required_custom_bytes: Vec<(BamComponent, Box<[u8]>)>,
 }
 
 impl<T: AbiPod> Default for PodComponentHooks<T> {
+    /// Returns an empty [`PodComponentHooks`] with all lifecycle callbacks unset, cloning
+    /// disabled, and no required components or ABI 0.3 metadata.
     fn default() -> Self {
         Self {
             on_add: None,
@@ -48,6 +60,10 @@ impl<T: AbiPod> Default for PodComponentHooks<T> {
             on_despawn: None,
             enable_clone: false,
             required_components: Vec::new(),
+            schema_fingerprint: 0,
+            fields: &[],
+            required_init_descs: Vec::new(),
+            required_custom_bytes: Vec::new(),
         }
     }
 }
@@ -101,8 +117,66 @@ impl<T: AbiPod> PodComponentHooks<T> {
         self.required_components.extend_from_slice(components);
         self
     }
+
+    /// Sets the ABI `0.3` 64-bit FNV-1a structural schema fingerprint.
+    #[inline]
+    pub fn with_schema_fingerprint(mut self, fingerprint: u64) -> Self {
+        self.schema_fingerprint = fingerprint;
+        self
+    }
+
+    /// Sets the ABI `0.3` static field reflection slice (`ModComponent::BAM_FIELDS`).
+    #[inline]
+    pub fn with_fields(mut self, fields: &'static [BamFieldDesc]) -> Self {
+        self.fields = fields;
+        self
+    }
+
+    /// Appends extended ABI `0.3` required-component initialization descriptors.
+    pub fn with_required_init_descs(mut self, descs: &[BamRequiredComponent]) -> Self {
+        self.required_init_descs.extend_from_slice(descs);
+        self
+    }
+
+    /// Appends a required component initialized from a copy of POD value `value`.
+    pub fn with_required_pod_value<R: AbiPod>(
+        mut self,
+        component: BamComponent,
+        value: &R,
+    ) -> Self {
+        let size = core::mem::size_of::<R>();
+        let bytes = if size == 0 {
+            Vec::new()
+        } else {
+            // SAFETY: `R: AbiPod` has no drop glue or uninitialized padding invariants; reading
+            // `size_of::<R>()` initialized bytes from `&R` into a `Vec<u8>` is always valid.
+            unsafe { core::slice::from_raw_parts(core::ptr::from_ref(value).cast::<u8>(), size) }
+                .to_vec()
+        };
+        self.required_custom_bytes
+            .push((component, bytes.into_boxed_slice()));
+        self
+    }
+
+    /// Populates `schema_fingerprint`, `fields`, and `required_init_descs` from `T: ModComponent`.
+    pub fn with_mod_component_metadata(mut self) -> Self
+    where
+        T: ModComponent,
+    {
+        self.schema_fingerprint = T::SCHEMA_FINGERPRINT;
+        self.fields = T::BAM_FIELDS;
+        self.required_init_descs
+            .extend_from_slice(T::REQUIRED_COMPONENTS);
+        self
+    }
 }
 
+/// Heap-pinned lifecycle hook state owned by [`GuestInstance`] for a dynamic `T: AbiPod`
+/// component.
+///
+/// Wraps each optional guest callback (`on_add`, `on_insert`, `on_discard`, `on_remove`,
+/// `on_despawn`) in a [`ReentrantCell`] to prevent reentrant mutable aliasing if a hook
+/// indirectly triggers itself.
 struct HookTrampolineState<T: AbiPod> {
     on_add: Option<ReentrantCell<PodHookCallback<T>>>,
     on_insert: Option<ReentrantCell<PodHookCallback<T>>>,
@@ -111,6 +185,11 @@ struct HookTrampolineState<T: AbiPod> {
     on_despawn: Option<ReentrantCell<PodHookCallback<T>>>,
 }
 
+/// Validates `component_ptr` and invokes a single POD lifecycle hook stored in `cell_opt`.
+///
+/// Uses `NonNull::dangling()` for zero-sized `T`, rejects null or misaligned pointers for
+/// non-zero-sized `T`, and executes the callback through [`ReentrantCell::try_with_mut`] so
+/// reentrant invocations are silently ignored rather than causing undefined behavior.
 fn dispatch_pod_hook<T: AbiPod>(
     entity: FfiEntity,
     component_ptr: *const c_void,
@@ -119,22 +198,27 @@ fn dispatch_pod_hook<T: AbiPod>(
     let Some(cell) = cell_opt else {
         return;
     };
-    let val_ref: &T = if core::mem::size_of::<T>() == 0 {
-        // SAFETY: Zero-sized `T: AbiPod` may be referenced via `NonNull::dangling()`.
-        unsafe { core::ptr::NonNull::<T>::dangling().as_ref() }
-    } else {
-        if component_ptr.is_null()
-            || !(component_ptr as usize).is_multiple_of(core::mem::align_of::<T>())
-        {
-            return;
-        }
-        // SAFETY: Host guarantees `component_ptr` points to an initialized `T` on `entity`
-        // for the duration of the lifecycle hook call.
-        unsafe { &*component_ptr.cast::<T>() }
-    };
-    let _ = cell.try_with_mut(|cb| cb(entity, val_ref));
+    if core::mem::size_of::<T>() > 0
+        && (component_ptr.is_null()
+            || !(component_ptr as usize).is_multiple_of(core::mem::align_of::<T>()))
+    {
+        return;
+    }
+    let _ = cell.try_with_mut(|cb| {
+        let val_ref: &T = if core::mem::size_of::<T>() == 0 {
+            // SAFETY: Zero-sized `T: AbiPod` may be referenced via `NonNull::dangling()`.
+            unsafe { core::ptr::NonNull::<T>::dangling().as_ref() }
+        } else {
+            // SAFETY: Verified non-null and aligned above; `try_with_mut` excludes re-entrant
+            // invocation, and host guarantees `component_ptr` points to an initialized `T`.
+            unsafe { &*component_ptr.cast::<T>() }
+        };
+        cb(entity, val_ref);
+    });
 }
 
+/// Generates a panic-safe `extern "C"` [`ComponentHookFn`] trampoline (`$fn_name`) that recovers
+/// [`HookTrampolineState`] from `user_data` and dispatches to [`dispatch_pod_hook`] for `$field`.
 macro_rules! define_pod_hook_trampoline {
     ($fn_name:ident, $field:ident) => {
         unsafe extern "C" fn $fn_name<T: AbiPod>(
@@ -142,12 +226,15 @@ macro_rules! define_pod_hook_trampoline {
             component_ptr: *const c_void,
             user_data: *mut c_void,
         ) {
-            if user_data.is_null() {
+            if user_data.is_null()
+                || !(user_data as usize)
+                    .is_multiple_of(core::mem::align_of::<HookTrampolineState<T>>())
+            {
                 return;
             }
             catch_guest_unit(|| {
-                // SAFETY: `user_data` was allocated via `GuestInstance::track_allocation` for
-                // `HookTrampolineState<T>`, and the host disarms hooks prior to shutdown.
+                // SAFETY: `user_data` is non-null, aligned, and allocated via
+                // `GuestInstance::track_allocation` for `HookTrampolineState<T>`.
                 let state = unsafe { &*user_data.cast::<HookTrampolineState<T>>() };
                 dispatch_pod_hook::<T>(entity, component_ptr, &state.$field);
             });
@@ -163,9 +250,12 @@ define_pod_hook_trampoline!(pod_on_despawn_trampoline, on_despawn);
 
 /// Panic-safe `extern "C"` bitwise [`ComponentCloneFn`] trampoline for `T: AbiPod`.
 ///
+/// Uses `core::ptr::copy` (`memmove` semantics) so overlapping or identical `(src, dst)` regions
+/// remain defined rather than triggering `copy_nonoverlapping` aliasing UB.
+///
 /// # Safety
-/// When `size_of::<T>() > 0`, `src` and `dst` must be non-null, non-overlapping, and valid for
-/// `size_of::<T>()` bytes (`src` readable, `dst` writable).
+/// When `size_of::<T>() > 0`, `src` and `dst` must be non-null and valid for `size_of::<T>()`
+/// bytes (`src` readable, `dst` writable).
 pub unsafe extern "C" fn pod_clone_trampoline<T: AbiPod>(
     src: *const c_void,
     dst: *mut c_void,
@@ -179,10 +269,11 @@ pub unsafe extern "C" fn pod_clone_trampoline<T: AbiPod>(
         if src.is_null() || dst.is_null() {
             return FfiResult::NULL_POINTER;
         }
-        // SAFETY: `T: AbiPod` is `Copy` without drop glue; copying `size` bytes via `u8` pointers
-        // preserves uninitialized padding provenance cleanly without forming `&[u8]`.
+        // SAFETY: `T: AbiPod` is `Copy` without drop glue; `core::ptr::copy` via `u8` pointers
+        // preserves padding provenance cleanly without forming `&[u8]` and is sound even if `src`
+        // and `dst` overlap.
         unsafe {
-            core::ptr::copy_nonoverlapping(src.cast::<u8>(), dst.cast::<u8>(), size);
+            core::ptr::copy(src.cast::<u8>(), dst.cast::<u8>(), size);
         }
         FfiResult::OK
     })
@@ -349,6 +440,39 @@ pub unsafe fn register_pod_component_with_hooks<T: AbiPod>(
         // SAFETY: `raw_req` stays pinned inside `instance` until `bamabi_shutdown`.
         let req_ptr = unsafe { (*raw_req).as_ptr() };
         desc = desc.with_required_components(req_ptr, req_len);
+    }
+    if hooks.schema_fingerprint != 0 {
+        desc = desc.with_schema_fingerprint(hooks.schema_fingerprint);
+    }
+    if !hooks.fields.is_empty() {
+        desc = desc.with_fields(hooks.fields.as_ptr(), hooks.fields.len());
+    }
+    let mut all_req_inits = hooks.required_init_descs;
+    for (comp, bytes) in hooks.required_custom_bytes {
+        let mut req_desc = BamRequiredComponent::by_handle(comp);
+        req_desc.flags |= BAM_REQUIRED_FLAG_CUSTOM_BYTES;
+        if !bytes.is_empty() {
+            let len = bytes.len();
+            let raw_bytes = instance.track_allocation(Box::new(bytes));
+            // SAFETY: `raw_bytes` stays pinned inside `instance` until `bamabi_shutdown`.
+            req_desc.init_bytes = unsafe { (*raw_bytes).as_ptr() };
+            req_desc.init_size = len;
+        }
+        all_req_inits.push(req_desc);
+    }
+    if !all_req_inits.is_empty() {
+        for req in &all_req_inits {
+            let v = req.validate();
+            if !v.is_ok() {
+                return Err(v);
+            }
+        }
+        let boxed_inits: Box<[BamRequiredComponent]> = all_req_inits.into_boxed_slice();
+        let inits_len = boxed_inits.len();
+        let raw_inits = instance.track_allocation(Box::new(boxed_inits));
+        // SAFETY: `raw_inits` stays pinned inside `instance` until `bamabi_shutdown`.
+        let inits_ptr = unsafe { (*raw_inits).as_ptr() };
+        desc = desc.with_required_init_descs(inits_ptr, inits_len);
     }
 
     let host = *instance.host();
@@ -575,11 +699,19 @@ pub unsafe fn register_relation(
     unsafe { register_relation_raw(load_ctx, &host, &desc) }
 }
 
-struct RowMigrateCtx<F> {
-    func: F,
+/// Stack-pinned closure wrapper passed as `user_data` to [`row_migrate_trampoline`] during a
+/// synchronous `BamHostApi::migrate_component_column` call.
+pub(crate) struct RowMigrateCtx<F> {
+    pub(crate) func: F,
 }
 
-unsafe extern "C" fn row_migrate_trampoline<Old, New, F>(
+/// Panic-safe `extern "C"` [`BamRowMigrateFn`] trampoline that converts one `Old: AbiPod` row
+/// into a `New: AbiPod` row during hot-reload schema migration.
+///
+/// Validates pointer nullness and alignment for `user_data`, `Old`, and `New` (handling zero-sized
+/// types via `NonNull::dangling()`), invokes the guest migration closure inside
+/// [`catch_guest_result`], and writes the resulting `New` value into `dst_row` on success.
+pub(crate) unsafe extern "C" fn row_migrate_trampoline<Old, New, F>(
     src_row: *const c_void,
     dst_row: *mut c_void,
     user_data: *mut c_void,
@@ -592,6 +724,9 @@ where
     catch_guest_result(|| {
         if user_data.is_null() {
             return FfiResult::NULL_POINTER;
+        }
+        if !(user_data as usize).is_multiple_of(core::mem::align_of::<RowMigrateCtx<F>>()) {
+            return FfiResult::INVALID_ARGUMENT;
         }
         let old_ref: &Old = if core::mem::size_of::<Old>() == 0 {
             // SAFETY: Zero-sized `Old: AbiPod` may be referenced via `NonNull::dangling()`.

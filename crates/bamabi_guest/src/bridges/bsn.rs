@@ -62,6 +62,7 @@ impl GuestScene {
 }
 
 impl From<GuestScene> for FfiAssetHandle {
+    /// Extracts the underlying wire [`FfiAssetHandle`] from a [`GuestScene`] wrapper.
     #[inline]
     fn from(scene: GuestScene) -> Self {
         scene.raw
@@ -98,11 +99,13 @@ pub trait GuestCommandsBsnExt {
 }
 
 impl GuestCommandsBsnExt for GuestCommands<'_> {
+    /// Queues spawning `scene` as a root scene entity (no parent) via `BamHostApi::cmd_spawn_scene`.
     #[inline]
     fn spawn_scene(&mut self, scene: &GuestScene) -> Result<FfiEntity, FfiResult> {
         self.inner.spawn_scene(&scene.raw(), FfiEntity::NULL)
     }
 
+    /// Queues spawning `scene` parented under `parent` via `BamHostApi::cmd_spawn_scene`.
     #[inline]
     fn spawn_scene_as_child(
         &mut self,
@@ -112,6 +115,7 @@ impl GuestCommandsBsnExt for GuestCommands<'_> {
         self.inner.spawn_scene(&scene.raw(), parent)
     }
 
+    /// Queues spawning a raw [`FfiAssetHandle`] scene under `parent` (`FfiEntity::NULL` for root).
     #[inline]
     fn spawn_scene_handle(
         &mut self,
@@ -126,6 +130,8 @@ impl GuestCommandsBsnExt for GuestCommands<'_> {
 mod tests {
     use super::*;
 
+    /// Scenario: Verifies that `FfiAssetHandle::from_uuid` for a canonical BSN scene name produces
+    /// deterministic handles across calls and validates cleanly when wrapped in `GuestScene`.
     #[test]
     fn guest_scene_handle_uuid_is_deterministic_and_validates() {
         let scene_ty = BamComponent::from_raw(7);

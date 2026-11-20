@@ -44,6 +44,9 @@ mod version;
 #[cfg(test)]
 mod tests;
 
+#[cfg(kani)]
+mod kani_proofs;
+
 pub use access::{
     AccessMode, BAM_TERM_KNOWN_FLAGS, BamTermDesc, MAX_QUERIES_PER_SYSTEM, MAX_TERMS_PER_QUERY,
     ScheduleId,
@@ -94,11 +97,11 @@ pub use iter::{
     BamParForEachChunkFn, BamResMutPtrFn, BamResPtrFn, BamResTicksFn,
 };
 pub use primitives::{
-    BAM_CHILD_OF_NAME, BAM_CHILDREN_NAME, BamComponent, BamSymbol, BamSystem, BamSystemSet,
-    ComponentUuid, FNV1A_64_OFFSET_BASIS, FNV1A_64_PRIME, FfiAssetHandle, FfiAssetLoadState,
-    FfiBool, FfiChildOf, FfiEntity, FfiOption, FfiResult, FfiSlice, SIPHASH_KEY_0, SIPHASH_KEY_1,
-    StrView, fnv1a_64_init, fnv1a_64_str, fnv1a_64_update_bytes, fnv1a_64_update_u64,
-    siphash24_128,
+    BAM_CHILD_OF_NAME, BAM_CHILDREN_NAME, BAM_DISABLED_NAME, BamComponent, BamSymbol, BamSystem,
+    BamSystemSet, ComponentUuid, FNV1A_64_OFFSET_BASIS, FNV1A_64_PRIME, FfiAssetHandle,
+    FfiAssetLoadState, FfiBool, FfiChildOf, FfiDisabled, FfiEntity, FfiOption, FfiResult, FfiSlice,
+    SIPHASH_KEY_0, SIPHASH_KEY_1, StrView, fnv1a_64_init, fnv1a_64_str, fnv1a_64_update_bytes,
+    fnv1a_64_update_u64, siphash24_128,
 };
 pub use system::{
     BAM_OBSERVER_FLAG_PROPAGATE, BAM_OBSERVER_KNOWN_FLAGS, BAM_QUERY_KNOWN_FLAGS,

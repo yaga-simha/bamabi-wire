@@ -1,3 +1,8 @@
+//! `#[derive(GuestComponent)]` zero-overhead guest component metadata generator.
+//!
+//! Synthesizes `bamabi_guest::GuestComponent` implementations with compile-time SipHash-2-4-128
+//! field-schema hashing and storage flags (`sparse_set`, `immutable`, `summary_tick`).
+
 use std::ffi::CString;
 
 use crate::attrs::{
@@ -8,11 +13,25 @@ use proc_macro2::TokenStream;
 use quote::quote;
 use syn::{Data, DeriveInput, Fields, Index, LitCStr};
 
-/// Core expansion entry point for `#[derive(GuestComponent)]`.
+/// Entry point for `#[derive(GuestComponent)]` proc-macro expansion.
+///
+/// Intended purpose: generates a zero-runtime-allocation `GuestComponent` impl for an `AbiPod`
+/// guest struct so it can be registered and queried through `bamabi_guest` without manual
+/// `ComponentDesc` boilerplate.
+///
+/// What it does: delegates to [`expand_guest_component_inner`] using crate paths resolved from
+/// `Cargo.toml` or explicit `#[guest_component(crate = ..., guest_crate = ...)]` overrides.
 pub(crate) fn expand_guest_component(input: &DeriveInput) -> syn::Result<TokenStream> {
     expand_guest_component_inner(input, None, None)
 }
 
+/// Test-only entry point for `#[derive(GuestComponent)]` with injected crate paths.
+///
+/// Intended purpose: allows unit tests in `src/tests.rs` to inspect expanded token streams
+/// deterministically without depending on `proc-macro-crate` manifest lookups.
+///
+/// What it does: forwards explicit `sys_crate` and `guest_crate` path tokens into
+/// [`expand_guest_component_inner`].
 #[cfg(test)]
 pub(crate) fn expand_guest_component_with_crates(
     input: &DeriveInput,
@@ -22,6 +41,16 @@ pub(crate) fn expand_guest_component_with_crates(
     expand_guest_component_inner(input, Some(sys_crate.clone()), Some(guest_crate.clone()))
 }
 
+/// Core implementation of `#[derive(GuestComponent)]`.
+///
+/// Intended purpose: enforces that guest-defined components have deterministic non-packed C
+/// layouts and emit stable canonical C-string names, field-schema hashes, and storage flags.
+///
+/// What it does: rejects generics, enums/unions, `#[repr(packed)]`, and missing
+/// `#[repr(C)]`/`#[repr(transparent)]`; validates `#[guest_component(...)]` attributes
+/// (including rejecting `sparse_set` combined with `summary_tick`); builds the `NAME` `CStr`
+/// literal, `FIELD_SCHEMA_HASH` chain over `offset_of!`, bitmask `FLAGS`, and optional explicit
+/// `UUID`; and emits `impl GuestComponent for <Struct>`.
 fn expand_guest_component_inner(
     input: &DeriveInput,
     sys_crate_override: Option<TokenStream>,

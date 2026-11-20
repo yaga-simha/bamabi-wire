@@ -10,9 +10,9 @@ Refactored from the original [`bevy_mod_abi`](https://github.com/yaga-simha/bevy
 |---|---|---|---|---|
 | [`bamabi_sys`](crates/bamabi_sys/README.md) | `#![no_std]` (`unsafe` FFI contract) | Zero | `1.87` / `2024` | `ABI 0.3.0` (`0x0003_0000`) wire types, 68-slot `BamHostApi` (552 B 64-bit / 280 B 32-bit), `offsets` (`OFF64_*`/`OFF32_*`), `ComponentUuid` (SipHash-2-4-128), `FfiResult`, descriptors, `ModComponent`, `AbiPod`, `RawInsertable` |
 | [`bamabi_macros`](crates/bamabi_macros/README.md) | `#![forbid(unsafe_code)]` | `syn`, `quote`, `proc-macro2`, `proc-macro-crate` | `1.87` / `2024` | `#[derive(ModComponent, AbiPod, GuestComponent)]`, zero-padding checks, hygienic VTables, `SCHEMA_FINGERPRINT`, `BAM_FIELDS`, `REQUIRED_COMPONENTS`, `C_DECL`/`ZIG_DECL` |
-| [`bamabi_sdk_gen`](crates/bamabi_sdk_gen/README.md) | `#![forbid(unsafe_code)]` | `bamabi_sys` | `1.95` / `2024` | Generates `include/bamabi.h` (C99), `bamabi.hpp` (C++17), `bamabi.zig` (Zig), and C99 component headers with `BAM_EXPORT`, `BAM_RESTRICT`, and `BAM_HOST_API_OFFSET_*` |
-| [`bamabi_guest_sys`](crates/bamabi_guest_sys/README.md) | Guest `unsafe` FFI boundary | `bamabi_sys` | `1.87` / `2024` | `GuestInstance`, `extern "C"` panic guards (`ReentrantCell`), checked 68/68 `BamHostApi` wrappers, validated iterators, commands, and migration trampolines |
-| [`bamabi_guest`](crates/bamabi_guest/README.md) | `#![forbid(unsafe_code)]` | `bamabi_sys`, `bamabi_guest_sys`, opt. `bamabi_macros` (`derive`) | `1.87` / `2024` | Safe Rust `.cdylib` guest SDK (`GuestPlugin`, `GuestApp`, typed 1..=16-term `QueryTuple`, `Or<(T0..T7)>`, `GuestTransaction`, `ObserverBuilder`, `ScheduleSetBuilder`, `export_mod!`) |
+| [`bamabi_sdk_gen`](crates/bamabi_sdk_gen/README.md) | `#![forbid(unsafe_code)]` | `bamabi_sys` | `1.95` / `2024` | Generates `include/bamabi.h` (C99), `bamabi.hpp` (C++17 68/68 views + `ScopedTransaction`), `bamabi.zig` (Zig 0.16 68/68 views + lossless 18-code `BamError`), and C99 component headers with `BAM_EXPORT`, `BAM_RESTRICT`, and `BAM_HOST_API_OFFSET_*` |
+| [`bamabi_guest_sys`](crates/bamabi_guest_sys/README.md) | Guest `unsafe` FFI boundary | `bamabi_sys` | `1.87` / `2024` | `GuestInstance`, `extern "C"` panic guards (`ReentrantCell`), checked 68/68 `BamHostApi` wrappers, unconditional `wire_types` Bevy `0.20` POD projections, validated iterators, commands, and migration trampolines |
+| [`bamabi_guest`](crates/bamabi_guest/README.md) | `#![forbid(unsafe_code)]` | `bamabi_sys`, `bamabi_guest_sys`, opt. `bamabi_macros` (`derive`) | `1.87` / `2024` | Safe Rust `.cdylib` guest SDK (`GuestPlugin`, `GuestApp`, `BevySchedules`, `conditions::*`, `GuestEntityCommands`/`GuestChildSpawner`, `FfiDisabled`, 1..=16-term `QueryTuple`, `Or<(T0..T7)>`, `GuestTransaction`, `TypedObserverBuilder`, unconditional Bevy `0.20` subsystem bridges, `export_mod!`) |
 
 ## Wire Specification, Headers & Tests
 
@@ -80,6 +80,9 @@ MIRIFLAGS="-Zmiri-tree-borrows" \
   cargo +nightly miri test --target s390x-unknown-linux-gnu -p bamabi_sys -p bamabi_guest_sys -p bamabi_guest
 PROPTEST_CASES=2048 RUSTFLAGS="-Zrandomize-layout" \
   cargo +nightly test -p bamabi_sys -p bamabi_guest_sys -p bamabi_guest
+
+# Kani formal verification for `bamabi_sys` (PO-W1..PO-W8) & `bamabi_guest_sys` (PO-G1..PO-G7)
+cargo kani -p bamabi_sys -p bamabi_guest_sys -Z unstable-options --harness-timeout 15m --output-format terse -j
 ```
 
 ## Federated `bamabi` Repositories

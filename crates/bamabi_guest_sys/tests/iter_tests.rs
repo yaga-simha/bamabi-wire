@@ -11,12 +11,15 @@ use bamabi_sys::{
 };
 use common::make_mock_api;
 
+/// Heap-owning non-POD message fixture (`String` + `Vec<u32>`) used to test witness field
+/// serialization and reconstruction across `ValidatedIter`.
 #[derive(Default, Debug, Clone, PartialEq, Eq)]
 struct MockNonPodMsg {
     label: String,
     nums: Vec<u32>,
 }
 
+/// Mock `export_fields` witness symbol emitting `label` (`String`) and `nums` (`Vec<u32>`).
 unsafe extern "C" fn mock_export_fields(
     src_ptr: *const c_void,
     sink: Option<
@@ -62,6 +65,7 @@ unsafe extern "C" fn mock_export_fields(
     }
 }
 
+/// Mock `import_field` witness symbol reconstructing `label` and `nums` on a guest `MockNonPodMsg`.
 unsafe extern "C" fn mock_import_field(
     dst_ptr: *mut c_void,
     field_name: StrView,
@@ -126,15 +130,18 @@ impl ModComponent for MockNonPodMsg {
     const UUID: ComponentUuid = ComponentUuid::from_parts("mock::NonPodChat", 48, 8, 1);
     type VTable = ();
 
+    /// Returns the unit dummy VTable.
     fn vtable() -> &'static Self::VTable {
         &()
     }
 
+    /// Returns the mock `export_fields` and `import_field` symbols.
     fn symbols() -> &'static [SymbolEntry] {
         &MOCK_SYMS
     }
 }
 
+/// Negative-test message type lacking the host `"bam.v0.<M>.non_pod_message"` marker symbol.
 #[derive(Default, Debug, PartialEq, Eq)]
 struct MockPodWithoutMarker;
 
@@ -144,20 +151,24 @@ impl ModComponent for MockPodWithoutMarker {
     const UUID: ComponentUuid = ComponentUuid::from_parts("mock::PodWithoutMarker", 8, 8, 2);
     type VTable = ();
 
+    /// Returns the unit dummy VTable.
     fn vtable() -> &'static Self::VTable {
         &()
     }
 
+    /// Returns an empty symbol slice.
     fn symbols() -> &'static [SymbolEntry] {
         &[]
     }
 }
 
+/// Mock world backing `BamIter` for non-POD message read/send tests.
 struct MockMsgWorld {
     stored: Vec<MockNonPodMsg>,
     sent_packets: Vec<Vec<u8>>,
 }
 
+/// Mock `get_proc_address` exporting `export_fields` and `non_pod_message` marker for `NonPodChat`.
 unsafe extern "C" fn mock_get_proc(_ctx: *const BamHostCtx, sym: *const c_char) -> *const c_void {
     // SAFETY: Caller passes valid NUL-terminated CStr.
     let name = unsafe { CStr::from_ptr(sym) };
@@ -168,6 +179,7 @@ unsafe extern "C" fn mock_get_proc(_ctx: *const BamHostCtx, sym: *const c_char) 
     }
 }
 
+/// Mock `iter_column_info` describing term `0` (`MockNonPodMsg`) and term `1` (`MockPodWithoutMarker`).
 unsafe extern "C" fn mock_col_info(
     _iter: *const BamIter,
     term_index: usize,
@@ -196,6 +208,7 @@ unsafe extern "C" fn mock_col_info(
     FfiResult::OK
 }
 
+/// Mock `msg_read_batch` writing pointers to `MockMsgWorld::stored` elements into `out_buf`.
 unsafe extern "C" fn mock_msg_read_batch(
     iter: *mut BamIter,
     _term_index: usize,
@@ -227,6 +240,7 @@ unsafe extern "C" fn mock_msg_read_batch(
     FfiResult::OK
 }
 
+/// Mock `msg_send` capturing serialized witness packets into `MockMsgWorld::sent_packets`.
 unsafe extern "C" fn mock_msg_send(
     iter: *mut BamIter,
     _term_index: usize,
@@ -241,6 +255,9 @@ unsafe extern "C" fn mock_msg_send(
     FfiResult::OK
 }
 
+/// Verifies end-to-end non-POD message reading (via host `export_fields` + guest `import_field`),
+/// sending (encoding length-prefixed witness packets with `field_count == 2`), and fail-closed
+/// `TYPE_MISMATCH` rejection when a pointer-sized message lacks the `non_pod_message` marker.
 #[test]
 fn validated_iter_non_pod_message_read_and_send_encode_witness_packets() {
     let mut api = make_mock_api();

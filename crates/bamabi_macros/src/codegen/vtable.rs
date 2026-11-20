@@ -1,8 +1,18 @@
+//! Final VTable struct, anti-spoofing helper traits, alias-safe accessors, and `ModComponent`
+//! implementation emitter for `#[derive(ModComponent)]`.
+
 use crate::codegen::CodegenState;
 use proc_macro2::TokenStream;
 use quote::{format_ident, quote};
 use syn::Ident;
 
+/// Emits the complete `<Struct>VTable` definition, hygienic `const _: ()` helper scope,
+/// `ModComponent` trait impl, and conditional `RawInsertable`/`AbiPod`/`GuestComponent` impls.
+///
+/// Intended purpose: centralizes final token emission for both structs and enums so every derived
+/// component gets a `VTableHeader`-prefixed VTable, FNV-1a `SCHEMA_FINGERPRINT`, `BAM_FIELDS`,
+/// `REQUIRED_COMPONENTS`, `C_DECL`/`ZIG_DECL`, anti-spoofing trait checks (`__BamStdString`,
+/// `__BamStdVec`, `__BamFfiOption`, `__BamPrimBool`), and alias-safe `String`/`Vec` mutation helpers.
 pub(crate) fn emit_vtable_and_impls(state: &CodegenState, vtable_ident: &Ident) -> TokenStream {
     let sys_crate = &state.sys_crate;
     let struct_ident = &state.struct_ident;

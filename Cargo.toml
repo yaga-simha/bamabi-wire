@@ -22,6 +22,7 @@ categories = ["game-development", "api-bindings"]
 unsafe_op_in_unsafe_fn = "deny"
 improper_ctypes_definitions = "deny"
 unreachable_pub = "warn"
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(kani)'] }
 
 [workspace.lints.clippy]
 undocumented_unsafe_blocks = "warn"

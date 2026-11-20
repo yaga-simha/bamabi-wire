@@ -12,6 +12,10 @@ use bamabi_guest::{
 };
 use common::MockHostWorld;
 
+/// Scenario: Verifies `ChunkSlice` / `ChunkSliceMut` bounds, stride, alignment, `isize::MAX`
+/// overflow, and ZST invariants: accepts valid aligned slices, rejects mismatched strides and
+/// misaligned pointers, rejects byte lengths exceeding `isize::MAX` without wrapping, and handles
+/// non-empty zero-sized (`stride = 0`) slices without pointer arithmetic UB.
 #[test]
 fn slice_alignment_overflow_zst_and_stride_edge_cases() {
     let mut aligned_buf = [10u64, 20u64, 30u64];
@@ -60,16 +64,21 @@ fn slice_alignment_overflow_zst_and_stride_edge_cases() {
     assert!(zst_mut.get_mut_ptr(5, 0).is_none());
 }
 
+/// Scenario: Registers a `#[repr(C)]` dynamic component with a custom `Drop` implementation via
+/// `register_dynamic_component_with_drop`, verifying that normal destruction runs the destructor
+/// and that a panicking destructor is caught before unwinding across the `extern "C"` boundary.
 #[test]
 fn raw_dynamic_component_with_drop_contains_panics_and_runs_destructor() {
     static DROPS: AtomicUsize = AtomicUsize::new(0);
 
+    /// Test payload whose `Drop` increments `DROPS` and optionally panics to verify FFI containment.
     #[repr(C)]
     struct ForeignDropPayload {
         should_panic: u32,
     }
 
     impl Drop for ForeignDropPayload {
+        /// Increments the drop counter and panics when `should_panic != 0`.
         fn drop(&mut self) {
             DROPS.fetch_add(1, Ordering::SeqCst);
             if self.should_panic != 0 {

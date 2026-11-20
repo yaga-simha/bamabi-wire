@@ -28,6 +28,7 @@ use bamabi_guest::{
 // Mock ABI 0.3.0 Host World
 // ============================================================================
 
+/// Registered component metadata tracked by [`MockV03World`] (including ABI 0.3.0 schema fingerprint).
 #[derive(Clone)]
 struct RegisteredComp {
     handle: BamComponent,
@@ -40,6 +41,7 @@ struct RegisteredComp {
     fields: Vec<BamFieldDesc>,
 }
 
+/// Registered ABI 0.3.0 typed relationship metadata stored in [`MockV03World`].
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct RegisteredRelation {
     handle: BamComponent,
@@ -51,6 +53,7 @@ struct RegisteredRelation {
     max_degree: u32,
 }
 
+/// Registered system descriptor, callback, and mount metadata in [`MockV03World`].
 #[derive(Clone)]
 struct RegisteredSystem {
     handle: BamSystem,
@@ -63,6 +66,7 @@ struct RegisteredSystem {
     run_if_user_data: *mut c_void,
 }
 
+/// Registered ABI 0.3.0 schedule system-set configuration stored in [`MockV03World`].
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct RegisteredScheduleSet {
     handle: BamSystemSet,
@@ -73,6 +77,7 @@ struct RegisteredScheduleSet {
     after_sets: Vec<BamSystemSet>,
 }
 
+/// Recorded deferred command entry supporting transaction checkpoints and rollbacks.
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum RecordedCmd {
     SpawnEmpty(FfiEntity),
@@ -99,12 +104,14 @@ enum RecordedCmd {
     },
 }
 
+/// Simulated dense archetype chunk inside [`MockV03World`].
 struct MockChunk {
     entities: Vec<FfiEntity>,
     columns: HashMap<BamComponent, Vec<u64>>,
 }
 
 impl MockChunk {
+    /// Creates a mock chunk for the given `entities`.
     fn new(entities: Vec<FfiEntity>) -> Self {
         Self {
             entities,
@@ -112,6 +119,7 @@ impl MockChunk {
         }
     }
 
+    /// Populates a dense column buffer for `comp` from `values`.
     fn insert_dense<T: Copy>(&mut self, comp: BamComponent, values: &[T]) {
         assert_eq!(values.len(), self.entities.len());
         let byte_len = core::mem::size_of_val(values);
@@ -129,6 +137,7 @@ impl MockChunk {
         self.columns.insert(comp, words);
     }
 
+    /// Reads back the dense column elements for `comp` as `Vec<T>`.
     fn read_dense<T: Copy>(&self, comp: BamComponent) -> Vec<T> {
         let count = self.entities.len();
         if core::mem::size_of::<T>() == 0 {
@@ -144,6 +153,7 @@ impl MockChunk {
     }
 }
 
+/// Active iterator cursor and query term list backing `*mut BamIter` in [`MockV03World`].
 struct MockIterState {
     world: *mut MockV03World,
     terms: Vec<BamTermDesc>,
@@ -152,11 +162,13 @@ struct MockIterState {
     active_chunk_idx: Option<usize>,
 }
 
+/// Per-invocation frame backing `*mut BamSystemCtx` during [`V03TestHost::run_system`].
 struct MockSystemFrame {
     world: *mut MockV03World,
     iters: Vec<Box<MockIterState>>,
 }
 
+/// Full ABI `0.3.0` (68-slot) mock host world exercising all v0.3 guest SDK APIs.
 struct MockV03World {
     api: BamHostApi,
     components: Vec<RegisteredComp>,
@@ -184,11 +196,13 @@ struct MockV03World {
     named_objects: HashMap<String, FfiEntity>,
 }
 
+/// Owning pointer wrapper around heap-allocated [`MockV03World`] with stable provenance.
 struct V03TestHost {
     raw: *mut MockV03World,
 }
 
 impl Drop for V03TestHost {
+    /// Reclaims the heap-allocated [`MockV03World`].
     fn drop(&mut self) {
         if !self.raw.is_null() {
             unsafe { drop(Box::from_raw(self.raw)) };
@@ -198,22 +212,26 @@ impl Drop for V03TestHost {
 
 impl core::ops::Deref for V03TestHost {
     type Target = MockV03World;
+    /// Borrows the underlying [`MockV03World`] immutably.
     fn deref(&self) -> &Self::Target {
         unsafe { &*self.raw }
     }
 }
 
 impl core::ops::DerefMut for V03TestHost {
+    /// Borrows the underlying [`MockV03World`] mutably.
     fn deref_mut(&mut self) -> &mut Self::Target {
         unsafe { &mut *self.raw }
     }
 }
 
 impl V03TestHost {
+    /// Creates a [`V03TestHost`] wired with a complete 68-slot ABI `0.3.0` [`BamHostApi`].
     fn new() -> Self {
         Self::with_api(make_v03_host_api())
     }
 
+    /// Creates a [`V03TestHost`] using a custom `api` table (e.g., truncated v0.2 host).
     fn with_api(api: BamHostApi) -> Self {
         Self {
             raw: Box::into_raw(Box::new(MockV03World {
@@ -242,10 +260,12 @@ impl V03TestHost {
         }
     }
 
+    /// Returns a pointer to the mock world's [`BamHostApi`] table.
     const fn api_ptr(&self) -> *const BamHostApi {
         unsafe { &raw const (*self.raw).api }
     }
 
+    /// Initializes an inline closure mod named `mod_name` against this ABI `0.3.0` mock host.
     fn load_fn<F>(&self, mod_name: &CStr, build_fn: F) -> Result<*mut BamInstance, FfiResult>
     where
         F: FnOnce(&mut GuestApp<'_>) -> FfiResult,
@@ -268,10 +288,12 @@ impl V03TestHost {
         }
     }
 
+    /// Shuts down and frees a guest instance loaded via [`Self::load_fn`].
     fn unload(&self, instance: *mut BamInstance) {
         unsafe { shutdown_guest_instance(instance) };
     }
 
+    /// Executes registered system `sys_idx` against this mock world.
     fn run_system(&self, sys_idx: usize) -> FfiResult {
         let (run_if, run_if_data, callback, user_data, queries) = unsafe {
             let world = &*self.raw;
@@ -311,6 +333,7 @@ impl V03TestHost {
 }
 
 impl MockV03World {
+    /// Pre-registers a host component type `T` with explicit UUID and schema fingerprint.
     fn expose_component<T: 'static>(
         &mut self,
         name: &str,
@@ -336,6 +359,7 @@ impl MockV03World {
         handle
     }
 
+    /// Stores per-entity component bytes used by `host_iter_up_cascade` ancestor lookups.
     fn set_entity_component<T: Copy>(&mut self, entity: FfiEntity, comp: BamComponent, value: T) {
         let byte_len = core::mem::size_of::<T>();
         let word_len = byte_len.div_ceil(8).max(1);
@@ -352,16 +376,19 @@ impl MockV03World {
         self.entity_components.insert((entity, comp), words);
     }
 
+    /// Returns immutable metadata for 1-based component `handle`.
     fn comp_meta(&self, handle: BamComponent) -> Option<&RegisteredComp> {
         let idx = (handle.to_raw() as usize).checked_sub(1)?;
         self.components.get(idx)
     }
 
+    /// Returns mutable metadata for 1-based component `handle`.
     fn comp_meta_mut(&mut self, handle: BamComponent) -> Option<&mut RegisteredComp> {
         let idx = (handle.to_raw() as usize).checked_sub(1)?;
         self.components.get_mut(idx)
     }
 
+    /// Performs a DFS reachability check to detect whether adding `(source -> target)` creates a cycle.
     fn would_create_cycle(
         &self,
         relation: BamComponent,
@@ -392,6 +419,7 @@ impl MockV03World {
 // Mock ABI 0.2 + 0.3 Host FFI Implementations
 // ============================================================================
 
+/// Mock `BamHostApi::get_proc_address` (returns null in v0.3 harness).
 unsafe extern "C" fn host_get_proc_address(
     _ctx: *const BamHostCtx,
     _name: *const c_char,
@@ -399,6 +427,7 @@ unsafe extern "C" fn host_get_proc_address(
     core::ptr::null()
 }
 
+/// Mock `BamHostApi::last_error` copying `MockV03World::last_error` into caller's buffer.
 unsafe extern "C" fn host_last_error(
     ctx: *const BamHostCtx,
     buf: *mut c_char,
@@ -416,10 +445,12 @@ unsafe extern "C" fn host_last_error(
     bytes.len()
 }
 
+/// Mock `BamHostApi::load_host_ctx` returning the underlying `*const BamHostCtx`.
 unsafe extern "C" fn host_load_host_ctx(load_ctx: *const BamLoadCtx) -> *const BamHostCtx {
     load_ctx.cast::<BamHostCtx>()
 }
 
+/// Mock `BamHostApi::register_component` storing component metadata and ABI 0.3.0 fingerprint.
 unsafe extern "C" fn host_register_component(
     load_ctx: *mut BamLoadCtx,
     desc: *const ComponentDesc,
@@ -465,6 +496,7 @@ unsafe extern "C" fn host_register_component(
     FfiResult::OK
 }
 
+/// Mock `BamHostApi::resolve_component` resolving a component handle by name or UUID.
 unsafe extern "C" fn host_resolve_component(
     ctx: *const BamHostCtx,
     name: *const c_char,
@@ -504,6 +536,7 @@ unsafe extern "C" fn host_resolve_component(
     FfiResult::OK
 }
 
+/// Shared helper registering a `BamSystemDesc` into `world` and returning its 1-based [`BamSystem`].
 fn push_system(world: &mut MockV03World, desc: &BamSystemDesc) -> Result<BamSystem, FfiResult> {
     let st = desc.validate();
     if !st.is_ok() {
@@ -542,6 +575,7 @@ fn push_system(world: &mut MockV03World, desc: &BamSystemDesc) -> Result<BamSyst
     Ok(handle)
 }
 
+/// Mock `BamHostApi::register_system` delegating to [`push_system`].
 unsafe extern "C" fn host_register_system(
     load_ctx: *mut BamLoadCtx,
     desc: *const BamSystemDesc,
@@ -557,11 +591,13 @@ unsafe extern "C" fn host_register_system(
     }
 }
 
+/// Mock `BamHostApi::sys_host_ctx` returning the world pointer from `MockSystemFrame`.
 unsafe extern "C" fn host_sys_host_ctx(sys_ctx: *const BamSystemCtx) -> *const BamHostCtx {
     let frame = unsafe { &*sys_ctx.cast::<MockSystemFrame>() };
     frame.world.cast::<BamHostCtx>()
 }
 
+/// Mock `BamHostApi::sys_query` returning the `MockIterState` pointer for `query_index`.
 unsafe extern "C" fn host_sys_query(
     sys_ctx: *mut BamSystemCtx,
     query_index: usize,
@@ -575,6 +611,7 @@ unsafe extern "C" fn host_sys_query(
     FfiResult::OK
 }
 
+/// Mock `BamHostApi::sys_commands` returning the world pointer as `*mut BamCommands`.
 unsafe extern "C" fn host_sys_commands(
     sys_ctx: *mut BamSystemCtx,
     out_commands: *mut *mut BamCommands,
@@ -584,6 +621,7 @@ unsafe extern "C" fn host_sys_commands(
     FfiResult::OK
 }
 
+/// Mock `BamHostApi::iter_next_chunk` advancing to the next chunk in [`MockV03World`].
 unsafe extern "C" fn host_iter_next_chunk(iter: *mut BamIter, out_len: *mut usize) -> FfiBool {
     let state = unsafe { &mut *iter.cast::<MockIterState>() };
     let world = unsafe { &*state.world };
@@ -606,6 +644,7 @@ unsafe extern "C" fn host_iter_next_chunk(iter: *mut BamIter, out_len: *mut usiz
     FfiBool::FALSE
 }
 
+/// Mock `BamHostApi::iter_reset` rewinding the chunk cursor.
 unsafe extern "C" fn host_iter_reset(iter: *mut BamIter) -> FfiResult {
     let state = unsafe { &mut *iter.cast::<MockIterState>() };
     state.next_chunk_idx = 0;
@@ -613,6 +652,7 @@ unsafe extern "C" fn host_iter_reset(iter: *mut BamIter) -> FfiResult {
     FfiResult::OK
 }
 
+/// Mock `BamHostApi::iter_entities` returning the active chunk's entity slice pointer.
 unsafe extern "C" fn host_iter_entities(iter: *const BamIter) -> *const FfiEntity {
     let state = unsafe { &*iter.cast::<MockIterState>() };
     let Some(idx) = state.active_chunk_idx else {
@@ -622,6 +662,7 @@ unsafe extern "C" fn host_iter_entities(iter: *const BamIter) -> *const FfiEntit
     world.chunks[idx].entities.as_ptr()
 }
 
+/// Mock `BamHostApi::iter_column_readonly` returning a read-only dense column pointer.
 unsafe extern "C" fn host_iter_col_ro(iter: *const BamIter, term_index: usize) -> *const u8 {
     let state = unsafe { &*iter.cast::<MockIterState>() };
     let Some(idx) = state.active_chunk_idx else {
@@ -637,6 +678,7 @@ unsafe extern "C" fn host_iter_col_ro(iter: *const BamIter, term_index: usize) -
         .map_or(core::ptr::null(), |w| w.as_ptr().cast::<u8>())
 }
 
+/// Mock `BamHostApi::iter_column_mutable` returning a writable dense column pointer.
 unsafe extern "C" fn host_iter_col_mut(iter: *mut BamIter, term_index: usize) -> *mut u8 {
     let state = unsafe { &*iter.cast::<MockIterState>() };
     let Some(idx) = state.active_chunk_idx else {
@@ -652,10 +694,12 @@ unsafe extern "C" fn host_iter_col_mut(iter: *mut BamIter, term_index: usize) ->
         .map_or(core::ptr::null_mut(), |w| w.as_mut_ptr().cast::<u8>())
 }
 
+/// Mock `BamHostApi::iter_column_mutable_untracked` delegating to [`host_iter_col_mut`].
 unsafe extern "C" fn host_iter_col_mut_untracked(iter: *mut BamIter, term_index: usize) -> *mut u8 {
     unsafe { host_iter_col_mut(iter, term_index) }
 }
 
+/// Mock `BamHostApi::iter_mark_changed_range` accepting valid change-mark calls.
 unsafe extern "C" fn host_iter_mark_changed(
     _iter: *mut BamIter,
     _term_index: usize,
@@ -665,14 +709,17 @@ unsafe extern "C" fn host_iter_mark_changed(
     FfiResult::OK
 }
 
+/// Stub `BamHostApi::iter_column_rows_readonly` (unused in v0.3 dense tests).
 unsafe extern "C" fn host_iter_rows_ro(_iter: *mut BamIter, _idx: usize) -> *const *const u8 {
     core::ptr::null()
 }
 
+/// Stub `BamHostApi::iter_column_rows_mutable` (unused in v0.3 dense tests).
 unsafe extern "C" fn host_iter_rows_mut(_iter: *mut BamIter, _idx: usize) -> *const *mut u8 {
     core::ptr::null()
 }
 
+/// Mock `BamHostApi::iter_column_info` populating `BamColumnInfo` for `term_index`.
 unsafe extern "C" fn host_iter_col_info(
     iter: *const BamIter,
     term_index: usize,
@@ -702,14 +749,17 @@ unsafe extern "C" fn host_iter_col_info(
     FfiResult::OK
 }
 
+/// Stub `BamHostApi::res_ptr` (unused in v0.3 harness).
 unsafe extern "C" fn host_res_ptr(_iter: *const BamIter, _idx: usize) -> *const u8 {
     core::ptr::null()
 }
 
+/// Stub `BamHostApi::res_mut_ptr` (unused in v0.3 harness).
 unsafe extern "C" fn host_res_mut_ptr(_iter: *mut BamIter, _idx: usize) -> *mut u8 {
     core::ptr::null_mut()
 }
 
+/// Mock `BamHostApi::cmd_spawn_empty` allocating an entity ID and logging `RecordedCmd::SpawnEmpty`.
 unsafe extern "C" fn host_cmd_spawn_empty(
     cmds: *mut BamCommands,
     out_entity: *mut FfiEntity,
@@ -722,6 +772,7 @@ unsafe extern "C" fn host_cmd_spawn_empty(
     FfiResult::OK
 }
 
+/// Mock `BamHostApi::cmd_spawn` allocating an entity ID and logging `RecordedCmd::SpawnEmpty`.
 unsafe extern "C" fn host_cmd_spawn(
     cmds: *mut BamCommands,
     _comps: *const BamComponent,
@@ -732,12 +783,14 @@ unsafe extern "C" fn host_cmd_spawn(
     unsafe { host_cmd_spawn_empty(cmds, out_entity) }
 }
 
+/// Mock `BamHostApi::cmd_despawn` logging `RecordedCmd::Despawn`.
 unsafe extern "C" fn host_cmd_despawn(cmds: *mut BamCommands, entity: FfiEntity) -> FfiResult {
     let world = unsafe { &mut *cmds.cast::<MockV03World>() };
     world.commands.push(RecordedCmd::Despawn(entity));
     FfiResult::OK
 }
 
+/// Mock `BamHostApi::cmd_insert` logging `RecordedCmd::Insert`.
 unsafe extern "C" fn host_cmd_insert(
     cmds: *mut BamCommands,
     entity: FfiEntity,
@@ -759,6 +812,7 @@ unsafe extern "C" fn host_cmd_insert(
     FfiResult::OK
 }
 
+/// Mock `BamHostApi::cmd_insert_default` logging `RecordedCmd::Insert` with zero length.
 unsafe extern "C" fn host_cmd_insert_default(
     _cmds: *mut BamCommands,
     _entity: FfiEntity,
@@ -767,6 +821,7 @@ unsafe extern "C" fn host_cmd_insert_default(
     FfiResult::OK
 }
 
+/// Mock `BamHostApi::cmd_remove` logging `RecordedCmd::Remove`.
 unsafe extern "C" fn host_cmd_remove(
     cmds: *mut BamCommands,
     entity: FfiEntity,
@@ -782,6 +837,7 @@ unsafe extern "C" fn host_cmd_remove(
 
 // --- All 18 ABI 0.3.0 Host Slots (50..=67) ---
 
+/// Mock `BamHostApi::log_diagnostic` (slot 50) recording `(level, message)` diagnostics.
 unsafe extern "C" fn host_log_diagnostic(
     ctx: *const BamHostCtx,
     level: u32,
@@ -802,6 +858,7 @@ unsafe extern "C" fn host_log_diagnostic(
     FfiResult::OK
 }
 
+/// Mock `BamHostApi::report_guest_fault` (slot 51) recording fault messages and updating `last_error`.
 unsafe extern "C" fn host_report_guest_fault(
     ctx: *const BamHostCtx,
     message: StrView,
@@ -821,6 +878,7 @@ unsafe extern "C" fn host_report_guest_fault(
     FfiResult::OK
 }
 
+/// Mock `BamHostApi::resolve_component_by_uuid` (slot 52) looking up handles strictly by UUID.
 unsafe extern "C" fn host_resolve_component_by_uuid(
     ctx: *const BamHostCtx,
     uuid: *const ComponentUuid,
@@ -841,6 +899,7 @@ unsafe extern "C" fn host_resolve_component_by_uuid(
     FfiResult::OK
 }
 
+/// Mock `BamHostApi::component_layout_info` (slot 53) populating `BamLayoutInfo`.
 unsafe extern "C" fn host_component_layout_info(
     ctx: *const BamHostCtx,
     component: BamComponent,
@@ -874,6 +933,7 @@ unsafe extern "C" fn host_component_layout_info(
     FfiResult::OK
 }
 
+/// Mock `BamHostApi::register_relation` (slot 54) validating and storing relationship descriptors.
 unsafe extern "C" fn host_register_relation(
     load_ctx: *mut BamLoadCtx,
     desc: *const BamRelationDesc,
@@ -926,6 +986,7 @@ unsafe extern "C" fn host_register_relation(
     FfiResult::OK
 }
 
+/// Mock `BamHostApi::intern_symbol` (slot 55) deduplicating UTF-8 strings into `BamSymbol` IDs.
 unsafe extern "C" fn host_intern_symbol(
     ctx: *const BamHostCtx,
     symbol: StrView,
@@ -952,6 +1013,7 @@ unsafe extern "C" fn host_intern_symbol(
     FfiResult::OK
 }
 
+/// Mock `BamHostApi::bind_named_object` (slot 56) binding a canonical name to an `FfiEntity`.
 unsafe extern "C" fn host_bind_named_object(
     ctx: *const BamHostCtx,
     name: StrView,
@@ -974,6 +1036,7 @@ unsafe extern "C" fn host_bind_named_object(
     FfiResult::OK
 }
 
+/// Mock `BamHostApi::iter_count` (slot 57) non-destructively counting matching entities.
 unsafe extern "C" fn host_iter_count(iter: *mut BamIter, out_count: *mut usize) -> FfiResult {
     if iter.is_null() || out_count.is_null() {
         return FfiResult::NULL_POINTER;
@@ -985,6 +1048,7 @@ unsafe extern "C" fn host_iter_count(iter: *mut BamIter, out_count: *mut usize) 
     FfiResult::OK
 }
 
+/// Mock `BamHostApi::iter_up_cascade` (slot 58) walking relationship ancestors with cycle detection.
 unsafe extern "C" fn host_iter_up_cascade(
     iter: *mut BamIter,
     relation: BamComponent,
@@ -1037,6 +1101,7 @@ unsafe extern "C" fn host_iter_up_cascade(
     }
 }
 
+/// Mock `BamHostApi::par_for_each_chunk_readonly` (slot 59) rejecting writable queries and dispatching read-only chunks.
 unsafe extern "C" fn host_par_for_each_chunk_readonly(
     iter: *mut BamIter,
     task_fn: Option<BamChunkTaskFn>,
@@ -1076,6 +1141,7 @@ unsafe extern "C" fn host_par_for_each_chunk_readonly(
     FfiResult::OK
 }
 
+/// Mock `BamHostApi::register_system_handle` (slot 60) returning a decoupled `BamSystem` handle.
 unsafe extern "C" fn host_register_system_handle(
     load_ctx: *mut BamLoadCtx,
     desc: *const BamSystemDesc,
@@ -1095,6 +1161,7 @@ unsafe extern "C" fn host_register_system_handle(
     }
 }
 
+/// Mock `BamHostApi::configure_schedule_set` (slot 61) registering a schedule system set.
 unsafe extern "C" fn host_configure_schedule_set(
     load_ctx: *mut BamLoadCtx,
     desc: *const BamScheduleSetDesc,
@@ -1137,6 +1204,7 @@ unsafe extern "C" fn host_configure_schedule_set(
     FfiResult::OK
 }
 
+/// Mock `BamHostApi::mount_system_in_schedule` (slot 62) mounting a system into a schedule/set.
 unsafe extern "C" fn host_mount_system_in_schedule(
     load_ctx: *mut BamLoadCtx,
     system: BamSystem,
@@ -1160,6 +1228,7 @@ unsafe extern "C" fn host_mount_system_in_schedule(
     FfiResult::OK
 }
 
+/// Mock `BamHostApi::cmd_checkpoint` (slot 63) returning the current command-log watermark.
 unsafe extern "C" fn host_cmd_checkpoint(
     cmds: *mut BamCommands,
     out_checkpoint: *mut usize,
@@ -1172,6 +1241,7 @@ unsafe extern "C" fn host_cmd_checkpoint(
     FfiResult::OK
 }
 
+/// Mock `BamHostApi::cmd_rollback` (slot 64) truncating the command log back to `checkpoint`.
 unsafe extern "C" fn host_cmd_rollback(cmds: *mut BamCommands, checkpoint: usize) -> FfiResult {
     if cmds.is_null() {
         return FfiResult::NULL_POINTER;
@@ -1185,6 +1255,7 @@ unsafe extern "C" fn host_cmd_rollback(cmds: *mut BamCommands, checkpoint: usize
     FfiResult::OK
 }
 
+/// Mock `BamHostApi::cmd_insert_relation` (slot 65) enforcing exclusivity/acyclic/degree rules.
 unsafe extern "C" fn host_cmd_insert_relation(
     cmds: *mut BamCommands,
     entity: FfiEntity,
@@ -1233,6 +1304,7 @@ unsafe extern "C" fn host_cmd_insert_relation(
     FfiResult::OK
 }
 
+/// Mock `BamHostApi::cmd_remove_relation` (slot 66) removing a relation edge between entities.
 unsafe extern "C" fn host_cmd_remove_relation(
     cmds: *mut BamCommands,
     entity: FfiEntity,
@@ -1260,6 +1332,7 @@ unsafe extern "C" fn host_cmd_remove_relation(
     FfiResult::OK
 }
 
+/// Mock `BamHostApi::migrate_component_column` (slot 67) invoking the guest migration callback per row.
 unsafe extern "C" fn host_migrate_component_column(
     load_ctx: *mut BamLoadCtx,
     component: BamComponent,
@@ -1346,6 +1419,7 @@ unsafe extern "C" fn host_migrate_component_column(
     FfiResult::OK
 }
 
+/// Constructs a v0.2-only `BamHostApi` (with ABI 0.3.0 slots null and optionally truncated `struct_size`).
 fn make_v02_only_host_api(truncated_struct_size: bool) -> BamHostApi {
     BamHostApi {
         struct_size: if truncated_struct_size {
@@ -1425,6 +1499,7 @@ fn make_v02_only_host_api(truncated_struct_size: bool) -> BamHostApi {
     }
 }
 
+/// Constructs a complete 68-slot ABI `0.3.0` `BamHostApi` wired to all `host_*` callbacks.
 fn make_v03_host_api() -> BamHostApi {
     let mut api = make_v02_only_host_api(false);
     api.log_diagnostic = Some(host_log_diagnostic);
@@ -1452,6 +1527,7 @@ fn make_v03_host_api() -> BamHostApi {
 // Test Component Types (works with both default features and `--all-features`)
 // ============================================================================
 
+/// Helper macro defining a `#[repr(C)]` `AbiPod` + `GuestComponent` test fixture.
 macro_rules! define_pod_component {
     ($vis:vis struct $name:ident { $($field:ident : $ty:ty),* $(,)? } => $cname:literal) => {
         #[repr(C)]
@@ -1472,6 +1548,7 @@ define_pod_component!(struct Counter { value: u32 } => c"v03::Counter");
 define_pod_component!(struct EdgeWeight { weight: f32 } => c"v03::EdgeWeight");
 define_pod_component!(struct ParentRel {} => c"v03::ParentRel");
 
+/// Helper macro implementing `ModComponent` with explicit schema fingerprint and field descriptors.
 macro_rules! impl_manual_mod_component {
     ($ty:ty, $name:literal, $cstr:literal, $fp:expr, $fields:expr) => {
         impl ModComponent for $ty {
@@ -1488,6 +1565,7 @@ macro_rules! impl_manual_mod_component {
             const SCHEMA_FINGERPRINT: u64 = $fp;
             const BAM_FIELDS: &'static [BamFieldDesc] = $fields;
             type VTable = VTableHeader;
+            /// Returns a static unit VTable placeholder.
             fn vtable() -> &'static Self::VTable {
                 static VT: VTableHeader = VTableHeader::from_raw_parts(
                     core::mem::size_of::<VTableHeader>() as u32,
@@ -1497,6 +1575,7 @@ macro_rules! impl_manual_mod_component {
                 );
                 &VT
             }
+            /// Returns an empty symbol table for manual test fixtures.
             fn symbols() -> &'static [SymbolEntry] {
                 &[]
             }
@@ -1506,6 +1585,7 @@ macro_rules! impl_manual_mod_component {
 
 #[repr(C)]
 #[derive(Clone, Copy, Debug, PartialEq)]
+/// Legacy schema v1 stats fixture used as the migration source in column-migration tests.
 struct OldStats {
     hp: u32,
 }
@@ -1528,6 +1608,7 @@ impl_manual_mod_component!(
 
 #[repr(C)]
 #[derive(Clone, Copy, Debug, PartialEq)]
+/// Upgraded schema v2 stats fixture used as the migration target in column-migration tests.
 struct NewStats {
     hp: f64,
     armor: u32,
@@ -1562,6 +1643,7 @@ impl_manual_mod_component!(
 
 #[repr(C)]
 #[derive(Clone, Copy, Debug, PartialEq)]
+/// Fixture with matching size/align but a deliberately wrong `SCHEMA_FINGERPRINT`.
 struct BadFingerprintStats {
     hp: u32,
 }
@@ -1577,6 +1659,7 @@ impl_manual_mod_component!(
 
 #[repr(C)]
 #[derive(Clone, Copy, Debug, PartialEq)]
+/// Fixture with a deliberately mismatched byte size for `verify_component_layout` rejection.
 struct BadSizeStats {
     hp: u64,
 }
@@ -1592,6 +1675,7 @@ impl_manual_mod_component!(
 
 #[repr(C)]
 #[derive(Clone, Copy, Debug, PartialEq)]
+/// Fixture with a deliberately mismatched alignment for `verify_component_layout` rejection.
 struct BadAlignStats {
     bytes: [u8; 4],
 }
@@ -1607,6 +1691,7 @@ impl_manual_mod_component!(
 
 #[repr(C)]
 #[derive(Clone, Copy, Debug, PartialEq)]
+/// Zero-sized source marker fixture for ZST-to-ZST column migration testing.
 struct OldTag;
 unsafe impl RawInsertable for OldTag {}
 unsafe impl AbiPod for OldTag {}
@@ -1614,6 +1699,7 @@ impl_manual_mod_component!(OldTag, "v03::Tag", c"v03::Tag", 0x0000_0000_0000_000
 
 #[repr(C)]
 #[derive(Clone, Copy, Debug, PartialEq)]
+/// Zero-sized target marker fixture for ZST-to-ZST column migration testing.
 struct NewTag;
 unsafe impl RawInsertable for NewTag {}
 unsafe impl AbiPod for NewTag {}
@@ -1640,6 +1726,8 @@ define_pod_component!(struct C15 { v: u32 } => c"q16::C15");
 // 1. ABI 0.2 Truncated Table & Missing Slot `UNSUPPORTED` Fallbacks
 // ============================================================================
 
+/// Scenario: Loads a guest against both a truncated-`struct_size` v0.2 host and a full-size host
+/// with null ABI 0.3.0 slots (50..67), asserting every v0.3 wrapper cleanly returns `UNSUPPORTED`.
 #[test]
 fn abi_v02_truncated_and_missing_slots_return_unsupported() {
     for truncated in [true, false] {
@@ -1804,6 +1892,8 @@ fn abi_v02_truncated_and_missing_slots_return_unsupported() {
 // 2. Diagnostics (`log_diagnostic`, `guest_log!`) & `report_fault`
 // ============================================================================
 
+/// Scenario: Exercises `log_diagnostic` (slot 50) and `report_fault` (slot 51) across `GuestApp`,
+/// `SystemContext`, and `RunConditionContext`, verifying recorded levels, messages, and `last_error`.
 #[test]
 fn diagnostics_guest_log_and_report_fault() {
     let host = V03TestHost::new();
@@ -1868,6 +1958,9 @@ fn diagnostics_guest_log_and_report_fault() {
 // 3. UUID Resolution, `component_layout_info`, & `verify_component_layout`
 // ============================================================================
 
+/// Scenario: Exercises `resolve_component_by_uuid` (slot 52), `component_layout_info` (slot 53),
+/// and `verify_component_layout`, confirming matching schemas pass while mismatched fingerprint,
+/// size, or alignment fail with `TYPE_MISMATCH`.
 #[test]
 fn resolve_by_uuid_layout_info_and_verify_layout() {
     let mut host = V03TestHost::new();
@@ -1935,9 +2028,12 @@ fn resolve_by_uuid_layout_info_and_verify_layout() {
     host.unload(inst);
 }
 
+/// Scenario: Verifies that `#[derive(ModComponent)]` computes a non-zero `SCHEMA_FINGERPRINT` and
+/// accurate `BAM_FIELDS` descriptors that pass host `verify_component_layout` checks.
 #[cfg(feature = "derive")]
 #[test]
 fn derived_mod_component_schema_fingerprint_and_fields_verified() {
+    /// Derived `ModComponent` fixture verifying generated `SCHEMA_FINGERPRINT` and `BAM_FIELDS`.
     #[repr(C)]
     #[derive(Clone, Copy, Debug, Default, PartialEq, ModComponent)]
     #[mod_component(name = "v03::DerivedHero")]
@@ -1968,6 +2064,9 @@ fn derived_mod_component_schema_fingerprint_and_fields_verified() {
 // 4. Typed Relationships (`RelationDescBuilder`, `insert_relation`, Cycles)
 // ============================================================================
 
+/// Scenario: Exercises `RelationDescBuilder` + `register_relation` (slot 54), `insert_relation`
+/// (slot 65), and `remove_relation` (slot 66), verifying exclusivity, out-degree limits, payload
+/// edges, and `CYCLE_DETECTED` rejection on acyclic graphs.
 #[test]
 fn relations_builder_commands_and_cycle_detection() {
     let host = V03TestHost::new();
@@ -2095,6 +2194,8 @@ fn relations_builder_commands_and_cycle_detection() {
 // 5. Symbol Interning & Named Object Binding
 // ============================================================================
 
+/// Scenario: Exercises `intern_symbol` (slot 55) deduplication and `bind_named_object` (slot 56)
+/// across `GuestApp` and `SystemContext`, including invalid-argument rejections.
 #[test]
 fn symbol_interning_and_named_object_binding() {
     let host = V03TestHost::new();
@@ -2139,6 +2240,9 @@ fn symbol_interning_and_named_object_binding() {
 // 6. `iter_count`, `iter_up_cascade`, & `par_for_each_chunk_readonly`
 // ============================================================================
 
+/// Scenario: Exercises `iter_count` (slot 57) non-destructive counting, `up_cascade` (slot 58)
+/// ancestor lookup with cycle detection, and `par_chunks_readonly` (slot 59) confirming read-only
+/// queries succeed while writable queries are rejected with `PERMISSION_DENIED`.
 #[test]
 fn iter_count_up_cascade_and_par_readonly() {
     let mut host = V03TestHost::new();
@@ -2345,6 +2449,8 @@ fn iter_count_up_cascade_and_par_readonly() {
 // 7. Decoupled Scheduling (`register_handle`, `ScheduleSetBuilder`, `mount_system`)
 // ============================================================================
 
+/// Scenario: Exercises `register_handle` (slot 60), `ScheduleSetBuilder` + `configure_schedule_set`
+/// (slot 61), and `mount_system` (slot 62), verifying execution-mode flags and before/after ordering.
 #[test]
 fn decoupled_scheduling_and_schedule_sets() {
     let mut host = V03TestHost::new();
@@ -2479,6 +2585,9 @@ fn decoupled_scheduling_and_schedule_sets() {
 // 8. Command Transactions (`GuestTransaction<'a>` & `GuestCommands::transaction`)
 // ============================================================================
 
+/// Scenario: Exercises `GuestCommands::transaction` (`cmd_checkpoint` slot 63 / `cmd_rollback`
+/// slot 64) across explicit commit, explicit rollback, RAII drop auto-rollback, and nested
+/// transactions.
 #[test]
 fn command_transactions_commit_rollback_drop_and_nested() {
     let host = V03TestHost::new();
@@ -2601,6 +2710,9 @@ fn command_transactions_commit_rollback_drop_and_nested() {
 // 9. Live Component Column Migration (`migrate_component_column`)
 // ============================================================================
 
+/// Scenario: Exercises `migrate_component_column` (slot 67) across successful `OldStats -> NewStats`
+/// migration, callback error abort, panic containment (`PANIC_CAUGHT`), and ZST `OldTag -> NewTag`
+/// migration.
 #[test]
 fn component_column_migration_success_error_panic_and_zst() {
     let mut host = V03TestHost::new();
@@ -2752,8 +2864,11 @@ fn component_column_migration_success_error_panic_and_zst() {
 // 10. 16-Term `QueryTuple` & 2..=8 Branch `Or<(T0..T7)>` + `Or2`/`Or3`
 // ============================================================================
 
+/// Scenario: Verifies compile-time and descriptor-generation support for maximum-arity 16-term
+/// `QueryTuple`s and 8-branch `Or<(...)>` disjunctive filter groups.
 #[test]
 fn sixteen_term_query_tuple_and_eight_branch_or() {
+    /// Compile-time helper asserting that `Q` satisfies [`QueryTuple`].
     fn assert_tuple<Q: QueryTuple>() {}
 
     // Compile-time coverage for every QueryTuple arity 1..=16 and every Or arity 2..=8

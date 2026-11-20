@@ -8,6 +8,8 @@ use crate::{
     iter::{Chunk, ChunkIter},
 };
 
+/// Verifies that `term_index` on `iter` is a `REMOVED_READ` entity component stream matching
+/// `T`'s `(size, align)` and manifest-aware [`ComponentUuid`](bamabi_sys::ComponentUuid).
 fn validate_removed_term<T: GuestComponent>(
     iter: &ChunkIter<'_>,
     term_index: usize,
@@ -112,29 +114,48 @@ impl<'a> ChunkIter<'a> {
 }
 
 impl<'a> SystemContext<'a> {
-    /// Drains all unread `RemovedComponents<T>` entity IDs declared at `term_index` on primary
-    /// query `0`, validating `T`'s layout and UUID.
+    /// Drains all unread `RemovedComponents<T>` entity IDs declared at `term_index` either via
+    /// [`SystemBuilder::removed`](crate::SystemBuilder::removed) (system-level bundle) or via
+    /// [`QueryBuilder::removed`](crate::QueryBuilder::removed) on primary query `0`, validating
+    /// `T`'s layout and UUID.
     #[inline]
     pub fn read_removed<T: GuestComponent>(
         &mut self,
         term_index: usize,
     ) -> Result<Vec<FfiEntity>, FfiResult> {
-        self.query_mut(0)
-            .ok_or(FfiResult::OUT_OF_RANGE)?
-            .read_removed::<T>(term_index)
+        let mut res_err = None;
+        if let Some(res_q) = self.resource_query_mut() {
+            match validate_removed_term::<T>(res_q, term_index) {
+                Ok(()) => return res_q.drain_removed(term_index),
+                Err(err) => res_err = Some(err),
+            }
+        }
+        match self.query_mut(0) {
+            Some(q0) => q0.read_removed::<T>(term_index),
+            None => Err(res_err.unwrap_or(FfiResult::OUT_OF_RANGE)),
+        }
     }
 
     /// Reads up to `out_entities.len()` `RemovedComponents<T>` entity IDs declared at
-    /// `term_index` on primary query `0`, advancing the persistent cursor.
+    /// `term_index` either via [`SystemBuilder::removed`](crate::SystemBuilder::removed) or on
+    /// primary query `0`, advancing the persistent cursor.
     #[inline]
     pub fn read_removed_batch<T: GuestComponent>(
         &mut self,
         term_index: usize,
         out_entities: &mut [FfiEntity],
     ) -> Result<usize, FfiResult> {
-        self.query_mut(0)
-            .ok_or(FfiResult::OUT_OF_RANGE)?
-            .read_removed_batch_typed::<T>(term_index, out_entities)
+        let mut res_err = None;
+        if let Some(res_q) = self.resource_query_mut() {
+            match validate_removed_term::<T>(res_q, term_index) {
+                Ok(()) => return res_q.read_removed_batch(term_index, out_entities),
+                Err(err) => res_err = Some(err),
+            }
+        }
+        match self.query_mut(0) {
+            Some(q0) => q0.read_removed_batch_typed::<T>(term_index, out_entities),
+            None => Err(res_err.unwrap_or(FfiResult::OUT_OF_RANGE)),
+        }
     }
 
     /// Drains all unread `RemovedComponents<T>` entity IDs declared at `(query_index, term_index)`,
@@ -197,9 +218,13 @@ mod tests {
         iter::{Added, Allow, Changed, Has, Or2, Or3, QueryTerm, QueryTuple, With, Without},
     };
 
+    /// Compile-time trait-bound assertion helper for [`QueryTerm`].
     fn assert_term<T: QueryTerm>() {}
+    /// Compile-time trait-bound assertion helper for [`QueryTuple`].
     fn assert_tuple<Q: QueryTuple>() {}
 
+    /// Verifies that `Allow<T>`, `Has<T>`, `Or2<..>`, and `Or3<..>` filter wrappers satisfy
+    /// [`QueryTerm`] and compose cleanly inside [`QueryTuple`] signatures.
     #[test]
     fn filter_query_terms_and_tuples_typecheck() {
         assert_term::<Allow<FfiChildOf>>();
@@ -221,11 +246,14 @@ mod tests {
         )>();
     }
 
+    /// Verifies that custom `#[derive(AbiPod)]` components compose across `Allow`, `Has`, `Or2`,
+    /// and `Or3` inside a multi-term [`QueryTuple`].
     #[cfg(feature = "derive")]
     #[test]
     fn derived_filter_query_tuples_typecheck() {
         use crate::prelude::*;
 
+        /// Test `AbiPod` component fixture `A`.
         #[repr(C)]
         #[derive(Clone, Copy, Debug, PartialEq, AbiPod)]
         struct DummyA(f32);
@@ -233,6 +261,7 @@ mod tests {
             const NAME: &'static core::ffi::CStr = c"filters_test::DummyA";
         }
 
+        /// Test `AbiPod` component fixture `B`.
         #[repr(C)]
         #[derive(Clone, Copy, Debug, PartialEq, AbiPod)]
         struct DummyB(u32);
@@ -240,6 +269,7 @@ mod tests {
             const NAME: &'static core::ffi::CStr = c"filters_test::DummyB";
         }
 
+        /// Test `AbiPod` component fixture `C`.
         #[repr(C)]
         #[derive(Clone, Copy, Debug, PartialEq, AbiPod)]
         struct DummyC(u32);

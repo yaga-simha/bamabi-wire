@@ -530,10 +530,41 @@ impl BamEventKind {
         self.0 >= Self::ADD.0 && self.0 <= Self::DESPAWN.0
     }
 
+    /// Returns `true` if this kind is any built-in lifecycle or hierarchy event (`ADD`..=`READY`).
+    #[inline]
+    pub const fn is_lifecycle(self) -> bool {
+        self.0 >= Self::ADD.0 && self.0 <= Self::READY.0
+    }
+
     /// Returns `true` if `self == Self::READY`.
     #[inline]
     pub const fn is_ready(self) -> bool {
         self.0 == Self::READY.0
+    }
+
+    /// Returns the canonical uppercase constant name for recognized event kinds, or `"UNKNOWN"`.
+    #[inline]
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::CUSTOM => "CUSTOM",
+            Self::ADD => "ADD",
+            Self::INSERT => "INSERT",
+            Self::DISCARD => "DISCARD",
+            Self::REMOVE => "REMOVE",
+            Self::DESPAWN => "DESPAWN",
+            Self::READY => "READY",
+            _ => "UNKNOWN",
+        }
+    }
+}
+
+impl core::fmt::Display for BamEventKind {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        if self.is_valid() {
+            f.write_str(self.name())
+        } else {
+            write!(f, "UNKNOWN({})", self.0)
+        }
     }
 }
 

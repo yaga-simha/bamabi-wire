@@ -9,6 +9,8 @@ use core::ffi::CStr;
 use bamabi_guest::prelude::*;
 use common::{MockHostWorld, RecordedCommand};
 
+/// Fallback macro implementing `RawInsertable` and `AbiPod` for test fixtures when the `derive`
+/// feature is disabled.
 #[cfg(not(feature = "derive"))]
 macro_rules! impl_pod_no_derive {
     ($($ty:ty),* $(,)?) => {
@@ -23,6 +25,8 @@ macro_rules! impl_pod_no_derive {
     };
 }
 
+/// `#[repr(C)]` test component with 3 bytes of natural alignment padding to verify Miri
+/// uninitialized-padding soundness across `GuestCommands::insert` and batched `spawn`.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, PartialEq)]
 struct PaddedPayload {
@@ -43,6 +47,7 @@ impl GuestComponent for PaddedPayload {
     const NAME: &'static CStr = c"cmd::PaddedPayload";
 }
 
+/// Zero-sized marker component used to test ZST insertion and `SpawnEntry::marker`.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, PartialEq)]
 #[cfg_attr(feature = "derive", derive(AbiPod))]
@@ -52,6 +57,7 @@ impl GuestComponent for MarkerZst {
     const NAME: &'static CStr = c"cmd::MarkerZst";
 }
 
+/// Test component registered with host-side `Default` support to verify `insert_default`.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, PartialEq)]
 #[cfg_attr(feature = "derive", derive(AbiPod))]
@@ -66,6 +72,10 @@ impl GuestComponent for WithDefault {
 #[cfg(not(feature = "derive"))]
 impl_pod_no_derive!(MarkerZst, WithDefault);
 
+/// Scenario: Exercises handle-based and typed `GuestCommands` end-to-end across `spawn_empty`,
+/// padded-struct and ZST `insert`, `insert_default` (including `PERMISSION_DENIED` when default
+/// is absent), `remove`, empty batched `spawn(&[])`, the `<= 16` stack fast path, the `> 16` heap
+/// fallback (20 components), `despawn`, and invalid-handle/null-entity error rejections.
 #[test]
 fn handle_commands_and_batched_spawn_fast_and_heap_paths() {
     let mut world = MockHostWorld::new();

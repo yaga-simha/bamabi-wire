@@ -19,6 +19,14 @@ use common::{
     stub_component_layout_info_padded,
 };
 
+/// Verifies [`ReentrantCell`] re-entrancy rejection and panic recovery across both
+/// `BamSystemFn` and `BamRunIfFn` trampolines.
+///
+/// Scenario:
+/// 1. First system invocation calls itself re-entrantly and asserts `FfiResult::ACCESS_CONFLICT`.
+/// 2. Second invocation panics inside the closure and asserts `FfiResult::PANIC_CAUGHT`.
+/// 3. Third invocation confirms `ReleaseGuard` cleared `in_use` after unwind and returns `OK`.
+/// 4. Re-entrant `run_if` predicate returns `FfiBool::FALSE` on nested entry and `TRUE` on outer.
 #[test]
 fn reentrant_trampoline_conflict() {
     let api = make_mock_api();
@@ -32,11 +40,13 @@ fn reentrant_trampoline_conflict() {
     let host = unsafe { Host::from_raw(&api, host_ctx) }.unwrap();
     let mut instance = GuestInstance::new(host, "reentrant_mod");
 
+    /// `Send` pointer wrapper used to pass `user_data` into the re-entrant test closure.
     #[derive(Clone, Copy)]
     struct SendVoidPtr(*mut c_void);
     // SAFETY: Single-threaded test fixture preserving pointer provenance for Miri strict provenance.
     unsafe impl Send for SendVoidPtr {}
 
+    /// Shared slot storing `(BamSystemFn, user_data)` so the closure can re-enter itself.
     #[derive(Clone, Copy)]
     struct SysCallbackSlot {
         func: Option<BamSystemFn>,
@@ -79,6 +89,7 @@ fn reentrant_trampoline_conflict() {
     // SAFETY: Valid `sys_ctx` and `sys_data`.
     assert_eq!(unsafe { sys_fn(sys_ctx, sys_data) }, FfiResult::OK);
 
+    /// Shared slot storing `(BamRunIfFn, user_data)` so the predicate can re-enter itself.
     #[derive(Clone, Copy)]
     struct RunIfSlot {
         func: Option<BamRunIfFn>,
@@ -106,6 +117,12 @@ fn reentrant_trampoline_conflict() {
     assert_eq!(unsafe { run_if_fn(run_if_data) }, FfiBool::TRUE);
 }
 
+/// Verifies `Host::last_error`, `"bam.v0.*"` namespace enforcement, custom function pointer
+/// resolution, and [`VTableHeader`] validation under Miri.
+///
+/// Confirms that non-`"bam.v0."` symbols return `INVALID_ARGUMENT`, valid VTables resolve and
+/// execute, wrong UUIDs return `TYPE_MISMATCH`, and truncated or ABI-0.1 VTables return
+/// `INVALID_VERSION` before forming `&DummyVTable`.
 #[test]
 fn vtable_header_and_custom_symbol_validation_under_miri() {
     let api = make_mock_api();
@@ -156,6 +173,9 @@ fn vtable_header_and_custom_symbol_validation_under_miri() {
     assert_eq!(wrong_ver_res.err(), Some(FfiResult::INVALID_VERSION));
 }
 
+/// Verifies Miri soundness of [`SparseRows`]/[`SparseRowsMut`] row iteration and
+/// [`ValidatedCommands::spawn`]/[`ValidatedCommands::insert`] on `PaddedPod` structs containing
+/// uninitialized alignment padding bytes.
 #[test]
 fn sparse_rows_and_padded_commands_sound_under_miri() {
     let mut r0 = 10u32;
@@ -212,14 +232,22 @@ fn sparse_rows_and_padded_commands_sound_under_miri() {
     assert_eq!(world.last_inserted_val, 1234);
 }
 
+/// Verifies per-World [`GuestInstance`] isolation, LIFO shutdown hook execution, null-shutdown
+/// no-op behavior, and transactional rollback on failed `bamabi_init`.
+///
+/// Scenario: initializes two independent instances (World A and World B), shuts down World A and
+/// verifies World B's allocations remain alive, then triggers a failing `init_guest_instance` and
+/// verifies `*instance_out` is nulled, staged allocations drop, and unrun shutdown hooks do not fire.
 #[test]
 fn multi_world_guest_instance_isolation_and_rollback() {
     static DROPS_A: AtomicUsize = AtomicUsize::new(0);
     static DROPS_B: AtomicUsize = AtomicUsize::new(0);
     static HOOKS_A: AtomicUsize = AtomicUsize::new(0);
 
+    /// Drop probe incrementing an atomic counter when reclaimed by [`GuestInstance`].
     struct DropCounter(&'static AtomicUsize);
     impl Drop for DropCounter {
+        /// Records one drop event.
         fn drop(&mut self) {
             self.0.fetch_add(1, Ordering::SeqCst);
         }
@@ -318,17 +346,26 @@ fn multi_world_guest_instance_isolation_and_rollback() {
     let _ = AccessMode::READ;
 }
 
+/// Verifies runtime observer allocation tracking in [`RuntimeAllocTracker`] and graceful
+/// `FfiResult::UNSUPPORTED` fallbacks when optional ABI `0.3` host slots (`asset_load`,
+/// `sys_entity_children`) are unpopulated.
+///
+/// Confirms that a closure captured by `ValidatedCommands::observe` stays alive after
+/// `init_guest_instance` returns and drops exactly once during `shutdown_guest_instance`.
 #[test]
 fn runtime_observer_alloc_tracking_and_unsupported_fallbacks() {
     static OBS_DROPS: AtomicUsize = AtomicUsize::new(0);
+    /// Drop probe captured inside the runtime observer closure.
     struct ObsDropGuard;
     impl Drop for ObsDropGuard {
+        /// Increments `OBS_DROPS` when the runtime observer closure is reclaimed.
         fn drop(&mut self) {
             OBS_DROPS.fetch_add(1, Ordering::SeqCst);
         }
     }
 
     let mut api = make_mock_api();
+    /// Mock `cmd_observe` validating the descriptor and returning entity `77`.
     unsafe extern "C" fn mock_cmd_observe(
         _cmds: *mut BamCommands,
         desc: *const bamabi_sys::BamObserverDesc,
@@ -411,11 +448,14 @@ fn runtime_observer_alloc_tracking_and_unsupported_fallbacks() {
     assert_eq!(OBS_DROPS.load(Ordering::SeqCst), 1);
 }
 
+/// Verifies that `system_closure_trampoline` refreshes the invocation's [`Host::host_ctx`] from
+/// `BamHostApi::sys_host_ctx(sys_ctx)` rather than reusing a stale init-time context pointer.
 #[test]
 fn system_closure_trampoline_refreshes_host_ctx_via_sys_host_ctx() {
     static OBSERVED_ADDRS: AtomicUsize = AtomicUsize::new(0);
     static EXPECTED_RUNTIME_PTR: AtomicPtr<BamHostCtx> = AtomicPtr::new(core::ptr::null_mut());
 
+    /// Mock `sys_host_ctx` returning the runtime world context pointer.
     unsafe extern "C" fn runtime_sys_host_ctx(_sys_ctx: *const BamSystemCtx) -> *const BamHostCtx {
         EXPECTED_RUNTIME_PTR.load(Ordering::SeqCst).cast_const()
     }
@@ -451,22 +491,28 @@ fn system_closure_trampoline_refreshes_host_ctx_via_sys_host_ctx() {
     assert_ne!(OBSERVED_ADDRS.load(Ordering::SeqCst), init_ctx_ptr.addr());
 }
 
+/// Verifies `ValidatedLoadCtx::register_dynamic_mod_component` symbol registration (canonical +
+/// manifest-qualified VTable and `init_default` trampoline) and confirms that failed
+/// `insert_moved`/`spawn_moved` calls drop the guest-owned non-POD value cleanly without leaking.
 #[test]
 fn register_dynamic_mod_component_symbols_and_moved_command_error_drops_cleanly() {
     static DROP_COUNT: AtomicUsize = AtomicUsize::new(0);
 
+    /// Non-POD test component with heap `String` and drop counter.
     #[derive(Default)]
     struct DynMockComp {
         label: String,
     }
 
     impl Drop for DynMockComp {
+        /// Records each destructor invocation on the guest heap.
         fn drop(&mut self) {
             let _ = self.label.len();
             DROP_COUNT.fetch_add(1, Ordering::SeqCst);
         }
     }
 
+    /// Header-only VTable fixture for `DynMockComp`.
     #[repr(C)]
     #[derive(Copy, Clone)]
     struct DynMockVTable {
@@ -492,9 +538,11 @@ fn register_dynamic_mod_component_symbols_and_moved_command_error_drops_cleanly(
         const COMPONENT_CSTR: &'static CStr = c"DynMockComp";
         const UUID: ComponentUuid = DYN_MOCK_UUID;
         type VTable = DynMockVTable;
+        /// Returns the static `DynMockVTable`.
         fn vtable() -> &'static Self::VTable {
             &DYN_MOCK_VT
         }
+        /// Returns the exported VTable symbol table.
         fn symbols() -> &'static [SymbolEntry] {
             &DYN_MOCK_SYMS
         }

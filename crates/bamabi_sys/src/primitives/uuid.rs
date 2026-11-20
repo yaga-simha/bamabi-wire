@@ -6,6 +6,13 @@ pub const SIPHASH_KEY_0: u64 = 0x4241_4d5f_5555_4944;
 /// Fixed SipHash-2-4-128 domain-separation key half 1 (`"V0_2SIPH"` in big-endian ASCII).
 pub const SIPHASH_KEY_1: u64 = 0x5630_5f32_5349_5048;
 
+/// Executes one ARX SipRound permutation over the 256-bit internal SipHash state `(v0..v3)`.
+///
+/// Intended purpose: provides a `const`-evaluatable primitive for compile-time `ComponentUuid`
+/// hashing with zero external dependencies.
+///
+/// What it does: performs the canonical Aumasson & Bernstein add/rotate/xor mixing steps and
+/// returns the updated `(v0, v1, v2, v3)` state tuple.
 #[inline]
 const fn sipround(v0: u64, v1: u64, v2: u64, v3: u64) -> (u64, u64, u64, u64) {
     let v0 = v0.wrapping_add(v1);
@@ -35,6 +42,10 @@ struct ConstSipHasher128 {
 }
 
 impl ConstSipHasher128 {
+    /// Initializes the 128-bit (`DOUBLE` mode) SipHash-2-4 state with domain keys `(k0, k1)`.
+    ///
+    /// Intended purpose: seeds `v0..v3` with the standard SipHash IVs XORed with `(k0, k1)` and
+    /// the `0xee` 128-bit output-length domain separator on `v1`.
     #[inline]
     const fn new(k0: u64, k1: u64) -> Self {
         Self {
@@ -48,6 +59,7 @@ impl ConstSipHasher128 {
         }
     }
 
+    /// Absorbs one little-endian 64-bit message block `m` using 2 SipRounds (SipHash-2-4).
     #[inline]
     const fn compress_word(mut self, m: u64) -> Self {
         self.v3 ^= m;
@@ -57,6 +69,10 @@ impl ConstSipHasher128 {
         self
     }
 
+    /// Streams an arbitrary byte slice into the hasher, buffering partial `< 8`-byte tails.
+    ///
+    /// Intended purpose: allows multi-part inputs (canonical name, separator, size, align, schema)
+    /// to hash identically to a single concatenated buffer in `const` contexts.
     #[inline]
     const fn write(mut self, bytes: &[u8]) -> Self {
         let mut idx = 0;
@@ -100,6 +116,8 @@ impl ConstSipHasher128 {
         self
     }
 
+    /// Finalizes the stream with length-byte padding and two 4-round finalization passes,
+    /// returning the 16-byte little-endian SipHash-2-4-128 tag.
     #[inline]
     const fn finish(mut self) -> [u8; 16] {
         let mut b = ((self.total_len as u64) & 0xff) << 56;
@@ -139,6 +157,8 @@ pub const fn siphash24_128(data: &[u8], k0: u64, k1: u64) -> [u8; 16] {
     ConstSipHasher128::new(k0, k1).write(data).finish()
 }
 
+/// Decodes a single ASCII hexadecimal digit (`0-9`, `a-f`, `A-F`) into its 4-bit nibble (`0..=15`),
+/// returning `None` for any non-hex byte.
 #[inline]
 const fn hex_nibble(byte: u8) -> Option<u8> {
     match byte {
@@ -169,7 +189,7 @@ const fn hex_nibble(byte: u8) -> Option<u8> {
 /// assert_eq!(explicit.to_u128(), 0x00112233_4455_6677_8899_aabbccddeeff);
 /// ```
 #[repr(C)]
-#[derive(Debug, Copy, Clone, PartialEq, Eq, Hash, Default)]
+#[derive(Debug, Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
 pub struct ComponentUuid {
     /// Raw 16-byte UUID representation.
     pub bytes: [u8; 16],

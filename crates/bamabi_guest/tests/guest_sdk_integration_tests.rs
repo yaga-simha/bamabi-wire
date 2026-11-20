@@ -25,6 +25,7 @@ use bamabi_guest::{
 };
 use common::{MockChunkData, MockHostWorld};
 
+/// Fallback macro implementing `RawInsertable` and `AbiPod` for test structs without `derive`.
 #[cfg(not(feature = "derive"))]
 macro_rules! impl_pod_no_derive {
     ($($ty:ty),* $(,)?) => {
@@ -39,6 +40,7 @@ macro_rules! impl_pod_no_derive {
     };
 }
 
+/// 2D position test component (`game::Pos`) used across integration queries.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, PartialEq)]
 #[cfg_attr(feature = "derive", derive(AbiPod))]
@@ -51,6 +53,7 @@ impl GuestComponent for Pos {
     const NAME: &'static CStr = c"game::Pos";
 }
 
+/// 2D velocity test component (`game::Vel`) used across integration queries.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, PartialEq)]
 #[cfg_attr(feature = "derive", derive(AbiPod))]
@@ -76,6 +79,7 @@ impl GuestComponent for ImposterPos {
     const NAME: &'static CStr = c"game::ImposterPos";
 }
 
+/// Zero-sized inclusion filter tag component (`game::Tag`).
 #[repr(C)]
 #[derive(Clone, Copy, Debug, PartialEq)]
 #[cfg_attr(feature = "derive", derive(AbiPod))]
@@ -85,6 +89,7 @@ impl GuestComponent for Tag {
     const NAME: &'static CStr = c"game::Tag";
 }
 
+/// Zero-sized exclusion filter marker (`game::Dead`) for `Without<Dead>` tests.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, PartialEq)]
 #[cfg_attr(feature = "derive", derive(AbiPod))]
@@ -94,6 +99,7 @@ impl GuestComponent for Dead {
     const NAME: &'static CStr = c"game::Dead";
 }
 
+/// Optional/immutable shield component (`game::Shield`) used to verify immutability and `Option` access.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, PartialEq)]
 #[cfg_attr(feature = "derive", derive(AbiPod))]
@@ -105,6 +111,7 @@ impl GuestComponent for Shield {
     const NAME: &'static CStr = c"game::Shield";
 }
 
+/// Read-only simulation delta-time singleton resource (`game::SimTime`).
 #[repr(C)]
 #[derive(Clone, Copy, Debug, PartialEq)]
 #[cfg_attr(feature = "derive", derive(AbiPod))]
@@ -116,6 +123,7 @@ impl GuestComponent for SimTime {
     const NAME: &'static CStr = c"game::SimTime";
 }
 
+/// Mutable score counter singleton resource (`game::Score`).
 #[repr(C)]
 #[derive(Clone, Copy, Debug, PartialEq)]
 #[cfg_attr(feature = "derive", derive(AbiPod))]
@@ -127,6 +135,7 @@ impl GuestComponent for Score {
     const NAME: &'static CStr = c"game::Score";
 }
 
+/// Sparse-set stored buff component (`game::SparseBuff`) exercising `rows` / `rows_mut`.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, PartialEq)]
 #[cfg_attr(feature = "derive", derive(AbiPod))]
@@ -152,12 +161,16 @@ impl_pod_no_derive!(
     SparseBuff
 );
 
+/// Provenance-preserving `Send` wrapper around `*const MockHostWorld` for re-entrancy tests.
 #[derive(Clone, Copy)]
 struct SendWorldPtr(*const MockHostWorld);
 // SAFETY: Single-threaded test fixture preserving pointer provenance under Miri strict provenance.
 #[allow(unsafe_code)]
 unsafe impl Send for SendWorldPtr {}
 
+/// Scenario: Invokes a system callback and a `run_if` predicate re-entrantly from inside
+/// themselves, verifying lock-free `ReentrantCell` returns `ACCESS_CONFLICT` / `FfiBool::FALSE`,
+/// and verifies that a panicking system returns `PANIC_CAUGHT` while releasing its guard cleanly.
 #[test]
 fn reentrant_trampoline_conflict() {
     let mut world = MockHostWorld::new();
@@ -251,6 +264,9 @@ fn reentrant_trampoline_conflict() {
     world.unload_instance(inst);
 }
 
+/// Scenario: Attempts to borrow dense columns and resources with layout-identical wrong UUIDs
+/// (`ImposterPos` vs `Pos`), wrong sizes/alignments, read-only columns as mutable, and immutable
+/// components as mutable, verifying every invalid borrow returns `None` while valid UUIDs succeed.
 #[test]
 fn column_uuid_mismatch_returns_none() {
     let mut world = MockHostWorld::new();
@@ -340,6 +356,9 @@ fn column_uuid_mismatch_returns_none() {
     world.unload_instance(inst);
 }
 
+/// Scenario: Compiles a full `SystemBuilder` with read/write/with/without/changed/added/optional
+/// terms, system-level resources, schedule selection, `after`/`before` ordering, `main_thread`,
+/// and `run_if_fn`, plus verifies `CAPACITY_EXCEEDED` (> 8 queries) and `NOT_FOUND` propagation.
 #[test]
 fn unified_system_builder_compiles_queries_resources_ordering_and_flags() {
     let mut world = MockHostWorld::new();
@@ -432,6 +451,7 @@ fn unified_system_builder_compiles_queries_resources_ordering_and_flags() {
             assert_eq!(over_q.build(|_| {}), FfiResult::CAPACITY_EXCEEDED);
 
             // Unresolvable component propagates `NOT_FOUND` cleanly on `.build(...)`:
+            /// Unregistered component fixture used to verify `NOT_FOUND` error latching.
             #[repr(C)]
             #[derive(Clone, Copy)]
             #[cfg_attr(feature = "derive", derive(AbiPod))]
@@ -483,6 +503,9 @@ fn unified_system_builder_compiles_queries_resources_ordering_and_flags() {
     world.unload_instance(inst);
 }
 
+/// Scenario: Exercises sparse-set `component_rows` / `component_rows_mut` (rejecting dense casts),
+/// untracked dense mutation (`component_mut_untracked`) without marking the whole chunk changed,
+/// selective `mark_changed`, and out-of-range `mark_changed_range` rejection.
 #[test]
 fn sparse_rows_and_untracked_change_marking_work_end_to_end() {
     let mut world = MockHostWorld::new();
@@ -587,6 +610,9 @@ fn sparse_rows_and_untracked_change_marking_work_end_to_end() {
     world.unload_instance(inst);
 }
 
+/// Scenario: Verifies `init_guest_instance` rejects under-sized `BamHostApi` (`INVALID_VERSION`
+/// with `*instance_out = null`), retrieves `last_error`, resolves valid `"bam.v0.*"` custom
+/// symbols, and rejects unprefixed (`INVALID_ARGUMENT`) or missing (`NOT_FOUND`) symbols.
 #[test]
 fn host_handshake_custom_symbols_and_vtable_validation() {
     let mut world = MockHostWorld::new();
@@ -646,9 +672,12 @@ fn host_handshake_custom_symbols_and_vtable_validation() {
     world.unload_instance(inst);
 }
 
+/// Scenario: Resolves a `#[derive(ModComponent)]`-generated `HealthVTable` via `Host::resolve_vtable`,
+/// invokes its `get_current`/`set_current` slots, and verifies wrong-UUID lookups fail with `TYPE_MISMATCH`.
 #[cfg(feature = "derive")]
 #[test]
 fn derive_mod_component_vtable_header_roundtrip() {
+    /// Derived component fixture exposing getter/setter VTable slots for roundtrip verification.
     #[repr(C)]
     #[derive(Clone, Copy, Debug, PartialEq, ModComponent)]
     #[mod_component(name = "game::Health")]
@@ -701,8 +730,12 @@ fn derive_mod_component_vtable_header_roundtrip() {
     world.unload_instance(inst);
 }
 
+/// Scenario: Exercises an 8-arity `QueryTuple` (with `FfiEntity`, `&mut`, `&`, `Option<&mut>`,
+/// `Changed`, `Added`, `With`, `Without`), wrong-UUID `TYPE_MISMATCH` rejection, parallel
+/// `par_for_each` chunk iteration, and `par_chunks` worker panic containment (`PANIC_CAUGHT`).
 #[test]
 fn typed_tuple_queries_and_par_chunks_without_magic_indices() {
+    /// Acceleration test component (`game::Accel`) used in the 8-arity typed tuple query.
     #[repr(C)]
     #[derive(Clone, Copy, Debug, PartialEq)]
     #[cfg_attr(feature = "derive", derive(AbiPod))]
@@ -716,6 +749,7 @@ fn typed_tuple_queries_and_par_chunks_without_magic_indices() {
         const NAME: &'static CStr = c"game::Accel";
     }
 
+    /// Scalar mass test component (`game::Mass`) used with `Added<Mass>` in the typed tuple query.
     #[repr(C)]
     #[derive(Clone, Copy, Debug, PartialEq)]
     #[cfg_attr(feature = "derive", derive(AbiPod))]
@@ -873,8 +907,12 @@ fn typed_tuple_queries_and_par_chunks_without_magic_indices() {
     world.unload_instance(inst);
 }
 
+/// Scenario: Verifies hot-reload `GuestPlugin::save_state`/`restore_state` byte roundtrips,
+/// `on_add`/`on_remove` component lifecycle hook trampolines, independent multi-reader message
+/// cursors (`send_message`/`read_messages`), and filter/access/UUID-checked random `get`/`get_mut`.
 #[test]
 fn state_messages_random_get_and_hooks() {
+    /// Buffered POD message fixture (`game::DamageEvent`) used to test multi-reader cursors.
     #[repr(C)]
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
     #[cfg_attr(feature = "derive", derive(AbiPod))]
@@ -889,6 +927,7 @@ fn state_messages_random_get_and_hooks() {
         const NAME: &'static CStr = c"game::DamageEvent";
     }
 
+    /// Dynamic component fixture registered with `on_add` and `on_remove` lifecycle hooks.
     #[repr(C)]
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
     #[cfg_attr(feature = "derive", derive(AbiPod))]
@@ -902,6 +941,7 @@ fn state_messages_random_get_and_hooks() {
     }
 
     static SAVED_RESTORED_VALUE: AtomicUsize = AtomicUsize::new(0);
+    /// Hot-reloadable test plugin persisting a `u64` counter across `save_state` / `restore_state`.
     #[derive(Default)]
     struct StatefulMod {
         counter: u64,
@@ -911,15 +951,18 @@ fn state_messages_random_get_and_hooks() {
         const NAME: &'static CStr = c"stateful_mod";
         const VERSION: &'static CStr = c"0.2.0";
 
+        /// Initializes `counter` to `42` on plugin load.
         fn build(&mut self, _app: &mut GuestApp<'_>) -> FfiResult {
             self.counter = 42;
             FfiResult::OK
         }
 
+        /// Serializes `counter` as 8 little-endian bytes.
         fn save_state(&self) -> Result<Vec<u8>, FfiResult> {
             Ok(self.counter.to_le_bytes().to_vec())
         }
 
+        /// Deserializes the 8-byte counter, adds `100`, and records it in `SAVED_RESTORED_VALUE`.
         fn restore_state(&mut self, bytes: &[u8]) -> FfiResult {
             let Ok(arr) = <[u8; 8]>::try_from(bytes) else {
                 return FfiResult::INVALID_ARGUMENT;
@@ -955,6 +998,7 @@ fn state_messages_random_get_and_hooks() {
         .load_plugin::<StatefulMod>()
         .expect("load StatefulMod A");
     let mut state_blob: Vec<u8> = Vec::new();
+    /// C-ABI byte-sink callback appending `save_state` output chunks into a `Vec<u8>`.
     #[allow(unsafe_code)]
     unsafe extern "C" fn vec_writer(ctx: *mut c_void, bytes: *const u8, len: usize) -> FfiResult {
         #[allow(unsafe_code)]
@@ -1116,6 +1160,8 @@ fn state_messages_random_get_and_hooks() {
     world.unload_instance(inst_ext);
 }
 
+/// Scenario: Smoke-tests `FfiChildOf` canonical name/UUID parity and `GuestRes`/`GuestResMut`
+/// change-tick detection (`is_added`, `is_changed`) and deref/mutation semantics.
 #[test]
 fn guest_sdk_child_of_ticks_and_in_set_smoke() {
     use bamabi_guest::prelude::*;

@@ -165,6 +165,8 @@ impl<'a> GuestCommands<'a> {
 }
 
 impl<'b> QueryBuilder<'b> {
+    /// Resolves dynamic [`ModComponent`] `T` on the host and appends a [`BamTermDesc`] with `mode`,
+    /// recording the first resolution or capacity error on `self.first_error`.
     #[inline]
     fn push_dynamic_term<T: ModComponent>(&mut self, mode: AccessMode) {
         match resolve_mod_component::<T>(self.host) {
@@ -230,6 +232,41 @@ impl<'b> QueryBuilder<'b> {
     #[inline]
     pub fn optional_write_dynamic<T: ModComponent>(mut self) -> Self {
         self.push_dynamic_term::<T>(AccessMode::OPTIONAL_WRITE);
+        self
+    }
+
+    /// Appends a `Changed<T> + &T` tick-filter term for a dynamic [`ModComponent`] (`T`).
+    #[inline]
+    pub fn changed_dynamic<T: ModComponent>(mut self) -> Self {
+        self.push_dynamic_term::<T>(AccessMode::CHANGED);
+        self
+    }
+
+    /// Appends an `Added<T> + &T` tick-filter term for a dynamic [`ModComponent`] (`T`).
+    #[inline]
+    pub fn added_dynamic<T: ModComponent>(mut self) -> Self {
+        self.push_dynamic_term::<T>(AccessMode::ADDED);
+        self
+    }
+
+    /// Appends an `Allow<T>` disabling-filter bypass term for a dynamic [`ModComponent`] (`T`).
+    #[inline]
+    pub fn allow_dynamic<T: ModComponent>(mut self) -> Self {
+        self.push_dynamic_term::<T>(AccessMode::ALLOW);
+        self
+    }
+
+    /// Appends a `Has<T>` archetypal presence term for a dynamic [`ModComponent`] (`T`).
+    #[inline]
+    pub fn has_dynamic<T: ModComponent>(mut self) -> Self {
+        self.push_dynamic_term::<T>(AccessMode::HAS);
+        self
+    }
+
+    /// Appends a `RemovedComponents<T>` removal-stream term for a dynamic [`ModComponent`] (`T`).
+    #[inline]
+    pub fn removed_dynamic<T: ModComponent>(mut self) -> Self {
+        self.push_dynamic_term::<T>(AccessMode::REMOVED_READ);
         self
     }
 }

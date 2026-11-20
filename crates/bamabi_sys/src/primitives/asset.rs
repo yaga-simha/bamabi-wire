@@ -169,6 +169,18 @@ impl FfiAssetLoadState {
         self.0 <= Self::FAILED.0
     }
 
+    /// Returns `true` if `self == Self::NOT_LOADED`.
+    #[inline]
+    pub const fn is_not_loaded(self) -> bool {
+        self.0 == Self::NOT_LOADED.0
+    }
+
+    /// Returns `true` if `self == Self::LOADING`.
+    #[inline]
+    pub const fn is_loading(self) -> bool {
+        self.0 == Self::LOADING.0
+    }
+
     /// Returns `true` if `self == Self::LOADED`.
     #[inline]
     pub const fn is_loaded(self) -> bool {
@@ -179,6 +191,28 @@ impl FfiAssetLoadState {
     #[inline]
     pub const fn is_failed(self) -> bool {
         self.0 == Self::FAILED.0
+    }
+
+    /// Returns the canonical uppercase constant name for recognized load states, or `"UNKNOWN"`.
+    #[inline]
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::NOT_LOADED => "NOT_LOADED",
+            Self::LOADING => "LOADING",
+            Self::LOADED => "LOADED",
+            Self::FAILED => "FAILED",
+            _ => "UNKNOWN",
+        }
+    }
+}
+
+impl core::fmt::Display for FfiAssetLoadState {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        if self.is_valid() {
+            f.write_str(self.name())
+        } else {
+            write!(f, "UNKNOWN({})", self.0)
+        }
     }
 }
 

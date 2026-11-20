@@ -1,6 +1,12 @@
 //! Guest-side `#![forbid(unsafe_code)]`, zero-Bevy helpers for bridged Bevy `0.20` states
-//! (`GuestStateBridge`, deterministic `OnEnter`/`OnExit`/`OnTransition` schedule IDs,
-//! `.run_if_in_state(...)`, `set_state_if_different`, and `DespawnOnExit`/`DespawnOnEnter`).
+//! matching `bamabi_bridges::state` bit-for-bit:
+//!
+//! - Unbounded dynamic `ModStateSlab` (`ModStateHandle`, `ModStateEntry`,
+//!   `ModStateTransitionRequest`, `ModDespawnOnExit`, `ModDespawnOnEnter`) supporting arbitrary
+//!   `States`, `SubStates`, and read-only `ComputedStates` without fixed slot limits.
+//! - Primary slot-0 legacy `GuestStateBridge` (`"bevy_state::State#0"` / `"bamabi::ModNextState#0"`),
+//!   deterministic `OnEnter`/`OnExit`/`OnTransition` schedule IDs, `.run_if_in_state(...)`, and
+//!   `DespawnOnExit`/`DespawnOnEnter` markers.
 
 use bamabi_guest_sys::{Host, ValidatedSystemRef, ValidatedWireVTable, resolve_component};
 use bamabi_sys::{
@@ -9,8 +15,62 @@ use bamabi_sys::{
 use core::ffi::CStr;
 use std::ffi::CString;
 
+pub use bamabi_guest_sys::wire_types::{
+    FfiStateTransitionEvent, MOD_STATE_FLAG_ACTIVE, MOD_STATE_FLAG_COMPUTED,
+    MOD_STATE_FLAG_MUTABLE, MOD_STATE_FLAG_SUB_STATE, ModDespawnOnEnter, ModDespawnOnExit,
+    ModStateEntry, ModStateHandle, ModStateTransitionRequest, STATE_ABSENT_DISCRIMINANT,
+};
+
 use crate::app::{QueryBuilder, SystemBuilder, SystemContext};
 use crate::commands::GuestCommands;
+use crate::component::GuestComponent;
+
+/// Canonical ABI name for the dynamic read-only [`ModStateEntry`] snapshot component.
+pub const CANONICAL_MOD_STATE_ENTRY_NAME: &str = "bevy_state::ModStateEntry";
+/// Canonical ABI name for the dynamic [`ModStateTransitionRequest`] message stream.
+pub const CANONICAL_MOD_STATE_TRANSITION_REQUEST_NAME: &str =
+    "bevy_state::ModStateTransitionRequest";
+/// Canonical ABI name for the dynamic [`ModDespawnOnExit`] component.
+pub const CANONICAL_MOD_DESPAWN_ON_EXIT_NAME: &str = "bevy_state::ModDespawnOnExit";
+/// Canonical ABI name for the dynamic [`ModDespawnOnEnter`] component.
+pub const CANONICAL_MOD_DESPAWN_ON_ENTER_NAME: &str = "bevy_state::ModDespawnOnEnter";
+/// Canonical ABI name for host-opt-in bridged Bevy `0.20` `StateTransitionEvent` messages.
+pub const CANONICAL_STATE_TRANSITION_EVENT_NAME: &str = "bevy_state::state::StateTransitionEvent";
+
+impl GuestComponent for ModStateEntry {
+    const NAME: &'static CStr = c"bevy_state::ModStateEntry";
+    const FIELD_SCHEMA_HASH: u64 = Self::FIELD_SCHEMA_HASH;
+}
+
+impl GuestComponent for ModStateTransitionRequest {
+    const NAME: &'static CStr = c"bevy_state::ModStateTransitionRequest";
+    const FIELD_SCHEMA_HASH: u64 = Self::FIELD_SCHEMA_HASH;
+}
+
+impl GuestComponent for ModDespawnOnExit {
+    const NAME: &'static CStr = c"bevy_state::ModDespawnOnExit";
+    const FIELD_SCHEMA_HASH: u64 = Self::FIELD_SCHEMA_HASH;
+}
+
+impl GuestComponent for ModDespawnOnEnter {
+    const NAME: &'static CStr = c"bevy_state::ModDespawnOnEnter";
+    const FIELD_SCHEMA_HASH: u64 = Self::FIELD_SCHEMA_HASH;
+}
+
+impl GuestComponent for FfiStateTransitionEvent {
+    const NAME: &'static CStr = c"bevy_state::state::StateTransitionEvent";
+    const FIELD_SCHEMA_HASH: u64 = Self::FIELD_SCHEMA_HASH;
+}
+
+/// Builds the canonical host state-gating system-set name (`"host::state.<state_name>.<variant>"`)
+/// for [`GuestStateSystemBuilderExt::run_if_in_state`].
+pub fn state_set_name(state_name: &str, variant: &str) -> Result<CString, FfiResult> {
+    if state_name.is_empty() || variant.is_empty() {
+        return Err(FfiResult::INVALID_ARGUMENT);
+    }
+    CString::new(format!("host::state.{state_name}.{variant}"))
+        .map_err(|_| FfiResult::INVALID_ARGUMENT)
+}
 
 /// Computes the deterministic `OnEnter(variant)` custom [`ScheduleId`] for `variant_index`
 /// (`0..variant_count`) under `base`.
@@ -41,8 +101,13 @@ pub const fn on_transition_schedule(
     ScheduleId::custom(base.0 + 2 * variant_count + exited_index * variant_count + entered_index)
 }
 
-/// Safe guest bridge for reading `State<S>` (`u32` discriminant) and writing `ModNextState<S>`
-/// (`NextState::set_if_different`) on a host-exposed Bevy state machine.
+/// Safe guest bridge for reading `State<S>` (`u32` discriminant, or [`STATE_ABSENT_DISCRIMINANT`]
+/// when absent) and writing `ModNextState<S>` (`NextState::set_if_different`) on a host-exposed
+/// primary Bevy state machine (`slot = 0`).
+///
+/// For unbounded multi-state, `SubStates`, and `ComputedStates` workflows backed by host
+/// `ModStateSlab`, query [`ModStateEntry`] components directly and emit
+/// [`ModStateTransitionRequest`] messages.
 #[derive(Clone, Copy)]
 pub struct GuestStateBridge {
     state_slot: usize,
@@ -125,7 +190,7 @@ impl GuestStateBridge {
         self.next_state_handle
     }
 
-    /// Reads the current `State<S>` `u32` discriminant declared in query `0` at `term_index`.
+    /// Reads the current `State<S>` raw `u32` discriminant declared in query `0` at `term_index`.
     #[inline]
     pub fn current(
         &self,
@@ -135,6 +200,21 @@ impl GuestStateBridge {
         ctx.iter()
             .inner
             .read_mapped_wire_resource(term_index, &self.state_vtable)
+    }
+
+    /// Reads the current `State<S>` discriminant, mapping [`STATE_ABSENT_DISCRIMINANT`]
+    /// (`u32::MAX`) or `FfiResult::NOT_FOUND` to `Ok(None)`.
+    #[inline]
+    pub fn current_optional(
+        &self,
+        ctx: &mut SystemContext<'_>,
+        term_index: usize,
+    ) -> Result<Option<u32>, FfiResult> {
+        match self.current(ctx, term_index) {
+            Ok(STATE_ABSENT_DISCRIMINANT) | Err(FfiResult::NOT_FOUND) => Ok(None),
+            Ok(disc) => Ok(Some(disc)),
+            Err(err) => Err(err),
+        }
     }
 
     /// Reads the current `State<S>` `u32` discriminant declared in `query_index` at `term_index`.
@@ -196,6 +276,16 @@ impl GuestStateBridge {
         )
     }
 
+    /// Reads the current `State<S>` `u32` discriminant by handle on a [`ValidatedSystemRef`].
+    #[inline]
+    pub fn current_by_handle(
+        &self,
+        sys_ref: &ValidatedSystemRef<'_>,
+        state_handle: BamComponent,
+    ) -> Result<(u32, BamChangeTicks), FfiResult> {
+        sys_ref.read_mapped_wire_resource_by_handle(state_handle, &self.state_vtable)
+    }
+
     /// Queues a state transition via `ModNextState<S>` handle on a [`ValidatedSystemRef`].
     #[inline]
     pub fn set_state_if_different_by_handle(
@@ -211,7 +301,7 @@ impl GuestStateBridge {
         )
     }
 
-    /// Resolves the `DespawnOnExit` marker component handle for `variant_slot` (`0..32`).
+    /// Resolves the legacy slot-0 `DespawnOnExit` marker handle for `variant_slot` (`0..32`).
     pub fn resolve_despawn_on_exit(
         &self,
         host: &Host,
@@ -226,7 +316,7 @@ impl GuestStateBridge {
         bamabi_guest_sys::resolve_component(host, Some(&cstr), Some(uuid))
     }
 
-    /// Resolves the `DespawnOnEnter` marker component handle for `variant_slot` (`0..32`).
+    /// Resolves the legacy slot-0 `DespawnOnEnter` marker handle for `variant_slot` (`0..32`).
     pub fn resolve_despawn_on_enter(
         &self,
         host: &Host,
@@ -242,29 +332,85 @@ impl GuestStateBridge {
     }
 }
 
-/// Extension trait on [`SystemBuilder`] attaching a host-exposed `in_state` system set
-/// (`"host::state.<StateName>.<Variant|disc>"`).
+/// Extension trait on [`SystemBuilder`] attaching host-exposed `in_state` sets and `ModStateSlab`
+/// transition message writers.
 pub trait GuestStateSystemBuilderExt<'b> {
     /// Schedules this system inside `host_state_set` (which runs on the host iff `in_state(S::V)`
     /// holds).
     fn run_if_in_state(self, host_state_set: &'b CStr) -> Self;
+
+    /// Declares a [`ModStateTransitionRequest`] message writer (`MESSAGE_WRITE`) so the system can
+    /// request transitions on any `FreelyMutableState` or `SubStates` slot in host `ModStateSlab`.
+    fn write_state_transitions(self) -> Self;
 }
 
 impl<'b, 'a> GuestStateSystemBuilderExt<'b> for SystemBuilder<'b, 'a> {
+    /// Places the system inside the host-managed state-gated system set `host_state_set`.
     #[inline]
     fn run_if_in_state(self, host_state_set: &'b CStr) -> Self {
         self.in_set(host_state_set)
     }
+
+    /// Appends `message_write::<ModStateTransitionRequest>()` to this system.
+    #[inline]
+    fn write_state_transitions(self) -> Self {
+        self.message_write::<ModStateTransitionRequest>()
+    }
 }
 
-/// Extension trait on [`GuestCommands`] for attaching `DespawnOnExit` / `DespawnOnEnter`
-/// state-scoped lifetime markers to spawned entities.
+/// Extension trait on [`SystemContext`] for requesting transitions on any dynamic `ModStateSlab`
+/// handle (`FreelyMutableState` or `SubStates`).
+pub trait GuestStateSlabContextExt {
+    /// Sends a [`ModStateTransitionRequest`] for `(state, target_discriminant)` on the
+    /// `MESSAGE_WRITE` stream declared at `decl_index`.
+    fn request_state_transition(
+        &mut self,
+        decl_index: usize,
+        state: ModStateHandle,
+        target_discriminant: u32,
+    ) -> FfiResult;
+}
+
+impl GuestStateSlabContextExt for SystemContext<'_> {
+    #[inline]
+    fn request_state_transition(
+        &mut self,
+        decl_index: usize,
+        state: ModStateHandle,
+        target_discriminant: u32,
+    ) -> FfiResult {
+        self.send_message(
+            decl_index,
+            &ModStateTransitionRequest::new(state, target_discriminant),
+        )
+    }
+}
+
+/// Extension trait on [`GuestCommands`] for attaching both legacy `DespawnOnExit`/`DespawnOnEnter`
+/// marker handles and unbounded `ModStateSlab` [`ModDespawnOnExit`]/[`ModDespawnOnEnter`]
+/// components.
 pub trait GuestCommandsStateExt {
-    /// Attaches a pre-resolved `DespawnOnExit` marker component (`exit_marker`) onto `entity`.
+    /// Attaches a pre-resolved legacy `DespawnOnExit` marker component (`exit_marker`) onto `entity`.
     fn despawn_on_exit(&mut self, entity: FfiEntity, exit_marker: BamComponent) -> FfiResult;
 
-    /// Attaches a pre-resolved `DespawnOnEnter` marker component (`enter_marker`) onto `entity`.
+    /// Attaches a pre-resolved legacy `DespawnOnEnter` marker component (`enter_marker`) onto `entity`.
     fn despawn_on_enter(&mut self, entity: FfiEntity, enter_marker: BamComponent) -> FfiResult;
+
+    /// Attaches a dynamic [`ModDespawnOnExit`] component for `(state, discriminant)` onto `entity`.
+    fn despawn_on_exit_slab(
+        &mut self,
+        entity: FfiEntity,
+        state: ModStateHandle,
+        discriminant: u32,
+    ) -> FfiResult;
+
+    /// Attaches a dynamic [`ModDespawnOnEnter`] component for `(state, discriminant)` onto `entity`.
+    fn despawn_on_enter_slab(
+        &mut self,
+        entity: FfiEntity,
+        state: ModStateHandle,
+        discriminant: u32,
+    ) -> FfiResult;
 }
 
 impl GuestCommandsStateExt for GuestCommands<'_> {
@@ -277,10 +423,30 @@ impl GuestCommandsStateExt for GuestCommands<'_> {
     fn despawn_on_enter(&mut self, entity: FfiEntity, enter_marker: BamComponent) -> FfiResult {
         self.insert_default(entity, enter_marker)
     }
+
+    #[inline]
+    fn despawn_on_exit_slab(
+        &mut self,
+        entity: FfiEntity,
+        state: ModStateHandle,
+        discriminant: u32,
+    ) -> FfiResult {
+        self.insert_component(entity, &ModDespawnOnExit::new(state, discriminant))
+    }
+
+    #[inline]
+    fn despawn_on_enter_slab(
+        &mut self,
+        entity: FfiEntity,
+        state: ModStateHandle,
+        discriminant: u32,
+    ) -> FfiResult {
+        self.insert_component(entity, &ModDespawnOnEnter::new(state, discriminant))
+    }
 }
 
-/// Extension trait on [`QueryBuilder`] adding bridged `State<S>` and `ModNextState<S>` resource
-/// terms.
+/// Extension trait on [`QueryBuilder`] adding bridged `State<S>`, `ModNextState<S>`, and dynamic
+/// `ModStateEntry` terms.
 pub trait GuestStateQueryBuilderExt {
     /// Appends a shared resource read (`Res<State<S>>`) term using `bridge`.
     fn read_state(self, bridge: &GuestStateBridge) -> Self;
@@ -290,6 +456,9 @@ pub trait GuestStateQueryBuilderExt {
     fn read_primary_state(self) -> Self;
     /// Appends an exclusive resource write (`ResMut<ModNextState<S>>`) term for primary slot `0`.
     fn write_primary_next_state(self) -> Self;
+    /// Appends a shared read (`&ModStateEntry`) term covering all dynamic `States`, `SubStates`,
+    /// and `ComputedStates` entries in host `ModStateSlab`.
+    fn read_state_entries(self) -> Self;
 }
 
 impl GuestStateQueryBuilderExt for QueryBuilder<'_> {
@@ -320,10 +489,19 @@ impl GuestStateQueryBuilderExt for QueryBuilder<'_> {
             AccessMode::RESOURCE_WRITE,
         )
     }
+
+    #[inline]
+    fn read_state_entries(self) -> Self {
+        self.term_named(
+            ModStateEntry::NAME,
+            Some(ModStateEntry::UUID),
+            AccessMode::READ,
+        )
+    }
 }
 
-/// Bundled state bridge + pre-resolved `DespawnOnExit` / `DespawnOnEnter` marker handles
-/// (`0..variant_count`) for one host-exposed state slot.
+/// Bundled state bridge + pre-resolved legacy `DespawnOnExit` / `DespawnOnEnter` marker handles
+/// (`0..variant_count`) for primary state slot `0`.
 #[derive(Clone)]
 pub struct GuestStateHandles {
     /// Resolved state VTable and resource handle bridge.
@@ -374,6 +552,9 @@ impl GuestStateHandles {
 mod tests {
     use super::*;
 
+    /// Scenario: Verifies that `on_enter_schedule`, `on_exit_schedule`, and
+    /// `on_transition_schedule` compute deterministic `ScheduleId::custom(...)` offsets matching
+    /// the host's contiguous state-transition layout.
     #[test]
     fn deterministic_state_schedule_ids_match_host_layout() {
         let base = ScheduleId::custom(2000);

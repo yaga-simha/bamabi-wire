@@ -1,8 +1,17 @@
+//! Codegen accessor specification for Rust `bool` fields exposed via `FfiBool`.
+
 use crate::codegen::{AccessorSpec, ReceiverKind, SlotSpec};
 use proc_macro2::{Span, TokenStream};
 use quote::{quote, quote_spanned};
 use syn::Type;
 
+/// Builds the [`AccessorSpec`] (`get_<field>`, `set_<field>`) for a Rust `bool` field.
+///
+/// Intended purpose: prevents invalid bit-pattern UB (`2..=255`) across `extern "C"` by
+/// marshaling Rust `bool` fields through `FfiBool` (`u8`) and excluding `RawInsertable`/`AbiPod`.
+///
+/// What it does: emits a `__BamPrimBool` compile-time type guard (preventing spoofed `bool`
+/// aliases) and generates `get` (`-> FfiBool`) and `set` (`FfiBool -> FfiResult`) VTable slots.
 pub(crate) fn spec(
     sys_crate: &TokenStream,
     member_tokens: &TokenStream,

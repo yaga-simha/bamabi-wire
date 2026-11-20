@@ -656,6 +656,8 @@ static void mock_guest_shutdown(BamInstance* instance) {
  * Test Suites
  * ========================================================================== */
 
+/* Scenario: Verifies ABI 0.3.0 version packing/compatibility rules, `bam_result_name` strings,
+ * relation/schedule-set flag bitmasks, and `BamStrView` construction (including NULL input). */
 static void test_versions_and_result_names(void) {
     assert(BAM_ABI_VERSION == 0x00030000u);
     assert(bam_version_major(BAM_ABI_VERSION) == 0u);
@@ -693,6 +695,8 @@ static void test_versions_and_result_names(void) {
     }
 }
 
+/* Scenario: Verifies C99 `bam_uuid_from_parts` and `bam_uuid_from_canonical_name` produce exact
+ * byte-for-byte golden SipHash-2-4 digests matching Rust `bamabi_sys::ComponentUuid`. */
 static void test_cross_language_siphash_uuids(void) {
     /* Exact 16-byte golden digests produced by `bamabi_sys::ComponentUuid::from_parts` */
     static const uint8_t expected_health_uuid[16] = {
@@ -714,6 +718,8 @@ static void test_cross_language_siphash_uuids(void) {
     assert(bam_uuid_equals(c_health, c_health));
 }
 
+/* Scenario: Verifies `bam_host_api_copy_bounded` zero-fills trailing future slots when copying
+ * an older host table into a larger guest struct, and rejects under-sized tables with INVALID_VERSION. */
 static void test_extensible_host_api_copy_bounded(void) {
     typedef struct FutureGuestHostApiV03 {
         BamHostApi v0_2;
@@ -747,6 +753,9 @@ static void test_extensible_host_api_copy_bounded(void) {
     );
 }
 
+/* Scenario: Runs a full C99 mod lifecycle (manifest check, `init`, component/system registration,
+ * custom VTable lookup, `last_error` reporting, `run_if`, chunk iteration, untracked mutation +
+ * `mark_changed_range`, batched `cmd_spawn`, drop hook, and `shutdown`). */
 static void test_end_to_end_c99_lifecycle_and_vtable(void) {
     BamManifestFn manifest_fn = mock_guest_manifest;
     BamInitFn init_fn = mock_guest_init;
@@ -875,6 +884,8 @@ static BamResult mock_observer_cb(BamEntity target_entity, const void* event_dat
     return BAM_RESULT_OK;
 }
 
+/* Scenario: Verifies `BamChildOf` layout/UUID, `BamChangeTicks` wraparound detection, dynamic
+ * layout registration helper, 64-bit entity packing in `BamObserverDesc`, and `SystemDesc.in_sets`. */
 static void test_hierarchy_ticks_layout_and_observer_descriptors(void) {
     BamChildOf child_of;
     BamChangeTicks ticks;
@@ -986,6 +997,9 @@ static BamResult mock_mut_observer_cb(
     return BAM_RESULT_OK;
 }
 
+/* Scenario: Verifies ABI 0.3.0 extended wire types (`BAM_OPTION_STRUCT`, `BamAssetHandle`,
+ * `BamAccessMode` ALLOW/HAS/REMOVED_READ, `or_group`, extended `BamComponentDesc`/`BamObserverDesc`/
+ * `BamTriggerDesc`/`BamSystemDesc`, and all 68 `BamHostApi` slots + `covers_slot` checks). */
 static void test_extended_wire_descriptors(void) {
     BamOptionU32 opt_u32;
     BamOptionEntity opt_ent;
@@ -1073,6 +1087,29 @@ static void test_extended_wire_descriptors(void) {
 
     /* 6. Extended BamSystemDesc & 68-slot BamHostApi */
     assert(strcmp(BAM_CHILDREN_NAME, "bevy_ecs::hierarchy::Children") == 0);
+    assert(strcmp(BAM_DISABLED_NAME, "bevy_ecs::entity_disabling::Disabled") == 0);
+    assert(bam_uuid_equals(
+        bam_disabled_uuid(),
+        bam_uuid_from_canonical_name(BAM_DISABLED_NAME)
+    ));
+    assert(!bam_entity_is_valid(BAM_ENTITY_NULL));
+    assert(bam_entity_is_valid(1ull));
+    assert(bam_asset_load_state_is_not_loaded(BAM_ASSET_LOAD_STATE_NOT_LOADED));
+    assert(bam_asset_load_state_is_loading(BAM_ASSET_LOAD_STATE_LOADING));
+    assert(bam_asset_load_state_is_loaded(BAM_ASSET_LOAD_STATE_LOADED));
+    assert(bam_asset_load_state_is_failed(BAM_ASSET_LOAD_STATE_FAILED));
+    assert(!bam_event_kind_is_lifecycle(BAM_EVENT_KIND_CUSTOM));
+    assert(bam_event_kind_is_lifecycle(BAM_EVENT_KIND_ADD));
+    assert(bam_event_kind_is_lifecycle(BAM_EVENT_KIND_READY));
+    assert(!bam_event_kind_is_lifecycle(99u));
+    assert(bam_schedule_is_valid(BAM_SCHEDULE_UPDATE));
+    assert(bam_schedule_is_valid(BAM_SCHEDULE_LAST));
+    assert(!bam_schedule_is_valid(6u));
+    assert(!bam_schedule_is_valid(1023u));
+    assert(bam_schedule_is_valid(BAM_SCHEDULE_CUSTOM_BASE));
+    assert(bam_field_kind_is_valid(BAM_FIELD_KIND_F32));
+    assert(bam_field_kind_is_valid(BAM_FIELD_KIND_OPAQUE));
+    assert(!bam_field_kind_is_valid(99u));
     memset(&sys_desc, 0, sizeof(sys_desc));
     sys_desc.struct_size = (uint32_t)sizeof(BamSystemDesc);
     sys_desc.flags = BAM_SYSTEM_FLAG_AMBIGUOUS_WITH_ALL;

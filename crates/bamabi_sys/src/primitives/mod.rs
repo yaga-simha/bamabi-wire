@@ -11,8 +11,8 @@ pub use self::{
     asset::{FfiAssetHandle, FfiAssetLoadState},
     bool::FfiBool,
     entity::{
-        BAM_CHILD_OF_NAME, BAM_CHILDREN_NAME, BamComponent, BamSymbol, BamSystem, BamSystemSet,
-        FfiChildOf, FfiEntity,
+        BAM_CHILD_OF_NAME, BAM_CHILDREN_NAME, BAM_DISABLED_NAME, BamComponent, BamSymbol,
+        BamSystem, BamSystemSet, FfiChildOf, FfiDisabled, FfiEntity,
     },
     option::FfiOption,
     slice::{FfiSlice, StrView},

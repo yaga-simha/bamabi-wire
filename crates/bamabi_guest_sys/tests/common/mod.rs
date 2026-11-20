@@ -11,6 +11,9 @@ use bamabi_sys::{
     FfiEntity, FfiResult, RawInsertable, VTableHeader, pack_abi_version,
 };
 
+/// `#[repr(C)]` POD component with 3 bytes of natural alignment padding between `tag` and `val`,
+/// used to verify under Miri that raw-pointer command copies do not read uninitialized padding as
+/// `&[u8]`.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct PaddedPod {
@@ -23,6 +26,7 @@ unsafe impl RawInsertable for PaddedPod {}
 // SAFETY: Deterministic C layout and all fields are `AbiPod`.
 unsafe impl AbiPod for PaddedPod {}
 
+/// Minimal `#[repr(C)]` test VTable prefixed by [`VTableHeader`] for `Host::resolve_vtable` tests.
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub struct DummyVTable {
@@ -30,6 +34,7 @@ pub struct DummyVTable {
     pub getter: Option<unsafe extern "C" fn(*const c_void) -> u32>,
 }
 
+/// Stub VTable getter callback returning `42`.
 pub unsafe extern "C" fn dummy_getter(_ptr: *const c_void) -> u32 {
     42
 }
@@ -65,16 +70,19 @@ pub static WRONG_VERSION_VTABLE: DummyVTable = DummyVTable {
     getter: Some(dummy_getter),
 };
 
+/// Stub custom `"bam.v0.math.add10"` host function returning `x + 10`.
 pub unsafe extern "C" fn custom_math_fn(x: u32) -> u32 {
     x + 10
 }
 
+/// Minimal mock world backing `BamHostCtx`, `BamLoadCtx`, and `BamCommands` pointers in unit tests.
 pub struct MockWorldCtx {
     pub error_msg: &'static [u8],
     pub spawned: usize,
     pub last_inserted_val: u32,
 }
 
+/// Mock `get_proc_address` exporting valid, truncated, and version-mismatched VTables plus `add10`.
 pub unsafe extern "C" fn stub_get_proc_address(
     _ctx: *const BamHostCtx,
     name: *const c_char,
@@ -92,6 +100,7 @@ pub unsafe extern "C" fn stub_get_proc_address(
     }
 }
 
+/// Mock `last_error` implementing the `snprintf`-style two-pass sizing contract over `MockWorldCtx`.
 pub unsafe extern "C" fn stub_last_error(
     ctx: *const BamHostCtx,
     buf: *mut c_char,
@@ -112,10 +121,12 @@ pub unsafe extern "C" fn stub_last_error(
     msg.len()
 }
 
+/// Mock `load_host_ctx` reinterpreting `load_ctx` as `*const BamHostCtx`.
 pub unsafe extern "C" fn stub_load_host_ctx(load_ctx: *const BamLoadCtx) -> *const BamHostCtx {
     load_ctx.cast::<BamHostCtx>()
 }
 
+/// Mock `register_component` assigning handle `1`.
 pub unsafe extern "C" fn stub_register_component(
     _load_ctx: *mut BamLoadCtx,
     desc: *const ComponentDesc,
@@ -128,6 +139,7 @@ pub unsafe extern "C" fn stub_register_component(
     FfiResult::OK
 }
 
+/// Mock `resolve_component` returning handle `2`.
 pub unsafe extern "C" fn stub_resolve_component(
     _ctx: *const BamHostCtx,
     _name: *const c_char,
@@ -138,6 +150,7 @@ pub unsafe extern "C" fn stub_resolve_component(
     FfiResult::OK
 }
 
+/// Mock `register_system` validating `desc` via [`BamSystemDesc::validate`].
 pub unsafe extern "C" fn stub_register_system(
     _load_ctx: *mut BamLoadCtx,
     desc: *const BamSystemDesc,
@@ -148,10 +161,12 @@ pub unsafe extern "C" fn stub_register_system(
     unsafe { (*desc).validate() }
 }
 
+/// Mock `sys_host_ctx` reinterpreting `sys_ctx` as `*const BamHostCtx`.
 pub unsafe extern "C" fn stub_sys_host_ctx(sys_ctx: *const BamSystemCtx) -> *const BamHostCtx {
     sys_ctx.cast::<BamHostCtx>()
 }
 
+/// Mock `sys_query` returning a null iterator handle.
 pub unsafe extern "C" fn stub_sys_query(
     _sys_ctx: *mut BamSystemCtx,
     _query_index: usize,
@@ -161,6 +176,7 @@ pub unsafe extern "C" fn stub_sys_query(
     FfiResult::OK
 }
 
+/// Mock `sys_commands` aliasing `sys_ctx` as `*mut BamCommands`.
 pub unsafe extern "C" fn stub_sys_commands(
     sys_ctx: *mut BamSystemCtx,
     out_commands: *mut *mut BamCommands,
@@ -169,6 +185,7 @@ pub unsafe extern "C" fn stub_sys_commands(
     FfiResult::OK
 }
 
+/// Mock `iter_next_chunk` reporting immediate exhaustion.
 pub unsafe extern "C" fn stub_iter_next_chunk(
     _iter: *mut BamIter,
     _out_len: *mut usize,
@@ -176,22 +193,27 @@ pub unsafe extern "C" fn stub_iter_next_chunk(
     FfiBool::FALSE
 }
 
+/// Mock `iter_reset` no-op returning `OK`.
 pub unsafe extern "C" fn stub_iter_reset(_iter: *mut BamIter) -> FfiResult {
     FfiResult::OK
 }
 
+/// Mock `iter_entities` returning null.
 pub unsafe extern "C" fn stub_iter_entities(_iter: *const BamIter) -> *const FfiEntity {
     core::ptr::null()
 }
 
+/// Mock `iter_column_readonly` returning null.
 pub unsafe extern "C" fn stub_iter_col_ro(_iter: *const BamIter, _idx: usize) -> *const u8 {
     core::ptr::null()
 }
 
+/// Mock `iter_column_mutable` / `iter_column_mutable_untracked` returning null.
 pub unsafe extern "C" fn stub_iter_col_mut(_iter: *mut BamIter, _idx: usize) -> *mut u8 {
     core::ptr::null_mut()
 }
 
+/// Mock `iter_mark_changed_range` no-op returning `OK`.
 pub unsafe extern "C" fn stub_iter_mark_changed(
     _iter: *mut BamIter,
     _idx: usize,
@@ -201,14 +223,17 @@ pub unsafe extern "C" fn stub_iter_mark_changed(
     FfiResult::OK
 }
 
+/// Mock `iter_column_rows_readonly` returning null.
 pub unsafe extern "C" fn stub_iter_rows_ro(_iter: *mut BamIter, _idx: usize) -> *const *const u8 {
     core::ptr::null()
 }
 
+/// Mock `iter_column_rows_mutable` returning null.
 pub unsafe extern "C" fn stub_iter_rows_mut(_iter: *mut BamIter, _idx: usize) -> *const *mut u8 {
     core::ptr::null()
 }
 
+/// Mock `iter_column_info` returning `OUT_OF_RANGE`.
 pub unsafe extern "C" fn stub_iter_col_info(
     _iter: *const BamIter,
     _idx: usize,
@@ -217,14 +242,17 @@ pub unsafe extern "C" fn stub_iter_col_info(
     FfiResult::OUT_OF_RANGE
 }
 
+/// Mock `res_ptr` returning null.
 pub unsafe extern "C" fn stub_res_ptr(_iter: *const BamIter, _idx: usize) -> *const u8 {
     core::ptr::null()
 }
 
+/// Mock `res_mut_ptr` returning null.
 pub unsafe extern "C" fn stub_res_mut_ptr(_iter: *mut BamIter, _idx: usize) -> *mut u8 {
     core::ptr::null_mut()
 }
 
+/// Mock `cmd_spawn_empty` incrementing `MockWorldCtx::spawned` and returning its entity ID.
 pub unsafe extern "C" fn stub_cmd_spawn_empty(
     cmds: *mut BamCommands,
     out_entity: *mut FfiEntity,
@@ -235,6 +263,8 @@ pub unsafe extern "C" fn stub_cmd_spawn_empty(
     FfiResult::OK
 }
 
+/// Mock `cmd_spawn` copying the first `PaddedPod` entry via raw `copy_nonoverlapping` into
+/// `MaybeUninit<PaddedPod>` and recording `last_inserted_val`.
 pub unsafe extern "C" fn stub_cmd_spawn(
     cmds: *mut BamCommands,
     _comps: *const BamComponent,
@@ -260,10 +290,12 @@ pub unsafe extern "C" fn stub_cmd_spawn(
     FfiResult::OK
 }
 
+/// Mock `cmd_despawn` no-op returning `OK`.
 pub unsafe extern "C" fn stub_cmd_despawn(_cmds: *mut BamCommands, _e: FfiEntity) -> FfiResult {
     FfiResult::OK
 }
 
+/// Mock `cmd_insert` copying `PaddedPod` bytes via `copy_nonoverlapping` and recording `val`.
 pub unsafe extern "C" fn stub_cmd_insert(
     cmds: *mut BamCommands,
     _e: FfiEntity,
@@ -281,6 +313,7 @@ pub unsafe extern "C" fn stub_cmd_insert(
     FfiResult::OK
 }
 
+/// Mock `cmd_insert_default` no-op returning `OK`.
 pub unsafe extern "C" fn stub_cmd_insert_default(
     _cmds: *mut BamCommands,
     _e: FfiEntity,
@@ -289,6 +322,7 @@ pub unsafe extern "C" fn stub_cmd_insert_default(
     FfiResult::OK
 }
 
+/// Mock `cmd_remove` no-op returning `OK`.
 pub unsafe extern "C" fn stub_cmd_remove(
     _cmds: *mut BamCommands,
     _e: FfiEntity,
@@ -297,6 +331,7 @@ pub unsafe extern "C" fn stub_cmd_remove(
     FfiResult::OK
 }
 
+/// Mock `component_layout_info` reporting `PaddedPod`'s `(size, align, uuid)` for handle `1`.
 pub unsafe extern "C" fn stub_component_layout_info_padded(
     _ctx: *const BamHostCtx,
     comp: BamComponent,

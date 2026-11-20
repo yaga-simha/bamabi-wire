@@ -44,6 +44,11 @@ pub(crate) enum FieldKind {
     },
 }
 
+/// Returns `true` if `ty` syntactically spells `target` either unqualified (e.g., `bool`) or
+/// qualified under `core::primitive::<target>` / `std::primitive::<target>`.
+///
+/// Intended purpose: supports syntactic classification in [`classify_type`] without false positives
+/// on unrelated paths while compile-time trait guards enforce the actual type identity.
 fn match_unqualified_or_std_primitive(ty: &Type, target: &str) -> bool {
     if let Type::Path(tp) = ty
         && tp.qself.is_none()
@@ -228,8 +233,9 @@ pub(crate) fn classify_type(ty: &Type, attr_override: FieldAttrOverride) -> syn:
                     (
                         PathArguments::None,
                         "f32" | "f64" | "i8" | "i16" | "i32" | "i64" | "u8" | "u16" | "u32" | "u64"
-                        | "FfiBool" | "FfiEntity" | "TargetEntity" | "BamComponent"
-                        | "ComponentUuid",
+                        | "FfiBool" | "FfiEntity" | "TargetEntity" | "BamComponent" | "BamSystem"
+                        | "BamSystemSet" | "BamSymbol" | "FfiAssetLoadState" | "BamEventKind"
+                        | "BamFieldKind" | "ComponentUuid",
                     ) => {
                         return Ok(FieldKind::Primitive {
                             ty: boxed_ty(),

@@ -1,3 +1,5 @@
+//! Unified `#[derive(ModComponent)]` code-generation pipeline (VTables, C/Zig headers, and witnesses).
+
 mod bool;
 pub(crate) mod c_decl;
 mod enums;
@@ -120,6 +122,11 @@ pub(crate) struct AccessorSpec {
     pub(crate) slots: Vec<SlotSpec>,
 }
 
+/// Field reflection metadata collected for emitting `ModComponent::BAM_FIELDS` (`BamFieldDesc`).
+///
+/// Intended purpose: preserves each field's name, canonical type tag, `BamFieldKind` variant,
+/// and member token so `vtable.rs` can synthesize `offset_of!` reflection descriptors and
+/// FNV-1a `SCHEMA_FINGERPRINT` constants.
 pub(crate) struct BamFieldMeta {
     pub(crate) name: String,
     pub(crate) type_tag: String,
@@ -128,6 +135,7 @@ pub(crate) struct BamFieldMeta {
     pub(crate) field_ty: syn::Type,
 }
 
+/// Returns `true` if `ty` spells primitive `target` either unqualified or under `core/std::primitive`.
 fn match_prim_ident(ty: &syn::Type, target: &str) -> bool {
     if let syn::Type::Path(tp) = ty
         && tp.qself.is_none()
@@ -148,6 +156,7 @@ fn match_prim_ident(ty: &syn::Type, target: &str) -> bool {
     false
 }
 
+/// Maps a classified [`FieldKind`] and field type to its `bamabi_sys::BamFieldKind` constant name.
 fn infer_bam_field_kind_ident(kind: &FieldKind, ty: &syn::Type) -> &'static str {
     match kind {
         FieldKind::Skip => "OPAQUE",
@@ -183,13 +192,15 @@ fn infer_bam_field_kind_ident(kind: &FieldKind, ty: &syn::Type) -> &'static str 
                 "ISIZE"
             } else if let syn::Type::Path(tp) = ty
                 && tp.qself.is_none()
-                && tp
-                    .path
-                    .segments
-                    .last()
-                    .is_some_and(|s| s.ident == "FfiBool")
+                && let Some(last) = tp.path.segments.last()
             {
-                "BOOL"
+                match last.ident.to_string().as_str() {
+                    "FfiBool" => "BOOL",
+                    "FfiEntity" | "TargetEntity" => "U64",
+                    "BamComponent" | "BamSystem" | "BamSystemSet" | "BamSymbol"
+                    | "FfiAssetLoadState" | "BamEventKind" | "BamFieldKind" => "U32",
+                    _ => "UNKNOWN",
+                }
             } else {
                 "UNKNOWN"
             }
@@ -197,6 +208,8 @@ fn infer_bam_field_kind_ident(kind: &FieldKind, ty: &syn::Type) -> &'static str 
     }
 }
 
+/// Accumulator holding all generated tokens, metadata, and collision-tracking sets during
+/// `#[derive(ModComponent)]` expansion for a single struct or enum.
 pub(crate) struct CodegenState {
     pub(crate) sys_crate: TokenStream,
     /// Present when `#[mod_component(..., guest)]` is enabled, holding the resolved path to `bamabi_guest`.
@@ -367,6 +380,11 @@ pub(crate) fn expand_mod_component(input: &DeriveInput) -> syn::Result<TokenStre
     expand_mod_component_with_crate(input, current_crate.as_deref())
 }
 
+/// Testable core implementation of [`expand_mod_component`] accepting an explicit crate name.
+///
+/// Intended purpose: drives the full `#[derive(ModComponent)]` pipeline—validating attributes
+/// and `#[repr(...)]`, dispatching enums to `enums::expand_enum_mod_component` or classifying
+/// struct fields, emitting VTable accessors, reflection witnesses, and C99/C++17/Zig declarations.
 pub(crate) fn expand_mod_component_with_crate(
     input: &DeriveInput,
     current_crate_name: Option<&str>,

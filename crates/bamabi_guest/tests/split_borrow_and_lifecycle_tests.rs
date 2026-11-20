@@ -12,6 +12,7 @@ use std::sync::{
 use bamabi_guest::prelude::*;
 use common::{MockChunkData, MockHostWorld, RecordedCommand};
 
+/// Fallback macro implementing `RawInsertable` and `AbiPod` for test structs without `derive`.
 #[cfg(not(feature = "derive"))]
 macro_rules! impl_pod_no_derive {
     ($($ty:ty),* $(,)?) => {
@@ -24,6 +25,7 @@ macro_rules! impl_pod_no_derive {
     };
 }
 
+/// 2D position test component (`sim::Pos`) for split-borrow and multi-query tests.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, PartialEq)]
 #[cfg_attr(feature = "derive", derive(AbiPod))]
@@ -36,6 +38,7 @@ impl GuestComponent for Pos {
     const NAME: &'static CStr = c"sim::Pos";
 }
 
+/// 2D velocity test component (`sim::Vel`) for split-borrow and multi-query tests.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, PartialEq)]
 #[cfg_attr(feature = "derive", derive(AbiPod))]
@@ -48,6 +51,7 @@ impl GuestComponent for Vel {
     const NAME: &'static CStr = c"sim::Vel";
 }
 
+/// 2D acceleration test component (`sim::Accel`) used as a read-only column and nested query.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, PartialEq)]
 #[cfg_attr(feature = "derive", derive(AbiPod))]
@@ -60,6 +64,7 @@ impl GuestComponent for Accel {
     const NAME: &'static CStr = c"sim::Accel";
 }
 
+/// Unqualified test counter component verifying automatic `<manifest_name>::` prefixing.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, PartialEq)]
 #[cfg_attr(feature = "derive", derive(AbiPod))]
@@ -67,6 +72,7 @@ struct LocalCounter {
     ticks: u32,
 }
 
+/// Layout-identical unqualified counter used to verify UUID-mismatch rejection against [`LocalCounter`].
 #[repr(C)]
 #[derive(Clone, Copy, Debug, PartialEq)]
 #[cfg_attr(feature = "derive", derive(AbiPod))]
@@ -90,12 +96,14 @@ impl GuestComponent for WrongCounter {
 static SHUTDOWN_EVENTS: Mutex<Vec<u32>> = Mutex::new(Vec::new());
 static NEXT_WORLD_TAG: AtomicUsize = AtomicUsize::new(1);
 
+/// Test `GuestPlugin` exported via `export_mod!` to verify multi-World instance isolation.
 struct IsolatedPlugin {
     world_tag: u32,
     local_ticks: Arc<AtomicUsize>,
 }
 
 impl Default for IsolatedPlugin {
+    /// Assigns a unique monotonically increasing `world_tag` for each instantiated World.
     fn default() -> Self {
         let tag = NEXT_WORLD_TAG.fetch_add(1, Ordering::SeqCst) as u32;
         Self {
@@ -109,6 +117,8 @@ impl GuestPlugin for IsolatedPlugin {
     const NAME: &'static CStr = c"isolated_plugin";
     const VERSION: &'static CStr = c"0.2.0";
 
+    /// Registers `LocalCounter` and a ticking system that exercises auto-prefixed views, UUID
+    /// rejection, and deferred component commands.
     fn build(&mut self, app: &mut GuestApp<'_>) -> FfiResult {
         let counter_h = match app.register_component::<LocalCounter>() {
             Ok(h) => h,
@@ -195,6 +205,7 @@ impl GuestPlugin for IsolatedPlugin {
             })
     }
 
+    /// Records `world_tag * 1000 + total_ticks` in `SHUTDOWN_EVENTS` to assert isolated teardown.
     fn on_shutdown(&mut self) {
         let total = self.local_ticks.load(Ordering::SeqCst) as u32;
         SHUTDOWN_EVENTS
@@ -207,6 +218,9 @@ impl GuestPlugin for IsolatedPlugin {
 // Export real ABI v0.2 C entry points in this integration test binary.
 export_mod!(plugin: IsolatedPlugin);
 
+/// Scenario: Loads the same `export_mod!`-generated C entry points into two independent
+/// `MockHostWorld` instances simultaneously, verifies manifest metadata, auto-prefixed component
+/// resolution, independent ticking, and that shutting down World A leaves World B running cleanly.
 #[test]
 fn export_mod_manifest_and_multi_world_instance_isolation() {
     SHUTDOWN_EVENTS.lock().unwrap().clear();
@@ -307,6 +321,9 @@ fn export_mod_manifest_and_multi_world_instance_isolation() {
     assert_eq!(*SHUTDOWN_EVENTS.lock().unwrap(), vec![1003, 2002]);
 }
 
+/// Scenario: Exercises multi-query `queries_2_and_commands`, split mutable/shared chunk borrows
+/// (`component_write_2`, `entities_and_component_read_write`), aliasing rejections on duplicate
+/// column indices or handles, and nested inner-query `reset()` for N x M iteration.
 #[test]
 fn split_borrows_and_multi_query_nested_reset_enforce_disjointness() {
     let mut world = MockHostWorld::new();
@@ -402,6 +419,9 @@ fn split_borrows_and_multi_query_nested_reset_enforce_disjointness() {
     world.unload_instance(inst);
 }
 
+/// Scenario: Verifies that unqualified `GuestComponent` names auto-prefix with the current mod's
+/// manifest across sparse-set columns and singleton resources, while rejecting columns belonging
+/// to another mod (`other_mod::LocalCounter`) despite identical byte layout.
 #[test]
 fn unqualified_guest_component_sparse_resource_and_cross_mod_rejection() {
     use bamabi_guest::raw::BAM_COMPONENT_FLAG_SPARSE_SET;

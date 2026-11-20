@@ -1,8 +1,18 @@
+//! Codegen accessor specification for host-owned `std::vec::Vec<T>` fields (`T: AbiPod`).
+
 use crate::codegen::{AccessorSpec, ReceiverKind, SlotSpec};
 use proc_macro2::{Span, TokenStream};
 use quote::{quote, quote_spanned};
 use syn::Type;
 
+/// Builds the [`AccessorSpec`] for a host-owned `Vec<T>` field (`T: AbiPod`).
+///
+/// Intended purpose: preserves strict host allocator ownership over `Vec<T>` buffers while giving
+/// guests full slice inspection and alias-safe mutation across `extern "C"`.
+///
+/// What it does: emits `__BamStdVec<Elem>` anti-spoofing and `assert_abi_pod::<Elem>()` guards,
+/// excludes `RawInsertable`/`AbiPod`, and generates 11 VTable slots (`get`, `set`, `len`, `clear`,
+/// `push`, `pop`, `remove`, `swap_remove`, `truncate`, `reserve`, `as_mut_slice`).
 pub(crate) fn spec(
     sys_crate: &TokenStream,
     member_tokens: &TokenStream,

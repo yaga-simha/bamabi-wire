@@ -7,7 +7,7 @@ use bamabi_guest_sys::{
 };
 use bamabi_sys::{
     AbiPod, BamChangeTicks, BamComponent, BamHostApi, BamSystemCtx, ComponentUuid, FfiEntity,
-    FfiResult, MAX_QUERIES_PER_SYSTEM,
+    FfiResult, MAX_QUERIES_PER_SYSTEM, ModComponent,
 };
 
 use crate::{
@@ -27,6 +27,7 @@ pub struct RunConditionContext<'a> {
 }
 
 impl<'a> RunConditionContext<'a> {
+    /// Wraps a validated world-scoped [`Host`] reference for a single run-condition evaluation.
     #[inline]
     pub(crate) const fn new(host: &'a Host) -> Self {
         Self { host }
@@ -124,6 +125,7 @@ impl<'a, R> GuestRes<'a, R> {
 impl<R> core::ops::Deref for GuestRes<'_, R> {
     type Target = R;
 
+    /// Borrows the underlying singleton resource value `&R`.
     #[inline]
     fn deref(&self) -> &Self::Target {
         self.value
@@ -165,6 +167,7 @@ impl<'a, R> GuestResMut<'a, R> {
 impl<R> core::ops::Deref for GuestResMut<'_, R> {
     type Target = R;
 
+    /// Borrows the underlying singleton resource value `&R`.
     #[inline]
     fn deref(&self) -> &Self::Target {
         self.value
@@ -172,6 +175,7 @@ impl<R> core::ops::Deref for GuestResMut<'_, R> {
 }
 
 impl<R> core::ops::DerefMut for GuestResMut<'_, R> {
+    /// Mutably borrows the underlying singleton resource value `&mut R`.
     #[inline]
     fn deref_mut(&mut self) -> &mut Self::Target {
         self.value
@@ -179,6 +183,8 @@ impl<R> core::ops::DerefMut for GuestResMut<'_, R> {
 }
 
 impl<'a> SystemContext<'a> {
+    /// Constructs a [`SystemContext`] by extracting the validated system reference, declared query
+    /// slots, optional system-level resource query slot, and deferred command buffer from `inv`.
     pub(crate) fn from_invocation(inv: &mut ValidatedSystemInvocation<'a>) -> Self {
         let host = inv.host();
         let sys_ref = inv
@@ -280,6 +286,18 @@ impl<'a> SystemContext<'a> {
         }
     }
 
+    /// Simultaneously borrows three distinct queries `idx_a`, `idx_b`, and `idx_c` (`None` if any
+    /// two indices are equal or any index is out of range).
+    pub fn queries_3_mut(
+        &mut self,
+        idx_a: usize,
+        idx_b: usize,
+        idx_c: usize,
+    ) -> Option<(&mut ChunkIter<'a>, &mut ChunkIter<'a>, &mut ChunkIter<'a>)> {
+        let (a, b, c, _) = self.queries_3_and_commands(idx_a, idx_b, idx_c)?;
+        Some((a, b, c))
+    }
+
     /// Borrows the deferred [`GuestCommands`] buffer mutably.
     #[inline]
     pub fn commands(&mut self) -> &mut GuestCommands<'a> {
@@ -321,6 +339,60 @@ impl<'a> SystemContext<'a> {
         }
     }
 
+    /// Simultaneously borrows three distinct queries `idx_a`, `idx_b`, and `idx_c` alongside
+    /// [`GuestCommands`].
+    #[allow(clippy::type_complexity)]
+    pub fn queries_3_and_commands(
+        &mut self,
+        idx_a: usize,
+        idx_b: usize,
+        idx_c: usize,
+    ) -> Option<(
+        &mut ChunkIter<'a>,
+        &mut ChunkIter<'a>,
+        &mut ChunkIter<'a>,
+        &mut GuestCommands<'a>,
+    )> {
+        if idx_a == idx_b
+            || idx_b == idx_c
+            || idx_a == idx_c
+            || idx_a >= self.user_query_count
+            || idx_b >= self.user_query_count
+            || idx_c >= self.user_query_count
+        {
+            return None;
+        }
+        let mut order = [(idx_a, 0u8), (idx_b, 1u8), (idx_c, 2u8)];
+        order.sort_unstable_by_key(|&(idx, _)| idx);
+        let (i0, p0) = order[0];
+        let (i1, p1) = order[1];
+        let (i2, p2) = order[2];
+        let cmds = &mut self.commands;
+        let (s0, rest1) = self.queries.split_at_mut(i1);
+        let (s1, s2) = rest1.split_at_mut(i2 - i1);
+        let r0 = s0[i0].as_mut()?;
+        let r1 = s1[0].as_mut()?;
+        let r2 = s2[0].as_mut()?;
+        let ordered = match (p0, p1, p2) {
+            (0, 1, 2) => (r0, r1, r2),
+            (0, 2, 1) => (r0, r2, r1),
+            (1, 0, 2) => (r1, r0, r2),
+            (1, 2, 0) => (r2, r0, r1),
+            (2, 0, 1) => (r1, r2, r0),
+            (2, 1, 0) => (r2, r1, r0),
+            _ => return None,
+        };
+        Some((ordered.0, ordered.1, ordered.2, cmds))
+    }
+
+    /// Mutably borrows the dedicated system-level resource query iterator, if one was registered.
+    #[inline]
+    pub(crate) fn resource_query_mut(&mut self) -> Option<&mut ChunkIter<'a>> {
+        self.resource_query.as_mut()
+    }
+
+    /// Returns the iterator holding system-level resources/messages (preferring the dedicated
+    /// `resource_query` slot, or falling back to primary query `0`).
     #[inline]
     fn resource_iter(&self) -> Option<&ChunkIter<'a>> {
         self.resource_query
@@ -328,6 +400,7 @@ impl<'a> SystemContext<'a> {
             .or_else(|| self.queries.first().and_then(Option::as_ref))
     }
 
+    /// Mutable variant of [`Self::resource_iter`] for exclusive resource and message-writer access.
     #[inline]
     fn resource_iter_mut(&mut self) -> Option<&mut ChunkIter<'a>> {
         self.resource_query
@@ -479,6 +552,23 @@ impl<'a> SystemContext<'a> {
         Some((qa.typed::<Q1>(), qb.typed::<Q2>()))
     }
 
+    /// Simultaneously borrows three distinct queries as [`TypedChunkIter`]s.
+    #[inline]
+    #[allow(clippy::type_complexity)]
+    pub fn queries_3_typed<Q1: QueryTuple, Q2: QueryTuple, Q3: QueryTuple>(
+        &mut self,
+        idx_a: usize,
+        idx_b: usize,
+        idx_c: usize,
+    ) -> Option<(
+        TypedChunkIter<'_, 'a, Q1>,
+        TypedChunkIter<'_, 'a, Q2>,
+        TypedChunkIter<'_, 'a, Q3>,
+    )> {
+        let (qa, qb, qc) = self.queries_3_mut(idx_a, idx_b, idx_c)?;
+        Some((qa.typed::<Q1>(), qb.typed::<Q2>(), qc.typed::<Q3>()))
+    }
+
     /// Looks up a shared `&T` (`T: GuestComponent`) on `entity` using declared access on
     /// `(query_index, term_index)`, verifying `T`'s UUID.
     #[inline]
@@ -564,6 +654,60 @@ impl<'a> SystemContext<'a> {
         )
     }
 
+    /// Looks up a shared `&T` for a same-mod dynamic [`ModComponent`] on `entity` using declared
+    /// access on `(query_index, term_index)`, verifying layout, UUID, and same-mod VTable
+    /// provenance.
+    #[inline]
+    pub fn get_dynamic<T: ModComponent>(
+        &self,
+        query_index: usize,
+        term_index: usize,
+        entity: FfiEntity,
+    ) -> Option<&T> {
+        if query_index >= self.user_query_count {
+            return None;
+        }
+        let q = self.queries[query_index].as_ref()?;
+        self.sys_ref
+            .entity_get_dynamic_checked::<T>(&q.inner, query_index, term_index, entity)
+    }
+
+    /// Looks up an exclusive `&mut T` for a same-mod dynamic [`ModComponent`] on `entity` using
+    /// declared writable access on `(query_index, term_index)`, marking Bevy change ticks.
+    #[inline]
+    pub fn get_dynamic_mut<T: ModComponent>(
+        &mut self,
+        query_index: usize,
+        term_index: usize,
+        entity: FfiEntity,
+    ) -> Option<&mut T> {
+        if query_index >= self.user_query_count {
+            return None;
+        }
+        let q = self.queries[query_index].as_mut()?;
+        self.sys_ref.entity_get_dynamic_mut_checked::<T>(
+            &mut q.inner,
+            query_index,
+            term_index,
+            entity,
+        )
+    }
+
+    /// Looks up shared `&T` (`T: GuestComponent`) references for `N` entities simultaneously
+    /// (mirroring Bevy's `Query::get_many`), returning `None` if any entity does not carry `T`.
+    pub fn get_many<const N: usize, T: GuestComponent>(
+        &self,
+        query_index: usize,
+        term_index: usize,
+        entities: [FfiEntity; N],
+    ) -> Option<[&T; N]> {
+        let mut refs = Vec::with_capacity(N);
+        for entity in entities {
+            refs.push(self.get::<T>(query_index, term_index, entity)?);
+        }
+        refs.try_into().ok()
+    }
+
     /// Drains unread messages (`M: GuestComponent`) declared at `decl_index`, validating `M`'s UUID.
     #[inline]
     pub fn read_messages<M: GuestComponent>(
@@ -614,5 +758,57 @@ impl<'a> SystemContext<'a> {
         self.resource_iter_mut()
             .ok_or(FfiResult::OUT_OF_RANGE)?
             .send_messages::<M>(decl_index, messages)
+    }
+
+    /// Batch-appends POD `messages` (`M: AbiPod`) into the stream declared with `MESSAGE_WRITE`
+    /// at `decl_index`.
+    #[inline]
+    pub fn send_pod_messages<M: AbiPod>(
+        &mut self,
+        decl_index: usize,
+        messages: &[M],
+    ) -> Result<(), FfiResult> {
+        self.resource_iter_mut()
+            .ok_or(FfiResult::OUT_OF_RANGE)?
+            .send_pod_messages::<M>(decl_index, messages)
+    }
+
+    /// Drains unread VTable-backed non-POD messages (`M: ModComponent + Default`) declared at
+    /// `decl_index` (e.g. via [`SystemBuilder::message_read_dynamic`](crate::SystemBuilder::message_read_dynamic)).
+    #[inline]
+    pub fn read_non_pod_messages<M: ModComponent + Default>(
+        &mut self,
+        decl_index: usize,
+    ) -> Result<Vec<M>, FfiResult> {
+        self.resource_iter_mut()
+            .ok_or(FfiResult::OUT_OF_RANGE)?
+            .read_non_pod_messages::<M>(decl_index)
+    }
+
+    /// Reads up to `max_count` unread VTable-backed non-POD messages (`M: ModComponent + Default`)
+    /// declared at `decl_index`.
+    #[inline]
+    pub fn read_non_pod_messages_batch<M: ModComponent + Default>(
+        &mut self,
+        decl_index: usize,
+        max_count: usize,
+    ) -> Result<Vec<M>, FfiResult> {
+        self.resource_iter_mut()
+            .ok_or(FfiResult::OUT_OF_RANGE)?
+            .read_non_pod_messages_batch::<M>(decl_index, max_count)
+    }
+
+    /// Sends a VTable-backed non-POD message (`M: ModComponent`) to the stream declared with
+    /// `MESSAGE_WRITE` at `decl_index`.
+    #[inline]
+    pub fn send_non_pod_message<M: ModComponent>(
+        &mut self,
+        decl_index: usize,
+        msg: &M,
+    ) -> FfiResult {
+        match self.resource_iter_mut() {
+            Some(q) => q.send_non_pod_message::<M>(decl_index, msg),
+            None => FfiResult::OUT_OF_RANGE,
+        }
     }
 }

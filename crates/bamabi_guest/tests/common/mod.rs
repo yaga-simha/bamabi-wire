@@ -25,6 +25,7 @@ use bamabi_guest::raw::{
 };
 use bamabi_guest::{GuestApp, GuestPlugin, build_guest_fn, build_guest_plugin};
 
+/// Metadata for a component or resource registered in [`MockHostWorld`].
 #[derive(Clone)]
 pub struct RegisteredComp {
     pub handle: BamComponent,
@@ -41,6 +42,7 @@ pub struct RegisteredComp {
     pub hook_user_data: *mut c_void,
 }
 
+/// Log entry recording a deferred ECS command submitted to [`MockHostWorld`].
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum RecordedCommand {
     SpawnEmpty(FfiEntity),
@@ -64,6 +66,7 @@ pub enum RecordedCommand {
     },
 }
 
+/// Descriptor and callbacks for a guest system registered in [`MockHostWorld`].
 pub struct RegisteredSystem {
     pub name: String,
     pub queries: Vec<Vec<BamTermDesc>>,
@@ -77,6 +80,7 @@ pub struct RegisteredSystem {
     pub run_if_user_data: *mut c_void,
 }
 
+/// Simulated archetype chunk storing dense columns, sparse rows, and change-tracking flags.
 pub struct MockChunkData {
     pub entities: Vec<FfiEntity>,
     /// Dense columns keyed by `BamComponent` -> aligned raw byte buffer (`len * comp.size`).
@@ -90,6 +94,7 @@ pub struct MockChunkData {
 }
 
 impl MockChunkData {
+    /// Creates an empty mock chunk populated with the given `entities`.
     pub fn new(entities: Vec<FfiEntity>) -> Self {
         Self {
             entities,
@@ -100,6 +105,7 @@ impl MockChunkData {
         }
     }
 
+    /// Populates a dense contiguous column buffer for `comp` from `values`.
     pub fn insert_dense<T: Copy>(&mut self, comp: BamComponent, values: &[T]) {
         assert_eq!(values.len(), self.entities.len());
         let byte_len = core::mem::size_of_val(values);
@@ -118,6 +124,7 @@ impl MockChunkData {
         self.dense_columns.insert(comp, words);
     }
 
+    /// Reads back the dense column elements for `comp` as a `Vec<T>`.
     pub fn read_dense<T: Copy>(&self, comp: BamComponent) -> Vec<T> {
         let count = self.entities.len();
         if core::mem::size_of::<T>() == 0 {
@@ -134,6 +141,7 @@ impl MockChunkData {
         out
     }
 
+    /// Populates a sparse-set column for `comp` with optional per-row elements.
     pub fn insert_sparse<T: Copy>(&mut self, comp: BamComponent, rows: Vec<Option<T>>) {
         assert_eq!(rows.len(), self.entities.len());
         let elem_size = core::mem::size_of::<T>();
@@ -160,6 +168,7 @@ impl MockChunkData {
         self.sparse_columns.insert(comp, boxed_rows);
     }
 
+    /// Reads back the sparse-set column elements for `comp` as `Vec<Option<T>>`.
     pub fn read_sparse<T: Copy>(&self, comp: BamComponent) -> Vec<Option<T>> {
         let rows = self
             .sparse_columns
@@ -176,6 +185,7 @@ impl MockChunkData {
     }
 }
 
+/// Active iterator cursor and query term list passed as `*mut BamIter` during system execution.
 pub struct MockIterState {
     pub world: *mut MockHostWorld,
     pub sys_idx: usize,
@@ -189,12 +199,14 @@ pub struct MockIterState {
     pub mut_rows_scratch: Vec<*mut u8>,
 }
 
+/// Per-invocation system frame backing `*mut BamSystemCtx` during `TestHost::run_system`.
 pub struct MockSystemFrame {
     pub world: *mut MockHostWorld,
     pub sys_idx: usize,
     pub iters: Vec<Box<MockIterState>>,
 }
 
+/// In-memory mock host ECS world implementing the `BamHostApi` C-ABI table for guest SDK tests.
 pub struct MockHostWorld {
     pub api: BamHostApi,
     pub components: Vec<RegisteredComp>,
@@ -212,11 +224,13 @@ pub struct MockHostWorld {
     pub symbols: HashMap<String, *const c_void>,
 }
 
+/// Owning smart pointer around a heap-allocated [`MockHostWorld`] preserving stable pointer provenance.
 pub struct TestHost {
     raw: *mut MockHostWorld,
 }
 
 impl Drop for TestHost {
+    /// Reclaims the heap-allocated [`MockHostWorld`] backing this test harness.
     fn drop(&mut self) {
         if !self.raw.is_null() {
             unsafe { drop(Box::from_raw(self.raw)) };
@@ -227,26 +241,31 @@ impl Drop for TestHost {
 impl core::ops::Deref for TestHost {
     type Target = MockHostWorld;
 
+    /// Borrows the underlying [`MockHostWorld`] immutably.
     fn deref(&self) -> &Self::Target {
         unsafe { &*self.raw }
     }
 }
 
 impl core::ops::DerefMut for TestHost {
+    /// Borrows the underlying [`MockHostWorld`] mutably.
     fn deref_mut(&mut self) -> &mut Self::Target {
         unsafe { &mut *self.raw }
     }
 }
 
 impl TestHost {
+    /// Returns the stable raw `*mut MockHostWorld` pointer passed as host context.
     pub const fn raw_ptr(&self) -> *mut MockHostWorld {
         self.raw
     }
 
+    /// Returns a pointer to the mock world's populated [`BamHostApi`] table.
     pub const fn api_ptr(&self) -> *const BamHostApi {
         unsafe { &raw const (*self.raw).api }
     }
 
+    /// Initializes a [`GuestPlugin`] `P` against this mock host and returns its `*mut BamInstance`.
     pub fn load_plugin<P: GuestPlugin>(&self) -> Result<*mut BamInstance, FfiResult> {
         let manifest = P::MANIFEST;
         let api_ptr = self.api_ptr();
@@ -268,6 +287,7 @@ impl TestHost {
         }
     }
 
+    /// Initializes an inline closure mod named `mod_name` against this mock host.
     pub fn load_fn<F>(&self, mod_name: &CStr, build_fn: F) -> Result<*mut BamInstance, FfiResult>
     where
         F: FnOnce(&mut GuestApp<'_>) -> FfiResult,
@@ -292,10 +312,12 @@ impl TestHost {
         }
     }
 
+    /// Shuts down and frees a guest instance created by `load_plugin` or `load_fn`.
     pub fn unload_instance(&self, instance: *mut BamInstance) {
         unsafe { shutdown_guest_instance(instance) };
     }
 
+    /// Evaluates `run_if` (if present) and executes registered system `sys_idx` on this mock world.
     pub fn run_system(&self, sys_idx: usize) -> FfiResult {
         let (run_if, run_if_data) = unsafe {
             let world_ref = &*self.raw;
@@ -344,6 +366,7 @@ impl TestHost {
 
 impl MockHostWorld {
     #[allow(clippy::new_ret_no_self)]
+    /// Allocates a fresh [`TestHost`] initialized with [`make_mock_host_api`].
     pub fn new() -> TestHost {
         TestHost {
             raw: Box::into_raw(Box::new(Self {
@@ -365,6 +388,7 @@ impl MockHostWorld {
         }
     }
 
+    /// Pre-registers a host component type `T` in the mock world and returns its [`BamComponent`] handle.
     pub fn expose_component<T: 'static>(
         &mut self,
         name: &str,
@@ -395,6 +419,7 @@ impl MockHostWorld {
         handle
     }
 
+    /// Inserts or updates a singleton resource `R` in the mock world, returning its handle.
     pub fn insert_resource<R: Copy + 'static>(
         &mut self,
         name: &str,
@@ -423,18 +448,21 @@ impl MockHostWorld {
         handle
     }
 
+    /// Reads the current value of singleton resource `handle` as `R`.
     pub fn read_resource<R: Copy>(&self, handle: BamComponent) -> R {
         let words = self.resources.get(&handle).expect("missing resource");
         // SAFETY: `words` holds an initialized `R`.
         unsafe { core::ptr::read(words.as_ptr().cast::<R>()) }
     }
 
+    /// Looks up registered metadata for 1-based component `handle`.
     fn comp_meta(&self, handle: BamComponent) -> Option<&RegisteredComp> {
         let idx = (handle.to_raw() as usize).checked_sub(1)?;
         self.components.get(idx)
     }
 }
 
+/// Mock `BamHostApi::get_proc_address` resolving symbols from `MockHostWorld::symbols`.
 unsafe extern "C" fn host_get_proc_address(
     ctx: *const BamHostCtx,
     name: *const c_char,
@@ -450,6 +478,7 @@ unsafe extern "C" fn host_get_proc_address(
     world.symbols.get(key).copied().unwrap_or(core::ptr::null())
 }
 
+/// Mock `BamHostApi::last_error` copying `MockHostWorld::last_error` into caller's UTF-8 buffer.
 unsafe extern "C" fn host_last_error(
     ctx: *const BamHostCtx,
     buf: *mut c_char,
@@ -472,10 +501,12 @@ unsafe extern "C" fn host_last_error(
     bytes.len()
 }
 
+/// Mock `BamHostApi::load_host_ctx` returning the underlying `*const BamHostCtx`.
 unsafe extern "C" fn host_load_host_ctx(load_ctx: *const BamLoadCtx) -> *const BamHostCtx {
     load_ctx.cast::<BamHostCtx>()
 }
 
+/// Mock `BamHostApi::register_component` registering a dynamic component descriptor in the world.
 unsafe extern "C" fn host_register_component(
     load_ctx: *mut BamLoadCtx,
     desc: *const ComponentDesc,
@@ -529,6 +560,7 @@ unsafe extern "C" fn host_register_component(
     FfiResult::OK
 }
 
+/// Mock `BamHostApi::resolve_component` resolving a component handle by name and/or UUID.
 unsafe extern "C" fn host_resolve_component(
     ctx: *const BamHostCtx,
     name: *const c_char,
@@ -568,6 +600,7 @@ unsafe extern "C" fn host_resolve_component(
     FfiResult::OK
 }
 
+/// Mock `BamHostApi::register_system` storing a guest system's queries, ordering, and callbacks.
 unsafe extern "C" fn host_register_system(
     load_ctx: *mut BamLoadCtx,
     desc: *const BamSystemDesc,
@@ -624,6 +657,7 @@ unsafe extern "C" fn host_register_system(
     FfiResult::OK
 }
 
+/// Mock `BamHostApi::sys_host_ctx` returning the world context from `MockSystemFrame`.
 unsafe extern "C" fn host_sys_host_ctx(sys_ctx: *const BamSystemCtx) -> *const BamHostCtx {
     if sys_ctx.is_null() {
         return core::ptr::null();
@@ -632,6 +666,7 @@ unsafe extern "C" fn host_sys_host_ctx(sys_ctx: *const BamSystemCtx) -> *const B
     frame.world.cast::<BamHostCtx>()
 }
 
+/// Mock `BamHostApi::sys_query` returning the `MockIterState` pointer for `query_index`.
 unsafe extern "C" fn host_sys_query(
     sys_ctx: *mut BamSystemCtx,
     query_index: usize,
@@ -649,6 +684,7 @@ unsafe extern "C" fn host_sys_query(
     FfiResult::OK
 }
 
+/// Mock `BamHostApi::sys_commands` returning the world pointer as `*mut BamCommands`.
 unsafe extern "C" fn host_sys_commands(
     sys_ctx: *mut BamSystemCtx,
     out_commands: *mut *mut BamCommands,
@@ -661,6 +697,7 @@ unsafe extern "C" fn host_sys_commands(
     FfiResult::OK
 }
 
+/// Mock `BamHostApi::iter_next_chunk` advancing to the next matching chunk and writing its length.
 unsafe extern "C" fn host_iter_next_chunk(iter: *mut BamIter, out_len: *mut usize) -> FfiBool {
     if iter.is_null() || out_len.is_null() {
         return FfiBool::FALSE;
@@ -701,6 +738,7 @@ unsafe extern "C" fn host_iter_next_chunk(iter: *mut BamIter, out_len: *mut usiz
     FfiBool::FALSE
 }
 
+/// Mock `BamHostApi::iter_reset` rewinding the chunk cursor to the start of the query.
 unsafe extern "C" fn host_iter_reset(iter: *mut BamIter) -> FfiResult {
     if iter.is_null() {
         return FfiResult::NULL_POINTER;
@@ -711,6 +749,7 @@ unsafe extern "C" fn host_iter_reset(iter: *mut BamIter) -> FfiResult {
     FfiResult::OK
 }
 
+/// Mock `BamHostApi::iter_entities` returning the active chunk's entity slice pointer.
 unsafe extern "C" fn host_iter_entities(iter: *const BamIter) -> *const FfiEntity {
     if iter.is_null() {
         return core::ptr::null();
@@ -723,6 +762,7 @@ unsafe extern "C" fn host_iter_entities(iter: *const BamIter) -> *const FfiEntit
     world.chunks[c_idx].entities.as_ptr()
 }
 
+/// Mock `BamHostApi::iter_column_readonly` returning a read-only dense column pointer.
 unsafe extern "C" fn host_iter_col_ro(iter: *const BamIter, term_index: usize) -> *const u8 {
     if iter.is_null() {
         return core::ptr::null();
@@ -750,6 +790,7 @@ unsafe extern "C" fn host_iter_col_ro(iter: *const BamIter, term_index: usize) -
         .map_or(core::ptr::null(), |words| words.as_ptr().cast::<u8>())
 }
 
+/// Mock `BamHostApi::iter_column_mutable` marking the chunk changed and returning a writable pointer.
 unsafe extern "C" fn host_iter_col_mut(iter: *mut BamIter, term_index: usize) -> *mut u8 {
     let ptr = unsafe { host_iter_col_mut_untracked(iter, term_index) };
     if !ptr.is_null() {
@@ -762,6 +803,7 @@ unsafe extern "C" fn host_iter_col_mut(iter: *mut BamIter, term_index: usize) ->
     ptr
 }
 
+/// Mock `BamHostApi::iter_column_mutable_untracked` returning a writable pointer without marking changed.
 unsafe extern "C" fn host_iter_col_mut_untracked(iter: *mut BamIter, term_index: usize) -> *mut u8 {
     if iter.is_null() {
         return core::ptr::null_mut();
@@ -791,6 +833,7 @@ unsafe extern "C" fn host_iter_col_mut_untracked(iter: *mut BamIter, term_index:
         })
 }
 
+/// Mock `BamHostApi::iter_mark_changed_range` recording changed row indices on the active chunk.
 unsafe extern "C" fn host_iter_mark_changed_range(
     iter: *mut BamIter,
     term_index: usize,
@@ -822,6 +865,7 @@ unsafe extern "C" fn host_iter_mark_changed_range(
     FfiResult::OK
 }
 
+/// Mock `BamHostApi::iter_column_rows_readonly` returning sparse-set per-row pointer array.
 unsafe extern "C" fn host_iter_rows_ro(iter: *mut BamIter, term_index: usize) -> *const *const u8 {
     if iter.is_null() {
         return core::ptr::null();
@@ -851,6 +895,7 @@ unsafe extern "C" fn host_iter_rows_ro(iter: *mut BamIter, term_index: usize) ->
     state.ro_rows_scratch.as_ptr()
 }
 
+/// Mock `BamHostApi::iter_column_rows_mutable` returning writable sparse-set per-row pointer array.
 unsafe extern "C" fn host_iter_rows_mut(iter: *mut BamIter, term_index: usize) -> *const *mut u8 {
     if iter.is_null() {
         return core::ptr::null();
@@ -886,6 +931,7 @@ unsafe extern "C" fn host_iter_rows_mut(iter: *mut BamIter, term_index: usize) -
     state.mut_rows_scratch.as_ptr()
 }
 
+/// Mock `BamHostApi::iter_column_info` populating `BamColumnInfo` for `term_index`.
 unsafe extern "C" fn host_iter_col_info(
     iter: *const BamIter,
     term_index: usize,
@@ -929,6 +975,7 @@ unsafe extern "C" fn host_iter_col_info(
     FfiResult::OK
 }
 
+/// Mock `BamHostApi::res_ptr` returning a read-only pointer to a declared singleton resource.
 unsafe extern "C" fn host_res_ptr(iter: *const BamIter, term_index: usize) -> *const u8 {
     if iter.is_null() {
         return core::ptr::null();
@@ -947,6 +994,7 @@ unsafe extern "C" fn host_res_ptr(iter: *const BamIter, term_index: usize) -> *c
         .map_or(core::ptr::null(), |words| words.as_ptr().cast::<u8>())
 }
 
+/// Mock `BamHostApi::res_mut_ptr` returning a mutable pointer to a writable singleton resource.
 unsafe extern "C" fn host_res_mut_ptr(iter: *mut BamIter, term_index: usize) -> *mut u8 {
     if iter.is_null() {
         return core::ptr::null_mut();
@@ -967,6 +1015,7 @@ unsafe extern "C" fn host_res_mut_ptr(iter: *mut BamIter, term_index: usize) -> 
         })
 }
 
+/// Mock `BamHostApi::cmd_spawn_empty` allocating the next entity ID and logging `SpawnEmpty`.
 unsafe extern "C" fn host_cmd_spawn_empty(
     cmds: *mut BamCommands,
     out_entity: *mut FfiEntity,
@@ -982,6 +1031,7 @@ unsafe extern "C" fn host_cmd_spawn_empty(
     FfiResult::OK
 }
 
+/// Mock `BamHostApi::cmd_spawn` logging a batched component spawn command.
 unsafe extern "C" fn host_cmd_spawn(
     cmds: *mut BamCommands,
     comps: *const BamComponent,
@@ -1029,6 +1079,7 @@ unsafe extern "C" fn host_cmd_spawn(
     FfiResult::OK
 }
 
+/// Mock `BamHostApi::cmd_despawn` logging a deferred entity despawn.
 unsafe extern "C" fn host_cmd_despawn(cmds: *mut BamCommands, entity: FfiEntity) -> FfiResult {
     if cmds.is_null() {
         return FfiResult::NULL_POINTER;
@@ -1041,6 +1092,7 @@ unsafe extern "C" fn host_cmd_despawn(cmds: *mut BamCommands, entity: FfiEntity)
     FfiResult::OK
 }
 
+/// Mock `BamHostApi::cmd_insert` validating inputs and logging a component insertion.
 unsafe extern "C" fn host_cmd_insert(
     cmds: *mut BamCommands,
     entity: FfiEntity,
@@ -1084,6 +1136,7 @@ unsafe extern "C" fn host_cmd_insert(
     FfiResult::OK
 }
 
+/// Mock `BamHostApi::cmd_insert_default` checking `has_default` and logging default insertion.
 unsafe extern "C" fn host_cmd_insert_default(
     cmds: *mut BamCommands,
     entity: FfiEntity,
@@ -1106,6 +1159,7 @@ unsafe extern "C" fn host_cmd_insert_default(
     FfiResult::OK
 }
 
+/// Mock `BamHostApi::cmd_remove` logging a deferred component removal.
 unsafe extern "C" fn host_cmd_remove(
     cmds: *mut BamCommands,
     entity: FfiEntity,
@@ -1125,6 +1179,7 @@ unsafe extern "C" fn host_cmd_remove(
     FfiResult::OK
 }
 
+/// Mock `BamHostApi::par_for_each_chunk` dispatching chunk tasks sequentially over matching chunks.
 unsafe extern "C" fn host_par_for_each_chunk(
     iter: *mut BamIter,
     chunk_fn: Option<BamChunkTaskFn>,
@@ -1165,6 +1220,7 @@ unsafe extern "C" fn host_par_for_each_chunk(
     FfiResult::OK
 }
 
+/// Mock `BamHostApi::sys_entity_get` performing filter-checked random read-only entity lookup.
 unsafe extern "C" fn host_sys_entity_get(
     sys_ctx: *const BamSystemCtx,
     query_index: usize,
@@ -1217,6 +1273,7 @@ unsafe extern "C" fn host_sys_entity_get(
     core::ptr::null()
 }
 
+/// Mock `BamHostApi::sys_entity_get_mut` performing filter-checked random mutable entity lookup.
 unsafe extern "C" fn host_sys_entity_get_mut(
     sys_ctx: *mut BamSystemCtx,
     query_index: usize,
@@ -1275,6 +1332,7 @@ unsafe extern "C" fn host_sys_entity_get_mut(
     core::ptr::null_mut()
 }
 
+/// Mock `BamHostApi::msg_read_batch` draining unread messages for the reader's per-system cursor.
 unsafe extern "C" fn host_msg_read_batch(
     iter: *mut BamIter,
     term_index: usize,
@@ -1325,6 +1383,7 @@ unsafe extern "C" fn host_msg_read_batch(
     FfiResult::OK
 }
 
+/// Mock `BamHostApi::msg_send` appending an encoded POD message into the world's message log.
 unsafe extern "C" fn host_msg_send(
     iter: *mut BamIter,
     term_index: usize,
@@ -1369,6 +1428,7 @@ unsafe extern "C" fn host_msg_send(
     FfiResult::OK
 }
 
+/// Mock `BamHostApi::component_layout_info` returning ABI 0.3.0 layout metadata for `component`.
 unsafe extern "C" fn host_component_layout_info(
     host_ctx: *const BamHostCtx,
     component: BamComponent,
@@ -1402,6 +1462,7 @@ unsafe extern "C" fn host_component_layout_info(
     FfiResult::OK
 }
 
+/// Constructs a populated [`BamHostApi`] table wired to all mock host callbacks in this module.
 pub fn make_mock_host_api() -> BamHostApi {
     BamHostApi {
         struct_size: core::mem::size_of::<BamHostApi>() as u32,

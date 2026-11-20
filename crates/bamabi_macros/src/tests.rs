@@ -6,6 +6,8 @@ use proc_macro_crate::FoundCrate;
 use quote::quote;
 use syn::{DeriveInput, Path, parse_quote};
 
+/// Test scenario: verifies `#[derive(ModComponent)]` rejects generic structs with a clear
+/// compile-time error because monomorphized layouts cannot produce a single C-ABI VTable.
 #[test]
 fn rejects_generic_structs() {
     let input: DeriveInput = parse_quote! {
@@ -17,6 +19,8 @@ fn rejects_generic_structs() {
     assert!(err.to_string().contains("does not support generic structs"));
 }
 
+/// Test scenario: verifies enums lacking `#[repr(C, <int>)]`/`#[repr(<int>)]`, zero-variant
+/// enums, unsupported `#[repr(usize|u128)]` enums, and `#[derive(AbiPod)]` on enums are all rejected.
 #[test]
 fn rejects_invalid_enum_reprs_and_abi_pod_enums() {
     let rust_repr_enum: DeriveInput = parse_quote! {
@@ -64,6 +68,8 @@ fn rejects_invalid_enum_reprs_and_abi_pod_enums() {
     );
 }
 
+/// Test scenario: verifies `#[repr(C, packed)]` structs are rejected by `#[derive(ModComponent)]`
+/// because unaligned field references are undefined behavior.
 #[test]
 fn rejects_packed_structs() {
     let input: DeriveInput = parse_quote! {
@@ -77,6 +83,8 @@ fn rejects_packed_structs() {
     assert!(err.to_string().contains("packed"));
 }
 
+/// Test scenario: verifies duplicate generated VTable accessor names (e.g. colliding `ptr_x`
+/// slots) are detected and rejected at macro-expansion time.
 #[test]
 fn rejects_nested_field_name_collision() {
     let input: DeriveInput = parse_quote! {
@@ -92,6 +100,8 @@ fn rejects_nested_field_name_collision() {
     );
 }
 
+/// Test scenario: verifies heap-owning or Rust-layout-specific stdlib types (`Option`, `Box`,
+/// `HashMap`, etc.) are rejected unless explicitly marked `#[mod_field(skip)]`.
 #[test]
 fn rejects_heap_owning_types_without_skip() {
     for bad_input in [
@@ -109,6 +119,8 @@ fn rejects_heap_owning_types_without_skip() {
     }
 }
 
+/// Test scenario: verifies unknown `#[mod_component(...)]` keys, malformed `uuid = "..."` hex
+/// strings, and conflicting `namespace` + namespaced `name` combinations are rejected.
 #[test]
 fn rejects_unknown_attributes_and_invalid_uuids() {
     let bad_attr: DeriveInput = parse_quote! {
@@ -151,6 +163,8 @@ fn rejects_unknown_attributes_and_invalid_uuids() {
     );
 }
 
+/// Test scenario: verifies a `bool` field generates `FfiBool` getter and `FfiResult` setter
+/// slots while omitting `RawInsertable` and `AbiPod` impls.
 #[test]
 fn bool_generates_ffi_bool_and_ffi_result_and_omits_raw_insertable() {
     let input: DeriveInput = parse_quote! {
@@ -169,6 +183,8 @@ fn bool_generates_ffi_bool_and_ffi_result_and_omits_raw_insertable() {
     assert!(!ts.contains("unsafe impl :: bamabi_sys :: AbiPod for Flagged"));
 }
 
+/// Test scenario: verifies `String` and `Vec<T>` fields omit `RawInsertable`/`AbiPod` and emit
+/// host-allocator VTable slots including `push_<field>` for `Vec<T>`.
 #[test]
 fn string_and_vec_omit_raw_insertable_and_emit_push() {
     for input in [
@@ -206,6 +222,8 @@ fn string_and_vec_omit_raw_insertable_and_emit_push() {
     }
 }
 
+/// Test scenario: verifies expansion of fieldless and tagged `#[repr(C, u8)]` enums,
+/// `FfiOption<T>` fields, `#[mod_component(summary_tick)]`, and `#[mod_component(require(...))]`.
 #[test]
 fn supports_enums_ffi_option_summary_tick_and_require() {
     let fieldless_enum: DeriveInput = parse_quote! {
@@ -271,6 +289,8 @@ fn supports_enums_ffi_option_summary_tick_and_require() {
     );
 }
 
+/// Test scenario: verifies non-opaque components emit `field_info`, `export_fields`, and
+/// `import_field` witness symbols whereas `#[mod_component(opaque)]` omits all three.
 #[test]
 fn emits_witness_symbols_for_non_opaque_and_omits_for_opaque() {
     let non_opaque: DeriveInput = parse_quote! {
@@ -296,6 +316,8 @@ fn emits_witness_symbols_for_non_opaque_and_omits_for_opaque() {
     assert!(!ts_opaque.contains("bam.v0.schema::OpaqueItem.import_field"));
 }
 
+/// Test scenario: verifies a `#[repr(C)]` POD struct emits `RawInsertable`, `AbiPod`, and
+/// schema-hashed `ComponentUuid::from_parts`.
 #[test]
 fn repr_c_pod_emits_raw_insertable_abi_pod_and_schema_uuid() {
     let input: DeriveInput = parse_quote! {
@@ -314,6 +336,8 @@ fn repr_c_pod_emits_raw_insertable_abi_pod_and_schema_uuid() {
     assert!(ts.contains("unsafe impl :: bamabi_sys :: AbiPod for PodPos"));
 }
 
+/// Test scenario: verifies a `#[repr(C)]` struct with a `usize` field implements
+/// `RawInsertable` (same-process safe) but omits `AbiPod` (pointer-width dependent).
 #[test]
 fn usize_in_mod_component_is_raw_insertable_but_not_abi_pod() {
     let input: DeriveInput = parse_quote! {
@@ -329,6 +353,8 @@ fn usize_in_mod_component_is_raw_insertable_but_not_abi_pod() {
     assert!(!ts.contains("unsafe impl :: bamabi_sys :: AbiPod for HostCounter"));
 }
 
+/// Test scenario: verifies `#[derive(AbiPod)]` rejects non-`#[repr(C)]` and `#[repr(packed)]`
+/// structs and emits `assert_abi_pod`, zero-padding assertions, `RawInsertable`, and `AbiPod`.
 #[test]
 fn abi_pod_derive_uses_assert_abi_pod_and_raw_insertable() {
     let missing_repr: DeriveInput = parse_quote! {
@@ -373,6 +399,8 @@ fn abi_pod_derive_uses_assert_abi_pod_and_raw_insertable() {
     assert!(ts.contains("unsafe impl :: bamabi_sys :: AbiPod for ValidPod"));
 }
 
+/// Test scenario: verifies `resolve_sys_crate_with` and `resolve_guest_crate_with` handle
+/// explicit overrides, direct/renamed dependencies, self-crate builds, and facade re-exports.
 #[test]
 fn crate_path_resolution_and_overrides() {
     let override_path: Path = parse_quote!(crate::reexport::sys);
@@ -453,6 +481,8 @@ fn crate_path_resolution_and_overrides() {
     assert!(ts.contains("my_facade :: bamabi_sys :: ModComponent"));
 }
 
+/// Test scenario: verifies generated extern helpers stay private inside `const _: ()` by
+/// default and only emit `#[unsafe(export_name = "bam_...")]` when `export_symbols` is set.
 #[test]
 fn hygienic_const_scope_and_namespaced_bam_export_symbols() {
     let private_fns: DeriveInput = parse_quote! {
@@ -492,6 +522,9 @@ fn hygienic_const_scope_and_namespaced_bam_export_symbols() {
     assert!(ts_ns.contains("\"bam.v0.physics::Position.get_x\""));
 }
 
+/// Test scenario: verifies `#[derive(GuestComponent)]` expands `NAME`, `FIELD_SCHEMA_HASH`,
+/// `FLAGS`, and explicit `UUID`, and rejects generics, enums, `#[repr(packed)]`, and
+/// `sparse_set + summary_tick` conflicts.
 #[test]
 fn guest_component_derive_expansion_and_errors() {
     let basic: DeriveInput = parse_quote! {
@@ -586,6 +619,8 @@ fn guest_component_derive_expansion_and_errors() {
     );
 }
 
+/// Test scenario: verifies `#[mod_component(guest)]` emits a delegating `GuestComponent` impl
+/// for `AbiPod` structs and rejects non-POD structs or enums.
 #[test]
 fn mod_component_guest_shorthand_and_non_pod_rejection() {
     let valid: DeriveInput = parse_quote! {
@@ -641,4 +676,43 @@ fn mod_component_guest_shorthand_and_non_pod_rejection() {
             .to_string()
             .contains("cannot be applied to enums")
     );
+}
+
+/// Test scenario: verifies ABI 0.3 handle and enum-like primitive types (`BamSystem`,
+/// `BamSystemSet`, `BamSymbol`, `FfiAssetLoadState`, `BamEventKind`, `BamFieldKind`,
+/// `FfiChildOf`, `FfiAssetHandle`) classify as `AbiPod` and emit exact C99/Zig typedef names.
+#[test]
+fn abi_v03_handles_classify_as_primitives_and_emit_c_zig_types() {
+    let input: DeriveInput = parse_quote! {
+        #[repr(C)]
+        #[mod_component(name = "game::AbiHandles")]
+        pub struct AbiHandles {
+            pub sys: BamSystem,
+            pub set: BamSystemSet,
+            pub sym: BamSymbol,
+            pub load_state: FfiAssetLoadState,
+            pub ev_kind: BamEventKind,
+            pub field_kind: BamFieldKind,
+            pub parent: FfiChildOf,
+            pub asset: FfiAssetHandle,
+        }
+    };
+    let ts = expand_mod_component(&input).unwrap().to_string();
+    assert!(ts.contains("IS_ABI_POD : bool = true"));
+    assert!(ts.contains("BamSystem sys;"));
+    assert!(ts.contains("BamSystemSet set;"));
+    assert!(ts.contains("BamSymbol sym;"));
+    assert!(ts.contains("BamAssetLoadState load_state;"));
+    assert!(ts.contains("BamEventKind ev_kind;"));
+    assert!(ts.contains("BamFieldKind field_kind;"));
+    assert!(ts.contains("BamChildOf parent;"));
+    assert!(ts.contains("BamAssetHandle asset;"));
+    assert!(ts.contains("sys: bam.BamSystem,"));
+    assert!(ts.contains("set: bam.BamSystemSet,"));
+    assert!(ts.contains("sym: bam.BamSymbol,"));
+    assert!(ts.contains("load_state: bam.BamAssetLoadState,"));
+    assert!(ts.contains("ev_kind: bam.BamEventKind,"));
+    assert!(ts.contains("field_kind: bam.BamFieldKind,"));
+    assert!(ts.contains("parent: bam.BamChildOf,"));
+    assert!(ts.contains("asset: bam.BamAssetHandle,"));
 }

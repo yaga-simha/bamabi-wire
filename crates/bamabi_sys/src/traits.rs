@@ -7,7 +7,7 @@ use crate::{
     component::{BamFieldDesc, BamFieldKind, BamRequiredComponent},
     primitives::{
         BamComponent, BamSymbol, BamSystem, BamSystemSet, ComponentUuid, FfiAssetHandle,
-        FfiAssetLoadState, FfiBool, FfiChildOf, FfiEntity, FfiOption,
+        FfiAssetLoadState, FfiBool, FfiChildOf, FfiDisabled, FfiEntity, FfiOption,
     },
     system::BamEventKind,
 };
@@ -123,6 +123,7 @@ impl_abi_pod_primitives!(
     BamSymbol,
     FfiEntity,
     FfiChildOf,
+    FfiDisabled,
     BamChangeTicks,
     ComponentUuid,
     FfiAssetHandle,

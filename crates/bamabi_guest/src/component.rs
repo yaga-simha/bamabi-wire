@@ -4,7 +4,10 @@ use core::ffi::CStr;
 use std::ffi::CString;
 
 use bamabi_guest_sys::{Host, PodComponentHooks, UuidFilter, resolve_component};
-use bamabi_sys::{AbiPod, BamComponent, ComponentUuid, FfiEntity, FfiResult};
+use bamabi_sys::{
+    AbiPod, BamComponent, BamFieldDesc, BamRequiredComponent, ComponentUuid, FfiEntity, FfiResult,
+    ModComponent,
+};
 
 /// Safe builder for optional dynamic component lifecycle hooks (`on_add`, `on_insert`,
 /// `on_discard`, `on_remove`, `on_despawn`), `EntityCloner` support, and required components.
@@ -13,6 +16,7 @@ pub struct GuestComponentHooks<T: AbiPod> {
 }
 
 impl<T: AbiPod> Default for GuestComponentHooks<T> {
+    /// Returns an empty [`GuestComponentHooks`] configuration via [`Self::new`].
     fn default() -> Self {
         Self::new()
     }
@@ -89,6 +93,50 @@ impl<T: AbiPod> GuestComponentHooks<T> {
     pub fn with_required_handle(mut self, component: BamComponent) -> Self {
         self.inner.required_components.push(component);
         self
+    }
+
+    /// Sets the ABI `0.3` 64-bit FNV-1a structural schema fingerprint.
+    #[inline]
+    pub fn with_schema_fingerprint(mut self, fingerprint: u64) -> Self {
+        self.inner.schema_fingerprint = fingerprint;
+        self
+    }
+
+    /// Sets static ABI `0.3` field reflection metadata (`ModComponent::BAM_FIELDS`).
+    #[inline]
+    pub fn with_fields(mut self, fields: &'static [BamFieldDesc]) -> Self {
+        self.inner.fields = fields;
+        self
+    }
+
+    /// Appends an extended ABI `0.3` required-component initialization descriptor.
+    #[inline]
+    pub fn with_required_init_desc(mut self, desc: BamRequiredComponent) -> Self {
+        self.inner.required_init_descs.push(desc);
+        self
+    }
+
+    /// Appends a required component handle initialized from POD `value` bytes.
+    #[inline]
+    pub fn with_required_pod_value<R: AbiPod>(
+        mut self,
+        component: BamComponent,
+        value: &R,
+    ) -> Self {
+        self.inner = self.inner.with_required_pod_value(component, value);
+        self
+    }
+
+    /// Creates hook options pre-populated with ABI `0.3` `SCHEMA_FINGERPRINT`, `BAM_FIELDS`, and
+    /// `REQUIRED_COMPONENTS` from `T: ModComponent`.
+    #[inline]
+    pub fn from_mod_component() -> Self
+    where
+        T: ModComponent,
+    {
+        Self {
+            inner: PodComponentHooks::new().with_mod_component_metadata(),
+        }
     }
 }
 
@@ -173,6 +221,11 @@ pub trait GuestComponent: AbiPod {
 impl GuestComponent for bamabi_sys::FfiChildOf {
     const NAME: &'static CStr = c"bevy_ecs::hierarchy::ChildOf";
     const UUID: ComponentUuid = bamabi_sys::FfiChildOf::UUID;
+}
+
+impl GuestComponent for bamabi_sys::FfiDisabled {
+    const NAME: &'static CStr = c"bevy_ecs::entity_disabling::Disabled";
+    const UUID: ComponentUuid = bamabi_sys::FfiDisabled::UUID;
 }
 
 /// Computes the qualified registration `(CString, ComponentUuid)` for `T: GuestComponent` inside a

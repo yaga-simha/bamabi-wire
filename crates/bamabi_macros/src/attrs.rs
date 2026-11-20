@@ -1,3 +1,6 @@
+//! Container-level and field-level attribute parsing, validation, and crate-path resolution
+//! for `#[derive(ModComponent)]`, `#[derive(AbiPod)]`, and `#[derive(GuestComponent)]`.
+
 use proc_macro_crate::FoundCrate;
 use proc_macro2::{Span, TokenStream};
 use quote::quote;
@@ -60,10 +63,12 @@ pub(crate) enum IntRepr {
 }
 
 impl IntRepr {
+    /// Returns `true` if an explicit fixed-width integer `#[repr(...)]` was parsed.
     pub(crate) fn is_some(self) -> bool {
         !matches!(self, Self::None)
     }
 
+    /// Returns the Rust primitive type name for this discriminant width (defaulting to `"i32"`).
     pub(crate) fn rust_ty_str(self) -> &'static str {
         match self {
             Self::U8 => "u8",
@@ -77,6 +82,7 @@ impl IntRepr {
         }
     }
 
+    /// Returns the corresponding ISO C99 `<stdint.h>` integer type name for generated headers.
     pub(crate) fn c_ty_str(self) -> &'static str {
         match self {
             Self::None | Self::I32 => "int32_t",
@@ -90,10 +96,12 @@ impl IntRepr {
         }
     }
 
+    /// Returns the corresponding Zig primitive integer type name for `ZIG_DECL` emission.
     pub(crate) fn zig_ty_str(self) -> &'static str {
         self.rust_ty_str()
     }
 
+    /// Checks whether `value` fits within the closed numeric range of this integer representation.
     pub(crate) fn fits_i128(self, value: i128) -> bool {
         match self {
             Self::None | Self::I32 => value >= i32::MIN as i128 && value <= i32::MAX as i128,
@@ -119,6 +127,7 @@ pub(crate) struct ReprFlags {
 }
 
 impl ReprFlags {
+    /// Returns `true` if the type uses `#[repr(C)]` or `#[repr(transparent)]` without `packed`.
     pub(crate) fn is_deterministic_unpacked(&self) -> bool {
         (self.has_c || self.has_transparent) && !self.has_packed
     }
@@ -197,6 +206,7 @@ pub(crate) fn parse_repr_flags(attrs: &[Attribute]) -> syn::Result<ReprFlags> {
     Ok(flags)
 }
 
+/// Parses a `crate = ...` or `guest_crate = ...` attribute value as either a string literal or bare path.
 fn parse_crate_path_value(meta: &syn::meta::ParseNestedMeta<'_>) -> syn::Result<Path> {
     let value = meta.value()?;
     if value.peek(LitStr) {
@@ -232,6 +242,8 @@ pub(crate) fn is_valid_uuid_hex(hex: &str) -> bool {
     true
 }
 
+/// Validates that a string literal attribute is non-empty and contains no interior NUL bytes
+/// so it can safely be emitted as a C-ABI `CStr`.
 fn validate_non_empty_no_nul(lit: &LitStr, label: &str) -> syn::Result<String> {
     let val = lit.value();
     if val.is_empty() {
@@ -249,6 +261,8 @@ fn validate_non_empty_no_nul(lit: &LitStr, label: &str) -> syn::Result<String> {
     Ok(val)
 }
 
+/// Validates a canonical component name or namespace literal for non-emptiness, NUL-freedom,
+/// and well-formed `::` path separators.
 fn validate_namespaced_ident(lit: &LitStr, label: &str) -> syn::Result<String> {
     let val = validate_non_empty_no_nul(lit, label)?;
     if val.starts_with("::") || val.ends_with("::") || val.contains("::::") {
@@ -260,6 +274,7 @@ fn validate_namespaced_ident(lit: &LitStr, label: &str) -> syn::Result<String> {
     Ok(val)
 }
 
+/// Validates an explicit `uuid = "..."` string literal at macro-expansion time using [`is_valid_uuid_hex`].
 fn validate_uuid_lit(lit: &LitStr, attr_name: &str) -> syn::Result<String> {
     let val = lit.value();
     if !is_valid_uuid_hex(&val) {
@@ -589,6 +604,10 @@ pub(crate) fn resolve_sys_crate_path(crate_override: Option<&Path>) -> TokenStre
     })
 }
 
+/// Testable core implementation of [`resolve_sys_crate_path`] parameterized over dependency lookup.
+///
+/// Intended purpose: resolves `bamabi_sys` whether a downstream crate depends on it directly,
+/// renames it in `Cargo.toml`, or accesses it through a facade (`bamabi`, `bamabi_host`, `bamabi_guest`).
 pub(crate) fn resolve_sys_crate_with<F>(
     crate_override: Option<&Path>,
     current_crate_name: Option<&str>,
@@ -645,6 +664,7 @@ pub(crate) fn resolve_guest_crate_path(guest_crate_override: Option<&Path>) -> T
     })
 }
 
+/// Testable core implementation of [`resolve_guest_crate_path`] parameterized over dependency lookup.
 pub(crate) fn resolve_guest_crate_with<F>(
     guest_crate_override: Option<&Path>,
     current_crate_name: Option<&str>,

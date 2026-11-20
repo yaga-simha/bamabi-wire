@@ -20,6 +20,12 @@ use crate::{
 type SaveStateHook = Box<dyn FnMut() -> Result<Vec<u8>, FfiResult> + Send + 'static>;
 type RestoreStateHook = Box<dyn FnMut(&[u8]) -> FfiResult + Send + 'static>;
 
+/// Type-erased handle to a guest-heap `Box<T>` tracked by [`GuestInstance`] or
+/// [`RuntimeAllocTracker`].
+///
+/// Ensures strict allocator isolation: every closure, `CString`, or descriptor slice allocated by
+/// the guest is reclaimed on the guest heap during `bamabi_shutdown` (or init rollback) without
+/// leaking or crossing the host allocator boundary.
 struct ErasedAllocation {
     ptr: *mut c_void,
     drop_fn: unsafe fn(*mut c_void),
@@ -29,6 +35,8 @@ struct ErasedAllocation {
 unsafe impl Send for ErasedAllocation {}
 
 impl Drop for ErasedAllocation {
+    /// Reclaims the tracked allocation via its typed destructor inside [`catch_guest_unit`] so a
+    /// panicking `Drop` implementation cannot unwind across `bamabi_shutdown`.
     fn drop(&mut self) {
         let ptr = self.ptr;
         let drop_fn = self.drop_fn;
@@ -40,6 +48,8 @@ impl Drop for ErasedAllocation {
     }
 }
 
+/// Monomorphized destructor function stored in [`ErasedAllocation::drop_fn`] to reconstitute and
+/// drop a `Box<T>` created by `Box::into_raw`.
 unsafe fn drop_boxed<T>(ptr: *mut c_void) {
     // SAFETY: Caller guarantees `ptr` came from `Box::into_raw` for `T` and has not been freed.
     drop(unsafe { Box::from_raw(ptr.cast::<T>()) });
@@ -53,12 +63,15 @@ pub(crate) struct RuntimeAllocTracker {
 }
 
 impl RuntimeAllocTracker {
+    /// Creates an empty mutex-guarded [`RuntimeAllocTracker`].
     fn new() -> Self {
         Self {
             allocations: std::sync::Mutex::new(Vec::new()),
         }
     }
 
+    /// Converts `boxed` into a stable raw pointer, records its type-erased destructor under the
+    /// mutex (recovering from poison if a prior thread panicked), and returns the raw pointer.
     pub(crate) fn track<T: Send + 'static>(&self, boxed: Box<T>) -> *mut T {
         let raw = Box::into_raw(boxed);
         let mut guard = self
@@ -72,6 +85,7 @@ impl RuntimeAllocTracker {
         raw
     }
 
+    /// Returns the number of runtime allocations currently tracked.
     fn len(&self) -> usize {
         self.allocations
             .lock()
@@ -79,6 +93,10 @@ impl RuntimeAllocTracker {
             .len()
     }
 
+    /// Drains and drops all tracked runtime allocations in reverse (LIFO) registration order.
+    ///
+    /// Swaps the vector out of the mutex before dropping so destructors cannot deadlock on
+    /// re-acquiring the lock.
     fn drain_lifo(&self) {
         let mut drained = {
             let mut guard = self
@@ -93,6 +111,11 @@ impl RuntimeAllocTracker {
     }
 }
 
+/// Raw-pointer owner for a heap-pinned [`RuntimeAllocTracker`] inside [`GuestInstance`].
+///
+/// Uses `Box::into_raw` instead of `Box<RuntimeAllocTracker>` so moving `GuestInstance` (for
+/// example when boxing it at the end of `init_guest_instance`) does not retag or invalidate the
+/// shared `*const RuntimeAllocTracker` pointer stored inside [`Host`] under Miri Tree Borrows.
 struct OwnedRuntimeAllocs(*mut RuntimeAllocTracker);
 
 // SAFETY: `OwnedRuntimeAllocs` uniquely owns a heap-allocated `RuntimeAllocTracker` created via
@@ -102,15 +125,18 @@ struct OwnedRuntimeAllocs(*mut RuntimeAllocTracker);
 unsafe impl Send for OwnedRuntimeAllocs {}
 
 impl OwnedRuntimeAllocs {
+    /// Heap-allocates a fresh [`RuntimeAllocTracker`] with stable raw provenance.
     fn new() -> Self {
         Self(Box::into_raw(Box::new(RuntimeAllocTracker::new())))
     }
 
+    /// Returns the stable `*const RuntimeAllocTracker` pointer stamped onto [`Host`].
     #[inline]
     const fn as_ptr(&self) -> *const RuntimeAllocTracker {
         self.0.cast_const()
     }
 
+    /// Returns a shared reference to the underlying [`RuntimeAllocTracker`].
     #[inline]
     fn tracker(&self) -> &RuntimeAllocTracker {
         // SAFETY: `self.0` was allocated via `Box::into_raw` in `OwnedRuntimeAllocs::new` and
@@ -120,6 +146,8 @@ impl OwnedRuntimeAllocs {
 }
 
 impl Drop for OwnedRuntimeAllocs {
+    /// Reclaims the heap-allocated [`RuntimeAllocTracker`] after `GuestInstance::drop` has
+    /// already dropped every closure holding a [`Host`] reference to it.
     fn drop(&mut self) {
         // SAFETY: `self.0` was allocated via `Box::into_raw(Box::new(RuntimeAllocTracker))` and
         // `GuestInstance::drop` already tore down every closure/hook holding a `Host` pointer to it.
@@ -127,6 +155,10 @@ impl Drop for OwnedRuntimeAllocs {
     }
 }
 
+/// Raw-pointer owner for immutable UTF-8 manifest name bytes inside [`GuestInstance`].
+///
+/// Uses `Box::into_raw` on `Box<[u8]>` so moving `GuestInstance` preserves pointer provenance
+/// for the `*const u8` copy embedded in [`Host`] under Miri Tree Borrows.
 struct OwnedManifestBytes {
     ptr: *mut u8,
     len: usize,
@@ -137,6 +169,8 @@ struct OwnedManifestBytes {
 unsafe impl Send for OwnedManifestBytes {}
 
 impl OwnedManifestBytes {
+    /// Converts `name` into a pinned raw UTF-8 byte allocation (or a dangling zero-length handle
+    /// when `name` is empty).
     fn new(name: String) -> Self {
         let len = name.len();
         if len == 0 {
@@ -155,6 +189,8 @@ impl OwnedManifestBytes {
 }
 
 impl Drop for OwnedManifestBytes {
+    /// Frees the pinned UTF-8 byte slice after all closures referencing [`Host::manifest_name`]
+    /// have been dropped.
     fn drop(&mut self) {
         if self.len > 0 {
             // SAFETY: `self.ptr` was allocated via `Box::into_raw` of a `Box<[u8]>` of length
@@ -165,6 +201,8 @@ impl Drop for OwnedManifestBytes {
     }
 }
 
+/// `Send + Sync` newtype wrapping a `'static` guest-exported `"bam.v0.*"` function or VTable
+/// address stored in [`GuestInstance::symbols`].
 #[derive(Clone, Copy)]
 struct GuestSymbolPtr(*const c_void);
 
@@ -299,6 +337,8 @@ impl GuestInstance {
 }
 
 impl Drop for GuestInstance {
+    /// Tears down hooks, symbol tables, runtime observer allocations, and init-time allocations
+    /// in strict LIFO order before Rust drops `_runtime_allocs` and `_manifest_bytes`.
     fn drop(&mut self) {
         // Drop tracked allocations in reverse (LIFO) registration order so later closures or
         // descriptors drop before earlier dependencies. Unrun `shutdown_hooks` (from failed init
@@ -339,8 +379,11 @@ where
         if instance_out.is_null() {
             return FfiResult::NULL_POINTER;
         }
-        // SAFETY: Verified `instance_out` is non-null and writable per caller contract; initialize
-        // to null upfront so any early error or panic leaves `*instance_out == null`.
+        if !instance_out.is_aligned() {
+            return FfiResult::INVALID_ARGUMENT;
+        }
+        // SAFETY: Verified `instance_out` is non-null, aligned, and writable per caller contract;
+        // initialize to null upfront so any early error or panic leaves `*instance_out == null`.
         unsafe {
             *instance_out = core::ptr::null_mut();
         }
@@ -398,7 +441,9 @@ where
 /// If `instance` is non-null, it must have been produced by [`init_guest_instance`] in this guest
 /// binary and must not have been shut down previously or remain referenced by running systems.
 pub unsafe fn shutdown_guest_instance(instance: *mut BamInstance) {
-    if instance.is_null() {
+    if instance.is_null()
+        || !(instance as usize).is_multiple_of(core::mem::align_of::<GuestInstance>())
+    {
         return;
     }
     catch_guest_unit(|| {
@@ -428,7 +473,10 @@ pub unsafe extern "C" fn guest_save_state_trampoline(
         if instance.is_null() {
             return FfiResult::OK;
         }
-        // SAFETY: `instance` points to a live `GuestInstance` prior to `bamabi_shutdown`.
+        if !(instance as usize).is_multiple_of(core::mem::align_of::<GuestInstance>()) {
+            return FfiResult::INVALID_ARGUMENT;
+        }
+        // SAFETY: `instance` is non-null, aligned, and points to a live `GuestInstance` prior to `bamabi_shutdown`.
         let inst = unsafe { &*instance.cast::<GuestInstance>() };
         let Some(ref hook_cell) = inst.save_state_hook else {
             return FfiResult::OK;
@@ -465,21 +513,30 @@ pub unsafe extern "C" fn guest_restore_state_trampoline(
         if len > 0 && bytes.is_null() {
             return FfiResult::NULL_POINTER;
         }
+        if len > isize::MAX as usize {
+            return FfiResult::OUT_OF_RANGE;
+        }
         if instance.is_null() {
             return FfiResult::OK;
         }
-        // SAFETY: `instance` points to a live `GuestInstance` after `bamabi_init`.
+        if !(instance as usize).is_multiple_of(core::mem::align_of::<GuestInstance>()) {
+            return FfiResult::INVALID_ARGUMENT;
+        }
+        // SAFETY: `instance` is non-null, aligned, and points to a live `GuestInstance` after `bamabi_init`.
         let inst = unsafe { &*instance.cast::<GuestInstance>() };
         let Some(ref hook_cell) = inst.restore_state_hook else {
             return FfiResult::OK;
         };
-        let slice = if len == 0 {
-            &[]
-        } else {
-            // SAFETY: When `len > 0`, `bytes` is non-null and valid for `len` bytes per caller contract.
-            unsafe { core::slice::from_raw_parts(bytes, len) }
-        };
-        let Some(status) = hook_cell.try_with_mut(|hook| hook(slice)) else {
+        let Some(status) = hook_cell.try_with_mut(|hook| {
+            let slice = if len == 0 {
+                &[]
+            } else {
+                // SAFETY: Verified `len <= isize::MAX` and `bytes` is non-null; caller guarantees
+                // `bytes` covers `len` initialized readable bytes for this call.
+                unsafe { core::slice::from_raw_parts(bytes, len) }
+            };
+            hook(slice)
+        }) else {
             return FfiResult::ACCESS_CONFLICT;
         };
         status
@@ -501,14 +558,17 @@ pub unsafe extern "C" fn resolve_guest_instance_symbol(
 ) -> *const c_void {
     let mut out = core::ptr::null();
     catch_guest_unit(|| {
-        if instance.is_null() || name.is_null() {
+        if instance.is_null()
+            || name.is_null()
+            || !(instance as usize).is_multiple_of(core::mem::align_of::<GuestInstance>())
+        {
             return;
         }
         // SAFETY: Caller guarantees `name` is a valid NUL-terminated C string for this call.
         let Ok(name_str) = (unsafe { CStr::from_ptr(name) }).to_str() else {
             return;
         };
-        // SAFETY: Caller guarantees `instance` points to a live `GuestInstance` prior to shutdown.
+        // SAFETY: Verified non-null, aligned `instance` pointing to a live `GuestInstance` prior to shutdown.
         let inst = unsafe { &*instance.cast::<GuestInstance>() };
         if let Some(ptr) = inst.resolve_symbol(name_str) {
             out = ptr;
@@ -572,7 +632,7 @@ pub fn resolve_mod_component<T: ModComponent>(host: &Host) -> Result<BamComponen
 /// # Safety
 /// When `size_of::<T>() > 0`, `dst` must be non-null, aligned to `align_of::<T>()`, and point to
 /// `size_of::<T>()` writable bytes whose ownership transfers to the caller on [`FfiResult::OK`].
-unsafe extern "C" fn init_default_trampoline<T: Default>(dst: *mut c_void) -> FfiResult {
+pub(crate) unsafe extern "C" fn init_default_trampoline<T: Default>(dst: *mut c_void) -> FfiResult {
     catch_guest_result(|| {
         let size = core::mem::size_of::<T>();
         if size == 0 {

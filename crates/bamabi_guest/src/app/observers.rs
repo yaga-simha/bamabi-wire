@@ -1,7 +1,7 @@
 //! Safe `#![forbid(unsafe_code)]` Bevy 0.20 observer, lifecycle, mutable payload,
 //! relationship-propagation trigger, and runtime entity-observer SDK extensions.
 
-use core::ffi::CStr;
+use core::{ffi::CStr, marker::PhantomData};
 
 use bamabi_guest_sys::{ValidatedCommands, resolve_component};
 use bamabi_sys::{
@@ -20,6 +20,8 @@ pub(crate) type RunIfPredicate = Box<dyn FnMut(&RunConditionContext<'_>) -> bool
 const READY_CANONICAL_CSTR: &CStr = c"bevy_scene::Ready";
 const READY_ALIAS_CSTR: &CStr = c"Ready";
 
+/// Temporarily wraps a borrowed [`ValidatedCommands`] inside a [`GuestCommands`] facade via
+/// `core::mem::swap`, executes `f`, and restores the inner command handle without `unsafe`.
 #[inline]
 pub(crate) fn with_guest_commands<R>(
     validated_cmds: &mut ValidatedCommands<'_>,
@@ -85,6 +87,7 @@ impl<'a> GuestApp<'a> {
         }
     }
 
+    /// Resolves `C: GuestComponent` and registers a global component-lifecycle observer for `kind`.
     #[inline]
     fn observe_component_lifecycle<C, F>(
         &mut self,
@@ -184,6 +187,36 @@ impl<'a> GuestApp<'a> {
     #[inline]
     pub fn observe_ready_with(&mut self, name: impl Into<String>) -> ObserverBuilder<'_, 'a> {
         ObserverBuilder::ready(self, name)
+    }
+
+    /// Starts building a configurable custom `Event` / `EntityEvent` observer for
+    /// `E: GuestComponent` supporting entity scoping, upward propagation, custom propagation
+    /// relationships, `.run_if(...)` predicates, and immutable or mutable callbacks.
+    #[inline]
+    pub fn observe_event<E: GuestComponent>(
+        &mut self,
+        name: impl Into<String>,
+    ) -> TypedObserverBuilder<'_, 'a, E> {
+        let resolved = self.resolve_component::<E>();
+        match resolved {
+            Ok(event) => TypedObserverBuilder::from_handle(self, name, event),
+            Err(err) => TypedObserverBuilder::with_error(self, name, err),
+        }
+    }
+
+    /// Starts building a configurable custom event observer for pre-resolved handle `event`
+    /// carrying payload `E: AbiPod`.
+    #[inline]
+    pub fn observe_event_handle<E: AbiPod>(
+        &mut self,
+        name: impl Into<String>,
+        event: BamComponent,
+    ) -> TypedObserverBuilder<'_, 'a, E> {
+        if !event.is_valid() {
+            TypedObserverBuilder::with_error(self, name, FfiResult::INVALID_COMPONENT)
+        } else {
+            TypedObserverBuilder::from_handle(self, name, event)
+        }
     }
 
     /// Registers a global mutable event observer (`&mut E`, `&mut bool` propagate) for `E: GuestComponent`.
@@ -311,6 +344,22 @@ impl<'a> GuestCommands<'a> {
     pub fn observe_entity_mut<E, F>(
         &mut self,
         target: FfiEntity,
+        callback: F,
+    ) -> Result<FfiEntity, FfiResult>
+    where
+        E: GuestComponent,
+        F: FnMut(FfiEntity, &mut E, &mut bool, &mut GuestCommands<'_>) + Send + 'static,
+    {
+        self.observe_entity_mut_with::<E, _>(target, false, BamComponent::INVALID, callback)
+    }
+
+    /// Queues deferred spawning of a mutable entity-scoped runtime observer for `E: GuestComponent`
+    /// with optional upward relationship propagation (`BAM_OBSERVER_FLAG_PROPAGATE`).
+    pub fn observe_entity_mut_with<E, F>(
+        &mut self,
+        target: FfiEntity,
+        propagate: bool,
+        propagate_relationship: BamComponent,
         mut callback: F,
     ) -> Result<FfiEntity, FfiResult>
     where
@@ -319,17 +368,110 @@ impl<'a> GuestCommands<'a> {
     {
         let host = self.inner.host();
         let event = resolve_guest_component::<E>(host, host.manifest_name())?;
+        let flags = if propagate || propagate_relationship.is_valid() {
+            BAM_OBSERVER_FLAG_PROPAGATE
+        } else {
+            0
+        };
         self.inner.observe_mut::<E, _>(
             None,
             event,
             target,
-            0,
-            BamComponent::INVALID,
+            flags,
+            propagate_relationship,
             move |tgt, ev, prop, validated_cmds| {
                 with_guest_commands(validated_cmds, |cmds| callback(tgt, ev, prop, cmds));
                 FfiResult::OK
             },
         )
+    }
+
+    /// Queues deferred spawning of a runtime lifecycle observer for `C: GuestComponent` on `target`
+    /// (`FfiEntity::NULL` for global).
+    #[inline]
+    fn observe_component_lifecycle_runtime<C, F>(
+        &mut self,
+        kind: BamEventKind,
+        target: FfiEntity,
+        callback: F,
+    ) -> Result<FfiEntity, FfiResult>
+    where
+        C: GuestComponent,
+        F: FnMut(FfiEntity, &mut GuestCommands<'_>) + Send + 'static,
+    {
+        let host = self.inner.host();
+        let comp = resolve_guest_component::<C>(host, host.manifest_name())?;
+        self.observe_entity_lifecycle(kind, &[comp], target, callback)
+    }
+
+    /// Queues deferred spawning of a runtime `Add<C>` lifecycle observer.
+    #[inline]
+    pub fn observe_add<C, F>(
+        &mut self,
+        target: FfiEntity,
+        callback: F,
+    ) -> Result<FfiEntity, FfiResult>
+    where
+        C: GuestComponent,
+        F: FnMut(FfiEntity, &mut GuestCommands<'_>) + Send + 'static,
+    {
+        self.observe_component_lifecycle_runtime::<C, _>(BamEventKind::ADD, target, callback)
+    }
+
+    /// Queues deferred spawning of a runtime `Insert<C>` lifecycle observer.
+    #[inline]
+    pub fn observe_insert<C, F>(
+        &mut self,
+        target: FfiEntity,
+        callback: F,
+    ) -> Result<FfiEntity, FfiResult>
+    where
+        C: GuestComponent,
+        F: FnMut(FfiEntity, &mut GuestCommands<'_>) + Send + 'static,
+    {
+        self.observe_component_lifecycle_runtime::<C, _>(BamEventKind::INSERT, target, callback)
+    }
+
+    /// Queues deferred spawning of a runtime `Discard<C>` lifecycle observer.
+    #[inline]
+    pub fn observe_discard<C, F>(
+        &mut self,
+        target: FfiEntity,
+        callback: F,
+    ) -> Result<FfiEntity, FfiResult>
+    where
+        C: GuestComponent,
+        F: FnMut(FfiEntity, &mut GuestCommands<'_>) + Send + 'static,
+    {
+        self.observe_component_lifecycle_runtime::<C, _>(BamEventKind::DISCARD, target, callback)
+    }
+
+    /// Queues deferred spawning of a runtime `Remove<C>` lifecycle observer.
+    #[inline]
+    pub fn observe_remove<C, F>(
+        &mut self,
+        target: FfiEntity,
+        callback: F,
+    ) -> Result<FfiEntity, FfiResult>
+    where
+        C: GuestComponent,
+        F: FnMut(FfiEntity, &mut GuestCommands<'_>) + Send + 'static,
+    {
+        self.observe_component_lifecycle_runtime::<C, _>(BamEventKind::REMOVE, target, callback)
+    }
+
+    /// Queues deferred spawning of a runtime `Despawn<C>` lifecycle observer.
+    #[inline]
+    pub fn observe_despawn<C, F>(
+        &mut self,
+        target: FfiEntity,
+        callback: F,
+    ) -> Result<FfiEntity, FfiResult>
+    where
+        C: GuestComponent,
+        F: FnMut(FfiEntity, &mut GuestCommands<'_>) + Send + 'static,
+    {
+        self.observe_component_lifecycle_runtime::<C, _>(BamEventKind::DESPAWN, target, callback)
     }
 
     /// Queues deferred spawning of a runtime lifecycle or `Ready` observer.
@@ -722,6 +864,191 @@ impl<'app, 'a> ObserverBuilder<'app, 'a> {
     }
 }
 
+/// Fluent `#![forbid(unsafe_code)]` builder for custom `Event` / `EntityEvent` observers carrying
+/// payload `E: AbiPod` (including Bevy `0.20` flattened `Pointer*` events).
+///
+/// Created via [`GuestApp::observe_event`] or [`GuestApp::observe_event_handle`]. Supports entity
+/// scoping (`.with_target`), upward relationship propagation (`.with_propagate` /
+/// `.with_relationship`), composable `.run_if(...)` predicates, and read-only ([`Self::build`]) or
+/// mutable/stoppable ([`Self::build_mut`]) callbacks.
+pub struct TypedObserverBuilder<'app, 'a, E: AbiPod> {
+    app: &'app mut GuestApp<'a>,
+    name: String,
+    event: BamComponent,
+    target: FfiEntity,
+    flags: u32,
+    propagate_relationship: BamComponent,
+    conditions: Vec<RunIfPredicate>,
+    first_error: Option<FfiResult>,
+    _marker: PhantomData<fn() -> E>,
+}
+
+impl<'app, 'a, E: AbiPod> TypedObserverBuilder<'app, 'a, E> {
+    /// Initializes a [`TypedObserverBuilder`] bound to a pre-resolved event component handle.
+    #[inline]
+    pub(crate) fn from_handle(
+        app: &'app mut GuestApp<'a>,
+        name: impl Into<String>,
+        event: BamComponent,
+    ) -> Self {
+        Self {
+            app,
+            name: name.into(),
+            event,
+            target: FfiEntity::NULL,
+            flags: 0,
+            propagate_relationship: BamComponent::INVALID,
+            conditions: Vec::new(),
+            first_error: None,
+            _marker: PhantomData,
+        }
+    }
+
+    /// Initializes a [`TypedObserverBuilder`] with a latched resolution error to be returned on build.
+    #[inline]
+    pub(crate) fn with_error(
+        app: &'app mut GuestApp<'a>,
+        name: impl Into<String>,
+        err: FfiResult,
+    ) -> Self {
+        Self {
+            app,
+            name: name.into(),
+            event: BamComponent::INVALID,
+            target: FfiEntity::NULL,
+            flags: 0,
+            propagate_relationship: BamComponent::INVALID,
+            conditions: Vec::new(),
+            first_error: Some(err),
+            _marker: PhantomData,
+        }
+    }
+
+    /// Scopes this observer to `target` (`FfiEntity::NULL` observes globally).
+    #[inline]
+    pub const fn with_target(mut self, target: FfiEntity) -> Self {
+        self.target = target;
+        self
+    }
+
+    /// Enables or disables upward relationship propagation (`BAM_OBSERVER_FLAG_PROPAGATE`).
+    #[inline]
+    pub const fn with_propagate(mut self, propagate: bool) -> Self {
+        if propagate {
+            self.flags |= BAM_OBSERVER_FLAG_PROPAGATE;
+        } else {
+            self.flags &= !BAM_OBSERVER_FLAG_PROPAGATE;
+        }
+        self
+    }
+
+    /// Configures propagation along pre-resolved relationship handle `relationship`.
+    #[inline]
+    pub fn with_relationship_handle(mut self, relationship: BamComponent) -> Self {
+        if !relationship.is_valid() && self.first_error.is_none() {
+            self.first_error = Some(FfiResult::INVALID_COMPONENT);
+        }
+        self.propagate_relationship = relationship;
+        self.flags |= BAM_OBSERVER_FLAG_PROPAGATE;
+        self
+    }
+
+    /// Resolves `R: GuestComponent` as the propagation relationship and enables propagation.
+    pub fn with_relationship<R: GuestComponent>(mut self) -> Self {
+        match self.app.resolve_component::<R>() {
+            Ok(rel) => {
+                self.propagate_relationship = rel;
+                self.flags |= BAM_OBSERVER_FLAG_PROPAGATE;
+            }
+            Err(err) if self.first_error.is_none() => self.first_error = Some(err),
+            Err(_) => {}
+        }
+        self
+    }
+
+    /// Appends a composable run-condition predicate evaluated before invoking the observer.
+    #[inline]
+    pub fn run_if<F>(mut self, predicate: F) -> Self
+    where
+        F: FnMut(&RunConditionContext<'_>) -> bool + Send + 'static,
+    {
+        self.conditions.push(Box::new(predicate));
+        self
+    }
+
+    /// Appends a zero-argument run-condition predicate `|| -> bool`.
+    #[inline]
+    pub fn run_if_fn<F>(self, mut predicate: F) -> Self
+    where
+        F: FnMut() -> bool + Send + 'static,
+    {
+        self.run_if(move |_ctx| predicate())
+    }
+
+    /// Registers a read-only `(target, &E, &mut GuestCommands<'_>)` observer.
+    pub fn build<F>(self, mut callback: F) -> Result<&'app mut GuestApp<'a>, FfiResult>
+    where
+        F: FnMut(FfiEntity, &E, &mut GuestCommands<'_>) + Send + 'static,
+    {
+        if let Some(err) = self.first_error {
+            return Err(err);
+        }
+        let mut conditions = self.conditions;
+        let status = self.app.load_ctx.register_observer_with_options::<E, _>(
+            self.app.instance,
+            &self.name,
+            self.event,
+            self.target,
+            self.flags,
+            self.propagate_relationship,
+            move |tgt, ev, validated_cmds| {
+                if !conditions.is_empty() {
+                    let cond_ctx = RunConditionContext::new(validated_cmds.host());
+                    if !conditions.iter_mut().all(|pred| pred(&cond_ctx)) {
+                        return FfiResult::OK;
+                    }
+                }
+                with_guest_commands(validated_cmds, |cmds| callback(tgt, ev, cmds));
+                FfiResult::OK
+            },
+        );
+        if status.is_ok() {
+            Ok(self.app)
+        } else {
+            Err(status)
+        }
+    }
+
+    /// Registers a mutable `(target, &mut E, &mut bool, &mut GuestCommands<'_>)` observer
+    /// supporting in-place payload mutation and propagation stopping (`*propagate = false`).
+    pub fn build_mut<F>(self, mut callback: F) -> Result<&'app mut GuestApp<'a>, FfiResult>
+    where
+        F: FnMut(FfiEntity, &mut E, &mut bool, &mut GuestCommands<'_>) + Send + 'static,
+    {
+        if let Some(err) = self.first_error {
+            return Err(err);
+        }
+        let mut conditions = self.conditions;
+        self.app.observe_mut_handle::<E, _>(
+            &self.name,
+            self.event,
+            self.target,
+            self.flags,
+            self.propagate_relationship,
+            move |tgt, ev, prop, cmds| {
+                if !conditions.is_empty() {
+                    let cond_ctx = RunConditionContext::new(cmds.host());
+                    if !conditions.iter_mut().all(|pred| pred(&cond_ctx)) {
+                        return;
+                    }
+                }
+                callback(tgt, ev, prop, cmds);
+            },
+        )?;
+        Ok(self.app)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use crate::app::{GuestApp, GuestComponentOptions, ObserverBuilder};
@@ -729,6 +1056,8 @@ mod tests {
     use crate::component::GuestComponentHooks;
     use bamabi_sys::{BamComponent, BamEventKind, FfiChildOf, FfiEntity, FfiResult};
 
+    /// Compile-time signature fixture covering `Ready`, lifecycle, stoppable, and runtime
+    /// observer registration and trigger helpers under `#![forbid(unsafe_code)]`.
     #[allow(dead_code)]
     fn _verify_ready_observer_sdk_signatures<'a>(
         app: &'a mut GuestApp<'a>,
@@ -762,6 +1091,9 @@ mod tests {
         let _: Result<(), FfiResult> = cmds.trigger_ready_propagated_along::<FfiChildOf>(entity);
     }
 
+    /// Scenario: Constructs `GuestComponentHooks` with all five lifecycle hooks, clone support,
+    /// and required handles, then merges them into `GuestComponentOptions`, asserting that every
+    /// flag, hook callback, and required handle is preserved without loss.
     #[test]
     fn guest_hooks_and_options_builders_preserve_all_flags_hooks_and_requirements() {
         let _sig_check = _verify_ready_observer_sdk_signatures;

@@ -42,10 +42,12 @@
 //!   read/write (POD and witness-backed non-POD) and dynamic global, `EntityEvent`, lifecycle,
 //!   `Ready`, mutable, and upward-propagating observers ([`GuestApp::observe`],
 //!   [`ObserverBuilder`]).
-//! - **Optional Subsystem Bridges (`bridges`):** Ergonomic guest wrappers for Bevy standard
-//!   components/inputs (`std_types`), isolated `mod://<ns>/...` assets (`GuestAssetServer`),
-//!   `States` (`GuestStateBridge`), reflection/BRP/settings (`bridges::reflect`), and BSN scenes
-//!   (`GuestScene`).
+//! - **Subsystem Bridges (`bridges`):** Unconditional (`default = []`) zero-Bevy wrappers matching
+//!   `bamabi_bridges` and `bamabi_reflect` (`std_types` + mouse/gamepad, `picking`, `camera_light`,
+//!   `audio`, `ui` / Feathers / editable text / text bridges, isolated `mod://<ns>/...` &
+//!   `mod://overlay/...` `asset` handles, `state` including `ModStateSlab`, `reflect` / BRP /
+//!   `"BAMT"` `SystemTelemetryDigest64`, and `bsn` scenes), plus host-opt-in conventions for
+//!   `render`, `window`, and `gizmos`.
 //!
 //! ## Quickstart
 //!
@@ -101,6 +103,7 @@ pub mod bridges;
 pub mod commands;
 pub mod commands_lifecycle;
 pub mod component;
+pub mod entity_commands;
 pub mod iter;
 pub mod lifecycle;
 pub mod macros;
@@ -111,7 +114,7 @@ pub use bamabi_guest_sys::SpawnEntry;
 pub use bamabi_sys::{
     ABI_VERSION, ABI_VERSION_MAJOR, ABI_VERSION_MINOR, ABI_VERSION_PATCH, AbiPod, AccessMode,
     BAM_COMPONENT_FLAG_IMMUTABLE, BAM_COMPONENT_FLAG_SPARSE_SET, BAM_COMPONENT_FLAG_SUMMARY_TICK,
-    BAM_LOG_DEBUG, BAM_LOG_ERROR, BAM_LOG_INFO, BAM_LOG_TRACE, BAM_LOG_WARN,
+    BAM_DISABLED_NAME, BAM_LOG_DEBUG, BAM_LOG_ERROR, BAM_LOG_INFO, BAM_LOG_TRACE, BAM_LOG_WARN,
     BAM_OBSERVER_FLAG_PROPAGATE, BAM_RELATION_FLAG_ACYCLIC, BAM_RELATION_FLAG_CASCADE_DELETE,
     BAM_RELATION_FLAG_CASCADE_DESPAWN, BAM_RELATION_FLAG_CLEANUP_REMOVE,
     BAM_RELATION_FLAG_EXCLUSIVE, BAM_RELATION_FLAG_SYMMETRIC, BAM_SCHEDULE_SET_FLAG_AFTER_WEAK,
@@ -124,7 +127,7 @@ pub use bamabi_sys::{
     BamObserverDesc, BamObserverFn, BamObserverMutFn, BamRelationDesc, BamRequiredComponent,
     BamRowMigrateFn, BamScheduleSetDesc, BamSymbol, BamSystem, BamSystemSet, BamTermDesc,
     BamTriggerDesc, ComponentDesc, ComponentUuid, FfiAssetHandle, FfiAssetLoadState, FfiBool,
-    FfiChildOf, FfiEntity, FfiOption, FfiResult, FfiSlice, MAX_QUERIES_PER_SYSTEM,
+    FfiChildOf, FfiDisabled, FfiEntity, FfiOption, FfiResult, FfiSlice, MAX_QUERIES_PER_SYSTEM,
     MAX_TERMS_PER_QUERY, ModComponent, RawInsertable, ScheduleId, StrView, SymbolEntry,
     VTableHeader,
 };
@@ -133,33 +136,79 @@ pub use bamabi_sys::{
 pub use bamabi_macros::{AbiPod, GuestComponent, ModComponent};
 
 pub use app::{
-    GuestApp, GuestComponentOptions, GuestRes, GuestResMut, IntoSystemResult, ObserverBuilder,
-    QueryBuilder, RelationDescBuilder, RunConditionContext, ScheduleSetBuilder, SystemBuilder,
-    SystemContext,
+    BevySchedules, GuestApp, GuestComponentOptions, GuestRes, GuestResMut, IntoSystemResult,
+    ObserverBuilder, QueryBuilder, RelationDescBuilder, RunConditionContext, ScheduleSetBuilder,
+    SystemBuilder, SystemContext, TypedObserverBuilder, conditions,
 };
 pub use bridges::{
-    BRP_METHOD_GET_COMPONENTS, BRP_METHOD_GET_RESOURCES, BRP_METHOD_INSERT_COMPONENTS,
-    BRP_METHOD_LIST_COMPONENTS, BRP_METHOD_MUTATE_COMPONENTS, BRP_METHOD_MUTATE_RESOURCES,
-    FfiGlobalTransform, FfiKeyCode, FfiKeyboardInput, FfiMouseButton, FfiMouseInput, FfiTimeFixed,
-    FfiTimeReal, FfiTimeVirtual, FfiTransform, FfiVisibility, GuestAssetHandle, GuestAssetHostExt,
-    GuestAssetServer, GuestBridgesHostExt, GuestCommandsBsnExt, GuestCommandsStateExt,
-    GuestNameBridge, GuestScene, GuestStateBridge, GuestStateHandles, GuestStateQueryBuilderExt,
+    APPLY_EAR_POSITIONS, APPLY_EMITTER_POS, APPLY_SPEED, APPLY_VOLUME, AUDIO_SOURCE_ASSET_ALIAS,
+    BRP_METHOD_BAM_COMPONENT_SCHEMAS, BRP_METHOD_BAM_HOT_RELOAD, BRP_METHOD_BAM_LIST_MODS,
+    BRP_METHOD_BAM_SYSTEM_METRICS, BRP_METHOD_GET_COMPONENTS, BRP_METHOD_GET_RESOURCES,
+    BRP_METHOD_INSERT_COMPONENTS, BRP_METHOD_LIST_COMPONENTS, BRP_METHOD_MUTATE_COMPONENTS,
+    BRP_METHOD_MUTATE_RESOURCES, BRP_METHOD_REGISTRY_SCHEMA, BRP_METHOD_RPC_DISCOVER,
+    BRP_METHOD_WORLD_DESPAWN_ENTITY, BRP_METHOD_WORLD_GET_COMPONENTS,
+    BRP_METHOD_WORLD_GET_RESOURCES, BRP_METHOD_WORLD_INSERT_COMPONENTS,
+    BRP_METHOD_WORLD_INSERT_RESOURCES, BRP_METHOD_WORLD_LIST_COMPONENTS,
+    BRP_METHOD_WORLD_LIST_RESOURCES, BRP_METHOD_WORLD_MUTATE_COMPONENTS,
+    BRP_METHOD_WORLD_MUTATE_RESOURCES, BRP_METHOD_WORLD_QUERY, BRP_METHOD_WORLD_REMOVE_COMPONENTS,
+    BRP_METHOD_WORLD_REMOVE_RESOURCES, BRP_METHOD_WORLD_SPAWN_ENTITY, CANONICAL_AUDIO_SOURCE_NAME,
+    CLEAR_COLOR_CUSTOM, CLEAR_COLOR_DEFAULT, CLEAR_COLOR_NONE, DEPTH_LOAD_OP_CLEAR,
+    DEPTH_LOAD_OP_LOAD, FfiAppExit, FfiAssetEvent, FfiAssetEventKind, FfiAudioPlaybackSettings,
+    FfiAudioPlayerSpec, FfiBorderColor, FfiBorderRadius, FfiCamera2d, FfiCamera3d, FfiColor,
+    FfiCornerRadius, FfiDirectionalLight, FfiEditableTextConfig, FfiEmSize, FfiEntityCursor,
+    FfiFeathersColorInput, FfiFeathersDropdown, FfiFeathersListRow, FfiFeathersListView,
+    FfiFeathersNumberInput, FfiFeathersScrollableList, FfiFeathersSelect, FfiFontSize,
+    FfiGamepadButton, FfiGamepadRumble, FfiGamepadState, FfiGizmoArrow, FfiGizmoCircle,
+    FfiGizmoCuboid, FfiGizmoLine, FfiGizmoRay, FfiGizmoRect, FfiGizmoSphere, FfiGlobalTransform,
+    FfiInheritedVisibility, FfiInlineBox, FfiInlineImage, FfiKeyCode, FfiKeyboardInput, FfiMesh2d,
+    FfiMesh3d, FfiMouseButton, FfiMouseInput, FfiMouseMotion, FfiMouseScroll, FfiPanOrbitCamera,
+    FfiPointLight, FfiPointerButton, FfiPointerClick, FfiPointerDrag, FfiPointerKind,
+    FfiPointerMove, FfiPointerOut, FfiPointerOver, FfiPointerPress, FfiPointerRelease, FfiRemSize,
+    FfiRgba, FfiSelectedTab, FfiSolariLighting, FfiSpatialAudioSinkControl, FfiSpotLight,
+    FfiSprite, FfiSpriteMaterialSpec, FfiStandardMaterial, FfiStateTransitionEvent, FfiTab,
+    FfiTabList, FfiThemeContext, FfiTimeFixed, FfiTimeReal, FfiTimeVirtual, FfiTransform,
+    FfiUiNode, FfiUiRect, FfiUiTextStyle, FfiVal, FfiValueChange, FfiViewVisibility, FfiVisibility,
+    FfiWeslMaterialSpec, FfiWindow, FfiWindowCloseRequested, FfiWindowMode, FfiWindowResized,
+    GuestAppExitExt, GuestAppPickingExt, GuestAppUiExt, GuestAssetHandle, GuestAssetHostExt,
+    GuestAssetServer, GuestAudioQueryBuilderExt, GuestBackgroundColorBridge,
+    GuestBorderColorBridge, GuestBridgesHostExt, GuestCameraLightQueryBuilderExt,
+    GuestCommandsAudioExt, GuestCommandsBsnExt, GuestCommandsCameraLightExt,
+    GuestCommandsGizmosExt, GuestCommandsPickingExt, GuestCommandsRenderExt, GuestCommandsStateExt,
+    GuestCommandsUiExt, GuestDisabledBridge, GuestEmSizeBridge, GuestGlobalTransformBridge,
+    GuestInheritedVisibilityBridge, GuestKeyboardInputBridge, GuestMappedStringBridge,
+    GuestMouseInputBridge, GuestNameBridge, GuestPickingQueryBuilderExt, GuestRemSizeBridge,
+    GuestRenderQueryBuilderExt, GuestScene, GuestSpriteBridge, GuestStandardMaterialBridge,
+    GuestStateBridge, GuestStateHandles, GuestStateQueryBuilderExt, GuestStateSlabContextExt,
     GuestStateSystemBuilderExt, GuestStdCommandsExt, GuestStdHandles, GuestStdQueryBuilderExt,
-    TypedAssetHandle, on_enter_schedule, on_exit_schedule, on_transition_schedule,
-    resolve_reflected_handle, resolve_scene_patch_type, resolve_settings_handle,
-};
-#[cfg(feature = "derive")]
-pub use bridges::{
-    GuestGlobalTransformBridge, GuestKeyboardInputBridge, GuestMouseInputBridge, GuestStdTypes,
-    GuestTimeFixedBridge, GuestTimeRealBridge, GuestTimeVirtualBridge, GuestTransformBridge,
-    GuestVisibilityBridge, GuestWireBridge,
+    GuestStdTypes, GuestTextSpanBridge, GuestThemeContextBridge, GuestTimeFixedBridge,
+    GuestTimeRealBridge, GuestTimeVirtualBridge, GuestTransformBridge, GuestUiQueryBuilderExt,
+    GuestUiTextBridge, GuestViewVisibilityBridge, GuestVisibilityBridge, GuestWindowBridge,
+    GuestWindowQueryBuilderExt, GuestWireBridge, MOD_STATE_FLAG_ACTIVE, MOD_STATE_FLAG_COMPUTED,
+    MOD_STATE_FLAG_MUTABLE, MOD_STATE_FLAG_SUB_STATE, MUTE_CMD_MUTE, MUTE_CMD_NONE,
+    MUTE_CMD_TOGGLE, MUTE_CMD_UNMUTE, ModDespawnOnEnter, ModDespawnOnExit, ModStateEntry,
+    ModStateHandle, ModStateTransitionRequest, ORBIT_CONSTRAINT_FIXED, ORBIT_CONSTRAINT_FREE,
+    OVERLAY_NAMESPACE, PLAYBACK_MODE_DESPAWN, PLAYBACK_MODE_LOOP, PLAYBACK_MODE_ONCE,
+    PLAYBACK_MODE_REMOVE, SINK_CMD_NONE, SINK_CMD_PAUSE, SINK_CMD_PLAY, SINK_CMD_STOP,
+    SINK_CMD_TOGGLE_PLAYBACK, STATE_ABSENT_DISCRIMINANT, SYSTEM_TELEMETRY_DIGEST_SIZE,
+    SYSTEM_TELEMETRY_DIGEST_VERSION, SYSTEM_TELEMETRY_MAGIC, SystemTelemetryDigest64,
+    TELEMETRY_FLAG_BUDGET_BREACHED, TELEMETRY_FLAG_FAULTED, TELEMETRY_FLAG_QUARANTINED,
+    TELEMETRY_FLAG_SUMMARY_TICK_ACTIVE, TONEMAPPING_ACES_FITTED, TONEMAPPING_AGX,
+    TONEMAPPING_BLENDER_FILMIC, TONEMAPPING_KHRONOS_PBR_NEUTRAL, TONEMAPPING_LINEAR,
+    TONEMAPPING_NONE, TONEMAPPING_REINHARD, TONEMAPPING_REINHARD_LUMINANCE,
+    TONEMAPPING_SOMEWHAT_BORING_DISPLAY_TRANSFORM, TONEMAPPING_TONY_MC_MAPFACE,
+    TRANSMISSION_QUALITY_HIGH, TRANSMISSION_QUALITY_LOW, TRANSMISSION_QUALITY_MEDIUM,
+    TRANSMISSION_QUALITY_ULTRA, TelemetryFrameError, TypedAssetHandle, VOLUME_DECIBELS,
+    VOLUME_LINEAR, fnv1a_64_hash_system, mod_asset_path, mod_overlay_path, on_enter_schedule,
+    on_exit_schedule, on_transition_schedule, resolve_audio_source_type, resolve_reflected_handle,
+    resolve_scene_patch_type, resolve_settings_handle, state_set_name,
 };
 pub use commands::{GuestCommands, GuestTransaction};
 pub use component::{GuestComponent, GuestComponentHooks, guest_component_uuid};
+pub use entity_commands::{GuestChildSpawner, GuestEntityCommands};
 pub use iter::{
     Added, Allow, Changed, Chunk, ChunkIter, ChunkSlice, ChunkSliceMut, Has, Or, Or2, Or3,
-    OrFilterTerm, OrFilterTuple, QueryTerm, QueryTuple, SparseRows, SparseRowsIter, SparseRowsMut,
-    TypedChunkIter, With, Without,
+    OrFilterTerm, OrFilterTuple, QuerySingleError, QueryTerm, QueryTuple, SparseRows,
+    SparseRowsIter, SparseRowsMut, TypedChunkIter, With, Without,
 };
 pub use lifecycle::{GuestPlugin, build_guest_fn, build_guest_plugin};
 
@@ -178,6 +227,7 @@ mod tests {
     mod derive_smoke {
         use crate::prelude::*;
 
+        /// Sample `#[derive(AbiPod, GuestComponent)]` fixture disabling schema-hash mixing.
         #[repr(C)]
         #[derive(Clone, Copy, Debug, PartialEq, AbiPod, GuestComponent)]
         #[guest_component(name = "demo::DerivedVec2", no_schema_hash)]
@@ -186,6 +236,7 @@ mod tests {
             y: f32,
         }
 
+        /// Sample `#[derive(ModComponent)]` fixture using `guest` shorthand and `summary_tick` flag.
         #[repr(C)]
         #[derive(Clone, Copy, Debug, PartialEq, ModComponent)]
         #[mod_component(name = "demo::ShorthandVec2", summary_tick, guest)]
@@ -194,6 +245,9 @@ mod tests {
             y: f32,
         }
 
+        /// Verifies that `#[derive(GuestComponent)]` and `#[derive(ModComponent)]` with `guest`
+        /// produce deterministic `ComponentUuid`s matching `ComponentUuid::from_parts` and preserve
+        /// `BAM_COMPONENT_FLAG_SUMMARY_TICK`.
         #[test]
         fn derived_guest_component_uuid_is_deterministic() {
             let expected = ComponentUuid::from_parts(
@@ -214,6 +268,8 @@ mod tests {
         }
     }
 
+    /// Verifies that invalid `ChunkSlice` and `ChunkSliceMut` wrappers report empty length and
+    /// safely return `None` from typed slice conversions.
     #[test]
     fn invalid_slices_return_none_safely() {
         let slice = ChunkSlice::from_validated(ValidatedSlice::invalid());

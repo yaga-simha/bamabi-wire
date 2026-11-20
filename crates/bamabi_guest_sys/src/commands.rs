@@ -218,6 +218,12 @@ impl<'a> SpawnBatchColumn<'a> {
     }
 }
 
+/// Validates a [`SpawnBatchColumn`] against `host.component_layout_info(col.component)` and
+/// checks buffer bounds before passing columnar pointers to `BamHostApi::cmd_spawn_batch`.
+///
+/// Verifies that `col.component` is valid, `col.entity_count >= entity_count`, layout `(size,
+/// align)` matches the host's registered metadata when statically known, non-empty columns are
+/// non-null, and `entity_count * expected_size` does not overflow `isize::MAX`.
 fn validate_spawn_batch_column(
     host: &Host,
     col: &SpawnBatchColumn<'_>,
@@ -320,6 +326,12 @@ impl<'a> ValidatedCommands<'a> {
         if status.is_ok() { Ok(out) } else { Err(status) }
     }
 
+    /// Shared implementation for [`Self::spawn`] and [`Self::spawn_persistent`].
+    ///
+    /// Validates every [`SpawnEntry`] via [`validate_spawn_entry`], packs handles and data
+    /// pointers into stack scratch arrays when `entries.len() <= INLINE_SPAWN_CAP` (zero heap
+    /// allocation on hot paths) or falls back to temporary `Vec`s for larger archetypes, and
+    /// forwards to [`Self::spawn_raw`] or [`Self::spawn_persistent_raw`].
     fn spawn_entries_impl(
         &mut self,
         entries: &[SpawnEntry<'_>],

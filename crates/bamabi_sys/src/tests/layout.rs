@@ -9,7 +9,7 @@ use core::{
 use crate::{
     ABI_VERSION, ABI_VERSION_MAJOR, ABI_VERSION_MINOR, ABI_VERSION_PATCH, AccessMode,
     BAM_COMPONENT_FLAG_IMMUTABLE, BAM_COMPONENT_FLAG_SPARSE_SET, BAM_COMPONENT_FLAG_SUMMARY_TICK,
-    BAM_LOG_DEBUG, BAM_LOG_ERROR, BAM_LOG_INFO, BAM_LOG_TRACE, BAM_LOG_WARN,
+    BAM_DISABLED_NAME, BAM_LOG_DEBUG, BAM_LOG_ERROR, BAM_LOG_INFO, BAM_LOG_TRACE, BAM_LOG_WARN,
     BAM_OBSERVER_FLAG_PROPAGATE, BAM_RELATION_FLAG_ACYCLIC, BAM_RELATION_FLAG_CASCADE_DELETE,
     BAM_RELATION_FLAG_CASCADE_DESPAWN, BAM_RELATION_FLAG_CLEANUP_REMOVE,
     BAM_RELATION_FLAG_EXCLUSIVE, BAM_RELATION_FLAG_SYMMETRIC, BAM_RELATION_KNOWN_FLAGS,
@@ -39,7 +39,7 @@ use crate::{
     BamSysHostCtxFn, BamSysQueryFn, BamSysResMutPtrFn, BamSysResPtrFn, BamSystem, BamSystemCtx,
     BamSystemDesc, BamSystemFn, BamSystemSet, BamTermDesc, BamTriggerDesc, ComponentCloneFn,
     ComponentDesc, ComponentHookFn, ComponentUuid, ExtensibleStruct, FfiAssetHandle,
-    FfiAssetLoadState, FfiBool, FfiChildOf, FfiEntity, FfiOption, FfiResult, FfiSlice,
+    FfiAssetLoadState, FfiBool, FfiChildOf, FfiDisabled, FfiEntity, FfiOption, FfiResult, FfiSlice,
     MAX_QUERIES_PER_SYSTEM, MAX_TERMS_PER_QUERY, ModComponent, SIPHASH_KEY_0, SIPHASH_KEY_1,
     ScheduleId, StrView, SymbolEntry, VTableHeader, abi_version_is_compatible, abi_version_major,
     abi_version_minor, abi_version_patch, assert_abi_pod, assert_raw_insertable, fnv1a_64_init,
@@ -47,12 +47,17 @@ use crate::{
     siphash24_128, unpack_abi_version,
 };
 
+/// Fixed-capacity stack UTF-8 formatting buffer for `#![no_std]` `Display` tests.
+///
+/// Intended purpose: lets `bamabi_sys` unit tests verify `core::fmt::Display` formatting (such as
+/// `FfiResult`) without pulling in `alloc` or `std`.
 struct StackFmtBuf<const N: usize> {
     bytes: [u8; N],
     len: usize,
 }
 
 impl<const N: usize> StackFmtBuf<N> {
+    /// Creates an empty zero-initialized formatting buffer.
     const fn new() -> Self {
         Self {
             bytes: [0u8; N],
@@ -60,12 +65,14 @@ impl<const N: usize> StackFmtBuf<N> {
         }
     }
 
+    /// Views the written UTF-8 prefix as a `&str`.
     fn as_str(&self) -> &str {
         core::str::from_utf8(&self.bytes[..self.len]).expect("StackFmtBuf holds valid UTF-8")
     }
 }
 
 impl<const N: usize> Write for StackFmtBuf<N> {
+    /// Appends `s` into the stack buffer, returning `Err(core::fmt::Error)` if capacity is exceeded.
     fn write_str(&mut self, s: &str) -> core::fmt::Result {
         let rem = N.saturating_sub(self.len);
         if s.len() > rem {
@@ -287,6 +294,8 @@ unsafe extern "C" fn stub_run_if(_user_data: *mut c_void) -> FfiBool {
 
 unsafe extern "C" fn stub_drop(_ptr: *mut c_void) {}
 
+/// Builds a `BamHostApi` with all 27 mandatory core ABI `0.2` slots populated with no-op stubs
+/// and all extended/ABI `0.3` slots left as `None`, used to test validation and prefix reading.
 fn populated_host_api() -> BamHostApi {
     BamHostApi {
         struct_size: size_of::<BamHostApi>() as u32,
@@ -362,6 +371,9 @@ fn populated_host_api() -> BamHostApi {
     }
 }
 
+/// Test scenario: verifies exact `size_of`, `align_of`, `offset_of!`, and `MIN_V0_2_SIZE` /
+/// `MIN_V0_3_SIZE` invariants for every primitive newtype, `Option<unsafe extern "C" fn(...)>`
+/// niche-optimized pointer slot, and extensible descriptor on both 64-bit and 32-bit targets.
 #[test]
 fn abi_v0_2_exact_sizes_alignments_and_offsets() {
     assert_eq!(size_of::<FfiBool>(), 1);
@@ -517,6 +529,9 @@ fn abi_v0_2_exact_sizes_alignments_and_offsets() {
     }
 }
 
+/// Test scenario (PO-W1, PO-W2): verifies ABI version packing/unpacking (`0x0003_0000` for
+/// `0.3.0`) and Cargo-SemVer compatibility rules for both pre-1.0 (exact minor match, patch
+/// ignored) and post-1.0 (same major, `guest_minor <= host_minor`).
 #[test]
 fn zero_major_and_post_one_semver_handshake() {
     assert_eq!(ABI_VERSION_MAJOR, 0);
@@ -549,24 +564,33 @@ fn zero_major_and_post_one_semver_handshake() {
     assert!(!abi_version_is_compatible(v1_0_0, v0_2_0));
 }
 
+/// Test scenario (PO-W1): verifies `pack_abi_version` panics when `major > 0xFF` instead of
+/// silently truncating bits.
 #[test]
 #[should_panic(expected = "ABI major version exceeds 8-bit range")]
 fn pack_abi_version_rejects_major_overflow() {
     let _ = pack_abi_version(256, 0, 0);
 }
 
+/// Test scenario (PO-W1): verifies `pack_abi_version` panics when `minor > 0xFF` instead of
+/// silently truncating bits.
 #[test]
 #[should_panic(expected = "ABI minor version exceeds 8-bit range")]
 fn pack_abi_version_rejects_minor_overflow() {
     let _ = pack_abi_version(0, 256, 0);
 }
 
+/// Test scenario (PO-W1): verifies `pack_abi_version` panics when `patch > 0xFFFF` instead of
+/// silently truncating bits.
 #[test]
 #[should_panic(expected = "ABI patch version exceeds 16-bit range")]
 fn pack_abi_version_rejects_patch_overflow() {
     let _ = pack_abi_version(0, 2, 65_536);
 }
 
+/// Test scenario (PO-W6): verifies all 18 canonical `FfiResult` codes (`0..=16` and `99`),
+/// their `name()`, `is_ok()`/`is_err()`, and `Display` formatting, plus total panic-free
+/// handling of arbitrary unrecognized foreign integer codes (e.g. `FfiResult(777)`).
 #[test]
 fn ffi_result_taxonomy_and_display() {
     let expected = [
@@ -609,6 +633,11 @@ fn ffi_result_taxonomy_and_display() {
     assert_eq!(buf.as_str(), "UNKNOWN(777)");
 }
 
+/// Test scenario (PO-W3, PO-W4, PO-W5): exercises forward/backward `ExtensibleStruct` prefix
+/// reads—verifying zero-extension of trailing `Option<fn>` slots when a newer reader consumes an
+/// older struct, clean tail truncation when an older reader consumes a newer struct, rejection of
+/// undersized headers (`INVALID_VERSION`), null-pointer rejection (`NULL_POINTER`), and missing
+/// mandatory v0.2 `BamHostApi` slot rejection (`NULL_POINTER`).
 #[test]
 fn extensible_struct_zero_extension_and_truncation() {
     type FutureSlotFn = unsafe extern "C" fn(ctx: *const BamHostCtx) -> FfiResult;
@@ -699,6 +728,11 @@ fn extensible_struct_zero_extension_and_truncation() {
     );
 }
 
+/// Test scenario (PO-W5): verifies strict descriptor validation across `BamManifest`,
+/// `BamTermDesc`, `BamQueryDesc`, `BamSystemDesc`, and `ComponentDesc`—rejecting unknown flag
+/// bits (`UNSUPPORTED`), non-zero reserved fields (`INVALID_ARGUMENT`), invalid schedule IDs
+/// (`6..1024`), query/term capacity overflows (`CAPACITY_EXCEEDED`), `SPARSE_SET | SUMMARY_TICK`
+/// conflicts, and invalid component alignments while accepting ZST and over-aligned SIMD layouts.
 #[test]
 fn unknown_flags_and_nonzero_reserved_rejected() {
     // BamManifest
@@ -851,6 +885,10 @@ fn unknown_flags_and_nonzero_reserved_rejected() {
     );
 }
 
+/// Test scenario: validates `const` `siphash24_128` against the official Aumasson & Bernstein
+/// reference vectors, confirms streaming `ComponentUuid::from_parts` matches one-shot hashing,
+/// verifies cross-mod namespace/size/schema isolation, and tests hyphenated/compact hex parsing
+/// and malformed-input rejection.
 #[test]
 fn siphash24_128_vectors_and_component_uuid() {
     // Official Aumasson & Bernstein SipHash-2-4-128 test vectors for key 000102..0f:
@@ -953,6 +991,10 @@ fn siphash24_128_vectors_and_component_uuid() {
     assert!(ComponentUuid::try_parse_hex("01234567-89ab-cdef-fedc-9876543210cg").is_none());
 }
 
+/// Test scenario: verifies compile-time `AbiPod` vs. `RawInsertable` trait coverage (including
+/// `u128`/`usize` exclusion from `AbiPod`), mock `ModComponent` `VTableHeader` validation and
+/// symbol lookup, `BamColumnInfo` storage flags, wraparound-safe `BamChangeTicks` change
+/// detection, `BamObserverDesc` entity packing, and `FfiChildOf` POD invariants.
 #[test]
 fn abi_pod_and_vtable_header_and_column_info() {
     // Permitted cross-language `AbiPod` primitives & newtypes:
@@ -1141,6 +1183,9 @@ fn abi_pod_and_vtable_header_and_column_info() {
     );
 }
 
+/// Test scenario (PO-W3): constructs minimal ABI `0.2` prefix structs (`MIN_V0_2_SIZE`) for
+/// `BamManifest` and `ComponentDesc` and verifies `read_descriptor` zero-extends trailing
+/// optional callbacks/hooks to `None` while `covers_slot` accurately reports uncovered slots.
 #[test]
 fn min_v0_2_backwards_compatibility_for_manifest_component_desc_and_host_api() {
     #[repr(C)]
@@ -1214,6 +1259,9 @@ fn min_v0_2_backwards_compatibility_for_manifest_component_desc_and_host_api() {
     ));
 }
 
+/// Test scenario: verifies Miri-clean handling of C empty slices `(NULL, 0)` via dangling
+/// substitution, rejection of non-empty null slices (`NULL_POINTER`), rejection of unaligned
+/// pointers (`INVALID_ARGUMENT`), and rejection of invalid UTF-8 in `StrView` (`INVALID_UTF8`).
 #[test]
 fn ffi_slice_and_str_view_null_zero_and_alignment_safety() {
     // Empty C slice `(NULL, 0)` must be Miri-clean without UB in `core::slice::from_raw_parts`.
@@ -1255,6 +1303,10 @@ fn ffi_slice_and_str_view_null_zero_and_alignment_safety() {
     assert_eq!(bad_utf8_res.unwrap_err(), FfiResult::INVALID_UTF8);
 }
 
+/// Test scenario: exercises `FfiOption<T>` round-trips, `FfiAssetHandle` index/UUID/none
+/// validation and `FfiAssetLoadState`, `AccessMode` (`ALLOW`/`HAS`/`REMOVED_READ`) and
+/// `or_group` term descriptors, lifecycle/mutable `BamObserverDesc` and propagating
+/// `BamTriggerDesc`, and extended `BamSystemDesc`/`BamColumnInfo` `summary_tick` flags.
 #[test]
 fn ffi_option_asset_handles_triggers_lifecycle_observers_and_modes() {
     // 1. FfiOption<T>
@@ -1418,6 +1470,11 @@ fn ffi_option_asset_handles_triggers_lifecycle_observers_and_modes() {
     assert!(col_summary.is_summary_tick());
 }
 
+/// Test scenario: validates ABI `0.3.0` additions—typed handles (`BamSystem`, `BamSystemSet`,
+/// `BamSymbol`, `BamFieldKind`), log-level constants, FNV-1a determinism, 64-bit/32-bit sizes
+/// and offsets for `BamFieldDesc`/`BamRequiredComponent`/`BamRelationDesc`/`BamLayoutInfo`/
+/// `BamScheduleSetDesc`, mutually exclusive schedule-set flag validation, and partial v0.3
+/// `BamHostApi` slot detection.
 #[test]
 fn abi_v0_3_extension_layouts_and_validation() {
     // 1. Typed handles (`BamSystem`, `BamSystemSet`, `BamSymbol`)
@@ -1526,6 +1583,14 @@ fn abi_v0_3_extension_layouts_and_validation() {
     let mut bad_align = rel;
     bad_align.data_align = 3;
     assert_eq!(bad_align.validate(), FfiResult::INVALID_ARGUMENT);
+    let mut bad_size_overflow = rel;
+    bad_size_overflow.data_size = (isize::MAX as usize) + 1;
+    bad_size_overflow.data_align = 8;
+    assert_eq!(bad_size_overflow.validate(), FfiResult::INVALID_ARGUMENT);
+    let mut bad_size_round = rel;
+    bad_size_round.data_size = isize::MAX as usize;
+    bad_size_round.data_align = 8;
+    assert_eq!(bad_size_round.validate(), FfiResult::INVALID_ARGUMENT);
 
     let set_ok = BamScheduleSetDesc::new(c"combat::CombatSet".as_ptr());
     assert_eq!(set_ok.validate(), FfiResult::OK);
@@ -1583,4 +1648,245 @@ fn abi_v0_3_extension_layouts_and_validation() {
     let api = populated_host_api();
     assert!(!api.has_all_v0_3_slots());
     assert!(!api.has_all_slots());
+}
+
+/// Test scenario: verifies Bevy 0.20 additive helpers in `bamabi_sys` including `FfiDisabled`,
+/// `Ord` ordering on opaque handle primitives, `Display`/`name` on enum-like newtypes,
+/// `BamFieldDesc::validate`, `BamRequiredComponent::validate`, and descriptor predicates.
+#[test]
+fn bevy_020_additive_sys_helpers_and_validators() {
+    // FfiDisabled marker & ABI invariants
+    assert_abi_pod::<FfiDisabled>();
+    assert_eq!(size_of::<FfiDisabled>(), 0);
+    assert_eq!(align_of::<FfiDisabled>(), 1);
+    assert_eq!(BAM_DISABLED_NAME, "bevy_ecs::entity_disabling::Disabled");
+    assert_eq!(
+        FfiDisabled::UUID,
+        ComponentUuid::from_canonical_name(BAM_DISABLED_NAME)
+    );
+    assert_eq!(FfiDisabled::new(), FfiDisabled);
+
+    // FfiEntity::is_valid and Ord on handles + UUID
+    assert!(!FfiEntity::NULL.is_valid());
+    assert!(FfiEntity::from_bits(1).is_valid());
+    assert!(FfiEntity::from_bits(1) < FfiEntity::from_bits(2));
+    assert!(BamComponent::from_raw(1) < BamComponent::from_raw(2));
+    assert!(BamSystem::from_raw(0) < BamSystem::from_raw(1));
+    assert!(BamSystemSet::from_raw(0) < BamSystemSet::from_raw(1));
+    assert!(BamSymbol::from_raw(0) < BamSymbol::from_raw(1));
+    assert!(FfiChildOf::new(FfiEntity::from_bits(1)) < FfiChildOf::new(FfiEntity::from_bits(2)));
+    assert!(ComponentUuid::from_u128(1) < ComponentUuid::from_u128(2));
+
+    // AccessMode, ScheduleId, FfiAssetLoadState, BamEventKind, BamFieldKind Display + predicates
+    let mut buf = StackFmtBuf::<64>::new();
+    write!(buf, "{}", AccessMode::REMOVED_READ).unwrap();
+    assert_eq!(buf.as_str(), "REMOVED_READ");
+    let mut buf = StackFmtBuf::<64>::new();
+    write!(buf, "{}", AccessMode(99)).unwrap();
+    assert_eq!(buf.as_str(), "UNKNOWN(99)");
+
+    let mut buf = StackFmtBuf::<64>::new();
+    write!(buf, "{}", ScheduleId::FIXED_UPDATE).unwrap();
+    assert_eq!(buf.as_str(), "FIXED_UPDATE");
+    let mut buf = StackFmtBuf::<64>::new();
+    write!(buf, "{}", ScheduleId::custom(1024)).unwrap();
+    assert_eq!(buf.as_str(), "CUSTOM(1024)");
+    let mut buf = StackFmtBuf::<64>::new();
+    write!(buf, "{}", ScheduleId(42)).unwrap();
+    assert_eq!(buf.as_str(), "RESERVED(42)");
+
+    assert!(FfiAssetLoadState::NOT_LOADED.is_not_loaded());
+    assert!(FfiAssetLoadState::LOADING.is_loading());
+    assert!(!FfiAssetLoadState::LOADED.is_loading());
+    let mut buf = StackFmtBuf::<64>::new();
+    write!(buf, "{}", FfiAssetLoadState::LOADING).unwrap();
+    assert_eq!(buf.as_str(), "LOADING");
+    let mut buf = StackFmtBuf::<64>::new();
+    write!(buf, "{}", FfiAssetLoadState(7)).unwrap();
+    assert_eq!(buf.as_str(), "UNKNOWN(7)");
+
+    assert!(!BamEventKind::CUSTOM.is_lifecycle());
+    assert!(BamEventKind::ADD.is_lifecycle());
+    assert!(BamEventKind::READY.is_lifecycle());
+    assert!(!BamEventKind::READY.is_component_lifecycle());
+    let mut buf = StackFmtBuf::<64>::new();
+    write!(buf, "{}", BamEventKind::DISCARD).unwrap();
+    assert_eq!(buf.as_str(), "DISCARD");
+
+    assert!(BamFieldKind::OPAQUE.is_valid());
+    assert!(!BamFieldKind(19).is_valid());
+    let mut buf = StackFmtBuf::<64>::new();
+    write!(buf, "{}", BamFieldKind::FFI_OPTION).unwrap();
+    assert_eq!(buf.as_str(), "FFI_OPTION");
+    let mut buf = StackFmtBuf::<64>::new();
+    write!(buf, "{}", BamFieldKind(99)).unwrap();
+    assert_eq!(buf.as_str(), "UNKNOWN(99)");
+
+    // BamTermDesc::or_group / is_conjunctive
+    let conj = BamTermDesc::read(BamComponent::from_raw(1));
+    assert!(conj.is_conjunctive());
+    assert_eq!(conj.or_group(), 0);
+    let disj = conj.with_or_group(2);
+    assert!(!disj.is_conjunctive());
+    assert_eq!(disj.or_group(), 2);
+
+    // BamChangeTicks::new
+    let ticks = BamChangeTicks::new(10, 12, 11, 15);
+    assert!(!ticks.is_added());
+    assert!(ticks.is_changed());
+
+    // BamFieldDesc::validate edge cases
+    let ok_field = BamFieldDesc::new(
+        BamFieldKind::F32,
+        StrView::from_str("hp"),
+        StrView::from_str("f32"),
+        0,
+        4,
+        4,
+    );
+    assert_eq!(ok_field.validate(), FfiResult::OK);
+    let mut bad_field = ok_field;
+    bad_field.struct_size = 4;
+    assert_eq!(bad_field.validate(), FfiResult::INVALID_VERSION);
+    let mut bad_field = ok_field;
+    bad_field.kind = BamFieldKind(77);
+    assert_eq!(bad_field.validate(), FfiResult::INVALID_ARGUMENT);
+    let mut bad_field = ok_field;
+    bad_field.name = StrView::empty();
+    assert_eq!(bad_field.validate(), FfiResult::INVALID_ARGUMENT);
+    let mut bad_field = ok_field;
+    bad_field.name = StrView {
+        ptr: core::ptr::null(),
+        len: 3,
+    };
+    assert_eq!(bad_field.validate(), FfiResult::NULL_POINTER);
+    let mut bad_field = ok_field;
+    bad_field.type_tag = StrView {
+        ptr: core::ptr::null(),
+        len: 3,
+    };
+    assert_eq!(bad_field.validate(), FfiResult::NULL_POINTER);
+    let mut bad_field = ok_field;
+    bad_field.align = 3;
+    assert_eq!(bad_field.validate(), FfiResult::INVALID_ARGUMENT);
+    let mut bad_field = ok_field;
+    bad_field.name.len = (isize::MAX as usize) + 1;
+    assert_eq!(bad_field.validate(), FfiResult::INVALID_ARGUMENT);
+    let mut bad_field = ok_field;
+    bad_field.type_tag.len = (isize::MAX as usize) + 1;
+    assert_eq!(bad_field.validate(), FfiResult::INVALID_ARGUMENT);
+    let mut bad_field = ok_field;
+    bad_field.offset = isize::MAX as usize;
+    bad_field.size = 4;
+    assert_eq!(bad_field.validate(), FfiResult::INVALID_ARGUMENT);
+
+    // BamRequiredComponent::validate edge cases
+    static BYTES: [u8; 4] = [1, 2, 3, 4];
+    unsafe extern "C" fn stub_init(_dst: *mut c_void, _ud: *mut c_void) -> FfiResult {
+        FfiResult::OK
+    }
+    let req_ok =
+        BamRequiredComponent::by_handle(BamComponent::from_raw(3)).with_custom_bytes(&BYTES);
+    assert!(req_ok.has_custom_bytes());
+    assert!(!req_ok.has_init_fn());
+    assert!(!req_ok.resolves_by_uuid());
+    assert_eq!(req_ok.validate(), FfiResult::OK);
+
+    let req_uuid_ok = BamRequiredComponent::by_uuid(ComponentUuid::from_parts("m::A", 4, 4, 0))
+        .with_init_fn(stub_init, 4, core::ptr::null_mut());
+    assert!(req_uuid_ok.resolves_by_uuid());
+    assert!(req_uuid_ok.has_init_fn());
+    assert_eq!(req_uuid_ok.validate(), FfiResult::OK);
+
+    let req_both = req_ok.with_init_fn(stub_init, 4, core::ptr::null_mut());
+    assert_eq!(req_both.validate(), FfiResult::INVALID_ARGUMENT);
+
+    assert_eq!(
+        BamRequiredComponent::by_handle(BamComponent::INVALID).validate(),
+        FfiResult::INVALID_COMPONENT
+    );
+    assert_eq!(
+        BamRequiredComponent::by_uuid(ComponentUuid::ZERO).validate(),
+        FfiResult::INVALID_ARGUMENT
+    );
+    let mut req_null_bytes = req_ok;
+    req_null_bytes.init_bytes = core::ptr::null();
+    assert_eq!(req_null_bytes.validate(), FfiResult::NULL_POINTER);
+    let mut req_null_fn = req_uuid_ok;
+    req_null_fn.init_fn = None;
+    assert_eq!(req_null_fn.validate(), FfiResult::NULL_POINTER);
+    let mut req_bad_flag = req_ok;
+    req_bad_flag.flags |= 1 << 9;
+    assert_eq!(req_bad_flag.validate(), FfiResult::UNSUPPORTED);
+    let mut req_bad_res = req_ok;
+    req_bad_res.reserved0 = 1;
+    assert_eq!(req_bad_res.validate(), FfiResult::INVALID_ARGUMENT);
+    let mut req_bad_ver = req_ok;
+    req_bad_ver.struct_size = 8;
+    assert_eq!(req_bad_ver.validate(), FfiResult::INVALID_VERSION);
+    let mut req_bad_size = req_ok;
+    req_bad_size.init_size = (isize::MAX as usize) + 1;
+    assert_eq!(req_bad_size.validate(), FfiResult::INVALID_ARGUMENT);
+
+    // BamRelationDesc / BamScheduleSetDesc / BamLayoutInfo builders & predicates
+    let rel = BamRelationDesc::new(
+        c"game::OwnedBy".as_ptr(),
+        ComponentUuid::from_parts("game::OwnedBy", 0, 1, 0),
+    )
+    .with_flags(
+        BAM_RELATION_FLAG_EXCLUSIVE
+            | BAM_RELATION_FLAG_CASCADE_DESPAWN
+            | BAM_RELATION_FLAG_SYMMETRIC
+            | BAM_RELATION_FLAG_ACYCLIC
+            | BAM_RELATION_FLAG_CLEANUP_REMOVE,
+    )
+    .with_max_degree(4);
+    assert_eq!(rel.max_degree, 4);
+    assert!(rel.is_exclusive());
+    assert!(rel.is_cascade_despawn());
+    assert!(rel.is_symmetric());
+    assert!(rel.is_acyclic());
+    assert!(rel.is_cleanup_remove());
+    assert_eq!(rel.validate(), FfiResult::OK);
+
+    let before_sets = [BamSystemSet::from_raw(1)];
+    let after_sets = [BamSystemSet::from_raw(2)];
+    let sset = BamScheduleSetDesc::new(c"game::Physics".as_ptr())
+        .with_schedule(ScheduleId::FIXED_UPDATE)
+        .with_flags(
+            BAM_SCHEDULE_SET_FLAG_SEQUENCE
+                | BAM_SCHEDULE_SET_FLAG_BEFORE_WEAK
+                | BAM_SCHEDULE_SET_FLAG_AFTER_WEAK,
+        )
+        .with_before_sets(before_sets.as_ptr(), 1)
+        .with_after_sets(after_sets.as_ptr(), 1);
+    assert_eq!(sset.schedule, ScheduleId::FIXED_UPDATE);
+    assert!(sset.is_sequence());
+    assert!(!sset.is_sequence_weak());
+    assert!(!sset.is_parallel());
+    assert!(sset.is_before_weak());
+    assert!(sset.is_after_weak());
+    assert_eq!(sset.validate(), FfiResult::OK);
+
+    let mut layout = BamLayoutInfo::empty();
+    let expected_uuid = ComponentUuid::from_parts("game::Pos", 12, 4, 0);
+    layout.uuid = expected_uuid;
+    layout.size = 12;
+    layout.align = 4;
+    layout.flags = BAM_STORAGE_FLAG_SPARSE_SET
+        | BAM_STORAGE_FLAG_IMMUTABLE
+        | BAM_STORAGE_FLAG_RESOURCE
+        | BAM_STORAGE_FLAG_MESSAGE
+        | BAM_STORAGE_FLAG_EVENT
+        | BAM_STORAGE_FLAG_ENTITY_EVENT
+        | BAM_STORAGE_FLAG_SUMMARY_TICK;
+    assert!(layout.is_sparse_set());
+    assert!(layout.is_immutable());
+    assert!(layout.is_resource());
+    assert!(layout.is_message());
+    assert!(layout.is_event());
+    assert!(layout.is_entity_event());
+    assert!(layout.is_summary_tick());
+    assert!(layout.matches_layout(expected_uuid, 12, 4));
+    assert!(!layout.matches_layout(expected_uuid, 16, 4));
 }

@@ -30,6 +30,10 @@ use crate::{
 /// Required namespace prefix for custom game symbols looked up via `BamHostApi::get_proc_address`.
 pub const CUSTOM_SYMBOL_PREFIX: &[u8] = b"bam.v0.";
 
+/// `Send + Sync` newtype wrapping the opaque world-scoped `*const BamHostCtx` pointer.
+///
+/// Exists so [`Host`] can be embedded in `Send` guest system/observer closures while keeping raw
+/// pointer safety invariants explicitly audited in one place.
 #[derive(Clone, Copy, Debug)]
 struct HostCtxPtr(*const BamHostCtx);
 
@@ -42,6 +46,8 @@ unsafe impl Send for HostCtxPtr {}
 // symbol/component queries and diagnostics.
 unsafe impl Sync for HostCtxPtr {}
 
+/// `Send + Sync` newtype pointing to immutable UTF-8 manifest name bytes pinned inside
+/// [`GuestInstance`].
 #[derive(Clone, Copy, Debug)]
 struct ManifestNamePtr(*const u8);
 
@@ -52,6 +58,9 @@ unsafe impl Send for ManifestNamePtr {}
 // SAFETY: Shared read-only UTF-8 byte pointer safe to read concurrently across worker threads.
 unsafe impl Sync for ManifestNamePtr {}
 
+/// `Send + Sync` newtype pointing to the heap-pinned [`RuntimeAllocTracker`] owned by
+/// [`GuestInstance`], allowing runtime command helpers to register allocations safely across
+/// worker threads.
 #[derive(Clone, Copy, Debug)]
 struct RuntimeAllocsPtr(*const RuntimeAllocTracker);
 
@@ -70,6 +79,7 @@ pub struct ValidatedWireVTable<W: AbiPod> {
 impl<W: AbiPod> Copy for ValidatedWireVTable<W> {}
 
 impl<W: AbiPod> Clone for ValidatedWireVTable<W> {
+    /// Copies this validated wire VTable handle by value.
     #[inline]
     fn clone(&self) -> Self {
         *self
@@ -223,6 +233,21 @@ impl Host {
         })
     }
 
+    /// Constructs a [`Host`] directly from an already-validated [`BamHostApi`] value for Kani
+    /// proof harnesses, preserving typed function-pointer identity across CBMC without byte-level
+    /// `copy_nonoverlapping` erasure.
+    #[cfg(kani)]
+    #[inline]
+    pub(crate) const fn from_api_for_kani(api: BamHostApi, host_ctx: *const BamHostCtx) -> Self {
+        Self {
+            api,
+            host_ctx: HostCtxPtr(host_ctx),
+            manifest_name_ptr: ManifestNamePtr(core::ptr::NonNull::<u8>::dangling().as_ptr()),
+            manifest_name_len: 0,
+            runtime_allocs_ptr: RuntimeAllocsPtr(core::ptr::null()),
+        }
+    }
+
     /// Returns a copy of this [`Host`] stamped with the owning [`GuestInstance`]'s UTF-8
     /// `manifest_name` (`ptr`, `len`).
     ///
@@ -262,6 +287,12 @@ impl Host {
         self
     }
 
+    /// Registers a heap-allocated `boxed` value (such as a runtime observer closure or watched
+    /// component slice) in the owning [`GuestInstance`]'s [`RuntimeAllocTracker`].
+    ///
+    /// Returns `None` if this [`Host`] was constructed standalone without a [`GuestInstance`],
+    /// or `Some(raw_ptr)` pointing to the stable pinned allocation freed in LIFO order on
+    /// `bamabi_shutdown`.
     #[inline]
     pub(crate) fn track_runtime_allocation<T: Send + 'static>(
         &self,

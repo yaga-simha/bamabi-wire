@@ -4,14 +4,14 @@ use core::ffi::{CStr, c_void};
 
 use bamabi_guest_sys::{
     GuestInstance, Host, PreparedRunIf, SystemRegistrationConfig, ValidatedLoadCtx,
-    ValidatedSystemInvocation, resolve_component,
+    ValidatedSystemInvocation, resolve_component, resolve_mod_component,
 };
 use bamabi_sys::{
     AbiPod, AccessMode, BAM_COMPONENT_FLAG_IMMUTABLE, BAM_COMPONENT_FLAG_SPARSE_SET,
     BAM_COMPONENT_FLAG_SUMMARY_TICK, BAM_SYSTEM_FLAG_AMBIGUOUS_WITH_ALL,
-    BAM_SYSTEM_FLAG_MAIN_THREAD, BamComponent, BamHostApi, BamLoadCtx, BamSystem, BamTermDesc,
-    ComponentDropFn, ComponentUuid, FfiEntity, FfiResult, MAX_QUERIES_PER_SYSTEM,
-    MAX_TERMS_PER_QUERY, ScheduleId,
+    BAM_SYSTEM_FLAG_MAIN_THREAD, BamComponent, BamFieldDesc, BamHostApi, BamLoadCtx,
+    BamRequiredComponent, BamSystem, BamTermDesc, ComponentDropFn, ComponentUuid, FfiDisabled,
+    FfiEntity, FfiResult, MAX_QUERIES_PER_SYSTEM, MAX_TERMS_PER_QUERY, ModComponent, ScheduleId,
 };
 
 use crate::{
@@ -27,6 +27,7 @@ use crate::{
 };
 
 mod private {
+    /// Private sealing trait preventing downstream crates from implementing [`super::IntoSystemResult`].
     pub trait Sealed {}
 }
 
@@ -39,6 +40,7 @@ pub trait IntoSystemResult: private::Sealed {
 
 impl private::Sealed for FfiResult {}
 impl IntoSystemResult for FfiResult {
+    /// Returns the [`FfiResult`] status code unchanged.
     #[inline]
     fn into_ffi_result(self) -> FfiResult {
         self
@@ -47,6 +49,7 @@ impl IntoSystemResult for FfiResult {
 
 impl private::Sealed for () {}
 impl IntoSystemResult for () {
+    /// Converts an infallible `()` system return into [`FfiResult::OK`].
     #[inline]
     fn into_ffi_result(self) -> FfiResult {
         FfiResult::OK
@@ -55,6 +58,7 @@ impl IntoSystemResult for () {
 
 impl private::Sealed for Result<(), FfiResult> {}
 impl IntoSystemResult for Result<(), FfiResult> {
+    /// Maps `Ok(())` to [`FfiResult::OK`] and forwards `Err(err)` unchanged.
     #[inline]
     fn into_ffi_result(self) -> FfiResult {
         match self {
@@ -75,6 +79,7 @@ pub struct GuestComponentOptions<T: AbiPod> {
 }
 
 impl<T: AbiPod> Default for GuestComponentOptions<T> {
+    /// Delegates to [`GuestComponentOptions::new`] with zero flags, no hooks, and no requirements.
     fn default() -> Self {
         Self::new()
     }
@@ -126,15 +131,41 @@ impl<T: AbiPod> GuestComponentOptions<T> {
         self
     }
 
-    /// Attaches a pre-built [`GuestComponentHooks<T>`] configuration, preserving any `clone` or
-    /// required handles already set on `self` or `hooks`.
+    /// Attaches a pre-built [`GuestComponentHooks<T>`] configuration, preserving any `clone`,
+    /// ABI 0.3 metadata, or required handles already set on `self` or `hooks`.
     pub fn hooks(mut self, hooks: GuestComponentHooks<T>) -> Self {
         let enable_clone = self.hooks.inner.enable_clone || hooks.inner.enable_clone;
         let mut reqs = self.hooks.inner.required_components;
         reqs.extend_from_slice(&hooks.inner.required_components);
-        self.hooks = hooks;
-        self.hooks.inner.enable_clone = enable_clone;
-        self.hooks.inner.required_components = reqs;
+        let schema_fingerprint = if hooks.inner.schema_fingerprint != 0 {
+            hooks.inner.schema_fingerprint
+        } else {
+            self.hooks.inner.schema_fingerprint
+        };
+        let fields = if !hooks.inner.fields.is_empty() {
+            hooks.inner.fields
+        } else {
+            self.hooks.inner.fields
+        };
+        let mut req_inits = self.hooks.inner.required_init_descs;
+        req_inits.extend_from_slice(&hooks.inner.required_init_descs);
+        let mut req_bytes = self.hooks.inner.required_custom_bytes;
+        req_bytes.extend(hooks.inner.required_custom_bytes);
+        self.hooks = GuestComponentHooks {
+            inner: bamabi_guest_sys::PodComponentHooks {
+                on_add: hooks.inner.on_add,
+                on_insert: hooks.inner.on_insert,
+                on_discard: hooks.inner.on_discard,
+                on_remove: hooks.inner.on_remove,
+                on_despawn: hooks.inner.on_despawn,
+                enable_clone,
+                required_components: reqs,
+                schema_fingerprint,
+                fields,
+                required_init_descs: req_inits,
+                required_custom_bytes: req_bytes,
+            },
+        };
         self
     }
 
@@ -185,6 +216,53 @@ impl<T: AbiPod> GuestComponentOptions<T> {
     pub fn require_handle(mut self, component: BamComponent) -> Self {
         self.hooks = self.hooks.with_required_handle(component);
         self
+    }
+
+    /// Sets the ABI `0.3` 64-bit FNV-1a structural schema fingerprint.
+    #[inline]
+    pub fn with_schema_fingerprint(mut self, fingerprint: u64) -> Self {
+        self.hooks = self.hooks.with_schema_fingerprint(fingerprint);
+        self
+    }
+
+    /// Sets static ABI `0.3` field reflection metadata (`ModComponent::BAM_FIELDS`).
+    #[inline]
+    pub fn with_fields(mut self, fields: &'static [BamFieldDesc]) -> Self {
+        self.hooks = self.hooks.with_fields(fields);
+        self
+    }
+
+    /// Appends an extended ABI `0.3` required-component initialization descriptor.
+    #[inline]
+    pub fn require_init_desc(mut self, desc: BamRequiredComponent) -> Self {
+        self.hooks = self.hooks.with_required_init_desc(desc);
+        self
+    }
+
+    /// Declares a pre-resolved required component initialized from POD `value` bytes
+    /// (analogous to Bevy's `#[require(Comp = value)]`).
+    #[inline]
+    pub fn require_handle_with_value<R: AbiPod>(
+        mut self,
+        component: BamComponent,
+        value: &R,
+    ) -> Self {
+        self.hooks = self.hooks.with_required_pod_value(component, value);
+        self
+    }
+
+    /// Creates options pre-populated with ABI `0.3` `COMPONENT_FLAGS`, `SCHEMA_FINGERPRINT`,
+    /// `BAM_FIELDS`, and `REQUIRED_COMPONENTS` from `T: ModComponent`.
+    #[inline]
+    pub fn from_mod_component() -> Self
+    where
+        T: ModComponent,
+    {
+        Self {
+            flags: T::COMPONENT_FLAGS,
+            hooks: GuestComponentHooks::<T>::from_mod_component(),
+            required_resolvers: Vec::new(),
+        }
     }
 }
 
@@ -497,6 +575,8 @@ impl<'a> GuestApp<'a> {
     }
 }
 
+/// Generates typed [`QueryBuilder`] helper methods that resolve a `GuestComponent` and append a
+/// term with the corresponding [`AccessMode`].
 macro_rules! define_query_guest_terms {
     ($( $(#[$meta:meta])* $method:ident <$ty:ident> => $mode:ident );* $(;)?) => {
         $(
@@ -510,6 +590,8 @@ macro_rules! define_query_guest_terms {
     };
 }
 
+/// Generates handle-based [`QueryBuilder`] helper methods that append a pre-resolved
+/// [`BamComponent`] handle with the corresponding [`AccessMode`].
 macro_rules! define_query_handle_terms {
     ($( $(#[$meta:meta])* $method:ident => $mode:ident );* $(;)?) => {
         $(
@@ -532,6 +614,8 @@ pub struct QueryBuilder<'b> {
 }
 
 impl<'b> QueryBuilder<'b> {
+    /// Latches the first builder error encountered so fluent chaining can finish cleanly before
+    /// propagating the error during [`SystemBuilder::build`].
     #[inline]
     pub(crate) fn record_error(&mut self, err: FfiResult) {
         if self.first_error.is_none() {
@@ -539,6 +623,8 @@ impl<'b> QueryBuilder<'b> {
         }
     }
 
+    /// Validates `component`, `mode`, and the `MAX_TERMS_PER_QUERY` cap before appending a
+    /// [`BamTermDesc`] to the query's term list.
     #[inline]
     pub(crate) fn push_term(&mut self, component: BamComponent, mode: AccessMode) {
         if !component.is_valid() {
@@ -556,6 +642,8 @@ impl<'b> QueryBuilder<'b> {
         self.terms.push(BamTermDesc::new(component, mode));
     }
 
+    /// Resolves `T: GuestComponent` on the host (trying manifest-qualified identity first) and
+    /// appends it with `mode`, latching any resolution error on the builder.
     #[inline]
     fn push_guest_term<T: GuestComponent>(&mut self, mode: AccessMode) {
         match resolve_guest_component::<T>(self.host, self.manifest_name) {
@@ -650,6 +738,12 @@ impl<'b> QueryBuilder<'b> {
         changed_handle => CHANGED;
         /// Appends a pre-resolved `Added<T>` handle term.
         added_handle => ADDED;
+        /// Appends a pre-resolved `Allow<T>` disabling-filter bypass handle term.
+        allow_handle => ALLOW;
+        /// Appends a pre-resolved `Has<T>` archetypal presence handle term.
+        has_handle => HAS;
+        /// Appends a pre-resolved `RemovedComponents<T>` removal-stream handle term.
+        removed_handle => REMOVED_READ;
         /// Appends a pre-resolved `Res<R>` handle term.
         resource_read_handle => RESOURCE_READ;
         /// Appends a pre-resolved `ResMut<R>` handle term.
@@ -658,6 +752,30 @@ impl<'b> QueryBuilder<'b> {
         message_read_handle => MESSAGE_READ;
         /// Appends a pre-resolved `MessageWriter<M>` handle term.
         message_write_handle => MESSAGE_WRITE;
+    }
+
+    /// Appends `Allow<Disabled>` so this query also visits Bevy `0.20` disabled entities.
+    #[inline]
+    pub fn allow_disabled(self) -> Self {
+        self.allow::<FfiDisabled>()
+    }
+
+    /// Appends `With<Disabled>` to match only Bevy `0.20` disabled entities.
+    #[inline]
+    pub fn with_disabled(self) -> Self {
+        self.with::<FfiDisabled>()
+    }
+
+    /// Appends `Without<Disabled>` to explicitly exclude Bevy `0.20` disabled entities.
+    #[inline]
+    pub fn without_disabled(self) -> Self {
+        self.without::<FfiDisabled>()
+    }
+
+    /// Appends `Has<Disabled>` to query whether each chunk's archetype carries `Disabled`.
+    #[inline]
+    pub fn has_disabled(self) -> Self {
+        self.has::<FfiDisabled>()
     }
 
     /// Resolves `name` (with optional `uuid`) on the host and appends a term with `mode`.
@@ -696,6 +814,7 @@ pub struct SystemBuilder<'b, 'a> {
 }
 
 impl<'b, 'a> SystemBuilder<'b, 'a> {
+    /// Latches the first resolution or capacity error encountered during fluent system building.
     #[inline]
     fn record_error(&mut self, err: FfiResult) {
         if self.first_error.is_none() {
@@ -743,6 +862,8 @@ impl<'b, 'a> SystemBuilder<'b, 'a> {
         self
     }
 
+    /// Validates `component` and the `MAX_TERMS_PER_QUERY` cap before appending a system-level
+    /// singleton resource or message stream term.
     #[inline]
     fn push_system_resource_handle(&mut self, component: BamComponent, mode: AccessMode) {
         if !component.is_valid() {
@@ -822,6 +943,62 @@ impl<'b, 'a> SystemBuilder<'b, 'a> {
     #[inline]
     pub fn message_write_handle(mut self, component: BamComponent) -> Self {
         self.push_system_resource_handle(component, AccessMode::MESSAGE_WRITE);
+        self
+    }
+
+    /// Declares a shared singleton resource read (`Res<R>`) for a dynamic [`ModComponent`] `R`.
+    pub fn resource_read_dynamic<R: ModComponent>(mut self) -> Self {
+        match resolve_mod_component::<R>(self.app.host()) {
+            Ok(comp) => self.push_system_resource_handle(comp, AccessMode::RESOURCE_READ),
+            Err(err) => self.record_error(err),
+        }
+        self
+    }
+
+    /// Declares an exclusive singleton resource write (`ResMut<R>`) for a dynamic [`ModComponent`] `R`.
+    pub fn resource_write_dynamic<R: ModComponent>(mut self) -> Self {
+        match resolve_mod_component::<R>(self.app.host()) {
+            Ok(comp) => self.push_system_resource_handle(comp, AccessMode::RESOURCE_WRITE),
+            Err(err) => self.record_error(err),
+        }
+        self
+    }
+
+    /// Declares a buffered message stream reader (`MessageReader<M>`) for a dynamic
+    /// [`ModComponent`] `M`, accessible via [`SystemContext::read_non_pod_messages`].
+    pub fn message_read_dynamic<M: ModComponent>(mut self) -> Self {
+        match resolve_mod_component::<M>(self.app.host()) {
+            Ok(comp) => self.push_system_resource_handle(comp, AccessMode::MESSAGE_READ),
+            Err(err) => self.record_error(err),
+        }
+        self
+    }
+
+    /// Declares a buffered message stream writer (`MessageWriter<M>`) for a dynamic
+    /// [`ModComponent`] `M`, accessible via [`SystemContext::send_non_pod_message`].
+    pub fn message_write_dynamic<M: ModComponent>(mut self) -> Self {
+        match resolve_mod_component::<M>(self.app.host()) {
+            Ok(comp) => self.push_system_resource_handle(comp, AccessMode::MESSAGE_WRITE),
+            Err(err) => self.record_error(err),
+        }
+        self
+    }
+
+    /// Declares a system-level `RemovedComponents<T>` stream (`AccessMode::REMOVED_READ`) for
+    /// `T: GuestComponent`, accessible via [`SystemContext::read_removed`] in declaration order.
+    pub fn removed<T: GuestComponent>(mut self) -> Self {
+        match self.app.resolve_component::<T>() {
+            Ok(comp) => self.push_system_resource_handle(comp, AccessMode::REMOVED_READ),
+            Err(err) => self.record_error(err),
+        }
+        self
+    }
+
+    /// Declares a system-level `RemovedComponents` stream using a pre-resolved [`BamComponent`]
+    /// handle.
+    #[inline]
+    pub fn removed_handle(mut self, component: BamComponent) -> Self {
+        self.push_system_resource_handle(component, AccessMode::REMOVED_READ);
         self
     }
 
@@ -929,6 +1106,8 @@ impl<'b, 'a> SystemBuilder<'b, 'a> {
         self.run_if(move |_ctx| condition())
     }
 
+    /// Compiles accumulated `.run_if(...)` predicates into a single instance-owned
+    /// [`PreparedRunIf`] trampoline with short-circuit logical AND evaluation.
     fn prepare_run_if(
         instance: &mut GuestInstance,
         mut preds: Vec<RunIfPredicate>,
@@ -950,6 +1129,9 @@ impl<'b, 'a> SystemBuilder<'b, 'a> {
         }
     }
 
+    /// Shared finalization pipeline for [`Self::build`] and [`Self::register_handle`]: checks for
+    /// latched builder errors, assembles [`SystemRegistrationConfig`] and [`PreparedRunIf`], and
+    /// delegates submission to `submit`.
     fn finalize<Out>(
         self,
         submit: impl FnOnce(
@@ -1004,6 +1186,18 @@ impl<'b, 'a> SystemBuilder<'b, 'a> {
         )
     }
 
+    /// Finalizes and registers the system with persistent per-system local state `local: L`
+    /// (mirroring Bevy's `Local<L>` system parameter), passing `(&mut SystemContext<'_>, &mut L)`
+    /// on every tick.
+    pub fn build_with_local<L, F, R>(self, mut local: L, mut callback: F) -> FfiResult
+    where
+        L: Send + 'static,
+        F: FnMut(&mut SystemContext<'_>, &mut L) -> R + Send + 'static,
+        R: IntoSystemResult,
+    {
+        self.build(move |ctx| callback(ctx, &mut local))
+    }
+
     /// Finalizes and registers the system via `BamHostApi::register_system_handle` (slot 60),
     /// returning its assigned [`BamSystem`] handle for decoupled scheduling with
     /// [`GuestApp::mount_system`].
@@ -1026,5 +1220,20 @@ impl<'b, 'a> SystemBuilder<'b, 'a> {
             },
             Err,
         )
+    }
+
+    /// Registers a decoupled [`BamSystem`] handle carrying persistent per-system local state
+    /// `local: L` (mirroring Bevy's `Local<L>`).
+    pub fn register_handle_with_local<L, F, R>(
+        self,
+        mut local: L,
+        mut callback: F,
+    ) -> Result<BamSystem, FfiResult>
+    where
+        L: Send + 'static,
+        F: FnMut(&mut SystemContext<'_>, &mut L) -> R + Send + 'static,
+        R: IntoSystemResult,
+    {
+        self.register_handle(move |ctx| callback(ctx, &mut local))
     }
 }

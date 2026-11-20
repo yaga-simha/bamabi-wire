@@ -286,3 +286,26 @@ jobs:
             cargo +nightly miri test -p bamabi_sys -p bamabi_guest_sys -p bamabi_guest
           MIRIFLAGS="-Zmiri-tree-borrows" \
             cargo +nightly miri test -p bamabi_macros --test mod_component_vtable
+
+  kani:
+    name: Kani Formal Verification (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+
+      - name: Verify `bamabi_sys` (PO-W1..PO-W8) & `bamabi_guest_sys` (PO-G1..PO-G7) with Kani
+        uses: model-checking/kani-github-action@v1
+        with:
+          kani-version: '0.68.0'
+          args: >-
+            -p bamabi_sys -p bamabi_guest_sys
+            -Z unstable-options
+            --harness-timeout 15m
+            --output-format terse
+            -j

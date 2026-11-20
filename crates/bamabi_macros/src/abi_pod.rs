@@ -1,9 +1,24 @@
+//! `#[derive(AbiPod)]` compile-time layout and safety verifier.
+//!
+//! Enforces Bamabi's cross-language Plain-Old-Data invariant so components can be mapped
+//! zero-copy across C99, C++17, Zig, and Rust guest boundaries without serialization.
+
 use crate::attrs::{parse_abi_pod_crate_override, parse_repr_flags, resolve_sys_crate_path};
 use proc_macro2::TokenStream;
 use quote::{quote, quote_spanned};
 use syn::{Data, DeriveInput, spanned::Spanned};
 
-/// Core expansion function for `#[derive(AbiPod)]`.
+/// Expands `#[derive(AbiPod)]` into compile-time layout assertions and `RawInsertable`/`AbiPod` impls.
+///
+/// Intended purpose: guarantees at compile time that a struct has a deterministic C ABI layout
+/// with zero implicit compiler padding, zero drop glue, and only cross-language POD fields
+/// (excluding `bool`, `char`, `u128`/`i128`, `usize`/`isize`, heap types, and enums).
+///
+/// What it does: rejects generic types, non-structs, `#[repr(packed)]`, and missing
+/// `#[repr(C)]`/`#[repr(transparent)]` attributes, then emits a `const _: ()` block that asserts
+/// `Copy + 'static`, `!needs_drop::<Self>()`, `size_of::<Self>() == sum(size_of::<Field>())`,
+/// and recursive `assert_abi_pod::<Field>()` before emitting `unsafe impl RawInsertable` and
+/// `unsafe impl AbiPod`.
 pub(crate) fn expand_abi_pod(input: &DeriveInput) -> syn::Result<TokenStream> {
     if !input.generics.params.is_empty() {
         return Err(syn::Error::new_spanned(

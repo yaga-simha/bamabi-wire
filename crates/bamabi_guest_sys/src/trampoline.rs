@@ -25,9 +25,12 @@ use crate::{
     panic::{catch_guest_bool, catch_guest_result},
 };
 
+/// RAII guard that resets [`ReentrantCell::in_use`] to `false` with `Ordering::Release` on drop,
+/// ensuring the cell unlocks even if the guarded guest closure unwinds.
 struct ReleaseGuard<'a>(&'a AtomicBool);
 
 impl Drop for ReleaseGuard<'_> {
+    /// Clears the re-entrancy lock flag with `Ordering::Release`.
     #[inline]
     fn drop(&mut self) {
         self.0.store(false, Ordering::Release);
@@ -211,6 +214,8 @@ impl<'a> ValidatedSystemInvocation<'a> {
             .unwrap_or_else(|| ValidatedCommands::empty(self.host))
     }
 
+    /// Lazily fetches and caches the [`ValidatedIter`] for query slot `index` via
+    /// `BamHostApi::sys_query` if not already fetched or extracted.
     #[inline]
     fn ensure_query_slot(&mut self, index: usize) {
         if index >= self.total_query_count
@@ -238,6 +243,8 @@ impl<'a> ValidatedSystemInvocation<'a> {
         self.queries[index] = Some(iter);
     }
 
+    /// Fetches the active invocation's [`ValidatedCommands`] buffer via `BamHostApi::sys_commands`,
+    /// returning an empty disabled buffer if unavailable.
     #[inline]
     fn fetch_commands_slot(&self) -> ValidatedCommands<'a> {
         if self.sys_ctx.is_null() {
@@ -257,6 +264,7 @@ impl<'a> ValidatedSystemInvocation<'a> {
         }
     }
 
+    /// Populates `self.commands` on first access if not already fetched or taken.
     #[inline]
     fn ensure_commands_slot(&mut self) {
         if !self.commands_taken && self.commands.is_none() {
@@ -443,6 +451,8 @@ impl<'a> ValidatedSystemRef<'a> {
         self.host
     }
 
+    /// Validates `iter.column_info(term_index)` via `check_info` and invokes
+    /// `BamHostApi::sys_entity_get` to retrieve a shared component pointer for `entity`.
     #[inline]
     fn raw_entity_ptr_ro(
         &self,
@@ -469,6 +479,8 @@ impl<'a> ValidatedSystemRef<'a> {
         (!ptr.is_null()).then_some(ptr)
     }
 
+    /// Validates writable `iter.column_info(term_index)` via `check_info` and invokes
+    /// `BamHostApi::sys_entity_get_mut` to retrieve an exclusive component pointer for `entity`.
     #[inline]
     // `&mut ValidatedIter` is an intentional borrow-guard preventing aliasing chunk borrows while
     // `sys_entity_get_mut` holds a mutable pointer into `iter`'s query storage.
@@ -503,6 +515,8 @@ impl<'a> ValidatedSystemRef<'a> {
         (!ptr.is_null()).then_some(ptr)
     }
 
+    /// Converts a verified non-null read-only entity/resource pointer into `&'b T`, checking
+    /// alignment and handling zero-sized `T` via `NonNull::dangling()`.
     #[inline]
     unsafe fn cast_entity_ref<'b, T>(ptr: *const u8) -> Option<&'b T> {
         if core::mem::size_of::<T>() == 0 {
@@ -516,6 +530,8 @@ impl<'a> ValidatedSystemRef<'a> {
         Some(unsafe { &*ptr.cast::<T>() })
     }
 
+    /// Converts a verified non-null writable entity/resource pointer into `&'b mut T`, checking
+    /// alignment and handling zero-sized `T` via `NonNull::dangling()`.
     #[inline]
     unsafe fn cast_entity_mut<'b, T>(ptr: *mut u8) -> Option<&'b mut T> {
         if core::mem::size_of::<T>() == 0 {
@@ -708,6 +724,8 @@ impl<'a> ValidatedSystemRef<'a> {
         Ok(unsafe { core::slice::from_raw_parts(ptr, len) })
     }
 
+    /// Verifies via `Host::component_layout_info` that `component` matches `vtable`'s `(host_size,
+    /// host_align, uuid)` and mutability before invoking a mapped wire VTable getter/setter.
     fn validate_wire_resource_layout<W: AbiPod>(
         &self,
         component: BamComponent,
@@ -715,7 +733,12 @@ impl<'a> ValidatedSystemRef<'a> {
         require_mutable: bool,
     ) -> Result<(), FfiResult> {
         let info = self.host.component_layout_info(component)?;
-        if info.size != vtable.host_size() || info.align != vtable.host_align() {
+        if info.size != vtable.host_size()
+            || info.align != vtable.host_align()
+            || (vtable.host_size() > 0
+                && (!vtable.host_align().is_power_of_two()
+                    || !vtable.host_size().is_multiple_of(vtable.host_align())))
+        {
             return Err(FfiResult::TYPE_MISMATCH);
         }
         if !vtable.uuid().is_zero() && info.uuid != vtable.uuid() {
@@ -803,6 +826,8 @@ impl<'a> ValidatedSystemRef<'a> {
     }
 }
 
+/// Heap-pinned system callback state owned by [`GuestInstance`], pairing the cached [`Host`],
+/// query slot metadata, and a [`ReentrantCell`]-guarded guest closure.
 struct SystemClosureState<F> {
     host: Host,
     total_query_count: usize,
@@ -811,11 +836,18 @@ struct SystemClosureState<F> {
     closure: ReentrantCell<F>,
 }
 
+/// Heap-pinned `run_if` predicate state owned by [`GuestInstance`], pairing the cached [`Host`]
+/// with a [`ReentrantCell`]-guarded guest predicate closure.
 struct RunIfClosureState<R> {
     host: Host,
     closure: ReentrantCell<R>,
 }
 
+/// Panic-safe, re-entrancy-guarded `extern "C"` [`BamSystemFn`] trampoline.
+///
+/// Refreshes [`Host::host_ctx`] from `BamHostApi::sys_host_ctx(sys_ctx)` so per-tick diagnostics
+/// and symbol queries use the active world context, constructs a [`ValidatedSystemInvocation`],
+/// and returns [`FfiResult::ACCESS_CONFLICT`] on re-entry or [`FfiResult::PANIC_CAUGHT`] on panic.
 unsafe extern "C" fn system_closure_trampoline<F>(
     sys_ctx: *mut BamSystemCtx,
     user_data: *mut c_void,
@@ -827,8 +859,11 @@ where
         if sys_ctx.is_null() || user_data.is_null() {
             return FfiResult::NULL_POINTER;
         }
-        // SAFETY: `user_data` was allocated via `GuestInstance::track_allocation` for
-        // `SystemClosureState<F>` and remains valid until `bamabi_shutdown`.
+        if !(user_data as usize).is_multiple_of(core::mem::align_of::<SystemClosureState<F>>()) {
+            return FfiResult::INVALID_ARGUMENT;
+        }
+        // SAFETY: `user_data` is non-null, aligned, and allocated via
+        // `GuestInstance::track_allocation` for `SystemClosureState<F>`.
         let state = unsafe { &*user_data.cast::<SystemClosureState<F>>() };
         let inv_host = if let Some(sys_host_ctx_fn) = host_slot!(state.host.api(), sys_host_ctx) {
             // SAFETY: `sys_ctx` is non-null and active for the duration of this `BamSystemFn` call.
@@ -862,16 +897,20 @@ where
     })
 }
 
+/// Panic-safe, re-entrancy-guarded `extern "C"` [`BamRunIfFn`] trampoline returning
+/// [`FfiBool::FALSE`] on null `user_data`, re-entrant entry, or guest panic.
 unsafe extern "C" fn run_if_closure_trampoline<R>(user_data: *mut c_void) -> FfiBool
 where
     R: FnMut(&Host) -> bool + Send + 'static,
 {
     catch_guest_bool(|| {
-        if user_data.is_null() {
+        if user_data.is_null()
+            || !(user_data as usize).is_multiple_of(core::mem::align_of::<RunIfClosureState<R>>())
+        {
             return FfiBool::FALSE;
         }
-        // SAFETY: `user_data` was allocated via `GuestInstance::track_allocation` for
-        // `RunIfClosureState<R>` and remains valid until `bamabi_shutdown`.
+        // SAFETY: `user_data` is non-null, aligned, and allocated via
+        // `GuestInstance::track_allocation` for `RunIfClosureState<R>`.
         let state = unsafe { &*user_data.cast::<RunIfClosureState<R>>() };
         match state
             .closure
@@ -982,6 +1021,8 @@ pub struct SystemRegistrationConfig<'a> {
     pub ambiguous_with: &'a [&'a CStr],
 }
 
+/// Raw-pointer owner for a heap-allocated NUL-terminated C string that avoids `Box` retagging
+/// when [`OwnedDescriptorStorage`] is moved into [`GuestInstance::track_allocation`].
 struct OwnedRawCString(*mut c_char);
 
 // SAFETY: Uniquely owns an immutable heap NUL-terminated string created via `CString::into_raw`
@@ -989,10 +1030,12 @@ struct OwnedRawCString(*mut c_char);
 unsafe impl Send for OwnedRawCString {}
 
 impl OwnedRawCString {
+    /// Clones `s` into an owned raw C string allocation.
     fn from_cstr(s: &CStr) -> Self {
         Self(CString::from(s).into_raw())
     }
 
+    /// Returns the stable `*const c_char` pointer for descriptor fields.
     #[inline]
     const fn as_ptr(&self) -> *const c_char {
         self.0.cast_const()
@@ -1000,12 +1043,15 @@ impl OwnedRawCString {
 }
 
 impl Drop for OwnedRawCString {
+    /// Reclaims the owned `CString` allocation via `CString::from_raw`.
     fn drop(&mut self) {
         // SAFETY: `self.0` was created via `CString::into_raw` in `from_cstr` and is freed once.
         drop(unsafe { CString::from_raw(self.0) });
     }
 }
 
+/// Raw-pointer owner for a heap-allocated `[BamTermDesc]` slice that preserves pointer provenance
+/// across moves under Miri Stacked/Tree Borrows.
 struct OwnedRawTermSlice {
     ptr: *mut BamTermDesc,
     len: usize,
@@ -1016,6 +1062,7 @@ struct OwnedRawTermSlice {
 unsafe impl Send for OwnedRawTermSlice {}
 
 impl OwnedRawTermSlice {
+    /// Copies `terms` into a pinned raw heap slice (or a dangling zero-length handle if empty).
     fn from_slice(terms: &[BamTermDesc]) -> Self {
         let len = terms.len();
         if len == 0 {
@@ -1032,6 +1079,7 @@ impl OwnedRawTermSlice {
         }
     }
 
+    /// Returns the stable `*const BamTermDesc` pointer for [`BamQueryDesc::terms`].
     #[inline]
     const fn as_ptr(&self) -> *const BamTermDesc {
         self.ptr.cast_const()
@@ -1039,6 +1087,7 @@ impl OwnedRawTermSlice {
 }
 
 impl Drop for OwnedRawTermSlice {
+    /// Frees the raw `[BamTermDesc]` slice when `self.len > 0`.
     fn drop(&mut self) {
         if self.len > 0 {
             // SAFETY: `self.ptr` came from `Box::into_raw` of a `Box<[BamTermDesc]>` of length `self.len`.
@@ -1047,6 +1096,8 @@ impl Drop for OwnedRawTermSlice {
     }
 }
 
+/// Consolidated owner for all heap strings, query descriptors, and term slices referenced by a
+/// registered [`BamSystemDesc`], tracked as a single allocation inside [`GuestInstance`].
 struct OwnedDescriptorStorage {
     name: OwnedRawCString,
     _term_vecs: Vec<OwnedRawTermSlice>,
@@ -1070,6 +1121,9 @@ struct OwnedDescriptorStorage {
 // after construction (nor retagged on move).
 unsafe impl Send for OwnedDescriptorStorage {}
 
+/// Validates `config`, pins all owned strings/term slices and closure state inside `instance`,
+/// and assembles a validated [`BamSystemDesc`] ready for `register_system` or
+/// `register_system_handle`.
 fn prepare_system_desc<F>(
     instance: &mut GuestInstance,
     config: &SystemRegistrationConfig<'_>,
@@ -1161,6 +1215,7 @@ where
         None
     };
 
+    /// Clones a slice of `&CStr` set names into owned raw C strings plus a parallel pointer array.
     fn collect_cstrings(names: &[&CStr]) -> (Vec<OwnedRawCString>, Box<[*const c_char]>) {
         let mut owned: Vec<OwnedRawCString> = Vec::with_capacity(names.len());
         let mut ptrs: Vec<*const c_char> = Vec::with_capacity(names.len());
@@ -1453,12 +1508,16 @@ pub unsafe fn mount_system_in_schedule(
     unsafe { mount_fn(load_ctx, system, schedule, set) }
 }
 
-struct ObserverTrampolineState<F> {
-    host: Host,
-    callback: ReentrantCell<F>,
+/// Heap-pinned observer closure state owned by [`GuestInstance`] (or its [`RuntimeAllocTracker`]),
+/// pairing the cached [`Host`] with a [`ReentrantCell`]-guarded observer callback.
+pub(crate) struct ObserverTrampolineState<F> {
+    pub(crate) host: Host,
+    pub(crate) callback: ReentrantCell<F>,
 }
 
-unsafe extern "C" fn observer_closure_trampoline<E, F>(
+/// Panic-safe, re-entrancy-guarded `extern "C"` [`BamObserverFn`] trampoline for read-only custom
+/// `E: AbiPod` event observers.
+pub(crate) unsafe extern "C" fn observer_closure_trampoline<E, F>(
     target: FfiEntity,
     event_data: *const c_void,
     commands: *mut BamCommands,
@@ -1472,35 +1531,47 @@ where
         if user_data.is_null() {
             return FfiResult::NULL_POINTER;
         }
-        // SAFETY: `user_data` points to `ObserverTrampolineState<F>` owned by `GuestInstance`.
+        if !(user_data as usize).is_multiple_of(core::mem::align_of::<ObserverTrampolineState<F>>())
+        {
+            return FfiResult::INVALID_ARGUMENT;
+        }
+        if core::mem::size_of::<E>() > 0
+            && (event_data.is_null()
+                || !(event_data as usize).is_multiple_of(core::mem::align_of::<E>()))
+        {
+            return FfiResult::INVALID_ARGUMENT;
+        }
+        // SAFETY: `user_data` is non-null, aligned, and points to `ObserverTrampolineState<F>`
+        // owned by `GuestInstance`.
         let state = unsafe { &*user_data.cast::<ObserverTrampolineState<F>>() };
-        let event_ref: &E = if core::mem::size_of::<E>() == 0 {
-            // SAFETY: Zero-sized `E: AbiPod` may be referenced via `NonNull::dangling()`.
-            unsafe { core::ptr::NonNull::<E>::dangling().as_ref() }
-        } else {
-            if event_data.is_null()
-                || !(event_data as usize).is_multiple_of(core::mem::align_of::<E>())
-            {
-                return FfiResult::INVALID_ARGUMENT;
-            }
-            // SAFETY: Host guarantees `event_data` points to initialized `E` matching `event_key`.
-            unsafe { &*event_data.cast::<E>() }
-        };
-        // SAFETY: `commands` is stack-scoped for this observer invocation.
-        let mut cmds = unsafe { ValidatedCommands::from_raw(commands, &state.host) };
         state
             .callback
-            .try_with_mut(|cb| cb(target, event_ref, &mut cmds))
+            .try_with_mut(|cb| {
+                let event_ref: &E = if core::mem::size_of::<E>() == 0 {
+                    // SAFETY: Zero-sized `E: AbiPod` may be referenced via `NonNull::dangling()`.
+                    unsafe { core::ptr::NonNull::<E>::dangling().as_ref() }
+                } else {
+                    // SAFETY: Verified non-null and aligned above; `try_with_mut` excludes
+                    // re-entrant execution, and host guarantees `event_data` points to initialized `E`.
+                    unsafe { &*event_data.cast::<E>() }
+                };
+                // SAFETY: `commands` is stack-scoped for this observer invocation.
+                let mut cmds = unsafe { ValidatedCommands::from_raw(commands, &state.host) };
+                cb(target, event_ref, &mut cmds)
+            })
             .unwrap_or(FfiResult::ACCESS_CONFLICT)
     })
 }
 
+/// Selects whether an observer's owned state is tracked in init-time [`GuestInstance::allocations`]
+/// or in the thread-safe runtime [`RuntimeAllocTracker`] attached to [`Host`].
 enum ObserverAllocTarget<'a> {
     Init(&'a mut GuestInstance),
     Runtime(&'a Host),
 }
 
 impl ObserverAllocTarget<'_> {
+    /// Returns a copy of the cached [`Host`] associated with this allocation target.
     fn host(&self) -> Host {
         match self {
             Self::Init(inst) => *inst.host(),
@@ -1508,6 +1579,7 @@ impl ObserverAllocTarget<'_> {
         }
     }
 
+    /// Tracks `boxed` in the target lifetime container and returns its stable raw pointer.
     fn track<T: Send + 'static>(&mut self, boxed: Box<T>) -> Result<*mut T, FfiResult> {
         match self {
             Self::Init(inst) => Ok(inst.track_allocation(boxed)),
@@ -1518,12 +1590,15 @@ impl ObserverAllocTarget<'_> {
     }
 }
 
+/// Discriminates the three observer registration shapes supported by [`build_observer_desc`].
 enum ObserverKind {
     CustomRead(BamComponent, BamObserverFn),
     CustomMut(BamComponent, BamObserverMutFn),
     Lifecycle(BamEventKind, BamObserverFn),
 }
 
+/// Validates observer parameters, pins optional name/watched-component/closure allocations via
+/// `alloc`, and returns a validated [`BamObserverDesc`].
 #[allow(clippy::too_many_arguments)]
 fn build_observer_desc<F: Send + 'static>(
     mut alloc: ObserverAllocTarget<'_>,
@@ -1608,6 +1683,8 @@ fn build_observer_desc<F: Send + 'static>(
     Ok(desc)
 }
 
+/// Shared init-time observer registration helper that builds a [`BamObserverDesc`] via
+/// [`build_observer_desc`] and submits it to `BamHostApi::register_observer`.
 #[allow(clippy::too_many_arguments)]
 unsafe fn submit_init_observer<F: Send + 'static>(
     instance: &mut GuestInstance,
@@ -1677,7 +1754,9 @@ where
     }
 }
 
-unsafe extern "C" fn observer_mut_closure_trampoline<E, F>(
+/// Panic-safe, re-entrancy-guarded `extern "C"` [`BamObserverMutFn`] trampoline for mutable custom
+/// `E: AbiPod` event observers (`&mut E` + `&mut bool` propagation toggle).
+pub(crate) unsafe extern "C" fn observer_mut_closure_trampoline<E, F>(
     target: FfiEntity,
     event_data: *mut u8,
     propagate: *mut FfiBool,
@@ -1694,43 +1773,56 @@ where
         if user_data.is_null() {
             return FfiResult::NULL_POINTER;
         }
-        // SAFETY: `user_data` points to `ObserverTrampolineState<F>` owned by `GuestInstance`.
-        let state = unsafe { &*user_data.cast::<ObserverTrampolineState<F>>() };
-        let event_ref: &mut E = if core::mem::size_of::<E>() == 0 {
-            // SAFETY: Zero-sized `E: AbiPod` may be mutably referenced via `NonNull::dangling()`.
-            unsafe { core::ptr::NonNull::<E>::dangling().as_mut() }
-        } else {
-            if event_data.is_null()
-                || !(event_data as usize).is_multiple_of(core::mem::align_of::<E>())
-            {
-                return FfiResult::INVALID_ARGUMENT;
-            }
-            // SAFETY: Host guarantees exclusive mutable access to `E` at `event_data` during
-            // `BamObserverMutFn` execution.
-            unsafe { &mut *event_data.cast::<E>() }
-        };
-        let mut prop_val = if propagate.is_null() {
-            false
-        } else {
-            // SAFETY: When non-null, `propagate` points to an initialized `FfiBool` on the host stack.
-            unsafe { (*propagate).get() }
-        };
-        // SAFETY: `commands` is stack-scoped for this observer invocation.
-        let mut cmds = unsafe { ValidatedCommands::from_raw(commands, &state.host) };
-        let status = state
-            .callback
-            .try_with_mut(|cb| cb(target, event_ref, &mut prop_val, &mut cmds))
-            .unwrap_or(FfiResult::ACCESS_CONFLICT);
-        if !propagate.is_null() {
-            // SAFETY: `propagate` is non-null and writable for the duration of this callback.
-            unsafe {
-                *propagate = FfiBool::from_bool(prop_val);
-            }
+        if !(user_data as usize).is_multiple_of(core::mem::align_of::<ObserverTrampolineState<F>>())
+        {
+            return FfiResult::INVALID_ARGUMENT;
         }
-        status
+        if core::mem::size_of::<E>() > 0
+            && (event_data.is_null()
+                || !(event_data as usize).is_multiple_of(core::mem::align_of::<E>()))
+        {
+            return FfiResult::INVALID_ARGUMENT;
+        }
+        // SAFETY: `user_data` is non-null, aligned, and points to `ObserverTrampolineState<F>`
+        // owned by `GuestInstance`.
+        let state = unsafe { &*user_data.cast::<ObserverTrampolineState<F>>() };
+        // Acquire re-entrancy exclusivity BEFORE materializing `&mut E` or touching `*propagate`
+        // so any re-entrant call rejects with `ACCESS_CONFLICT` without aliasing UB or state clobbering.
+        state
+            .callback
+            .try_with_mut(|cb| {
+                let event_ref: &mut E = if core::mem::size_of::<E>() == 0 {
+                    // SAFETY: Zero-sized `E: AbiPod` may be mutably referenced via `NonNull::dangling()`.
+                    unsafe { core::ptr::NonNull::<E>::dangling().as_mut() }
+                } else {
+                    // SAFETY: Verified non-null and aligned above; `try_with_mut` excludes
+                    // re-entrant execution, and host guarantees exclusive access to `E` at
+                    // `event_data` during `BamObserverMutFn` execution.
+                    unsafe { &mut *event_data.cast::<E>() }
+                };
+                let mut prop_val = if propagate.is_null() {
+                    false
+                } else {
+                    // SAFETY: When non-null, `propagate` points to an initialized `FfiBool` on the host stack.
+                    unsafe { (*propagate).get() }
+                };
+                // SAFETY: `commands` is stack-scoped for this observer invocation.
+                let mut cmds = unsafe { ValidatedCommands::from_raw(commands, &state.host) };
+                let status = cb(target, event_ref, &mut prop_val, &mut cmds);
+                if !propagate.is_null() {
+                    // SAFETY: `propagate` is non-null and writable for the duration of this callback.
+                    unsafe {
+                        *propagate = FfiBool::from_bool(prop_val);
+                    }
+                }
+                status
+            })
+            .unwrap_or(FfiResult::ACCESS_CONFLICT)
     })
 }
 
+/// Panic-safe, re-entrancy-guarded `extern "C"` [`BamObserverFn`] trampoline for component
+/// lifecycle (`ADD`/`INSERT`/`DISCARD`/`REMOVE`/`DESPAWN`) and scene `READY` observers.
 unsafe extern "C" fn lifecycle_observer_closure_trampoline<F>(
     target: FfiEntity,
     _event_data: *const c_void,
@@ -1744,7 +1836,12 @@ where
         if user_data.is_null() {
             return FfiResult::NULL_POINTER;
         }
-        // SAFETY: `user_data` points to `ObserverTrampolineState<F>` owned by `GuestInstance`.
+        if !(user_data as usize).is_multiple_of(core::mem::align_of::<ObserverTrampolineState<F>>())
+        {
+            return FfiResult::INVALID_ARGUMENT;
+        }
+        // SAFETY: `user_data` is non-null, aligned, and points to `ObserverTrampolineState<F>`
+        // owned by `GuestInstance`.
         let state = unsafe { &*user_data.cast::<ObserverTrampolineState<F>>() };
         // SAFETY: `commands` is stack-scoped for this observer invocation.
         let mut cmds = unsafe { ValidatedCommands::from_raw(commands, &state.host) };
@@ -1868,6 +1965,8 @@ where
     }
 }
 
+/// Allocates a runtime read-only custom event [`BamObserverDesc`] tracked in `host`'s
+/// [`RuntimeAllocTracker`] for [`ValidatedCommands::observe`].
 pub(crate) fn allocate_runtime_observer_desc<E, F>(
     host: &Host,
     name: Option<&str>,
@@ -1893,6 +1992,8 @@ where
     )
 }
 
+/// Allocates a runtime mutable custom event [`BamObserverDesc`] tracked in `host`'s
+/// [`RuntimeAllocTracker`] for [`ValidatedCommands::observe_mut`].
 pub(crate) fn allocate_runtime_observer_mut_desc<E, F>(
     host: &Host,
     name: Option<&str>,
@@ -1920,6 +2021,8 @@ where
     )
 }
 
+/// Allocates a runtime lifecycle or `Ready` [`BamObserverDesc`] tracked in `host`'s
+/// [`RuntimeAllocTracker`] for [`ValidatedCommands::observe_lifecycle`].
 pub(crate) fn allocate_runtime_lifecycle_observer_desc<F>(
     host: &Host,
     name: Option<&str>,
@@ -1994,6 +2097,8 @@ macro_rules! wrap_run_condition {
 // Same-Mod Dynamic `ModComponent` Verification, Borrowing & Move Commands
 // ============================================================================
 
+/// Resolves `"bam.v0.<comp_name>.vtable"` via `host.resolve_custom_symbol`, using a 256-byte
+/// stack scratch buffer to avoid heap allocation on hot paths.
 #[inline]
 fn resolve_vtable_symbol_for_name(
     host: &Host,
@@ -2058,6 +2163,8 @@ pub fn verify_same_mod_dynamic_component<T: ModComponent>(
     false
 }
 
+/// Validates that dense column `col` on `iter` holds a same-mod dynamic [`ModComponent`] `T`
+/// with the requested read/write permission, returning `(chunk_len, is_optional)`.
 fn validate_dynamic_dense_col<T: ModComponent>(
     iter: &ValidatedIter<'_>,
     col: usize,
@@ -2076,6 +2183,8 @@ fn validate_dynamic_dense_col<T: ModComponent>(
     Some((iter.entities().len(), info.mode.is_optional()))
 }
 
+/// Forms `&'b [T]` for a verified same-mod dynamic [`ModComponent`] column after checking
+/// non-nullness, alignment, zero-sized handling, and `len * size_of::<T>() <= isize::MAX`.
 #[inline]
 unsafe fn cast_dynamic_slice<'b, T>(ptr: *const u8, len: usize) -> Option<&'b [T]> {
     let elem_size = core::mem::size_of::<T>();
@@ -2100,6 +2209,8 @@ unsafe fn cast_dynamic_slice<'b, T>(ptr: *const u8, len: usize) -> Option<&'b [T
     Some(unsafe { core::slice::from_raw_parts(ptr.cast::<T>(), len) })
 }
 
+/// Forms `&'b mut [T]` for a verified writable same-mod dynamic [`ModComponent`] column after
+/// checking non-nullness, alignment, zero-sized handling, and `len * size_of::<T>() <= isize::MAX`.
 #[inline]
 unsafe fn cast_dynamic_slice_mut<'b, T>(ptr: *mut u8, len: usize) -> Option<&'b mut [T]> {
     let elem_size = core::mem::size_of::<T>();
@@ -2170,6 +2281,9 @@ pub fn iter_entities_and_dynamic_slice_mut<'b, 'a, T: ModComponent>(
     let elem_size = core::mem::size_of::<T>();
     let ptr = iter.column_mutable_ptr(write_col);
     let entities = iter.entities();
+    if entities.len() != len {
+        return None;
+    }
     if elem_size > 0 {
         if ptr.is_null() {
             return None;
@@ -2230,6 +2344,8 @@ impl<'a> ValidatedSystemRef<'a> {
     }
 }
 
+/// Verifies via `Host::component_layout_info` and [`verify_same_mod_dynamic_component`] that
+/// `component` refers to same-mod dynamic type `T` before transferring ownership into host commands.
 fn verify_moved_component_handle<T: ModComponent>(
     host: &Host,
     component: BamComponent,

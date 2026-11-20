@@ -92,6 +92,7 @@ impl<'a> ChunkSlice<'a> {
 }
 
 impl<'a> From<ValidatedSlice<'a>> for ChunkSlice<'a> {
+    /// Wraps a [`ValidatedSlice`] in a safe [`ChunkSlice`].
     #[inline]
     fn from(inner: ValidatedSlice<'a>) -> Self {
         Self::from_validated(inner)
@@ -201,6 +202,7 @@ impl<'a> ChunkSliceMut<'a> {
 }
 
 impl<'a> From<ValidatedSliceMut<'a>> for ChunkSliceMut<'a> {
+    /// Wraps a [`ValidatedSliceMut`] in a safe [`ChunkSliceMut`].
     #[inline]
     fn from(inner: ValidatedSliceMut<'a>) -> Self {
         Self::from_validated(inner)

@@ -29,6 +29,15 @@ fn map_scalar_type(ty: &Type) -> Option<(&'static str, &'static str)> {
             "FfiBool" => Some(("BamBool", "bam.BamBool")),
             "FfiEntity" | "TargetEntity" => Some(("BamEntity", "bam.BamEntity")),
             "BamComponent" => Some(("BamComponent", "bam.BamComponent")),
+            "BamSystem" => Some(("BamSystem", "bam.BamSystem")),
+            "BamSystemSet" => Some(("BamSystemSet", "bam.BamSystemSet")),
+            "BamSymbol" => Some(("BamSymbol", "bam.BamSymbol")),
+            "FfiAssetLoadState" => Some(("BamAssetLoadState", "bam.BamAssetLoadState")),
+            "BamEventKind" => Some(("BamEventKind", "bam.BamEventKind")),
+            "BamFieldKind" => Some(("BamFieldKind", "bam.BamFieldKind")),
+            "FfiChildOf" => Some(("BamChildOf", "bam.BamChildOf")),
+            "FfiAssetHandle" => Some(("BamAssetHandle", "bam.BamAssetHandle")),
+            "BamChangeTicks" => Some(("BamChangeTicks", "bam.BamChangeTicks")),
             "ComponentUuid" => Some(("BamComponentUuid", "bam.BamComponentUuid")),
             _ => None,
         };
@@ -36,6 +45,8 @@ fn map_scalar_type(ty: &Type) -> Option<(&'static str, &'static str)> {
     None
 }
 
+/// Resolves a Rust type to its `(c_type, zig_type)` pair, falling back to bare struct names
+/// or caller-provided opaque fallbacks for unmapped types.
 fn map_type_name(ty: &Type, fallback_c: &str, fallback_zig: &str) -> (String, String) {
     if let Some((c, z)) = map_scalar_type(ty) {
         (c.to_owned(), z.to_owned())
@@ -51,6 +62,8 @@ fn map_type_name(ty: &Type, fallback_c: &str, fallback_zig: &str) -> (String, St
     }
 }
 
+/// Formats one struct field declaration line for both C99 (`<ty> <name>;`) and Zig (`<name>: <ty>,`),
+/// supporting scalars, fixed-size arrays, and nested POD struct identifiers.
 fn format_c_zig_field_decl(field_name: &str, ty: &Type) -> Option<(String, String)> {
     if let Some((c_ty, zig_ty)) = map_scalar_type(ty) {
         return Some((
@@ -105,6 +118,7 @@ pub(crate) struct DeclFieldInfo {
     pub(crate) raw_ty: Type,
 }
 
+/// Simplified field kind stored for C99/C++17/Zig declaration rendering.
 #[derive(Clone)]
 pub(crate) enum DeclFieldKind {
     Bool,
@@ -116,6 +130,8 @@ pub(crate) enum DeclFieldKind {
 }
 
 impl DeclFieldInfo {
+    /// Converts a classified [`FieldKind`] into a [`DeclFieldInfo`], prefixing numeric tuple-field
+    /// indices with `_` for valid C/Zig identifiers and returning `None` for skipped fields.
     pub(crate) fn from_classified(
         raw_field_name: &str,
         kind: &FieldKind,
@@ -152,6 +168,7 @@ impl DeclFieldInfo {
     }
 }
 
+/// Declaration metadata for a single non-skipped payload field inside an enum variant.
 pub(crate) struct DeclEnumVariantField {
     pub(crate) field_name: String,
     pub(crate) c_field_ident: String,
@@ -159,6 +176,7 @@ pub(crate) struct DeclEnumVariantField {
     pub(crate) raw_ty: Type,
 }
 
+/// Declaration metadata for one enum variant (name, discriminant, and payload fields).
 pub(crate) struct DeclEnumVariant {
     pub(crate) name: String,
     pub(crate) snake_name: String,
@@ -168,20 +186,24 @@ pub(crate) struct DeclEnumVariant {
     pub(crate) schema_fields: Vec<(String, String)>,
 }
 
+/// Aggregate declaration metadata for a `#[derive(ModComponent)]` enum.
 pub(crate) struct DeclEnumInfo {
     pub(crate) is_fieldless: bool,
     pub(crate) int_repr: IntRepr,
     pub(crate) variants: Vec<DeclEnumVariant>,
 }
 
+/// Builds the deterministic C99/Zig helper typedef name for an `FfiOption<T>` field.
 fn option_typedef_name(struct_name: &str, sfx: &str) -> String {
     format!("{struct_name}_{sfx}_Option")
 }
 
+/// Builds the deterministic C99/Zig helper typedef name for a `Vec<T>` slice view.
 fn slice_typedef_name(vt_name: &str, sfx: &str) -> String {
     format!("{vt_name}_{sfx}_Slice")
 }
 
+/// Emits matching C99 `typedef struct` and Zig `extern struct` declarations for an `FfiOption<T>`.
 fn emit_option_typedef(
     c_out: &mut String,
     zig_out: &mut String,
@@ -201,6 +223,8 @@ fn emit_option_typedef(
     Some(())
 }
 
+/// Appends the guarded shared C++17 RAII helper templates (`resolve_vtable`, `VTableHandle`,
+/// `UniqueGuest`, `HostVecView`, `ConstHostVecView`) into a generated `#ifdef __cplusplus` block.
 fn emit_cpp_shared_helpers(cpp: &mut String) {
     cpp.push_str(
         r#"namespace bam {
@@ -441,6 +465,8 @@ private:
     );
 }
 
+/// Generates `(c_decl, zig_decl)` for a `#[derive(ModComponent)]` enum (fieldless or tagged),
+/// emitting C99 tag constants, VTable struct with static size asserts, C++17 views, and Zig wrappers.
 #[allow(clippy::too_many_lines)]
 fn generate_enum_decls(
     state: &CodegenState,

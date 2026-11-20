@@ -22,6 +22,7 @@ use bamabi_guest::raw::{
 };
 use common::MockHostWorld;
 
+/// Snapshot of a host-registered `BamObserverDesc` captured by [`stub_register_observer`].
 #[derive(Clone, Copy)]
 struct CapturedObserver {
     event_kind: BamEventKind,
@@ -36,10 +37,12 @@ unsafe impl Send for CapturedObserver {}
 
 static CAPTURED_OBSERVERS: OnceLock<Mutex<Vec<CapturedObserver>>> = OnceLock::new();
 
+/// Returns the global mutex-protected list of observers captured during observer tests.
 fn captured_observers() -> &'static Mutex<Vec<CapturedObserver>> {
     CAPTURED_OBSERVERS.get_or_init(|| Mutex::new(Vec::new()))
 }
 
+/// Mock `BamHostApi::register_observer` callback recording registered observer descriptors.
 unsafe extern "C" fn stub_register_observer(
     load_ctx: *mut BamLoadCtx,
     desc: *const BamObserverDesc,
@@ -61,13 +64,18 @@ unsafe extern "C" fn stub_register_observer(
     FfiResult::OK
 }
 
+/// Drop-tracking guard verifying that chained `.run_if(...)` closures are freed on shutdown.
 struct DropCounter(Arc<AtomicUsize>);
 impl Drop for DropCounter {
+    /// Increments the shared drop counter when the captured predicate is destroyed.
     fn drop(&mut self) {
         self.0.fetch_add(1, Ordering::SeqCst);
     }
 }
 
+/// Scenario: Chains three `.run_if` / `.run_if_fn` predicates on a `SystemBuilder`, verifying
+/// short-circuit logical AND evaluation order across all truth-table transitions and asserting
+/// that all three closures are dropped cleanly on `unload_instance` with zero leaks.
 #[test]
 fn system_builder_chained_run_if_composes_and_drops_cleanly() {
     let world = MockHostWorld::new();
@@ -159,6 +167,10 @@ fn system_builder_chained_run_if_composes_and_drops_cleanly() {
     assert_eq!(drops.load(Ordering::SeqCst), 3);
 }
 
+/// Scenario: Registers three `Ready` observers via `ObserverBuilder` verifying (1) short-circuit
+/// AND evaluation of chained `.run_if` / `.run_if_fn` predicates, (2) that a gated-off
+/// `build_stoppable` observer leaves `*propagate == TRUE` untouched while an active one stops
+/// propagation, and (3) that a panicking predicate is contained as `FfiResult::PANIC_CAUGHT`.
 #[test]
 fn observer_builder_run_if_chains_controls_propagation_and_catches_panics() {
     static TEST_LOCK: Mutex<()> = Mutex::new(());
@@ -318,6 +330,7 @@ fn observer_builder_run_if_chains_controls_propagation_and_catches_panics() {
 mod derive_guest_component_tests {
     use super::*;
 
+    /// Host-side `#[derive(ModComponent)]` named struct fixture for UUID/flag parity checks.
     #[repr(C)]
     #[derive(Clone, Copy, Debug, PartialEq, ModComponent)]
     #[mod_component(name = "parity::Position", summary_tick)]
@@ -327,6 +340,7 @@ mod derive_guest_component_tests {
         z: f32,
     }
 
+    /// Guest-side `#[derive(GuestComponent)]` counterpart to [`HostPosition`].
     #[repr(C)]
     #[derive(Clone, Copy, Debug, PartialEq, AbiPod, GuestComponent)]
     #[guest_component(name = "parity::Position", summary_tick)]
@@ -336,26 +350,31 @@ mod derive_guest_component_tests {
         z: f32,
     }
 
+    /// Host-side tuple struct fixture using `namespace = "parity"`.
     #[repr(C)]
     #[derive(Clone, Copy, Debug, PartialEq, ModComponent)]
     #[mod_component(namespace = "parity", name = "Vel")]
     struct HostVel(f32, f32);
 
+    /// Guest-side tuple struct counterpart to [`HostVel`].
     #[repr(C)]
     #[derive(Clone, Copy, Debug, PartialEq, AbiPod, GuestComponent)]
     #[guest_component(namespace = "parity", name = "Vel")]
     struct GuestVel(f32, f32);
 
+    /// Host-side unit marker fixture with `sparse_set` storage flag.
     #[repr(C)]
     #[derive(Clone, Copy, Debug, PartialEq, ModComponent)]
     #[mod_component(name = "parity::Marker", sparse_set)]
     struct HostMarker;
 
+    /// Guest-side unit marker counterpart to [`HostMarker`].
     #[repr(C)]
     #[derive(Clone, Copy, Debug, PartialEq, AbiPod, GuestComponent)]
     #[guest_component(name = "parity::Marker", sparse_set)]
     struct GuestMarker;
 
+    /// Host-side nested struct fixture containing another `AbiPod` struct and a fixed array.
     #[repr(C)]
     #[derive(Clone, Copy, Debug, PartialEq, ModComponent)]
     #[mod_component(name = "parity::NestedPayload")]
@@ -364,6 +383,7 @@ mod derive_guest_component_tests {
         weights: [f32; 4],
     }
 
+    /// Guest-side nested struct counterpart to [`HostNested`].
     #[repr(C)]
     #[derive(Clone, Copy, Debug, PartialEq, AbiPod, GuestComponent)]
     #[guest_component(name = "parity::NestedPayload")]
@@ -372,6 +392,7 @@ mod derive_guest_component_tests {
         weights: [f32; 4],
     }
 
+    /// Fixture deriving both `ModComponent` and `GuestComponent` via shared `#[mod_component]` attrs.
     #[repr(C)]
     #[derive(Clone, Copy, Debug, PartialEq, ModComponent, GuestComponent)]
     #[mod_component(name = "parity::DualComp", summary_tick, immutable)]
@@ -381,6 +402,7 @@ mod derive_guest_component_tests {
         _pad: u32,
     }
 
+    /// Fixture using the `#[mod_component(..., guest)]` shorthand to emit `GuestComponent` too.
     #[repr(C)]
     #[derive(Clone, Copy, Debug, PartialEq, ModComponent)]
     #[mod_component(name = "parity::ShorthandComp", summary_tick, guest)]
@@ -389,6 +411,7 @@ mod derive_guest_component_tests {
         max_hp: f32,
     }
 
+    /// Fixture opting out of structural field hashing (`no_schema_hash`) so `FIELD_SCHEMA_HASH == 0`.
     #[repr(C)]
     #[derive(Clone, Copy, Debug, PartialEq, AbiPod, GuestComponent)]
     #[guest_component(name = "parity::NoSchemaHash", no_schema_hash)]
@@ -397,6 +420,7 @@ mod derive_guest_component_tests {
         b: u32,
     }
 
+    /// Fixture pinning an explicit 128-bit UUID override on a `#[repr(transparent)]` newtype.
     #[repr(transparent)]
     #[derive(Clone, Copy, Debug, PartialEq, AbiPod, GuestComponent)]
     #[guest_component(
@@ -405,12 +429,17 @@ mod derive_guest_component_tests {
     )]
     struct ExplicitUuid(u64);
 
+    /// Fixture with an unqualified default name verifying manifest auto-prefixing on registration.
     #[repr(C)]
     #[derive(Clone, Copy, Debug, PartialEq, AbiPod, GuestComponent)]
     struct UnqualifiedHealth {
         hp: f32,
     }
 
+    /// Scenario: Verifies bit-for-bit `NAME`, `UUID`, and `FLAGS` parity between host
+    /// `#[derive(ModComponent)]` and guest `#[derive(GuestComponent)]` across named, tuple, unit,
+    /// nested, dual-derived, shorthand, `no_schema_hash`, explicit-UUID, and manifest-qualified
+    /// dynamic components registered on a `MockHostWorld`.
     #[test]
     fn uuid_parity_flags_and_host_registration_match_mod_component() {
         // 1. Named struct UUID & flags parity.

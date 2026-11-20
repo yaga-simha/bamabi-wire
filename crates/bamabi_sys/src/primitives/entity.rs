@@ -17,7 +17,7 @@
 /// assert!(BamComponent::from_raw(1).is_valid());
 /// ```
 #[repr(transparent)]
-#[derive(Debug, Copy, Clone, PartialEq, Eq, Hash, Default)]
+#[derive(Debug, Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
 pub struct BamComponent(pub u32);
 
 impl BamComponent {
@@ -47,7 +47,7 @@ impl BamComponent {
 ///
 /// `u32::MAX` ([`BamSystem::INVALID`]) is reserved as the invalid/uninitialized sentinel.
 #[repr(transparent)]
-#[derive(Debug, Copy, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct BamSystem(pub u32);
 
 impl Default for BamSystem {
@@ -84,7 +84,7 @@ impl BamSystem {
 ///
 /// `u32::MAX` ([`BamSystemSet::INVALID`]) is reserved as the invalid/uninitialized sentinel.
 #[repr(transparent)]
-#[derive(Debug, Copy, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct BamSystemSet(pub u32);
 
 impl Default for BamSystemSet {
@@ -121,7 +121,7 @@ impl BamSystemSet {
 ///
 /// `u32::MAX` ([`BamSymbol::INVALID`]) is reserved as the invalid/uninitialized sentinel.
 #[repr(transparent)]
-#[derive(Debug, Copy, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct BamSymbol(pub u32);
 
 impl Default for BamSymbol {
@@ -183,7 +183,7 @@ const _: () = {
 /// assert_eq!(FfiEntity::default(), FfiEntity::NULL);
 /// ```
 #[repr(transparent)]
-#[derive(Debug, Copy, Clone, PartialEq, Eq, Hash, Default)]
+#[derive(Debug, Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
 pub struct FfiEntity(pub u64);
 
 impl FfiEntity {
@@ -207,6 +207,12 @@ impl FfiEntity {
     pub const fn is_null(self) -> bool {
         self.0 == Self::NULL.0
     }
+
+    /// Returns `true` if this entity handle is non-null (`!self.is_null()`).
+    #[inline]
+    pub const fn is_valid(self) -> bool {
+        self.0 != Self::NULL.0
+    }
 }
 
 use crate::primitives::ComponentUuid;
@@ -219,6 +225,10 @@ pub const BAM_CHILD_OF_NAME: &str = "bevy_ecs::hierarchy::ChildOf";
 /// component (`bevy_ecs::hierarchy::Children`).
 pub const BAM_CHILDREN_NAME: &str = "bevy_ecs::hierarchy::Children";
 
+/// Canonical namespaced component name for Bevy's built-in entity disabling marker component
+/// (`bevy_ecs::entity_disabling::Disabled`).
+pub const BAM_DISABLED_NAME: &str = "bevy_ecs::entity_disabling::Disabled";
+
 /// FFI-safe wire representation of Bevy's `ChildOf(Entity)` hierarchy relationship component
 /// (`typedef struct BamChildOf { BamEntity parent; } BamChildOf;`).
 ///
@@ -226,7 +236,7 @@ pub const BAM_CHILDREN_NAME: &str = "bevy_ecs::hierarchy::Children";
 /// `GuestCommands` routes through host `EntityWorldMut` so `ChildOf` / `Children` relationship
 /// hooks maintain parent-child links and recursive despawn invariants.
 #[repr(C)]
-#[derive(Debug, Copy, Clone, Default, PartialEq, Eq, Hash)]
+#[derive(Debug, Copy, Clone, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct FfiChildOf {
     /// Target parent entity (`BamEntity`).
     pub parent: FfiEntity,
@@ -243,12 +253,36 @@ impl FfiChildOf {
     }
 }
 
+/// FFI-safe zero-sized marker representation of Bevy's `bevy_ecs::entity_disabling::Disabled`
+/// component.
+///
+/// Entities carrying `Disabled` are hidden from default Bevy queries unless the query explicitly
+/// opts in via [`crate::AccessMode::ALLOW`] (`Allow<Disabled>`), [`crate::AccessMode::FILTER_ONLY`]
+/// (`With<Disabled>`), or [`crate::AccessMode::HAS`] (`Has<Disabled>`).
+#[repr(C)]
+#[derive(Debug, Copy, Clone, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct FfiDisabled;
+
+impl FfiDisabled {
+    /// Deterministic 128-bit [`ComponentUuid`] matching host `StdTypesBridgePlugin`'s bridged
+    /// `bevy_ecs::entity_disabling::Disabled` registration (`ComponentUuid::from_canonical_name`).
+    pub const UUID: ComponentUuid = ComponentUuid::from_canonical_name(BAM_DISABLED_NAME);
+
+    /// Constructs a [`FfiDisabled`] marker value.
+    #[inline]
+    pub const fn new() -> Self {
+        Self
+    }
+}
+
 const _: () = {
     assert!(core::mem::size_of::<BamComponent>() == 4);
     assert!(core::mem::align_of::<BamComponent>() == 4);
     assert!(core::mem::size_of::<FfiEntity>() == 8);
     assert!(core::mem::size_of::<FfiChildOf>() == 8);
     assert!(core::mem::offset_of!(FfiChildOf, parent) == 0);
+    assert!(core::mem::size_of::<FfiDisabled>() == 0);
+    assert!(core::mem::align_of::<FfiDisabled>() == 1);
     #[cfg(target_pointer_width = "64")]
     {
         assert!(core::mem::align_of::<FfiChildOf>() == 8);

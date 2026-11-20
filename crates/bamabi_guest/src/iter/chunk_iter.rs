@@ -108,6 +108,13 @@ impl<'a> ChunkIter<'a> {
         self.inner.count()
     }
 
+    /// Non-destructively returns `true` iff this query matches zero entities (mirroring Bevy's
+    /// `Query::is_empty`).
+    #[inline]
+    pub fn is_empty(&mut self) -> Result<bool, FfiResult> {
+        Ok(self.count()? == 0)
+    }
+
     /// Walks an ancestor relationship chain upward along `relation` (`BamComponent::INVALID` selects
     /// Bevy's default `ChildOf` hierarchy on ABI `0.3.0` hosts) starting from `entity` via
     /// `BamHostApi::iter_up_cascade` (slot 58) until locating an ancestor carrying read-only
@@ -467,6 +474,7 @@ impl<'a> ChunkIter<'a> {
 }
 
 impl<'a> From<ValidatedIter<'a>> for ChunkIter<'a> {
+    /// Wraps a [`ValidatedIter`] in a safe [`ChunkIter`].
     #[inline]
     fn from(inner: ValidatedIter<'a>) -> Self {
         Self::from_validated(inner)

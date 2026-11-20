@@ -1,8 +1,17 @@
+//! Codegen accessor specification for `FfiOption<T>` fields (`T: AbiPod`).
+
 use crate::codegen::{AccessorSpec, ReceiverKind, SlotSpec};
 use proc_macro2::{Span, TokenStream};
 use quote::{quote, quote_spanned};
 use syn::{Type, spanned::Spanned as _};
 
+/// Builds the [`AccessorSpec`] (`get`, `set`, `clear`) for an `FfiOption<T>` field.
+///
+/// Intended purpose: allows optional `AbiPod` values to cross the C-ABI deterministically via
+/// `#[repr(C)]` `FfiOption<T>` without exposing Rust's layout-unstable `Option<T>`.
+///
+/// What it does: emits `__BamFfiOption<Inner>` and `assert_abi_pod::<Inner>()` compile-time
+/// guards and generates `get`, `set`, and `clear` VTable slots.
 pub(crate) fn spec(
     sys_crate: &TokenStream,
     member_tokens: &TokenStream,

@@ -52,12 +52,15 @@ impl UuidFilter {
 }
 
 impl From<ComponentUuid> for UuidFilter {
+    /// Converts a single [`ComponentUuid`] into an exact [`UuidFilter`].
     #[inline]
     fn from(uuid: ComponentUuid) -> Self {
         Self::exact(uuid)
     }
 }
 
+/// Validates that `info` describes a readable dense column matching `T: AbiPod` (access mode,
+/// element size/alignment, and optional UUID filter) before exposing a shared `&[T]` slice.
 #[inline]
 fn validate_dense_read_info<T: AbiPod>(
     info: &BamColumnInfo,
@@ -77,6 +80,9 @@ fn validate_dense_read_info<T: AbiPod>(
     true
 }
 
+/// Validates that `info` describes a writable dense column matching `T: AbiPod` (mutable access
+/// mode, non-immutable flag, element size/alignment, and optional UUID filter) before exposing
+/// an exclusive `&mut [T]` slice.
 #[inline]
 fn validate_dense_write_info<T: AbiPod>(
     info: &BamColumnInfo,
@@ -101,6 +107,8 @@ fn validate_dense_write_info<T: AbiPod>(
     true
 }
 
+/// Validates that `info` describes a readable row-indexed (sparse-set) column matching `T: AbiPod`
+/// before constructing a [`SparseRows`] view.
 #[inline]
 fn validate_rows_read_info<T: AbiPod>(
     info: &BamColumnInfo,
@@ -120,6 +128,8 @@ fn validate_rows_read_info<T: AbiPod>(
     true
 }
 
+/// Validates that `info` describes a writable row-indexed (sparse-set) column matching `T: AbiPod`
+/// (rejecting immutable columns) before constructing a [`SparseRowsMut`] view.
 #[inline]
 fn validate_rows_write_info<T: AbiPod>(
     info: &BamColumnInfo,
@@ -143,6 +153,8 @@ fn validate_rows_write_info<T: AbiPod>(
     true
 }
 
+/// Validates that `info` describes a readable singleton resource matching `R: AbiPod` (resource
+/// access mode, size/alignment, and optional UUID filter).
 #[inline]
 fn validate_resource_read_info<R: AbiPod>(
     info: &BamColumnInfo,
@@ -162,6 +174,8 @@ fn validate_resource_read_info<R: AbiPod>(
     true
 }
 
+/// Validates that `info` describes a writable singleton resource matching `R: AbiPod` (exclusive
+/// write access, non-immutable, size/alignment, and optional UUID filter).
 #[inline]
 fn validate_resource_write_info<R: AbiPod>(
     info: &BamColumnInfo,
@@ -181,8 +195,13 @@ fn validate_resource_write_info<R: AbiPod>(
     true
 }
 
+/// Reinterprets a host-supplied dense column pointer `(ptr, len)` as `&'a [T]` after verifying
+/// alignment, non-nullness (for non-empty slices), ZST rules, and `isize::MAX` byte-length bounds.
+///
+/// # Safety
+/// `ptr` must point to `len` initialized, validly readable elements of `T` for lifetime `'a`.
 #[inline]
-unsafe fn raw_dense_slice<'a, T: AbiPod>(ptr: *const u8, len: usize) -> Option<&'a [T]> {
+pub(crate) unsafe fn raw_dense_slice<'a, T: AbiPod>(ptr: *const u8, len: usize) -> Option<&'a [T]> {
     let elem_size = core::mem::size_of::<T>();
     if elem_size == 0 {
         if ptr.is_null() && len > 0 {
@@ -212,8 +231,16 @@ unsafe fn raw_dense_slice<'a, T: AbiPod>(ptr: *const u8, len: usize) -> Option<&
     Some(unsafe { core::slice::from_raw_parts(ptr.cast::<T>(), len) })
 }
 
+/// Reinterprets a host-supplied writable dense column pointer `(ptr, len)` as `&'a mut [T]` after
+/// verifying alignment, non-nullness, ZST rules, and `isize::MAX` byte-length bounds.
+///
+/// # Safety
+/// `ptr` must point to `len` exclusively accessible, initialized elements of `T` for lifetime `'a`.
 #[inline]
-unsafe fn raw_dense_slice_mut<'a, T: AbiPod>(ptr: *mut u8, len: usize) -> Option<&'a mut [T]> {
+pub(crate) unsafe fn raw_dense_slice_mut<'a, T: AbiPod>(
+    ptr: *mut u8,
+    len: usize,
+) -> Option<&'a mut [T]> {
     let elem_size = core::mem::size_of::<T>();
     if elem_size == 0 {
         if ptr.is_null() && len > 0 {
@@ -242,6 +269,8 @@ unsafe fn raw_dense_slice_mut<'a, T: AbiPod>(ptr: *mut u8, len: usize) -> Option
     Some(unsafe { core::slice::from_raw_parts_mut(ptr.cast::<T>(), len) })
 }
 
+/// Validates strided/dense slice metadata (`valid`, element size/alignment, stride compatibility,
+/// and byte-range overflow) for a host-returned `BamSliceMeta`.
 #[inline]
 fn validate_slice_meta<T: AbiPod>(
     valid: bool,
@@ -275,8 +304,10 @@ fn validate_slice_meta<T: AbiPod>(
     true
 }
 
+/// Computes the checked byte offset `index * elem_stride` within a validated strided slice,
+/// returning `None` if `!valid`, `index >= len`, or the multiplication overflows `isize::MAX`.
 #[inline]
-fn checked_slice_elem_offset(
+pub(crate) fn checked_slice_elem_offset(
     valid: bool,
     len: usize,
     expected_size: Option<usize>,
@@ -817,6 +848,7 @@ impl<'a, T: AbiPod> SparseRows<'a, T> {
 impl<T: AbiPod> Index<usize> for SparseRows<'_, T> {
     type Output = T;
 
+    /// Returns `&T` at `index`, panicking if out of bounds or if an optional sparse row is absent.
     #[inline]
     fn index(&self, index: usize) -> &Self::Output {
         self.get(index)
@@ -833,6 +865,7 @@ pub struct SparseRowsIter<'b, 'a, T: AbiPod> {
 impl<'b, T: AbiPod> Iterator for SparseRowsIter<'b, '_, T> {
     type Item = &'b T;
 
+    /// Advances past absent optional rows and yields the next present `&T` element.
     #[inline]
     fn next(&mut self) -> Option<Self::Item> {
         while self.index < self.rows.len {
@@ -845,6 +878,7 @@ impl<'b, T: AbiPod> Iterator for SparseRowsIter<'b, '_, T> {
         None
     }
 
+    /// Returns `(0, Some(remaining))` because optional sparse rows may be absent.
     #[inline]
     fn size_hint(&self) -> (usize, Option<usize>) {
         (0, Some(self.rows.len.saturating_sub(self.index)))
@@ -855,6 +889,7 @@ impl<'b, 'a, T: AbiPod> IntoIterator for &'b SparseRows<'a, T> {
     type Item = &'b T;
     type IntoIter = SparseRowsIter<'b, 'a, T>;
 
+    /// Delegates to [`SparseRows::iter`].
     #[inline]
     fn into_iter(self) -> Self::IntoIter {
         self.iter()
@@ -2037,10 +2072,12 @@ impl<'a> ValidatedIter<'a> {
         expected_uuid: Option<UuidFilter>,
         out_ptrs: &mut [*const c_void],
     ) -> Result<usize, FfiResult> {
-        const _: () = assert!(
-            core::mem::size_of::<*const c_void>() == core::mem::size_of::<usize>()
-                && core::mem::align_of::<*const c_void>() == core::mem::align_of::<usize>()
-        );
+        const _: () = {
+            assert!(
+                core::mem::size_of::<*const c_void>() == core::mem::size_of::<usize>()
+                    && core::mem::align_of::<*const c_void>() == core::mem::align_of::<usize>()
+            );
+        };
         if self.raw.is_null() {
             return Err(FfiResult::NULL_POINTER);
         }
@@ -2070,6 +2107,8 @@ impl<'a> ValidatedIter<'a> {
         Ok(read_count.min(out_ptrs.len()))
     }
 
+    /// Verifies that the host registered the `"bam.v0.<M>.non_pod_message"` custom symbol for `M`,
+    /// confirming non-POD message wire compatibility before marshaling.
     fn verify_non_pod_message_marker<M: ModComponent>(&self) -> Result<(), FfiResult> {
         let marker_sym = CString::new(format!("bam.v0.{}.non_pod_message", M::CANONICAL_NAME))
             .map_err(|_| FfiResult::TYPE_MISMATCH)?;
@@ -2151,11 +2190,13 @@ impl<'a> ValidatedIter<'a> {
         // SAFETY: `M::symbols()` exports `"bam.v0.<M>.import_field"` with `ImportFieldFn` ABI.
         let guest_import_fn: ImportFieldFn = unsafe { core::mem::transmute(guest_import_ptr) };
 
+        /// Trampoline context forwarding each host-decoded wire field into `M`'s `import_field`.
         struct ImportSinkCtx {
             dst_ptr: *mut c_void,
             import_fn: ImportFieldFn,
         }
 
+        /// C-ABI field-sink callback passed to host wire decoding that invokes `import_fn` on `dst_ptr`.
         unsafe extern "C" fn forward_field(
             ctx: *mut c_void,
             field_name: StrView,
@@ -2280,11 +2321,13 @@ impl<'a> ValidatedIter<'a> {
         // SAFETY: `M::symbols()` exports `"bam.v0.<M>.export_fields"` with `ExportFieldsFn` ABI.
         let export_fn: ExportFieldsFn = unsafe { core::mem::transmute(export_ptr) };
 
+        /// Accumulator serializing exported `ModComponent` fields into a length-prefixed wire packet.
         struct PacketBuilder {
             buf: Vec<u8>,
             field_count: u32,
         }
 
+        /// C-ABI field-sink callback invoked by `M::export_fields` to append one encoded field to `PacketBuilder`.
         unsafe extern "C" fn append_field(
             ctx: *mut c_void,
             field_name: StrView,
@@ -2438,6 +2481,8 @@ impl<'a> ValidatedIter<'a> {
         Ok(all)
     }
 
+    /// Validates that `term_index` points to a readable (or writable when `require_write` is true)
+    /// non-immutable bridged column matching `expected_uuid`.
     #[inline]
     fn validate_bridged_row_info(
         &self,
@@ -2459,12 +2504,16 @@ impl<'a> ValidatedIter<'a> {
             || info.uuid != expected_uuid
             || info.size != host_size
             || info.align != host_align
+            || (host_size > 0
+                && (!host_align.is_power_of_two() || !host_size.is_multiple_of(host_align)))
         {
             return Err(FfiResult::TYPE_MISMATCH);
         }
         Ok(info)
     }
 
+    /// Fetches the read-only raw host pointer for row `row_index` of bridged column `term_index`,
+    /// verifying column metadata, bounds, and `Optional` presence.
     #[inline]
     fn raw_bridged_row_ptr_ro(
         &mut self,
@@ -2536,15 +2585,22 @@ impl<'a> ValidatedIter<'a> {
             if !(base as usize).is_multiple_of(host_align) {
                 return Err(FfiResult::TYPE_MISMATCH);
             }
-            let offset = row.checked_mul(host_size).ok_or(FfiResult::OUT_OF_RANGE)?;
-            if offset > isize::MAX as usize {
+            if self
+                .current_len
+                .checked_mul(host_size)
+                .is_none_or(|total| total > isize::MAX as usize)
+            {
                 return Err(FfiResult::OUT_OF_RANGE);
             }
-            // SAFETY: `row < self.current_len`, `offset <= isize::MAX`, and `base` covers the column.
+            let offset = row.checked_mul(host_size).ok_or(FfiResult::OUT_OF_RANGE)?;
+            // SAFETY: `row < self.current_len`, `current_len * host_size <= isize::MAX` (so
+            // `offset + host_size <= isize::MAX`), and `base` covers the column.
             Ok(Some(unsafe { base.add(offset) }.cast::<c_void>()))
         }
     }
 
+    /// Fetches the writable raw host pointer for row `row_index` of bridged column `term_index`,
+    /// verifying mutable access, bounds, and `Optional` presence while stamping host change ticks.
     #[inline]
     fn raw_bridged_row_ptr_mut(
         &mut self,
@@ -2616,11 +2672,16 @@ impl<'a> ValidatedIter<'a> {
             if !(base as usize).is_multiple_of(host_align) {
                 return Err(FfiResult::TYPE_MISMATCH);
             }
-            let offset = row.checked_mul(host_size).ok_or(FfiResult::OUT_OF_RANGE)?;
-            if offset > isize::MAX as usize {
+            if self
+                .current_len
+                .checked_mul(host_size)
+                .is_none_or(|total| total > isize::MAX as usize)
+            {
                 return Err(FfiResult::OUT_OF_RANGE);
             }
-            // SAFETY: `row < self.current_len`, `offset <= isize::MAX`, and `base` covers the column.
+            let offset = row.checked_mul(host_size).ok_or(FfiResult::OUT_OF_RANGE)?;
+            // SAFETY: `row < self.current_len`, `current_len * host_size <= isize::MAX` (so
+            // `offset + host_size <= isize::MAX`), and `base` covers the column.
             Ok(Some(unsafe { base.add(offset) }.cast::<c_void>()))
         }
     }
@@ -2700,6 +2761,9 @@ impl<'a> ValidatedIter<'a> {
             || info.uuid != vtable.uuid()
             || info.size != vtable.host_size()
             || info.align != vtable.host_align()
+            || (vtable.host_size() > 0
+                && (!vtable.host_align().is_power_of_two()
+                    || !vtable.host_size().is_multiple_of(vtable.host_align())))
         {
             return Err(FfiResult::TYPE_MISMATCH);
         }
@@ -2741,6 +2805,9 @@ impl<'a> ValidatedIter<'a> {
             || info.uuid != vtable.uuid()
             || info.size != vtable.host_size()
             || info.align != vtable.host_align()
+            || (vtable.host_size() > 0
+                && (!vtable.host_align().is_power_of_two()
+                    || !vtable.host_size().is_multiple_of(vtable.host_align())))
         {
             return FfiResult::TYPE_MISMATCH;
         }
@@ -2813,11 +2880,14 @@ impl<'a> ValidatedIter<'a> {
     }
 }
 
+/// Context passed through `user_data` to [`par_chunk_task_trampoline`] during parallel chunk dispatch.
 struct ParChunkTaskContext<'h, F> {
     host: &'h Host,
     func: F,
 }
 
+/// Panic-isolated C-ABI trampoline invoked by the host `ComputeTaskPool` for each disjoint sub-chunk
+/// iterator during `par_for_each_chunk` and `par_for_each_chunk_readonly`.
 unsafe extern "C" fn par_chunk_task_trampoline<F>(
     sub_iter: *mut BamIter,
     user_data: *mut c_void,
@@ -2829,8 +2899,12 @@ where
         if sub_iter.is_null() || user_data.is_null() {
             return FfiResult::NULL_POINTER;
         }
-        // SAFETY: `user_data` points to `ParChunkTaskContext<'_, F>` live on the caller's stack
-        // throughout `par_for_each_chunk`, and `F: Sync` allows concurrent shared reads.
+        if !(user_data as usize).is_multiple_of(core::mem::align_of::<ParChunkTaskContext<'_, F>>())
+        {
+            return FfiResult::INVALID_ARGUMENT;
+        }
+        // SAFETY: `user_data` is non-null, aligned, and points to `ParChunkTaskContext<'_, F>` live
+        // on the caller's stack throughout `par_for_each_chunk`, and `F: Sync` allows concurrent shared reads.
         let ctx = unsafe { &*user_data.cast::<ParChunkTaskContext<'_, F>>() };
         // SAFETY: `sub_iter` is an isolated sub-range `BamIter` valid on this worker thread for
         // the duration of this task callback.
@@ -2845,6 +2919,8 @@ where
     })
 }
 
+/// Validates that `info` describes a `MESSAGE_READ` stream matching `M: AbiPod` (size, alignment,
+/// and optional UUID filter).
 #[inline]
 fn validate_message_read_info<M: AbiPod>(
     info: &BamColumnInfo,
@@ -2869,6 +2945,8 @@ fn validate_message_read_info<M: AbiPod>(
     true
 }
 
+/// Validates that `info` describes a `MESSAGE_WRITE` stream matching `M: AbiPod` (size, alignment,
+/// and optional UUID filter).
 #[inline]
 fn validate_message_write_info<M: AbiPod>(
     info: &BamColumnInfo,
@@ -2892,6 +2970,8 @@ fn validate_message_write_info<M: AbiPod>(
     true
 }
 
+/// Validates that `info` describes a non-POD message stream matching `expected_access`, non-zero
+/// power-of-two host alignment, and optional `expected_uuid`.
 #[inline]
 fn validate_non_pod_message_info(
     info: &BamColumnInfo,
@@ -2924,6 +3004,8 @@ fn validate_non_pod_message_info(
     true
 }
 
+/// Computes `M`'s manifest-qualified [`UuidFilter`] and validates `info` as a non-POD message
+/// stream for `expected_access`.
 #[inline]
 fn validate_non_pod_message_info_for<M: ModComponent>(
     info: &BamColumnInfo,
@@ -2942,6 +3024,9 @@ fn validate_non_pod_message_info_for<M: ModComponent>(
         .is_ok_and(|(_, qualified_uuid)| info.uuid == qualified_uuid)
 }
 
+/// Record of a single column borrow dispensed from [`ChunkColumnDispenser`], used to enforce
+/// Rust's aliasing rules (no overlapping `&mut` with any other borrow of the same component or
+/// address range) within a chunk.
 #[derive(Clone, Copy)]
 struct DispensedBorrow {
     component: BamComponent,
@@ -2997,8 +3082,21 @@ impl<'chunk, 'ctx> ChunkColumnDispenser<'chunk, 'ctx> {
         self.len() == 0
     }
 
+    #[cfg(kani)]
+    pub(crate) const fn borrowed_count(&self) -> usize {
+        self.borrowed_count
+    }
+
+    #[cfg(kani)]
+    pub(crate) fn set_entities_range(&mut self, range: Option<(usize, usize)>) {
+        self.entities_range = range;
+    }
+
+    /// Verifies that borrowing `(component, start..end, mutable)` does not conflict with any
+    /// previously dispensed borrow in this chunk (checking both component identity and raw byte
+    /// address overlap), recording the borrow on success or returning `ACCESS_CONFLICT`.
     #[inline]
-    fn check_and_record_borrow(
+    pub(crate) fn check_and_record_borrow(
         &mut self,
         component: BamComponent,
         start: usize,
@@ -3065,6 +3163,11 @@ impl<'chunk, 'ctx> ChunkColumnDispenser<'chunk, 'ctx> {
         }
         let start = ptr.addr();
         let end = start.checked_add(byte_len).ok_or(FfiResult::OUT_OF_RANGE)?;
+        if let Some(prev) = self.entities_range
+            && prev != (start, end)
+        {
+            return Err(FfiResult::ACCESS_CONFLICT);
+        }
         for prev in &self.borrowed[..self.borrowed_count] {
             if prev.is_mut && prev.end > prev.start && start < prev.end && prev.start < end {
                 return Err(FfiResult::ACCESS_CONFLICT);
@@ -3076,6 +3179,11 @@ impl<'chunk, 'ctx> ChunkColumnDispenser<'chunk, 'ctx> {
         Ok(unsafe { core::slice::from_raw_parts(ptr, len) })
     }
 
+    /// Validates pointer alignment/bounds, records a shared borrow in `self`, and dispenses
+    /// `&'chunk [T]` for a dense column.
+    ///
+    /// # Safety
+    /// `ptr` must be valid for `len` initialized `T` elements for lifetime `'chunk`.
     #[inline]
     unsafe fn dispense_dense_read<T: AbiPod>(
         &mut self,
@@ -3085,6 +3193,9 @@ impl<'chunk, 'ctx> ChunkColumnDispenser<'chunk, 'ctx> {
     ) -> Result<&'chunk [T], FfiResult> {
         let elem_size = core::mem::size_of::<T>();
         if len == 0 || elem_size == 0 {
+            if ptr.is_null() && (elem_size > 0 || len > 0) {
+                return Err(FfiResult::TYPE_MISMATCH);
+            }
             self.check_and_record_borrow(component, 0, 0, false)?;
             // SAFETY: `len == 0` or ZST `T: AbiPod`; `raw_dense_slice` uses `NonNull::dangling()`.
             return unsafe { raw_dense_slice::<T>(ptr, len) }.ok_or(FfiResult::TYPE_MISMATCH);
@@ -3093,12 +3204,22 @@ impl<'chunk, 'ctx> ChunkColumnDispenser<'chunk, 'ctx> {
         if byte_len > isize::MAX as usize {
             return Err(FfiResult::OUT_OF_RANGE);
         }
-        // SAFETY: Validated `ptr`, `len`, alignment, and `byte_len <= isize::MAX` before recording borrow.
-        let slice = unsafe { raw_dense_slice::<T>(ptr, len) }.ok_or(FfiResult::TYPE_MISMATCH)?;
+        if ptr.is_null() || !(ptr as usize).is_multiple_of(core::mem::align_of::<T>()) {
+            return Err(FfiResult::TYPE_MISMATCH);
+        }
+        // Check and record disjointness BEFORE forming `&'chunk [T]` so an overlapping hostile
+        // pointer can never alias an already-dispensed `&'chunk mut [...]` under Tree Borrows.
         self.check_and_record_borrow(component, ptr.addr(), byte_len, false)?;
-        Ok(slice)
+        // SAFETY: Verified non-null, aligned, `byte_len <= isize::MAX`, and strict disjointness
+        // from all active mutable borrows for `'chunk`.
+        unsafe { raw_dense_slice::<T>(ptr, len) }.ok_or(FfiResult::TYPE_MISMATCH)
     }
 
+    /// Validates pointer alignment/bounds, records an exclusive borrow in `self`, and dispenses
+    /// `&'chunk mut [T]` for a writable dense column.
+    ///
+    /// # Safety
+    /// `ptr` must be exclusively valid for `len` initialized `T` elements for lifetime `'chunk`.
     #[inline]
     unsafe fn dispense_dense_write<T: AbiPod>(
         &mut self,
@@ -3108,6 +3229,9 @@ impl<'chunk, 'ctx> ChunkColumnDispenser<'chunk, 'ctx> {
     ) -> Result<&'chunk mut [T], FfiResult> {
         let elem_size = core::mem::size_of::<T>();
         if len == 0 || elem_size == 0 {
+            if ptr.is_null() && (elem_size > 0 || len > 0) {
+                return Err(FfiResult::TYPE_MISMATCH);
+            }
             self.check_and_record_borrow(component, 0, 0, true)?;
             // SAFETY: `len == 0` or ZST `T: AbiPod`; `check_and_record_borrow` verified unique component.
             return unsafe { raw_dense_slice_mut::<T>(ptr, len) }.ok_or(FfiResult::TYPE_MISMATCH);

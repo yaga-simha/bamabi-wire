@@ -4,6 +4,14 @@ use bamabi_sys::ModComponent;
 
 /// Renders a standalone C99 + C++17 (`#ifdef __cplusplus` RAII / typed views) component header
 /// from a slice of `(canonical_name, is_abi_pod, c_decl)` sections.
+///
+/// Intended purpose: allows host crates to publish generated C/C++ component structs and VTable
+/// declarations derived from `#[derive(ModComponent)]` so polyglot guests can access host
+/// components with zero hand-written header maintenance.
+///
+/// What it does: wraps the provided `c_decl` snippets in `#ifndef <guard_macro>` include guards,
+/// `#include "<abi_header_include>"`, and `extern "C"` blocks, annotating each section with its
+/// canonical name and `IS_ABI_POD` flag.
 #[must_use]
 pub fn render_component_header(
     guard_macro: &str,
@@ -46,6 +54,11 @@ pub fn render_component_header(
 }
 
 /// Extracts `(CANONICAL_NAME, IS_ABI_POD, C_DECL)` metadata for any [`ModComponent`].
+///
+/// Intended purpose: provides a concise compile-time adapter for building the `sections` slice
+/// passed to [`render_component_header`].
+///
+/// What it does: returns the three associated constants from `T`'s [`ModComponent`] impl.
 #[must_use]
 pub const fn section_for<T: ModComponent>() -> (&'static str, bool, &'static str) {
     (T::CANONICAL_NAME, T::IS_ABI_POD, T::C_DECL)

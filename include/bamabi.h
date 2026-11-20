@@ -113,6 +113,7 @@ extern "C" {
 #define BAM_MAX_CHANGE_AGE 0xC233B000u
 #define BAM_CHILD_OF_NAME "bevy_ecs::hierarchy::ChildOf"
 #define BAM_CHILDREN_NAME "bevy_ecs::hierarchy::Children"
+#define BAM_DISABLED_NAME "bevy_ecs::entity_disabling::Disabled"
 
 /* ==========================================================================
 * 3. Primitive Newtypes, Handles, Status Codes, Modes & Flags
@@ -910,8 +911,42 @@ static BAM_UNUSED inline int bam_entity_is_null(BamEntity entity) {
 return entity == BAM_ENTITY_NULL;
 }
 
+static BAM_UNUSED inline int bam_entity_is_valid(BamEntity entity) {
+return entity != BAM_ENTITY_NULL;
+}
+
 static BAM_UNUSED inline int bam_component_is_valid(BamComponent component) {
 return component != BAM_COMPONENT_INVALID;
+}
+
+static BAM_UNUSED inline int bam_asset_load_state_is_not_loaded(BamAssetLoadState state) {
+return state == BAM_ASSET_LOAD_STATE_NOT_LOADED;
+}
+
+static BAM_UNUSED inline int bam_asset_load_state_is_loading(BamAssetLoadState state) {
+return state == BAM_ASSET_LOAD_STATE_LOADING;
+}
+
+static BAM_UNUSED inline int bam_asset_load_state_is_loaded(BamAssetLoadState state) {
+return state == BAM_ASSET_LOAD_STATE_LOADED;
+}
+
+static BAM_UNUSED inline int bam_asset_load_state_is_failed(BamAssetLoadState state) {
+return state == BAM_ASSET_LOAD_STATE_FAILED;
+}
+
+static BAM_UNUSED inline int bam_event_kind_is_lifecycle(BamEventKind kind) {
+return kind == BAM_EVENT_KIND_ADD || kind == BAM_EVENT_KIND_INSERT ||
+kind == BAM_EVENT_KIND_DISCARD || kind == BAM_EVENT_KIND_REMOVE ||
+kind == BAM_EVENT_KIND_DESPAWN || kind == BAM_EVENT_KIND_READY;
+}
+
+static BAM_UNUSED inline int bam_schedule_is_valid(BamScheduleId schedule) {
+return schedule <= BAM_SCHEDULE_LAST || schedule >= BAM_SCHEDULE_CUSTOM_BASE;
+}
+
+static BAM_UNUSED inline int bam_field_kind_is_valid(BamFieldKind kind) {
+return kind <= BAM_FIELD_KIND_OPAQUE;
 }
 
 static BAM_UNUSED inline BamTermDesc bam_term_desc(BamComponent component, BamAccessMode mode, uint16_t flags) {
@@ -1169,6 +1204,10 @@ return uuid;
 
 static BAM_UNUSED inline BamComponentUuid bam_uuid_from_canonical_name(const char* canonical_name) {
 return bam_uuid_from_parts(canonical_name, 0u, 0u, 0ull);
+}
+
+static BAM_UNUSED inline BamComponentUuid bam_disabled_uuid(void) {
+return bam_uuid_from_canonical_name(BAM_DISABLED_NAME);
 }
 
 static BAM_UNUSED inline int bam_uuid_equals(BamComponentUuid a, BamComponentUuid b) {

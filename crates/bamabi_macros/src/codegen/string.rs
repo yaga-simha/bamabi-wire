@@ -1,8 +1,17 @@
+//! Codegen accessor specification for host-owned `std::string::String` fields.
+
 use crate::codegen::{AccessorSpec, ReceiverKind, SlotSpec};
 use proc_macro2::{Span, TokenStream};
 use quote::{quote, quote_spanned};
 use syn::Type;
 
+/// Builds the [`AccessorSpec`] (`get_<field>`, `set_<field>`) for a host-owned `String` field.
+///
+/// Intended purpose: enforces Bamabi's strict allocator isolation invariant—guest mods read UTF-8
+/// via `StrView` and mutate via alias-safe host-allocator replacement without touching `String` internals.
+///
+/// What it does: emits a `__BamStdString` anti-spoofing guard, marks the parent struct non-POD
+/// and non-`RawInsertable`, and generates `get` (`-> StrView`) and `set` (`StrView -> FfiResult`) slots.
 pub(crate) fn spec(
     sys_crate: &TokenStream,
     member_tokens: &TokenStream,

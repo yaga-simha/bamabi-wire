@@ -59,6 +59,18 @@ pub struct BamChangeTicks {
 }
 
 impl BamChangeTicks {
+    /// Constructs a [`BamChangeTicks`] snapshot from explicit `(added, changed, last_run, this_run)` ticks.
+    #[inline]
+    #[must_use]
+    pub const fn new(added: u32, changed: u32, last_run: u32, this_run: u32) -> Self {
+        Self {
+            added,
+            changed,
+            last_run,
+            this_run,
+        }
+    }
+
     /// Evaluates wraparound-safe Bevy change detection: returns `true` iff `tick` occurred strictly
     /// after `last_run` relative to `this_run`, clamping ages at [`BAM_MAX_CHANGE_AGE`].
     #[inline]

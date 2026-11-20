@@ -148,6 +148,39 @@ impl AccessMode {
     pub const fn has_entity_column_data(self) -> bool {
         matches!(self.0, 0 | 1 | 4 | 5 | 6 | 7)
     }
+
+    /// Returns the canonical uppercase constant name for recognized access modes, or `"UNKNOWN"`.
+    #[inline]
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::READ => "READ",
+            Self::WRITE => "WRITE",
+            Self::FILTER_ONLY => "FILTER_ONLY",
+            Self::WITHOUT => "WITHOUT",
+            Self::OPTIONAL_READ => "OPTIONAL_READ",
+            Self::OPTIONAL_WRITE => "OPTIONAL_WRITE",
+            Self::CHANGED => "CHANGED",
+            Self::ADDED => "ADDED",
+            Self::RESOURCE_READ => "RESOURCE_READ",
+            Self::RESOURCE_WRITE => "RESOURCE_WRITE",
+            Self::MESSAGE_READ => "MESSAGE_READ",
+            Self::MESSAGE_WRITE => "MESSAGE_WRITE",
+            Self::ALLOW => "ALLOW",
+            Self::HAS => "HAS",
+            Self::REMOVED_READ => "REMOVED_READ",
+            _ => "UNKNOWN",
+        }
+    }
+}
+
+impl core::fmt::Display for AccessMode {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        if self.is_valid() {
+            f.write_str(self.name())
+        } else {
+            write!(f, "UNKNOWN({})", self.0)
+        }
+    }
 }
 
 /// FFI-safe Bevy schedule identifier (`typedef uint32_t BamScheduleId;`).
@@ -198,6 +231,32 @@ impl ScheduleId {
     pub const fn is_valid(self) -> bool {
         self.is_builtin() || self.is_custom()
     }
+
+    /// Returns the canonical uppercase name for built-in schedules (`"UPDATE"`..=`"LAST"`),
+    /// `"CUSTOM"` for custom schedules (`>= CUSTOM_BASE`), or `"RESERVED"` for `6..1024`.
+    #[inline]
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::UPDATE => "UPDATE",
+            Self::STARTUP => "STARTUP",
+            Self::PRE_UPDATE => "PRE_UPDATE",
+            Self::POST_UPDATE => "POST_UPDATE",
+            Self::FIXED_UPDATE => "FIXED_UPDATE",
+            Self::LAST => "LAST",
+            _ if self.is_custom() => "CUSTOM",
+            _ => "RESERVED",
+        }
+    }
+}
+
+impl core::fmt::Display for ScheduleId {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        if self.is_builtin() {
+            f.write_str(self.name())
+        } else {
+            write!(f, "{}({})", self.name(), self.0)
+        }
+    }
 }
 
 /// Mask of recognized [`BamTermDesc::flags`] bits in ABI `0.2` (`0`).
@@ -247,6 +306,18 @@ impl BamTermDesc {
     pub const fn with_or_group(mut self, or_group: u8) -> Self {
         self.or_group = or_group;
         self
+    }
+
+    /// Returns the disjunctive `Or<(...)>` group identifier (`0` means conjunctive top-level term).
+    #[inline]
+    pub const fn or_group(&self) -> u8 {
+        self.or_group
+    }
+
+    /// Returns `true` if this term is a top-level conjunctive term (`or_group == 0`).
+    #[inline]
+    pub const fn is_conjunctive(&self) -> bool {
+        self.or_group == 0
     }
 
     /// Creates a shared read-only (`&T`) term descriptor.

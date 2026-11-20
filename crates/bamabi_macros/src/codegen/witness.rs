@@ -1,8 +1,11 @@
+//! Reflection and hot-reload schema-migration witness codegen (`field_info`, `export_fields`, `import_field`).
+
 use crate::codegen::CodegenState;
 use proc_macro2::{Span, TokenStream};
 use quote::{format_ident, quote};
 use syn::{Ident, Type};
 
+/// Field category driving witness serialization/deserialization during schema migration.
 #[derive(Clone)]
 pub(crate) enum WitnessFieldKind {
     Bool,
@@ -13,6 +16,7 @@ pub(crate) enum WitnessFieldKind {
     Nested,
 }
 
+/// Recorded struct field metadata used by [`emit_struct_witnesses`].
 pub(crate) struct WitnessFieldInfo {
     pub(crate) field_name: String,
     pub(crate) type_tag: String,
@@ -21,6 +25,7 @@ pub(crate) struct WitnessFieldInfo {
     pub(crate) raw_ty: Type,
 }
 
+/// Recorded enum variant payload field metadata used by [`emit_enum_witnesses`].
 pub(crate) struct WitnessEnumVariantField {
     pub(crate) field_name: String,
     pub(crate) type_tag: String,
@@ -29,6 +34,7 @@ pub(crate) struct WitnessEnumVariantField {
     pub(crate) raw_ty: Type,
 }
 
+/// Recorded enum variant metadata used by [`emit_enum_witnesses`].
 pub(crate) struct WitnessEnumVariant {
     pub(crate) name: String,
     pub(crate) is_unit: bool,
@@ -472,6 +478,7 @@ pub(crate) fn emit_witness_helpers(sys_crate: &TokenStream) -> TokenStream {
     }
 }
 
+/// Emits the statement that exports a single struct or enum field's bytes into `sink_fn`.
 fn emit_export_field_stmt(
     sys_crate: &TokenStream,
     field_name: &str,
@@ -620,6 +627,7 @@ fn emit_export_field_stmt(
     }
 }
 
+/// Emits the match-arm body that imports a field's raw bytes (with primitive widening support) into `mut_ptr_expr`.
 fn emit_import_field_body(
     sys_crate: &TokenStream,
     type_tag: &str,
@@ -723,6 +731,8 @@ fn emit_import_field_body(
     }
 }
 
+/// Registers a `bam.v0.<canonical_name>.<slot_str>` witness symbol in `state.symbol_entries` and
+/// returns an optional `#[unsafe(export_name = ...)]` attribute when `export_symbols` is enabled.
 fn register_witness_symbol(
     state: &mut CodegenState,
     slot_str: &str,
@@ -750,6 +760,7 @@ fn register_witness_symbol(
     quote! {}
 }
 
+/// Emits `field_info`, `export_fields`, and `import_field` `extern "C"` witness functions for a non-opaque struct.
 #[allow(clippy::too_many_lines)]
 pub(crate) fn emit_struct_witnesses(state: &mut CodegenState) {
     if state.opaque {
@@ -950,6 +961,7 @@ pub(crate) fn emit_struct_witnesses(state: &mut CodegenState) {
     });
 }
 
+/// Emits `field_info`, `export_fields`, and `import_field` `extern "C"` witness functions for a non-opaque enum.
 #[allow(clippy::too_many_lines)]
 pub(crate) fn emit_enum_witnesses(state: &mut CodegenState, variants: &[WitnessEnumVariant]) {
     if state.opaque {

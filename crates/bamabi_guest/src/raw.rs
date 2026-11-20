@@ -39,11 +39,13 @@ pub trait GuestAppRawExt {
 }
 
 impl GuestAppRawExt for GuestApp<'_> {
+    /// Delegates to [`GuestApp::as_raw_load_ctx`].
     #[inline]
     fn raw_load_ctx(&self) -> *mut BamLoadCtx {
         self.as_raw_load_ctx()
     }
 
+    /// Delegates to [`Host::host_ctx`] on the active load session's cached host table.
     #[inline]
     fn raw_host_ctx(&self) -> *const BamHostCtx {
         self.host().host_ctx()
@@ -59,11 +61,13 @@ pub trait SystemContextRawExt {
 }
 
 impl SystemContextRawExt for SystemContext<'_> {
+    /// Delegates to [`SystemContext::as_raw_ptr`].
     #[inline]
     fn raw_sys_ctx(&self) -> *mut BamSystemCtx {
         self.as_raw_ptr()
     }
 
+    /// Delegates to [`Host::host_ctx`] on the active system invocation's cached host table.
     #[inline]
     fn raw_host_ctx(&self) -> *const BamHostCtx {
         self.host().host_ctx()
@@ -77,6 +81,7 @@ pub trait ChunkIterRawExt {
 }
 
 impl ChunkIterRawExt for ChunkIter<'_> {
+    /// Delegates to [`ChunkIter::as_raw_ptr`].
     #[inline]
     fn raw_iter(&self) -> *mut BamIter {
         self.as_raw_ptr()
@@ -90,6 +95,7 @@ pub trait GuestCommandsRawExt {
 }
 
 impl GuestCommandsRawExt for GuestCommands<'_> {
+    /// Delegates to [`GuestCommands::as_raw_ptr`].
     #[inline]
     fn raw_commands(&self) -> *mut BamCommands {
         self.as_raw_ptr()
@@ -103,6 +109,7 @@ pub trait ChunkSliceRawExt {
 }
 
 impl ChunkSliceRawExt for ChunkSlice<'_> {
+    /// Delegates to [`ChunkSlice::as_ptr`].
     #[inline]
     fn raw_ptr(&self) -> *const u8 {
         self.as_ptr()
@@ -118,11 +125,13 @@ pub trait ChunkSliceMutRawExt {
 }
 
 impl ChunkSliceMutRawExt for ChunkSliceMut<'_> {
+    /// Delegates to [`ChunkSliceMut::as_ptr`].
     #[inline]
     fn raw_ptr(&self) -> *const u8 {
         self.as_ptr()
     }
 
+    /// Delegates to [`ChunkSliceMut::as_mut_ptr`].
     #[inline]
     fn raw_mut_ptr(&mut self) -> *mut u8 {
         self.as_mut_ptr()

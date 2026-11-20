@@ -1,3 +1,5 @@
+//! `#[derive(ModComponent)]` code generation for fieldless and data-carrying enums.
+
 use crate::attrs::{IntRepr, ReprFlags, parse_field_attr, to_snake_case};
 use crate::classify::{
     FieldKind, canonical_field_type_tag, canonical_kind_type_tag, classify_type,
@@ -11,6 +13,10 @@ use proc_macro2::{Span, TokenStream};
 use quote::{format_ident, quote, quote_spanned};
 use syn::{DataEnum, DeriveInput, Expr, Fields, Ident, Lit, Type, UnOp, spanned::Spanned as _};
 
+/// Evaluates a literal or negated literal enum discriminant expression into an `i128`.
+///
+/// Intended purpose: enforces deterministic compile-time discriminants for C99/Zig header
+/// emission and `IntRepr` range checks without evaluating arbitrary Rust const expressions.
 fn parse_discriminant_i128(expr: &Expr) -> syn::Result<i128> {
     match expr {
         Expr::Group(g) => parse_discriminant_i128(&g.expr),
@@ -61,6 +67,7 @@ fn parse_discriminant_i128(expr: &Expr) -> syn::Result<i128> {
     }
 }
 
+/// Formats an `i128` discriminant value with its concrete `IntRepr` integer suffix (e.g. `42u32`).
 fn format_discriminant_tokens(val: i128, int_repr: IntRepr) -> TokenStream {
     let suffix = int_repr.rust_ty_str();
     let lit_str = format!("{val}{suffix}");
@@ -69,6 +76,7 @@ fn format_discriminant_tokens(val: i128, int_repr: IntRepr) -> TokenStream {
         .expect("valid integer literal with suffix")
 }
 
+/// Classified payload field metadata for a single field within a data-carrying enum variant.
 struct EnumFieldInfo {
     field_name: String,
     rust_ident: Option<Ident>,
@@ -77,6 +85,15 @@ struct EnumFieldInfo {
     span: Span,
 }
 
+/// Expands `#[derive(ModComponent)]` for fieldless and tagged data-carrying enums.
+///
+/// Intended purpose: exposes Rust enums across the C-ABI safely via checked `tag`,
+/// `set_<variant>`, and `try_get_<variant>_<field>` VTable slots while forbidding `AbiPod` and
+/// `RawInsertable` (enums have invalid discriminant bit patterns).
+///
+/// What it does: validates `#[repr(C, <int>)]` / `#[repr(<int>)]` and non-empty variants,
+/// parses explicit/implicit discriminants, emits tag/setter/getter extern functions and witness
+/// symbols, and delegates final VTable and `ModComponent` impl emission to `vtable::emit_vtable_and_impls`.
 #[allow(clippy::too_many_lines)]
 pub(crate) fn expand_enum_mod_component(
     input: &DeriveInput,
