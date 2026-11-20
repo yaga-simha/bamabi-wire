@@ -2164,12 +2164,6 @@ impl<'a> ValidatedIter<'a> {
             >,
             sink_ctx: *mut c_void,
         ) -> FfiResult;
-        type ImportFieldFn = unsafe extern "C" fn(
-            dst_ptr: *mut c_void,
-            field_name: StrView,
-            type_tag: StrView,
-            payload: FfiSlice<u8>,
-        ) -> FfiResult;
 
         let export_sym_name = CString::new(format!("bam.v0.{}.export_fields", M::CANONICAL_NAME))
             .map_err(|_| FfiResult::INVALID_ARGUMENT)?;
@@ -2187,36 +2181,9 @@ impl<'a> ValidatedIter<'a> {
         if guest_import_ptr.is_null() {
             return Err(FfiResult::UNSUPPORTED);
         }
-        // SAFETY: `M::symbols()` exports `"bam.v0.<M>.import_field"` with `ImportFieldFn` ABI.
-        let guest_import_fn: ImportFieldFn = unsafe { core::mem::transmute(guest_import_ptr) };
-
-        /// Trampoline context forwarding each host-decoded wire field into `M`'s `import_field`.
-        struct ImportSinkCtx {
-            dst_ptr: *mut c_void,
-            import_fn: ImportFieldFn,
-        }
-
-        /// C-ABI field-sink callback passed to host wire decoding that invokes `import_fn` on `dst_ptr`.
-        unsafe extern "C" fn forward_field(
-            ctx: *mut c_void,
-            field_name: StrView,
-            type_tag: StrView,
-            payload: FfiSlice<u8>,
-        ) -> FfiResult {
-            catch_guest_result(|| {
-                if ctx.is_null()
-                    || !(ctx as usize).is_multiple_of(core::mem::align_of::<ImportSinkCtx>())
-                {
-                    return FfiResult::INVALID_ARGUMENT;
-                }
-                // SAFETY: `ctx` is non-null, aligned, and points to a stack-pinned `ImportSinkCtx`
-                // for the duration of `host_export_fn`.
-                let sink_ctx = unsafe { &*ctx.cast::<ImportSinkCtx>() };
-                // SAFETY: `sink_ctx.dst_ptr` points to a valid initialized `M`, and `field_name`,
-                // `type_tag`, `payload` are valid slices for this synchronous callback.
-                unsafe { (sink_ctx.import_fn)(sink_ctx.dst_ptr, field_name, type_tag, payload) }
-            })
-        }
+        // SAFETY: `M::symbols()` exports `"bam.v0.<M>.import_field"` with `WitnessImportFieldFn` ABI.
+        let guest_import_fn: WitnessImportFieldFn =
+            unsafe { core::mem::transmute(guest_import_ptr) };
 
         let mut out = Vec::with_capacity(actual);
         for &host_msg_ptr in &ptrs[..actual] {
@@ -2320,64 +2287,6 @@ impl<'a> ValidatedIter<'a> {
         }
         // SAFETY: `M::symbols()` exports `"bam.v0.<M>.export_fields"` with `ExportFieldsFn` ABI.
         let export_fn: ExportFieldsFn = unsafe { core::mem::transmute(export_ptr) };
-
-        /// Accumulator serializing exported `ModComponent` fields into a length-prefixed wire packet.
-        struct PacketBuilder {
-            buf: Vec<u8>,
-            field_count: u32,
-        }
-
-        /// C-ABI field-sink callback invoked by `M::export_fields` to append one encoded field to `PacketBuilder`.
-        unsafe extern "C" fn append_field(
-            ctx: *mut c_void,
-            field_name: StrView,
-            type_tag: StrView,
-            payload: FfiSlice<u8>,
-        ) -> FfiResult {
-            catch_guest_result(|| {
-                if ctx.is_null()
-                    || !(ctx as usize).is_multiple_of(core::mem::align_of::<PacketBuilder>())
-                {
-                    return FfiResult::INVALID_ARGUMENT;
-                }
-                // SAFETY: `ctx` is non-null, aligned, and points to an active `PacketBuilder` on
-                // the stack for this call.
-                let builder = unsafe { &mut *ctx.cast::<PacketBuilder>() };
-                // SAFETY: `field_name`, `type_tag`, and `payload` come directly from `export_fields`
-                // and borrow live slices for this synchronous callback.
-                let Ok(name_bytes) = (unsafe { field_name.try_as_slice() }) else {
-                    return FfiResult::NULL_POINTER;
-                };
-                // SAFETY: Same as above for `type_tag`.
-                let Ok(tag_bytes) = (unsafe { type_tag.try_as_slice() }) else {
-                    return FfiResult::NULL_POINTER;
-                };
-                // SAFETY: Same as above for `payload`.
-                let Ok(val_bytes) = (unsafe { payload.try_as_slice() }) else {
-                    return FfiResult::NULL_POINTER;
-                };
-                let Ok(name_len) = u32::try_from(name_bytes.len()) else {
-                    return FfiResult::CAPACITY_EXCEEDED;
-                };
-                let Ok(tag_len) = u32::try_from(tag_bytes.len()) else {
-                    return FfiResult::CAPACITY_EXCEEDED;
-                };
-                let Ok(val_len) = u32::try_from(val_bytes.len()) else {
-                    return FfiResult::CAPACITY_EXCEEDED;
-                };
-                let Some(next_count) = builder.field_count.checked_add(1) else {
-                    return FfiResult::CAPACITY_EXCEEDED;
-                };
-                builder.field_count = next_count;
-                builder.buf.extend_from_slice(&name_len.to_le_bytes());
-                builder.buf.extend_from_slice(name_bytes);
-                builder.buf.extend_from_slice(&tag_len.to_le_bytes());
-                builder.buf.extend_from_slice(tag_bytes);
-                builder.buf.extend_from_slice(&val_len.to_le_bytes());
-                builder.buf.extend_from_slice(val_bytes);
-                FfiResult::OK
-            })
-        }
 
         let mut builder = PacketBuilder {
             buf: vec![0u8; 4],
@@ -2878,6 +2787,96 @@ impl<'a> ValidatedIter<'a> {
         // SAFETY: `ptr` is exclusively borrowed and `StrView::from_str(text)` is valid for this call.
         unsafe { vt_set(ptr, StrView::from_str(text)) }
     }
+}
+
+/// C-ABI `import_field` callback signature used by [`ImportSinkCtx`] and [`forward_field`].
+pub(crate) type WitnessImportFieldFn = unsafe extern "C" fn(
+    dst_ptr: *mut c_void,
+    field_name: StrView,
+    type_tag: StrView,
+    payload: FfiSlice<u8>,
+) -> FfiResult;
+
+/// Trampoline context forwarding each host-decoded wire field into `M`'s `import_field`.
+pub(crate) struct ImportSinkCtx {
+    pub(crate) dst_ptr: *mut c_void,
+    pub(crate) import_fn: WitnessImportFieldFn,
+}
+
+/// C-ABI field-sink callback passed to host wire decoding that invokes `import_fn` on `dst_ptr`.
+pub(crate) unsafe extern "C" fn forward_field(
+    ctx: *mut c_void,
+    field_name: StrView,
+    type_tag: StrView,
+    payload: FfiSlice<u8>,
+) -> FfiResult {
+    catch_guest_result(|| {
+        if ctx.is_null() || !(ctx as usize).is_multiple_of(core::mem::align_of::<ImportSinkCtx>()) {
+            return FfiResult::INVALID_ARGUMENT;
+        }
+        // SAFETY: `ctx` is non-null, aligned, and points to a stack-pinned `ImportSinkCtx`
+        // for the duration of `host_export_fn`.
+        let sink_ctx = unsafe { &*ctx.cast::<ImportSinkCtx>() };
+        // SAFETY: `sink_ctx.dst_ptr` points to a valid initialized `M`, and `field_name`,
+        // `type_tag`, `payload` are valid slices for this synchronous callback.
+        unsafe { (sink_ctx.import_fn)(sink_ctx.dst_ptr, field_name, type_tag, payload) }
+    })
+}
+
+/// Accumulator serializing exported `ModComponent` fields into a length-prefixed wire packet.
+pub(crate) struct PacketBuilder {
+    pub(crate) buf: Vec<u8>,
+    pub(crate) field_count: u32,
+}
+
+/// C-ABI field-sink callback invoked by `M::export_fields` to append one encoded field to `PacketBuilder`.
+pub(crate) unsafe extern "C" fn append_field(
+    ctx: *mut c_void,
+    field_name: StrView,
+    type_tag: StrView,
+    payload: FfiSlice<u8>,
+) -> FfiResult {
+    catch_guest_result(|| {
+        if ctx.is_null() || !(ctx as usize).is_multiple_of(core::mem::align_of::<PacketBuilder>()) {
+            return FfiResult::INVALID_ARGUMENT;
+        }
+        // SAFETY: `ctx` is non-null, aligned, and points to an active `PacketBuilder` on
+        // the stack for this call.
+        let builder = unsafe { &mut *ctx.cast::<PacketBuilder>() };
+        // SAFETY: `field_name`, `type_tag`, and `payload` come directly from `export_fields`
+        // and borrow live slices for this synchronous callback.
+        let Ok(name_bytes) = (unsafe { field_name.try_as_slice() }) else {
+            return FfiResult::NULL_POINTER;
+        };
+        // SAFETY: Same as above for `type_tag`.
+        let Ok(tag_bytes) = (unsafe { type_tag.try_as_slice() }) else {
+            return FfiResult::NULL_POINTER;
+        };
+        // SAFETY: Same as above for `payload`.
+        let Ok(val_bytes) = (unsafe { payload.try_as_slice() }) else {
+            return FfiResult::NULL_POINTER;
+        };
+        let Ok(name_len) = u32::try_from(name_bytes.len()) else {
+            return FfiResult::CAPACITY_EXCEEDED;
+        };
+        let Ok(tag_len) = u32::try_from(tag_bytes.len()) else {
+            return FfiResult::CAPACITY_EXCEEDED;
+        };
+        let Ok(val_len) = u32::try_from(val_bytes.len()) else {
+            return FfiResult::CAPACITY_EXCEEDED;
+        };
+        let Some(next_count) = builder.field_count.checked_add(1) else {
+            return FfiResult::CAPACITY_EXCEEDED;
+        };
+        builder.field_count = next_count;
+        builder.buf.extend_from_slice(&name_len.to_le_bytes());
+        builder.buf.extend_from_slice(name_bytes);
+        builder.buf.extend_from_slice(&tag_len.to_le_bytes());
+        builder.buf.extend_from_slice(tag_bytes);
+        builder.buf.extend_from_slice(&val_len.to_le_bytes());
+        builder.buf.extend_from_slice(val_bytes);
+        FfiResult::OK
+    })
 }
 
 /// Context passed through `user_data` to [`par_chunk_task_trampoline`] during parallel chunk dispatch.

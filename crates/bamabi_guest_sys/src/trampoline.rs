@@ -828,19 +828,19 @@ impl<'a> ValidatedSystemRef<'a> {
 
 /// Heap-pinned system callback state owned by [`GuestInstance`], pairing the cached [`Host`],
 /// query slot metadata, and a [`ReentrantCell`]-guarded guest closure.
-struct SystemClosureState<F> {
-    host: Host,
-    total_query_count: usize,
-    user_query_count: usize,
-    resource_query_index: Option<usize>,
-    closure: ReentrantCell<F>,
+pub(crate) struct SystemClosureState<F> {
+    pub(crate) host: Host,
+    pub(crate) total_query_count: usize,
+    pub(crate) user_query_count: usize,
+    pub(crate) resource_query_index: Option<usize>,
+    pub(crate) closure: ReentrantCell<F>,
 }
 
 /// Heap-pinned `run_if` predicate state owned by [`GuestInstance`], pairing the cached [`Host`]
 /// with a [`ReentrantCell`]-guarded guest predicate closure.
-struct RunIfClosureState<R> {
-    host: Host,
-    closure: ReentrantCell<R>,
+pub(crate) struct RunIfClosureState<R> {
+    pub(crate) host: Host,
+    pub(crate) closure: ReentrantCell<R>,
 }
 
 /// Panic-safe, re-entrancy-guarded `extern "C"` [`BamSystemFn`] trampoline.
@@ -848,7 +848,7 @@ struct RunIfClosureState<R> {
 /// Refreshes [`Host::host_ctx`] from `BamHostApi::sys_host_ctx(sys_ctx)` so per-tick diagnostics
 /// and symbol queries use the active world context, constructs a [`ValidatedSystemInvocation`],
 /// and returns [`FfiResult::ACCESS_CONFLICT`] on re-entry or [`FfiResult::PANIC_CAUGHT`] on panic.
-unsafe extern "C" fn system_closure_trampoline<F>(
+pub(crate) unsafe extern "C" fn system_closure_trampoline<F>(
     sys_ctx: *mut BamSystemCtx,
     user_data: *mut c_void,
 ) -> FfiResult
@@ -899,7 +899,7 @@ where
 
 /// Panic-safe, re-entrancy-guarded `extern "C"` [`BamRunIfFn`] trampoline returning
 /// [`FfiBool::FALSE`] on null `user_data`, re-entrant entry, or guest panic.
-unsafe extern "C" fn run_if_closure_trampoline<R>(user_data: *mut c_void) -> FfiBool
+pub(crate) unsafe extern "C" fn run_if_closure_trampoline<R>(user_data: *mut c_void) -> FfiBool
 where
     R: FnMut(&Host) -> bool + Send + 'static,
 {
@@ -1823,7 +1823,7 @@ where
 
 /// Panic-safe, re-entrancy-guarded `extern "C"` [`BamObserverFn`] trampoline for component
 /// lifecycle (`ADD`/`INSERT`/`DISCARD`/`REMOVE`/`DESPAWN`) and scene `READY` observers.
-unsafe extern "C" fn lifecycle_observer_closure_trampoline<F>(
+pub(crate) unsafe extern "C" fn lifecycle_observer_closure_trampoline<F>(
     target: FfiEntity,
     _event_data: *const c_void,
     commands: *mut BamCommands,

@@ -1,9 +1,8 @@
-//! Kani formal verification proof harnesses for `bamabi_guest_sys` (`PO-G1`..`PO-G7`).
+//! Kani formal verification proof harnesses for `bamabi_guest_sys` (`PO-G1`, `PO-G3`..`PO-G8`).
 //!
 //! Symbolically verifies the guest-side `unsafe` FFI boundary:
 //! - `PO-G1`: `host_slot!` bounds across all 41 extended/ABI-0.3 `BamHostApi` slots, plus
 //!   `Host::from_raw`, `Host::from_load_ctx`, and `Host::resolve_vtable` pointer/alignment/header guards.
-//! - `PO-G2`: `ReentrantCell<T>` mutual-exclusion, re-entrancy rejection, and RAII release.
 //! - `PO-G3`: `checked_slice_elem_offset`, `raw_dense_slice`, `raw_dense_slice_mut`, `ValidatedSlice`,
 //!   and `ValidatedSliceMut` layout, alignment, ZST, and overflow bounds.
 //! - `PO-G4`: `ChunkColumnDispenser` disjoint borrow tracking and anti-aliasing guarantees (including
@@ -14,10 +13,15 @@
 //!   query clamping, single-take exclusivity, and `queries_2_mut` disjointness.
 //! - `PO-G7`: `pod_clone_trampoline`, `generic_drop_trampoline`, `init_default_trampoline`, and
 //!   `ValidatedCommands` null/entity/component/payload/uncovered-slot guards.
+//! - `PO-G8`: `extern "C"` trampoline ABI guards (`system_closure_trampoline`,
+//!   `run_if_closure_trampoline`, `lifecycle_observer_closure_trampoline`,
+//!   `par_chunk_task_trampoline`, `pod_on_add_trampoline`/`pod_on_remove_trampoline`, and
+//!   `forward_field`/`append_field` non-POD message witness callbacks).
 
 use core::{
     ffi::{CStr, c_char, c_void},
     mem::{align_of, offset_of, size_of},
+    sync::atomic::{AtomicUsize, Ordering},
 };
 
 use bamabi_sys::{
@@ -25,8 +29,9 @@ use bamabi_sys::{
     BamHostCtx, BamInstance, BamIter, BamLayoutInfo, BamLoadCtx, BamObserverDesc, BamRelationDesc,
     BamScheduleSetDesc, BamSymbol, BamSystem, BamSystemCtx, BamSystemDesc, BamSystemSet,
     BamTermDesc, BamTriggerDesc, ComponentDesc, ComponentUuid, FfiAssetHandle, FfiAssetLoadState,
-    FfiBool, FfiEntity, FfiResult, MAX_QUERIES_PER_SYSTEM, MAX_TERMS_PER_QUERY, MappedStringVTable,
-    MappedWireVTable, ScheduleId, StrView, VTableHeader, abi_version_is_compatible,
+    FfiBool, FfiEntity, FfiResult, FfiSlice, MAX_QUERIES_PER_SYSTEM, MAX_TERMS_PER_QUERY,
+    MappedStringVTable, MappedWireVTable, ScheduleId, StrView, VTableHeader,
+    abi_version_is_compatible,
 };
 
 /// Zero-sized `AbiPod` marker alias for ZST proof paths.
@@ -37,13 +42,19 @@ use crate::{
     UuidFilter, ValidatedCommands, ValidatedIter, ValidatedSlice, ValidatedSliceMut,
     ValidatedSystemInvocation,
     component::{
-        RowMigrateCtx, generic_drop_trampoline, pod_clone_trampoline, row_migrate_trampoline,
+        HookTrampolineState, RowMigrateCtx, generic_drop_trampoline, pod_clone_trampoline,
+        pod_on_add_trampoline, pod_on_remove_trampoline, row_migrate_trampoline,
     },
     guest_restore_state_trampoline, guest_save_state_trampoline,
     instance::init_default_trampoline,
-    iter::{checked_slice_elem_offset, raw_dense_slice, raw_dense_slice_mut},
+    iter::{
+        ImportSinkCtx, PacketBuilder, append_field, checked_slice_elem_offset, forward_field,
+        raw_dense_slice, raw_dense_slice_mut,
+    },
     trampoline::{
-        ObserverTrampolineState, observer_closure_trampoline, observer_mut_closure_trampoline,
+        ObserverTrampolineState, RunIfClosureState, SystemClosureState,
+        lifecycle_observer_closure_trampoline, observer_closure_trampoline,
+        observer_mut_closure_trampoline, run_if_closure_trampoline, system_closure_trampoline,
     },
 };
 
@@ -570,6 +581,51 @@ fn make_valid_host(api: BamHostApi, host_ctx: *const BamHostCtx) -> Host {
 // PO-G1: `host_slot!` Bounds & `Host` Handshake / VTable Guards
 // ============================================================================
 
+/// Asserts that all 41 extended/ABI-0.3 `host_slot!` lookups return `None` on `api`.
+fn assert_all_41_extended_slots_none(api: &BamHostApi) {
+    assert!(host_slot!(api, par_for_each_chunk).is_none());
+    assert!(host_slot!(api, sys_entity_get).is_none());
+    assert!(host_slot!(api, sys_entity_get_mut).is_none());
+    assert!(host_slot!(api, msg_read_batch).is_none());
+    assert!(host_slot!(api, msg_send).is_none());
+    assert!(host_slot!(api, msg_write_batch).is_none());
+    assert!(host_slot!(api, res_ticks).is_none());
+    assert!(host_slot!(api, sys_res_ptr).is_none());
+    assert!(host_slot!(api, sys_res_mut_ptr).is_none());
+    assert!(host_slot!(api, register_observer).is_none());
+    assert!(host_slot!(api, cmd_trigger).is_none());
+    assert!(host_slot!(api, cmd_spawn_persistent).is_none());
+    assert!(host_slot!(api, cmd_spawn_batch).is_none());
+    assert!(host_slot!(api, cmd_despawn_all).is_none());
+    assert!(host_slot!(api, cmd_insert_if_new).is_none());
+    assert!(host_slot!(api, cmd_trigger_ex).is_none());
+    assert!(host_slot!(api, cmd_observe).is_none());
+    assert!(host_slot!(api, iter_read_removed).is_none());
+    assert!(host_slot!(api, sys_entity_children).is_none());
+    assert!(host_slot!(api, asset_load).is_none());
+    assert!(host_slot!(api, asset_get_load_state).is_none());
+    assert!(host_slot!(api, asset_release).is_none());
+    assert!(host_slot!(api, cmd_spawn_scene).is_none());
+    assert!(host_slot!(api, log_diagnostic).is_none());
+    assert!(host_slot!(api, report_guest_fault).is_none());
+    assert!(host_slot!(api, resolve_component_by_uuid).is_none());
+    assert!(host_slot!(api, component_layout_info).is_none());
+    assert!(host_slot!(api, register_relation).is_none());
+    assert!(host_slot!(api, intern_symbol).is_none());
+    assert!(host_slot!(api, bind_named_object).is_none());
+    assert!(host_slot!(api, iter_count).is_none());
+    assert!(host_slot!(api, iter_up_cascade).is_none());
+    assert!(host_slot!(api, par_for_each_chunk_readonly).is_none());
+    assert!(host_slot!(api, register_system_handle).is_none());
+    assert!(host_slot!(api, configure_schedule_set).is_none());
+    assert!(host_slot!(api, mount_system_in_schedule).is_none());
+    assert!(host_slot!(api, cmd_checkpoint).is_none());
+    assert!(host_slot!(api, cmd_rollback).is_none());
+    assert!(host_slot!(api, cmd_insert_relation).is_none());
+    assert!(host_slot!(api, cmd_remove_relation).is_none());
+    assert!(host_slot!(api, migrate_component_column).is_none());
+}
+
 /// PO-G1: `host_slot!` across all 41 extended/ABI-0.3 slots returns `Some` iff `populated` and
 /// `struct_size >= offset_of!(BamHostApi, slot) + size_of::<usize>()`, with zero overflow.
 #[kani::proof]
@@ -631,13 +687,25 @@ fn po_g1_host_slot_bounds_all_41_extended_slots() {
     check_slot!(cmd_insert_relation);
     check_slot!(cmd_remove_relation);
     check_slot!(migrate_component_column);
+
+    kani::cover!(host_slot!(&api, par_for_each_chunk).is_some());
+    kani::cover!(host_slot!(&api, par_for_each_chunk).is_none());
+    kani::cover!(host_slot!(&api, migrate_component_column).is_some());
+    kani::cover!(host_slot!(&api, migrate_component_column).is_none());
 }
 
 /// PO-G1: `Host::from_raw` and `Host::from_load_ctx` reject null pointers, misaligned `api_ptr`,
 /// undersized `struct_size`, incompatible `abi_version`, missing mandatory core slots, and null
-/// `load_host_ctx` returns without UB.
+/// `load_host_ctx` returns without UB, while proving an exact `BamHostApi::MIN_V0_2_SIZE`
+/// truncated stack buffer triggers zero out-of-bounds reads and leaves all 41 extended slots `None`.
 #[kani::proof]
 fn po_g1_host_from_raw_and_load_ctx_guards() {
+    #[repr(C)]
+    struct AlignedV02ApiBuf {
+        _align: [BamHostApi; 0],
+        bytes: [u8; BamHostApi::MIN_V0_2_SIZE],
+    }
+
     let mut dummy_load = 1u8;
     let host_ctx = (&raw const dummy_load).cast::<BamHostCtx>();
     let load_ctx = (&raw mut dummy_load).cast::<BamLoadCtx>();
@@ -685,35 +753,69 @@ fn po_g1_host_from_raw_and_load_ctx_guards() {
         FfiResult::INVALID_ARGUMENT
     );
 
-    // Symbolic struct_size, abi_version, and missing core slot through Host::from_raw.
+    // Exact truncated v0.2 `[u8; BamHostApi::MIN_V0_2_SIZE]` aligned stack buffer test.
     let sz: u32 = kani::any();
+    kani::assume((sz as usize) <= BamHostApi::MIN_V0_2_SIZE);
     let ver: u32 = kani::any();
     let drop_core_slot: bool = kani::any();
+    let null_load_ctx_ret: bool = kani::any();
+
     let mut sym_api = make_core_api(sz, ver);
     if drop_core_slot {
         sym_api.cmd_remove = None;
     }
-    // SAFETY: `sym_api` is a full aligned `BamHostApi` on the stack (`min(sz, size_of) <= size_of`).
-    let res = unsafe { Host::from_raw(&sym_api, host_ctx) };
+    if null_load_ctx_ret {
+        sym_api.load_host_ctx = Some(stub_load_host_ctx_null);
+    }
+
+    let mut trunc_buf = AlignedV02ApiBuf {
+        _align: [],
+        bytes: [0u8; BamHostApi::MIN_V0_2_SIZE],
+    };
+    // SAFETY: `sym_api` is initialized and `trunc_buf.bytes` holds exact `MIN_V0_2_SIZE` bytes.
+    unsafe {
+        core::ptr::copy_nonoverlapping(
+            (&raw const sym_api).cast::<u8>(),
+            trunc_buf.bytes.as_mut_ptr(),
+            BamHostApi::MIN_V0_2_SIZE,
+        );
+    }
+    let trunc_api_ptr = (&raw const trunc_buf).cast::<BamHostApi>();
+
+    // SAFETY: `trunc_api_ptr` is aligned and readable for `BamHostApi::MIN_V0_2_SIZE >= sz` bytes.
+    let res_raw = unsafe { Host::from_raw(trunc_api_ptr, host_ctx) };
     if (sz as usize) < BamHostApi::MIN_V0_2_SIZE || !abi_version_is_compatible(ver, ABI_VERSION) {
-        assert_eq!(res.unwrap_err(), FfiResult::INVALID_VERSION);
+        assert_eq!(res_raw.unwrap_err(), FfiResult::INVALID_VERSION);
     } else if drop_core_slot {
-        assert_eq!(res.unwrap_err(), FfiResult::NULL_POINTER);
+        assert_eq!(res_raw.unwrap_err(), FfiResult::NULL_POINTER);
     } else {
-        let host = res.expect("valid api must succeed");
+        let host = res_raw.expect("valid truncated v0.2 api must succeed");
         assert_eq!(host.api().struct_size, sz);
         assert_eq!(host.api().abi_version, ver);
         assert_eq!(host.host_ctx(), host_ctx);
+        assert!(host.api().has_all_v0_2_slots());
+        assert_all_41_extended_slots_none(host.api());
     }
+    kani::cover!(res_raw.is_ok());
+    kani::cover!(matches!(res_raw, Err(FfiResult::INVALID_VERSION)));
+    kani::cover!(matches!(res_raw, Err(FfiResult::NULL_POINTER)));
 
-    // `Host::from_load_ctx` returning null from `load_host_ctx` must fail with NULL_POINTER.
-    let mut null_ctx_api = make_core_api(size_of::<BamHostApi>() as u32, ABI_VERSION);
-    null_ctx_api.load_host_ctx = Some(stub_load_host_ctx_null);
-    // SAFETY: `null_ctx_api` is valid and `load_ctx` is non-null.
-    assert_eq!(
-        unsafe { Host::from_load_ctx(&null_ctx_api, load_ctx) }.unwrap_err(),
-        FfiResult::NULL_POINTER
-    );
+    // SAFETY: `trunc_api_ptr` is aligned and readable for `BamHostApi::MIN_V0_2_SIZE >= sz` bytes.
+    let res_load = unsafe { Host::from_load_ctx(trunc_api_ptr, load_ctx) };
+    if (sz as usize) < BamHostApi::MIN_V0_2_SIZE || !abi_version_is_compatible(ver, ABI_VERSION) {
+        assert_eq!(res_load.unwrap_err(), FfiResult::INVALID_VERSION);
+    } else if drop_core_slot || null_load_ctx_ret {
+        assert_eq!(res_load.unwrap_err(), FfiResult::NULL_POINTER);
+    } else {
+        let host = res_load.expect("valid truncated v0.2 api load_ctx must succeed");
+        assert_eq!(host.api().struct_size, sz);
+        assert_eq!(host.api().abi_version, ver);
+        assert!(host.api().has_all_v0_2_slots());
+        assert_all_41_extended_slots_none(host.api());
+    }
+    kani::cover!(res_load.is_ok());
+    kani::cover!(matches!(res_load, Err(FfiResult::INVALID_VERSION)));
+    kani::cover!(matches!(res_load, Err(FfiResult::NULL_POINTER)));
 }
 
 /// PO-G1: `Host::resolve_vtable` rejects undersized target types, null pointers, misaligned
@@ -814,41 +916,9 @@ fn po_g1_host_resolve_vtable_guards() {
         assert_eq!(resolved.tag, tag);
         assert_eq!(resolved.header.uuid, expected_uuid);
     }
-}
-
-// ============================================================================
-// PO-G2: `ReentrantCell<T>` Mutual Exclusion & Release Guard
-// ============================================================================
-
-/// PO-G2: `ReentrantCell` starts unlocked, detects and rejects nested re-entrancy with `None`
-/// without aliasing `UnsafeCell<T>`, releases `in_use` via `ReleaseGuard`, and preserves state
-/// across sequential invocations.
-#[kani::proof]
-fn po_g2_reentrant_cell_mutual_exclusion_and_release() {
-    let init: u64 = kani::any();
-    let delta: u64 = kani::any();
-    let cell = ReentrantCell::new(init);
-
-    assert!(!cell.is_in_use());
-
-    let out = cell.try_with_mut(|val| {
-        assert!(cell.is_in_use());
-        // Re-entrant entry MUST fail immediately with `None` and must NOT touch `val`.
-        let nested = cell.try_with_mut(|_| 999u64);
-        assert!(nested.is_none());
-        assert!(cell.is_in_use());
-
-        *val = val.wrapping_add(delta);
-        *val
-    });
-
-    assert_eq!(out, Some(init.wrapping_add(delta)));
-    assert!(!cell.is_in_use());
-
-    // Subsequent sequential entry succeeds and observes the mutated value.
-    let second = cell.try_with_mut(|val| *val);
-    assert_eq!(second, Some(init.wrapping_add(delta)));
-    assert!(!cell.is_in_use());
+    kani::cover!(res.is_ok());
+    kani::cover!(matches!(res, Err(FfiResult::INVALID_VERSION)));
+    kani::cover!(matches!(res, Err(FfiResult::TYPE_MISMATCH)));
 }
 
 // ============================================================================
@@ -941,6 +1011,8 @@ fn po_g3_checked_slice_elem_offset_exact_bounds() {
         assert_eq!(off, s_idx * s_stride);
         assert!(off + s_stride <= s_len * s_stride);
     }
+    kani::cover!(s_res.is_some());
+    kani::cover!(s_res.is_none());
 }
 
 /// PO-G3: `raw_dense_slice` and `raw_dense_slice_mut` reject null pointers, misaligned pointers,
@@ -1024,6 +1096,11 @@ fn po_g3_raw_dense_slice_and_mut_soundness() {
     }
     .expect("ZST mut with non-null ptr succeeds");
     assert_eq!(zst_rw.len(), zst_len);
+
+    kani::cover!(len > 0);
+    kani::cover!(len == 0);
+    // SAFETY: Null pointer is rejected before creating any slice.
+    kani::cover!(unsafe { raw_dense_slice::<u64>(core::ptr::null(), any_len) }.is_none());
 }
 
 /// PO-G3: `ValidatedSlice` and `ValidatedSliceMut` enforce mode, storage flags, immutability,
@@ -1083,6 +1160,13 @@ fn po_g3_validated_slice_and_mut_info_guards() {
     let stride: usize = kani::any();
     let ptr_opt = checked_mut.get_mut_ptr(idx, stride);
     assert_eq!(ptr_opt.is_some(), idx < 4 && stride == size_of::<u32>());
+
+    kani::cover!(ro_typed.is_some());
+    kani::cover!(ro_typed.is_none());
+    kani::cover!(rw_typed.is_some());
+    kani::cover!(rw_typed.is_none());
+    kani::cover!(ptr_opt.is_some());
+    kani::cover!(ptr_opt.is_none());
 }
 
 // ============================================================================
@@ -1116,6 +1200,8 @@ fn po_g4_dispenser_borrow_disjointness_and_entities_guard() {
     let l1: usize = kani::any();
     let m1: bool = kani::any();
     let r1 = dispenser.check_and_record_borrow(c1, s1, l1, m1);
+    kani::cover!(r1.is_ok());
+    kani::cover!(r1.is_err());
 
     let e1_opt = s1.checked_add(l1);
     if e1_opt.is_none() {
@@ -1140,6 +1226,9 @@ fn po_g4_dispenser_borrow_disjointness_and_entities_guard() {
     let l2: usize = kani::any();
     let m2: bool = kani::any();
     let r2 = dispenser.check_and_record_borrow(c2, s2, l2, m2);
+    kani::cover!(r2.is_ok());
+    kani::cover!(r2 == Err(FfiResult::ACCESS_CONFLICT));
+    kani::cover!(r2 == Err(FfiResult::OUT_OF_RANGE));
 
     let e2_opt = s2.checked_add(l2);
     if e2_opt.is_none() {
@@ -1192,11 +1281,11 @@ fn po_g4_dispenser_capacity_limit() {
         i += 1;
     }
     assert_eq!(dispenser.borrowed_count(), MAX_TERMS_PER_QUERY);
-    assert_eq!(
-        dispenser.check_and_record_borrow(BamComponent::from_raw(99), 1024, 8, false),
-        Err(FfiResult::CAPACITY_EXCEEDED)
-    );
+    let over = dispenser.check_and_record_borrow(BamComponent::from_raw(99), 1024, 8, false);
+    assert_eq!(over, Err(FfiResult::CAPACITY_EXCEEDED));
     assert_eq!(dispenser.borrowed_count(), MAX_TERMS_PER_QUERY);
+    kani::cover!(dispenser.borrowed_count() == MAX_TERMS_PER_QUERY);
+    kani::cover!(over == Err(FfiResult::CAPACITY_EXCEEDED));
 }
 
 /// PO-G4 (hostile overlapping host pointers): End-to-end verification that `next_write` followed
@@ -1318,6 +1407,8 @@ fn po_g4_dispenser_overlapping_write_then_read_soundness() {
         assert_eq!(read_slice[0], 30);
         assert_eq!(read_slice[1], 40);
     }
+    kani::cover!(read_offset < 2);
+    kani::cover!(read_offset == 2);
 }
 
 // ============================================================================
@@ -1425,6 +1516,8 @@ fn po_g5_sparse_rows_and_mut_validation() {
     assert!(zst_rows.get(0).is_some());
     assert!(zst_rows.get(1).is_none());
     assert!(zst_rows.get(2).is_none());
+    kani::cover!(expect_ok);
+    kani::cover!(!expect_ok);
 }
 
 // ============================================================================
@@ -1482,6 +1575,8 @@ fn po_g6_iter_mark_changed_range_overflow_and_bounds() {
         assert_eq!(res, FfiResult::OUT_OF_RANGE);
         assert!(!state.marked);
     }
+    kani::cover!(res == FfiResult::OK);
+    kani::cover!(res == FfiResult::OUT_OF_RANGE);
 }
 
 /// PO-G6: `ValidatedSystemInvocation` clamps arbitrary query counts to `MAX_QUERIES_PER_SYSTEM`,
@@ -1534,6 +1629,10 @@ fn po_g6_system_invocation_clamping_and_slot_exclusivity() {
     assert_eq!(first.is_some(), slot < clamped_total);
     let second = inv.take_raw_query_slot(slot);
     assert!(second.is_none());
+    kani::cover!(expect_pair);
+    kani::cover!(!expect_pair);
+    kani::cover!(slot < clamped_total);
+    kani::cover!(slot >= clamped_total);
 }
 
 // ============================================================================
@@ -1739,17 +1838,16 @@ fn po_g7_trampolines_null_alignment_and_zst_guards() {
         Ok([])
     }
     let mut zst_mig_ctx = RowMigrateCtx::<ZstMigFn> { func: mig_zst };
-    // SAFETY: ZST migration accepts null `src_row`/`dst_row` without dereferencing.
-    assert_eq!(
-        unsafe {
-            row_migrate_trampoline::<ZstPod, ZstPod, ZstMigFn>(
-                core::ptr::null(),
-                core::ptr::null_mut(),
-                core::ptr::from_mut(&mut zst_mig_ctx).cast(),
-            )
-        },
-        FfiResult::OK
-    );
+    let zst_mig_res = unsafe {
+        row_migrate_trampoline::<ZstPod, ZstPod, ZstMigFn>(
+            core::ptr::null(),
+            core::ptr::null_mut(),
+            core::ptr::from_mut(&mut zst_mig_ctx).cast(),
+        )
+    };
+    assert_eq!(zst_mig_res, FfiResult::OK);
+    kani::cover!(dst == src);
+    kani::cover!(zst_mig_res == FfiResult::OK);
 }
 
 /// PO-G7: `ValidatedCommands` rejects null command buffers, null entities, invalid components,
@@ -1829,6 +1927,10 @@ fn po_g7_validated_commands_null_entity_component_and_slot_guards() {
     } else {
         assert_eq!(ins_res, FfiResult::OK);
     }
+    kani::cover!(ins_res == FfiResult::OK);
+    kani::cover!(ins_res == FfiResult::INVALID_ENTITY);
+    kani::cover!(ins_res == FfiResult::INVALID_COMPONENT);
+    kani::cover!(ins_res == FfiResult::NULL_POINTER);
 
     // Mismatched parallel slice lengths in `spawn_raw` -> INVALID_ARGUMENT.
     let comps = [BamComponent::from_raw(1), BamComponent::from_raw(2)];
@@ -2082,18 +2184,18 @@ fn po_g7_guest_state_and_observer_trampolines() {
         host,
         callback: ReentrantCell::new(zst_obs_noop),
     };
-    // SAFETY: ZST observer uses `NonNull::dangling()`.
-    assert_eq!(
-        unsafe {
-            observer_closure_trampoline::<ZstPod, ZstObsFn>(
-                FfiEntity::from_bits(1),
-                core::ptr::null(),
-                core::ptr::null_mut(),
-                core::ptr::from_mut(&mut zst_obs).cast(),
-            )
-        },
-        FfiResult::OK
-    );
+    let zst_obs_res = unsafe {
+        observer_closure_trampoline::<ZstPod, ZstObsFn>(
+            FfiEntity::from_bits(1),
+            core::ptr::null(),
+            core::ptr::null_mut(),
+            core::ptr::from_mut(&mut zst_obs).cast(),
+        )
+    };
+    assert_eq!(zst_obs_res, FfiResult::OK);
+    kani::cover!(zst_obs_res == FfiResult::OK);
+    kani::cover!(init_prop);
+    kani::cover!(!init_prop);
 }
 
 /// PO-G4 (entities & `ValidatedIter` split-borrow overlap guards): Verifies
@@ -2228,6 +2330,10 @@ fn po_g4_dispenser_entities_and_iter_overlap_guards() {
     } else {
         assert!(repeat.is_ok());
     }
+    kani::cover!(off == 2);
+    kani::cover!(off < 2);
+    kani::cover!(repeat.is_ok());
+    kani::cover!(repeat == Err(FfiResult::ACCESS_CONFLICT));
 }
 
 /// PO-G1 / PO-G6 (mapped VTables & bridged row bounds): Verifies `Host::resolve_mapped_wire_vtable`
@@ -2359,6 +2465,8 @@ fn po_g1_mapped_vtables_and_bridged_row_bounds() {
     ));
 
     let wire_res = host.resolve_mapped_wire_vtable::<u64>(good_sym, uuid);
+    kani::cover!(wire_res.is_ok());
+    kani::cover!(wire_res.is_err());
     if !has_get {
         assert!(matches!(wire_res, Err(FfiResult::INVALID_ARGUMENT)));
         return;
@@ -2380,6 +2488,9 @@ fn po_g1_mapped_vtables_and_bridged_row_bounds() {
         1 | 2 => assert_eq!(read_res, Err(FfiResult::TYPE_MISMATCH)),
         _ => assert_eq!(read_res, Err(FfiResult::OUT_OF_RANGE)),
     }
+    kani::cover!(read_res.is_ok());
+    kani::cover!(matches!(read_res, Err(FfiResult::TYPE_MISMATCH)));
+    kani::cover!(matches!(read_res, Err(FfiResult::OUT_OF_RANGE)));
 
     // String VTable resolution check.
     vt_ctx.return_str = true;
@@ -2389,4 +2500,728 @@ fn po_g1_mapped_vtables_and_bridged_row_bounds() {
             .resolve_mapped_string_vtable(good_sym, uuid)
             .is_ok()
     );
+}
+
+// ============================================================================
+// PO-G8: `extern "C"` Trampoline ABI Guards
+// ============================================================================
+
+/// PO-G8 (`system_closure_trampoline` & `run_if_closure_trampoline`): Proves null/misaligned
+/// `sys_ctx`/`user_data` rejection, `sys_host_ctx` context refresh, re-entrancy rejection
+/// (`ACCESS_CONFLICT` / `FfiBool::FALSE`), and panic-freedom across all branches.
+#[kani::proof]
+fn po_g8_system_and_run_if_trampolines() {
+    #[repr(C)]
+    struct SysHostProbe {
+        refreshed_ctx: u64,
+        return_refreshed: bool,
+    }
+
+    unsafe extern "C" fn probe_sys_host_ctx(sys_ctx: *const BamSystemCtx) -> *const BamHostCtx {
+        // SAFETY: Test binds `sys_ctx` to `SysHostProbe`.
+        let st = unsafe { &*sys_ctx.cast::<SysHostProbe>() };
+        if st.return_refreshed {
+            (&raw const st.refreshed_ctx).cast::<BamHostCtx>()
+        } else {
+            core::ptr::null()
+        }
+    }
+
+    let orig_ctx_token = 1u64;
+    let orig_host_ctx = (&raw const orig_ctx_token).cast::<BamHostCtx>();
+    let mut api = make_core_api(size_of::<BamHostApi>() as u32, ABI_VERSION);
+    api.sys_host_ctx = Some(probe_sys_host_ctx);
+    let host = make_valid_host(api, orig_host_ctx);
+
+    let return_refreshed: bool = kani::any();
+    let want_err: bool = kani::any();
+    let mut probe = SysHostProbe {
+        refreshed_ctx: 2u64,
+        return_refreshed,
+    };
+    let sys_ctx = (&raw mut probe).cast::<BamSystemCtx>();
+    let orig_host_ctx_addr = orig_host_ctx as usize;
+    let expected_ctx_addr = if return_refreshed {
+        (&raw const probe.refreshed_ctx).cast::<BamHostCtx>() as usize
+    } else {
+        orig_host_ctx_addr
+    };
+
+    let sys_fn = move |inv: &mut ValidatedSystemInvocation<'_>| -> FfiResult {
+        assert_eq!(inv.query_count(), 1);
+        assert_eq!(inv.host().host_ctx() as usize, expected_ctx_addr);
+        if want_err {
+            FfiResult::INVALID_ARGUMENT
+        } else {
+            FfiResult::OK
+        }
+    };
+    let mut sys_state = SystemClosureState {
+        host,
+        total_query_count: 1,
+        user_query_count: 1,
+        resource_query_index: None,
+        closure: ReentrantCell::new(sys_fn),
+    };
+    let sys_ud = core::ptr::from_mut(&mut sys_state).cast::<c_void>();
+    fn sys_trampoline_for<F>(_: &SystemClosureState<F>) -> bamabi_sys::BamSystemFn
+    where
+        F: FnMut(&mut ValidatedSystemInvocation<'_>) -> FfiResult + Send + 'static,
+    {
+        system_closure_trampoline::<F>
+    }
+    let sys_trampoline = sys_trampoline_for(&sys_state);
+
+    // Null `sys_ctx` and null `user_data` -> NULL_POINTER.
+    // SAFETY: Null pointer arguments are rejected before dereferencing.
+    let null_sys_res = unsafe { sys_trampoline(core::ptr::null_mut(), sys_ud) };
+    assert_eq!(null_sys_res, FfiResult::NULL_POINTER);
+    // SAFETY: Null pointer arguments are rejected before dereferencing.
+    let null_ud_res = unsafe { sys_trampoline(sys_ctx, core::ptr::null_mut()) };
+    assert_eq!(null_ud_res, FfiResult::NULL_POINTER);
+
+    // Misaligned `user_data` -> INVALID_ARGUMENT.
+    let mut align_buf = [0u64; 2];
+    let misalign: usize = kani::any();
+    kani::assume(misalign >= 1 && misalign < align_of::<usize>());
+    let bad_ud = core::ptr::from_mut(&mut align_buf)
+        .cast::<u8>()
+        .wrapping_add(misalign)
+        .cast::<c_void>();
+    // SAFETY: Alignment guard rejects `bad_ud` before dereferencing.
+    let mis_sys_res = unsafe { sys_trampoline(sys_ctx, bad_ud) };
+    assert_eq!(mis_sys_res, FfiResult::INVALID_ARGUMENT);
+
+    // Valid invocation -> OK or closure error.
+    // SAFETY: `sys_ctx` and `sys_ud` are non-null, aligned, and initialized for this call.
+    let valid_sys_res = unsafe { sys_trampoline(sys_ctx, sys_ud) };
+    assert_eq!(
+        valid_sys_res,
+        if want_err {
+            FfiResult::INVALID_ARGUMENT
+        } else {
+            FfiResult::OK
+        }
+    );
+
+    // Re-entrant invocation -> ACCESS_CONFLICT without touching inner closure.
+    let mut reent_sys_res = FfiResult::OK;
+    let locked = sys_state.closure.try_with_mut(|_| {
+        // SAFETY: `sys_state.closure` is locked; trampoline must reject with ACCESS_CONFLICT.
+        reent_sys_res = unsafe { sys_trampoline(sys_ctx, sys_ud) };
+    });
+    assert!(locked.is_some());
+    assert_eq!(reent_sys_res, FfiResult::ACCESS_CONFLICT);
+
+    kani::cover!(null_sys_res == FfiResult::NULL_POINTER);
+    kani::cover!(mis_sys_res == FfiResult::INVALID_ARGUMENT);
+    kani::cover!(valid_sys_res == FfiResult::OK);
+    kani::cover!(valid_sys_res == FfiResult::INVALID_ARGUMENT);
+    kani::cover!(reent_sys_res == FfiResult::ACCESS_CONFLICT);
+
+    // `run_if_closure_trampoline`: null, misaligned, valid (true/false), and re-entrancy.
+    let pred_flag: bool = kani::any();
+    let run_if_fn = move |h: &Host| -> bool {
+        assert_eq!(h.host_ctx() as usize, orig_host_ctx_addr);
+        pred_flag
+    };
+    let mut run_if_state = RunIfClosureState {
+        host,
+        closure: ReentrantCell::new(run_if_fn),
+    };
+    let run_ud = core::ptr::from_mut(&mut run_if_state).cast::<c_void>();
+    fn run_if_trampoline_for<R>(_: &RunIfClosureState<R>) -> bamabi_sys::BamRunIfFn
+    where
+        R: FnMut(&Host) -> bool + Send + 'static,
+    {
+        run_if_closure_trampoline::<R>
+    }
+    let run_if_trampoline = run_if_trampoline_for(&run_if_state);
+
+    // SAFETY: Null `user_data` returns FfiBool::FALSE without dereferencing.
+    assert!(!unsafe { run_if_trampoline(core::ptr::null_mut()) }.get());
+    // SAFETY: Misaligned `user_data` returns FfiBool::FALSE without dereferencing.
+    assert!(!unsafe { run_if_trampoline(bad_ud) }.get());
+    // SAFETY: Valid `run_ud` invokes predicate safely.
+    let run_res = unsafe { run_if_trampoline(run_ud) };
+    assert_eq!(run_res.get(), pred_flag);
+
+    let mut reent_run_res = FfiBool::TRUE;
+    let run_locked = run_if_state.closure.try_with_mut(|_| {
+        // SAFETY: `run_if_state.closure` is locked; trampoline must return FALSE without re-entering.
+        reent_run_res = unsafe { run_if_trampoline(run_ud) };
+    });
+    assert!(run_locked.is_some());
+    assert!(!reent_run_res.get());
+
+    kani::cover!(run_res.get());
+    kani::cover!(!run_res.get());
+    kani::cover!(!reent_run_res.get());
+}
+
+/// PO-G8 (`lifecycle_observer_closure_trampoline`): Proves null/misaligned `user_data` rejection,
+/// `commands` forwarding, re-entrancy rejection (`ACCESS_CONFLICT`), and panic-freedom.
+#[kani::proof]
+fn po_g8_lifecycle_observer_trampoline() {
+    let dummy_ctx = 1u8;
+    let api = make_core_api(size_of::<BamHostApi>() as u32, ABI_VERSION);
+    let host = make_valid_host(api, (&raw const dummy_ctx).cast::<BamHostCtx>());
+
+    let target = FfiEntity(kani::any());
+    let with_cmds: bool = kani::any();
+    let want_err: bool = kani::any();
+    let mut dummy_cmds = 1u8;
+    let raw_cmds = if with_cmds {
+        (&raw mut dummy_cmds).cast::<BamCommands>()
+    } else {
+        core::ptr::null_mut()
+    };
+
+    let cb = move |got_target: FfiEntity, cmds: &mut ValidatedCommands<'_>| -> FfiResult {
+        assert_eq!(got_target, target);
+        assert_eq!(cmds.is_valid(), with_cmds);
+        if want_err {
+            FfiResult::INVALID_ARGUMENT
+        } else {
+            FfiResult::OK
+        }
+    };
+    let mut state = ObserverTrampolineState {
+        host,
+        callback: ReentrantCell::new(cb),
+    };
+    let ud = core::ptr::from_mut(&mut state).cast::<c_void>();
+    fn lifecycle_trampoline_for<F>(_: &ObserverTrampolineState<F>) -> bamabi_sys::BamObserverFn
+    where
+        F: FnMut(FfiEntity, &mut ValidatedCommands<'_>) -> FfiResult + Send + 'static,
+    {
+        lifecycle_observer_closure_trampoline::<F>
+    }
+    let lifecycle_trampoline = lifecycle_trampoline_for(&state);
+
+    // Null `user_data` -> NULL_POINTER.
+    // SAFETY: Null `user_data` is rejected before dereferencing.
+    let null_res =
+        unsafe { lifecycle_trampoline(target, core::ptr::null(), raw_cmds, core::ptr::null_mut()) };
+    assert_eq!(null_res, FfiResult::NULL_POINTER);
+
+    // Misaligned `user_data` -> INVALID_ARGUMENT.
+    let mut align_buf = [0u64; 2];
+    let misalign: usize = kani::any();
+    kani::assume(misalign >= 1 && misalign < align_of::<usize>());
+    let bad_ud = core::ptr::from_mut(&mut align_buf)
+        .cast::<u8>()
+        .wrapping_add(misalign)
+        .cast::<c_void>();
+    // SAFETY: Alignment guard rejects `bad_ud` before dereferencing.
+    let mis_res = unsafe { lifecycle_trampoline(target, core::ptr::null(), raw_cmds, bad_ud) };
+    assert_eq!(mis_res, FfiResult::INVALID_ARGUMENT);
+
+    // Valid invocation -> OK or closure error.
+    // SAFETY: `ud` is non-null, aligned, and `raw_cmds` is either null or valid stack storage.
+    let valid_res = unsafe { lifecycle_trampoline(target, core::ptr::null(), raw_cmds, ud) };
+    assert_eq!(
+        valid_res,
+        if want_err {
+            FfiResult::INVALID_ARGUMENT
+        } else {
+            FfiResult::OK
+        }
+    );
+
+    // Re-entrant invocation -> ACCESS_CONFLICT.
+    let mut reent_res = FfiResult::OK;
+    let locked = state.callback.try_with_mut(|_| {
+        // SAFETY: `state.callback` is locked; trampoline must return ACCESS_CONFLICT.
+        reent_res = unsafe { lifecycle_trampoline(target, core::ptr::null(), raw_cmds, ud) };
+    });
+    assert!(locked.is_some());
+    assert_eq!(reent_res, FfiResult::ACCESS_CONFLICT);
+
+    kani::cover!(null_res == FfiResult::NULL_POINTER);
+    kani::cover!(mis_res == FfiResult::INVALID_ARGUMENT);
+    kani::cover!(valid_res == FfiResult::OK);
+    kani::cover!(valid_res == FfiResult::INVALID_ARGUMENT);
+    kani::cover!(reent_res == FfiResult::ACCESS_CONFLICT);
+}
+
+/// PO-G8 (`par_chunk_task_trampoline`): Proves null `sub_iter`, null `user_data`, misaligned
+/// `user_data`, and panic-free chunk dispatch for both `par_for_each_chunk` and
+/// `par_for_each_chunk_readonly`.
+#[kani::proof]
+#[kani::unwind(4)]
+fn po_g8_par_chunk_task_trampoline() {
+    #[repr(C)]
+    struct ParIterState {
+        yielded: bool,
+        null_sub_res: FfiResult,
+        null_ud_res: FfiResult,
+        misaligned_ud_res: FfiResult,
+    }
+
+    unsafe extern "C" fn mock_sub_next(iter: *mut BamIter, out_len: *mut usize) -> FfiBool {
+        // SAFETY: Test binds `iter` to `ParIterState`.
+        let st = unsafe { &mut *iter.cast::<ParIterState>() };
+        if st.yielded {
+            return FfiBool::FALSE;
+        }
+        st.yielded = true;
+        // SAFETY: Caller provides writable `out_len`.
+        unsafe { *out_len = 2 };
+        FfiBool::TRUE
+    }
+
+    unsafe extern "C" fn mock_par_dispatch(
+        iter: *mut BamIter,
+        task_fn: Option<bamabi_sys::BamChunkTaskFn>,
+        user_data: *mut c_void,
+    ) -> FfiResult {
+        // SAFETY: Test binds `iter` to `ParIterState`.
+        let st = unsafe { &mut *iter.cast::<ParIterState>() };
+        let f = task_fn.expect("par_for_each_chunk must pass Some(par_chunk_task_trampoline)");
+
+        // 1. Null sub_iter -> NULL_POINTER.
+        // SAFETY: Null pointer guard rejects before dereferencing.
+        st.null_sub_res = unsafe { f(core::ptr::null_mut(), user_data) };
+        assert_eq!(st.null_sub_res, FfiResult::NULL_POINTER);
+
+        // 2. Null user_data -> NULL_POINTER.
+        // SAFETY: Null pointer guard rejects before dereferencing.
+        st.null_ud_res = unsafe { f(iter, core::ptr::null_mut()) };
+        assert_eq!(st.null_ud_res, FfiResult::NULL_POINTER);
+
+        // 3. Misaligned user_data -> INVALID_ARGUMENT.
+        let mut align_buf = [0u64; 2];
+        // SAFETY: `align_buf` has 16 bytes; `+ 1` is strictly misaligned for `ParChunkTaskContext`.
+        let bad_ud = core::ptr::from_mut(&mut align_buf)
+            .cast::<u8>()
+            .wrapping_add(1)
+            .cast::<c_void>();
+        // SAFETY: Alignment guard rejects `bad_ud` before dereferencing.
+        st.misaligned_ud_res = unsafe { f(iter, bad_ud) };
+        assert_eq!(st.misaligned_ud_res, FfiResult::INVALID_ARGUMENT);
+
+        // 4. Valid sub_iter + user_data.
+        // SAFETY: `iter` and `user_data` are valid and aligned for this call.
+        unsafe { f(iter, user_data) }
+    }
+
+    let dummy_ctx = 1u8;
+    let mut api = make_core_api(size_of::<BamHostApi>() as u32, ABI_VERSION);
+    api.iter_next_chunk = Some(mock_sub_next);
+    api.par_for_each_chunk = Some(mock_par_dispatch);
+    api.par_for_each_chunk_readonly = Some(mock_par_dispatch);
+    let host = make_valid_host(api, (&raw const dummy_ctx).cast::<BamHostCtx>());
+
+    let want_err: bool = kani::any();
+    let use_readonly: bool = kani::any();
+    let mut st = ParIterState {
+        yielded: false,
+        null_sub_res: FfiResult::OK,
+        null_ud_res: FfiResult::OK,
+        misaligned_ud_res: FfiResult::OK,
+    };
+    let hits = AtomicUsize::new(0);
+    // SAFETY: `st` stays pinned on the stack across `iter`.
+    let mut iter = unsafe { ValidatedIter::from_raw((&raw mut st).cast::<BamIter>(), &host) };
+
+    let task = |sub: &mut ValidatedIter<'_>| -> FfiResult {
+        assert_eq!(sub.current_len(), 2);
+        hits.fetch_add(1, Ordering::Relaxed);
+        if want_err {
+            FfiResult::INVALID_ARGUMENT
+        } else {
+            FfiResult::OK
+        }
+    };
+    let res = if use_readonly {
+        iter.par_for_each_chunk_readonly(task)
+    } else {
+        iter.par_for_each_chunk(task)
+    };
+
+    assert_eq!(hits.load(Ordering::Relaxed), 1);
+    assert_eq!(
+        res,
+        if want_err {
+            FfiResult::INVALID_ARGUMENT
+        } else {
+            FfiResult::OK
+        }
+    );
+    kani::cover!(res == FfiResult::OK);
+    kani::cover!(res == FfiResult::INVALID_ARGUMENT);
+    kani::cover!(st.null_sub_res == FfiResult::NULL_POINTER);
+    kani::cover!(st.misaligned_ud_res == FfiResult::INVALID_ARGUMENT);
+}
+
+/// PO-G8 (`pod_on_add_trampoline` & `pod_on_remove_trampoline`): Proves null/misaligned
+/// `user_data` and `component_ptr` rejection, ZST null-pointer handling, re-entrancy rejection,
+/// and panic-freedom for POD component lifecycle hooks.
+#[kani::proof]
+fn po_g8_pod_component_hook_trampolines() {
+    static ADD_HITS: AtomicUsize = AtomicUsize::new(0);
+    static REM_HITS: AtomicUsize = AtomicUsize::new(0);
+    static ZST_HITS: AtomicUsize = AtomicUsize::new(0);
+
+    fn on_add_u64(e: FfiEntity, v: &u64) {
+        assert_eq!(e, FfiEntity::from_bits(7));
+        assert_eq!(*v, 0x1234_5678);
+        ADD_HITS.fetch_add(1, Ordering::Relaxed);
+    }
+    fn on_rem_u64(e: FfiEntity, v: &u64) {
+        assert_eq!(e, FfiEntity::from_bits(7));
+        assert_eq!(*v, 0x1234_5678);
+        REM_HITS.fetch_add(1, Ordering::Relaxed);
+    }
+    fn on_add_zst(e: FfiEntity, _: &ZstPod) {
+        assert_eq!(e, FfiEntity::from_bits(7));
+        ZST_HITS.fetch_add(1, Ordering::Relaxed);
+    }
+
+    let entity = FfiEntity::from_bits(7);
+    let val: u64 = 0x1234_5678;
+    let test_remove: bool = kani::any();
+
+    let mut state = HookTrampolineState::<u64> {
+        on_add: Some(ReentrantCell::new(Box::new(
+            on_add_u64 as fn(FfiEntity, &u64),
+        ))),
+        on_insert: None,
+        on_discard: None,
+        on_remove: Some(ReentrantCell::new(Box::new(
+            on_rem_u64 as fn(FfiEntity, &u64),
+        ))),
+        on_despawn: None,
+    };
+    let ud = core::ptr::from_mut(&mut state).cast::<c_void>();
+    let comp_ptr = (&raw const val).cast::<c_void>();
+
+    let mut align_buf = [0u64; 2];
+    let misalign: usize = kani::any();
+    kani::assume(misalign >= 1 && misalign < align_of::<u64>());
+    let bad_ptr = core::ptr::from_mut(&mut align_buf)
+        .cast::<u8>()
+        .wrapping_add(misalign)
+        .cast::<c_void>();
+
+    if test_remove {
+        // SAFETY: Null/misaligned guards reject before dereferencing.
+        unsafe {
+            pod_on_remove_trampoline::<u64>(entity, comp_ptr, core::ptr::null_mut());
+            pod_on_remove_trampoline::<u64>(entity, comp_ptr, bad_ptr);
+            pod_on_remove_trampoline::<u64>(entity, core::ptr::null(), ud);
+            pod_on_remove_trampoline::<u64>(entity, bad_ptr, ud);
+        }
+        assert_eq!(REM_HITS.load(Ordering::Relaxed), 0);
+
+        // Re-entrancy rejection while `on_remove` cell is locked.
+        let locked = state
+            .on_remove
+            .as_ref()
+            .expect("on_remove populated")
+            .try_with_mut(|_| {
+                // SAFETY: `on_remove` cell is locked; trampoline must ignore re-entry.
+                unsafe { pod_on_remove_trampoline::<u64>(entity, comp_ptr, ud) };
+            });
+        assert!(locked.is_some());
+        assert_eq!(REM_HITS.load(Ordering::Relaxed), 0);
+
+        // Valid invocation runs callback once.
+        // SAFETY: `comp_ptr` and `ud` are valid and aligned.
+        unsafe { pod_on_remove_trampoline::<u64>(entity, comp_ptr, ud) };
+        assert_eq!(REM_HITS.load(Ordering::Relaxed), 1);
+    } else {
+        // SAFETY: Null/misaligned guards reject before dereferencing.
+        unsafe {
+            pod_on_add_trampoline::<u64>(entity, comp_ptr, core::ptr::null_mut());
+            pod_on_add_trampoline::<u64>(entity, comp_ptr, bad_ptr);
+            pod_on_add_trampoline::<u64>(entity, core::ptr::null(), ud);
+            pod_on_add_trampoline::<u64>(entity, bad_ptr, ud);
+        }
+        assert_eq!(ADD_HITS.load(Ordering::Relaxed), 0);
+
+        // Re-entrancy rejection while `on_add` cell is locked.
+        let locked = state
+            .on_add
+            .as_ref()
+            .expect("on_add populated")
+            .try_with_mut(|_| {
+                // SAFETY: `on_add` cell is locked; trampoline must ignore re-entry.
+                unsafe { pod_on_add_trampoline::<u64>(entity, comp_ptr, ud) };
+            });
+        assert!(locked.is_some());
+        assert_eq!(ADD_HITS.load(Ordering::Relaxed), 0);
+
+        // Valid invocation runs callback once.
+        // SAFETY: `comp_ptr` and `ud` are valid and aligned.
+        unsafe { pod_on_add_trampoline::<u64>(entity, comp_ptr, ud) };
+        assert_eq!(ADD_HITS.load(Ordering::Relaxed), 1);
+    }
+
+    // ZST `ZstPod` hook accepts null `component_ptr` cleanly.
+    let mut zst_state = HookTrampolineState::<ZstPod> {
+        on_add: Some(ReentrantCell::new(Box::new(
+            on_add_zst as fn(FfiEntity, &ZstPod),
+        ))),
+        on_insert: None,
+        on_discard: None,
+        on_remove: None,
+        on_despawn: None,
+    };
+    let zst_ud = core::ptr::from_mut(&mut zst_state).cast::<c_void>();
+    // SAFETY: ZST hook uses `NonNull::dangling()` without dereferencing `component_ptr`.
+    unsafe {
+        pod_on_add_trampoline::<ZstPod>(entity, core::ptr::null(), zst_ud);
+        // Unpopulated `on_remove` slot is a safe no-op.
+        pod_on_remove_trampoline::<ZstPod>(entity, core::ptr::null(), zst_ud);
+    }
+    assert_eq!(ZST_HITS.load(Ordering::Relaxed), 1);
+
+    kani::cover!(test_remove && REM_HITS.load(Ordering::Relaxed) == 1);
+    kani::cover!(!test_remove && ADD_HITS.load(Ordering::Relaxed) == 1);
+}
+
+/// PO-G8 (`forward_field` & `append_field`): Proves null/misaligned `ctx` rejection, null
+/// non-empty view guards, `u32` packet length/field-count overflow guards (`CAPACITY_EXCEEDED`),
+/// and panic-freedom on non-POD message witness callbacks.
+#[kani::proof]
+fn po_g8_non_pod_message_witness_callbacks() {
+    unsafe extern "C" fn mock_import_field(
+        dst_ptr: *mut c_void,
+        field_name: StrView,
+        _type_tag: StrView,
+        payload: FfiSlice<u8>,
+    ) -> FfiResult {
+        // SAFETY: `dst_ptr` points to `u32`.
+        let dst = unsafe { &mut *dst_ptr.cast::<u32>() };
+        if field_name.is_empty() {
+            return FfiResult::INVALID_ARGUMENT;
+        }
+        // SAFETY: `payload` is a valid slice for this synchronous callback.
+        let Ok(bytes) = (unsafe { payload.try_as_slice() }) else {
+            return FfiResult::NULL_POINTER;
+        };
+        if bytes.len() == 4 {
+            *dst = u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
+            FfiResult::OK
+        } else {
+            FfiResult::INVALID_ARGUMENT
+        }
+    }
+
+    let mut dst_val: u32 = 0;
+    let mut sink_ctx = ImportSinkCtx {
+        dst_ptr: (&raw mut dst_val).cast::<c_void>(),
+        import_fn: mock_import_field,
+    };
+    let sink_ctx_ptr = (&raw mut sink_ctx).cast::<c_void>();
+
+    let mut align_buf = [0u64; 2];
+    let misalign: usize = kani::any();
+    kani::assume(misalign >= 1 && misalign < align_of::<ImportSinkCtx>());
+    let bad_sink_ctx = core::ptr::from_mut(&mut align_buf)
+        .cast::<u8>()
+        .wrapping_add(misalign)
+        .cast::<c_void>();
+
+    // 1. `forward_field`: null/misaligned ctx, rejection from `import_fn`, and valid forwarding.
+    // SAFETY: Null/alignment guards reject before dereferencing `ctx`.
+    let fwd_null = unsafe {
+        forward_field(
+            core::ptr::null_mut(),
+            StrView::from_str("v"),
+            StrView::from_str("u32"),
+            FfiSlice::from_slice(&[1, 2, 3, 4]),
+        )
+    };
+    assert_eq!(fwd_null, FfiResult::INVALID_ARGUMENT);
+    // SAFETY: Alignment guard rejects `bad_sink_ctx` before dereferencing.
+    let fwd_mis = unsafe {
+        forward_field(
+            bad_sink_ctx,
+            StrView::from_str("v"),
+            StrView::from_str("u32"),
+            FfiSlice::from_slice(&[1, 2, 3, 4]),
+        )
+    };
+    assert_eq!(fwd_mis, FfiResult::INVALID_ARGUMENT);
+
+    let fwd_want_err: bool = kani::any();
+    let fwd_name = if fwd_want_err { "" } else { "v" };
+    // SAFETY: `sink_ctx_ptr` is aligned and points to live `ImportSinkCtx` for this call.
+    let fwd_res = unsafe {
+        forward_field(
+            sink_ctx_ptr,
+            StrView::from_str(fwd_name),
+            StrView::from_str("u32"),
+            FfiSlice::from_slice(&[42, 0, 0, 0]),
+        )
+    };
+    if fwd_want_err {
+        assert_eq!(fwd_res, FfiResult::INVALID_ARGUMENT);
+        assert_eq!(dst_val, 0);
+    } else {
+        assert_eq!(fwd_res, FfiResult::OK);
+        assert_eq!(dst_val, 42);
+    }
+
+    // 2. `append_field`: null/misaligned ctx, null views, `isize::MAX`/`u32` length & count overflow.
+    let mut builder = PacketBuilder {
+        buf: vec![0u8; 4],
+        field_count: 0,
+    };
+    let builder_ptr = (&raw mut builder).cast::<c_void>();
+    let bad_builder_ctx = core::ptr::from_mut(&mut align_buf)
+        .cast::<u8>()
+        .wrapping_add(1)
+        .cast::<c_void>();
+
+    // SAFETY: Null/alignment guards reject before dereferencing `ctx`.
+    assert_eq!(
+        unsafe {
+            append_field(
+                core::ptr::null_mut(),
+                StrView::from_str("v"),
+                StrView::from_str("u32"),
+                FfiSlice::from_slice(&[1]),
+            )
+        },
+        FfiResult::INVALID_ARGUMENT
+    );
+    // SAFETY: Alignment guard rejects `bad_builder_ctx` before dereferencing.
+    assert_eq!(
+        unsafe {
+            append_field(
+                bad_builder_ctx,
+                StrView::from_str("v"),
+                StrView::from_str("u32"),
+                FfiSlice::from_slice(&[1]),
+            )
+        },
+        FfiResult::INVALID_ARGUMENT
+    );
+
+    let app_case: u8 = kani::any();
+    kani::assume(app_case <= 6);
+    let bad_str = StrView {
+        ptr: core::ptr::null(),
+        len: 1,
+    };
+    let dummy_byte: u8 = 0;
+    let app_res = match app_case {
+        0 => {
+            // SAFETY: Null non-empty `field_name` rejected with NULL_POINTER.
+            unsafe {
+                append_field(
+                    builder_ptr,
+                    bad_str,
+                    StrView::from_str("u"),
+                    FfiSlice::from_slice(&[1]),
+                )
+            }
+        }
+        1 => {
+            // SAFETY: Null non-empty `type_tag` rejected with NULL_POINTER.
+            unsafe {
+                append_field(
+                    builder_ptr,
+                    StrView::from_str("v"),
+                    bad_str,
+                    FfiSlice::from_slice(&[1]),
+                )
+            }
+        }
+        2 => {
+            // SAFETY: Null non-empty `payload` rejected with NULL_POINTER.
+            unsafe {
+                append_field(
+                    builder_ptr,
+                    StrView::from_str("v"),
+                    StrView::from_str("u"),
+                    FfiSlice {
+                        ptr: core::ptr::null(),
+                        len: 4,
+                    },
+                )
+            }
+        }
+        3 => {
+            // SAFETY: `len > isize::MAX` rejected by `validate()` before `from_raw_parts`.
+            unsafe {
+                append_field(
+                    builder_ptr,
+                    StrView::from_str("v"),
+                    StrView::from_str("u"),
+                    FfiSlice {
+                        ptr: &raw const dummy_byte,
+                        len: (isize::MAX as usize) + 1,
+                    },
+                )
+            }
+        }
+        4 => {
+            builder.field_count = u32::MAX;
+            // SAFETY: `field_count == u32::MAX` triggers `checked_add(1)` -> CAPACITY_EXCEEDED.
+            unsafe {
+                append_field(
+                    builder_ptr,
+                    StrView::from_str("v"),
+                    StrView::from_str("u"),
+                    FfiSlice::from_slice(&[7, 0, 0, 0]),
+                )
+            }
+        }
+        5 => {
+            // SAFETY: Empty `(null, 0)` C slices are accepted cleanly via `NonNull::dangling()`.
+            unsafe {
+                append_field(
+                    builder_ptr,
+                    StrView::empty(),
+                    StrView::empty(),
+                    FfiSlice::empty(),
+                )
+            }
+        }
+        _ => {
+            // SAFETY: Valid `builder_ptr` and slices append 1 encoded field.
+            unsafe {
+                append_field(
+                    builder_ptr,
+                    StrView::from_str("v"),
+                    StrView::from_str("u"),
+                    FfiSlice::from_slice(&[7, 0, 0, 0]),
+                )
+            }
+        }
+    };
+
+    match app_case {
+        0..=3 => {
+            assert_eq!(app_res, FfiResult::NULL_POINTER);
+            assert_eq!(builder.field_count, 0);
+        }
+        4 => {
+            assert_eq!(app_res, FfiResult::CAPACITY_EXCEEDED);
+            assert_eq!(builder.field_count, u32::MAX);
+        }
+        5 => {
+            assert_eq!(app_res, FfiResult::OK);
+            assert_eq!(builder.field_count, 1);
+            // 4 (header) + 4 (name_len) + 4 (tag_len) + 4 (val_len) = 16 bytes.
+            assert_eq!(builder.buf.len(), 16);
+        }
+        _ => {
+            assert_eq!(app_res, FfiResult::OK);
+            assert_eq!(builder.field_count, 1);
+            // 4 (header) + 4+1 (name) + 4+1 (tag) + 4+4 (val) = 22 bytes.
+            assert_eq!(builder.buf.len(), 22);
+        }
+    }
+
+    kani::cover!(fwd_res == FfiResult::OK);
+    kani::cover!(fwd_res == FfiResult::INVALID_ARGUMENT);
+    kani::cover!(app_res == FfiResult::OK);
+    kani::cover!(app_res == FfiResult::NULL_POINTER);
+    kani::cover!(app_res == FfiResult::CAPACITY_EXCEEDED);
 }

@@ -16,7 +16,7 @@ use crate::{
     trampoline::ReentrantCell,
 };
 
-type PodHookCallback<T> = Box<dyn FnMut(FfiEntity, &T) + Send + 'static>;
+pub(crate) type PodHookCallback<T> = Box<dyn FnMut(FfiEntity, &T) + Send + 'static>;
 
 /// Optional lifecycle callbacks, clone capability, and required component dependencies for a
 /// dynamic POD component.
@@ -177,12 +177,12 @@ impl<T: AbiPod> PodComponentHooks<T> {
 /// Wraps each optional guest callback (`on_add`, `on_insert`, `on_discard`, `on_remove`,
 /// `on_despawn`) in a [`ReentrantCell`] to prevent reentrant mutable aliasing if a hook
 /// indirectly triggers itself.
-struct HookTrampolineState<T: AbiPod> {
-    on_add: Option<ReentrantCell<PodHookCallback<T>>>,
-    on_insert: Option<ReentrantCell<PodHookCallback<T>>>,
-    on_discard: Option<ReentrantCell<PodHookCallback<T>>>,
-    on_remove: Option<ReentrantCell<PodHookCallback<T>>>,
-    on_despawn: Option<ReentrantCell<PodHookCallback<T>>>,
+pub(crate) struct HookTrampolineState<T: AbiPod> {
+    pub(crate) on_add: Option<ReentrantCell<PodHookCallback<T>>>,
+    pub(crate) on_insert: Option<ReentrantCell<PodHookCallback<T>>>,
+    pub(crate) on_discard: Option<ReentrantCell<PodHookCallback<T>>>,
+    pub(crate) on_remove: Option<ReentrantCell<PodHookCallback<T>>>,
+    pub(crate) on_despawn: Option<ReentrantCell<PodHookCallback<T>>>,
 }
 
 /// Validates `component_ptr` and invokes a single POD lifecycle hook stored in `cell_opt`.
@@ -221,7 +221,7 @@ fn dispatch_pod_hook<T: AbiPod>(
 /// [`HookTrampolineState`] from `user_data` and dispatches to [`dispatch_pod_hook`] for `$field`.
 macro_rules! define_pod_hook_trampoline {
     ($fn_name:ident, $field:ident) => {
-        unsafe extern "C" fn $fn_name<T: AbiPod>(
+        pub(crate) unsafe extern "C" fn $fn_name<T: AbiPod>(
             entity: FfiEntity,
             component_ptr: *const c_void,
             user_data: *mut c_void,
