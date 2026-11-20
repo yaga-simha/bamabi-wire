@@ -86,6 +86,7 @@ impl TestArgs {
 #[derive(Debug, Default, PartialEq, Eq)]
 struct CTestArgs {
     no_asan: bool,
+    asan_only: bool,
 }
 
 /// Options for `cargo xtask header` and `cargo xtask gen-component-headers`.
@@ -99,6 +100,7 @@ struct CheckArgs {
 struct AuditArgs {
     baseline_rev: Option<String>,
     skip_targets: bool,
+    skip_typos: bool,
 }
 
 /// Options for `cargo xtask miri`.
@@ -131,11 +133,28 @@ struct KaniArgs {
 #[derive(Debug, PartialEq, Eq)]
 struct NightlyArgs {
     cases: usize,
+    s390x: bool,
+    randomize_layout: bool,
 }
 
 impl Default for NightlyArgs {
     fn default() -> Self {
-        Self { cases: 2048 }
+        Self {
+            cases: 2048,
+            s390x: false,
+            randomize_layout: false,
+        }
+    }
+}
+
+impl NightlyArgs {
+    /// Returns effective `(s390x, randomize_layout)` flags, defaulting to both.
+    fn resolved(&self) -> (bool, bool) {
+        if !self.s390x && !self.randomize_layout {
+            (true, true)
+        } else {
+            (self.s390x, self.randomize_layout)
+        }
     }
 }
 
@@ -320,12 +339,16 @@ fn parse_c_test_args(args: &[String]) -> Result<CTestArgs, String> {
     for arg in args {
         match arg.as_str() {
             "--no-asan" => parsed.no_asan = true,
+            "--asan-only" => parsed.asan_only = true,
             other => {
                 return Err(format!(
                     "unknown `c-test` flag `{other}`; run `cargo xtask c-test --help`"
                 ));
             }
         }
+    }
+    if parsed.no_asan && parsed.asan_only {
+        return Err("cannot combine `--no-asan` and `--asan-only`".to_owned());
     }
     Ok(parsed)
 }
@@ -362,6 +385,7 @@ fn parse_audit_args(args: &[String]) -> Result<AuditArgs, String> {
                     parsed.baseline_rev = Some(rev.to_owned());
                 }
                 "--skip-targets" => parsed.skip_targets = true,
+                "--skip-typos" => parsed.skip_typos = true,
                 other => {
                     return Err(format!(
                         "unknown `audit` flag `{other}`; run `cargo xtask audit --help`"
@@ -445,6 +469,8 @@ fn parse_nightly_args(args: &[String]) -> Result<NightlyArgs, String> {
                     let val = next_flag_value(args, &mut i, "--cases")?;
                     parsed.cases = parse_positive_usize("--cases", val)?;
                 }
+                "--s390x" => parsed.s390x = true,
+                "--randomize-layout" => parsed.randomize_layout = true,
                 other => {
                     return Err(format!(
                         "unknown `nightly` flag `{other}`; run `cargo xtask nightly --help`"
@@ -540,10 +566,11 @@ Defaults to running --no-default-features, --all-features, and --doc."
         Some(SubcommandKind::CTest) => println!(
             "\
 USAGE:
-    cargo xtask c-test [--no-asan]
+    cargo xtask c-test [--no-asan | --asan-only]
 
 OPTIONS:
-    --no-asan    Skip the ASan + UBSan clang build and run of tests/standalone_c_test.c"
+    --no-asan      Skip the ASan + UBSan clang build and run of tests/standalone_c_test.c
+    --asan-only    Run only the ASan + UBSan clang build and run of tests/standalone_c_test.c"
         ),
         Some(SubcommandKind::Header) => println!(
             "\
@@ -564,11 +591,12 @@ OPTIONS:
         Some(SubcommandKind::Audit) => println!(
             "\
 USAGE:
-    cargo xtask audit [--baseline-rev <rev>] [--skip-targets]
+    cargo xtask audit [--baseline-rev <rev>] [--skip-targets] [--skip-typos]
 
 OPTIONS:
     --baseline-rev <rev>    Run `cargo semver-checks check-release -p bamabi_sys --baseline-rev <rev>`
-    --skip-targets          Skip i686-unknown-linux-gnu and wasm32-unknown-unknown checks"
+    --skip-targets          Skip i686-unknown-linux-gnu and wasm32-unknown-unknown checks
+    --skip-typos            Skip running the `typos` spellchecker"
         ),
         Some(SubcommandKind::Miri) => println!(
             "\
@@ -593,10 +621,14 @@ OPTIONS:
         Some(SubcommandKind::Nightly) => println!(
             "\
 USAGE:
-    cargo xtask nightly [--cases N]
+    cargo xtask nightly [--cases N] [--s390x] [--randomize-layout]
 
 OPTIONS:
-    --cases N    Set PROPTEST_CASES=N for -Zrandomize-layout runs (default: 2048)"
+    --cases N             Set PROPTEST_CASES=N for -Zrandomize-layout runs (default: 2048)
+    --s390x               Run only the big-endian s390x-unknown-linux-gnu Miri suite
+    --randomize-layout    Run only the -Zrandomize-layout + extended proptest suites
+
+Defaults to running both --s390x and --randomize-layout."
         ),
         Some(SubcommandKind::Ci) => println!(
             "\
@@ -898,67 +930,72 @@ fn cmd_c_test(root: &Path, args: &CTestArgs) -> Result<(), String> {
     fs::create_dir_all(&target_dir)
         .map_err(|e| format!("failed to create {}: {e}", target_dir.display()))?;
 
-    let cc = c_compiler();
-    let bamabi_h = root.join("include").join("bamabi.h");
-    let testbed_h = root
-        .join("include")
-        .join("generated")
-        .join("testbed_components.h");
     let c_test_src = root.join("tests").join("standalone_c_test.c");
     let include_dir = root.join("include");
-
-    run_cmd(
-        Command::new(&cc)
-            .current_dir(root)
-            .args([
-                "-std=c99",
-                "-Wall",
-                "-Wextra",
-                "-Werror",
-                "-pedantic",
-                "-fsyntax-only",
-                "-x",
-                "c",
-            ])
-            .arg(&bamabi_h),
-        &format!("{cc} -std=c99 -Wall -Wextra -Werror -pedantic -fsyntax-only include/bamabi.h"),
-    )?;
-
-    run_cmd(
-        Command::new(&cc)
-            .current_dir(root)
-            .args([
-                "-std=c99",
-                "-Wall",
-                "-Wextra",
-                "-Werror",
-                "-pedantic",
-                "-fsyntax-only",
-                "-x",
-                "c",
-            ])
-            .arg(&testbed_h),
-        &format!(
-            "{cc} -std=c99 -Wall -Wextra -Werror -pedantic -fsyntax-only include/generated/testbed_components.h"
-        ),
-    )?;
-
     let exe_suffix = env::consts::EXE_SUFFIX;
-    let bin_path = target_dir.join(format!("standalone_c_test{exe_suffix}"));
-    run_cmd(
-        Command::new(&cc)
-            .current_dir(root)
-            .args(["-std=c99", "-Wall", "-Wextra", "-Werror", "-pedantic", "-I"])
-            .arg(&include_dir)
-            .arg(&c_test_src)
-            .arg("-o")
-            .arg(&bin_path),
-        &format!("{cc} tests/standalone_c_test.c -> target/standalone_c_test{exe_suffix}"),
-    )?;
-    run_cmd(
-        Command::new(&bin_path).current_dir(root),
-        &format!("target/standalone_c_test{exe_suffix}"),
-    )?;
+
+    if !args.asan_only {
+        let cc = c_compiler();
+        let bamabi_h = root.join("include").join("bamabi.h");
+        let testbed_h = root
+            .join("include")
+            .join("generated")
+            .join("testbed_components.h");
+
+        run_cmd(
+            Command::new(&cc)
+                .current_dir(root)
+                .args([
+                    "-std=c99",
+                    "-Wall",
+                    "-Wextra",
+                    "-Werror",
+                    "-pedantic",
+                    "-fsyntax-only",
+                    "-x",
+                    "c",
+                ])
+                .arg(&bamabi_h),
+            &format!(
+                "{cc} -std=c99 -Wall -Wextra -Werror -pedantic -fsyntax-only include/bamabi.h"
+            ),
+        )?;
+
+        run_cmd(
+            Command::new(&cc)
+                .current_dir(root)
+                .args([
+                    "-std=c99",
+                    "-Wall",
+                    "-Wextra",
+                    "-Werror",
+                    "-pedantic",
+                    "-fsyntax-only",
+                    "-x",
+                    "c",
+                ])
+                .arg(&testbed_h),
+            &format!(
+                "{cc} -std=c99 -Wall -Wextra -Werror -pedantic -fsyntax-only include/generated/testbed_components.h"
+            ),
+        )?;
+
+        let bin_path = target_dir.join(format!("standalone_c_test{exe_suffix}"));
+        run_cmd(
+            Command::new(&cc)
+                .current_dir(root)
+                .args(["-std=c99", "-Wall", "-Wextra", "-Werror", "-pedantic", "-I"])
+                .arg(&include_dir)
+                .arg(&c_test_src)
+                .arg("-o")
+                .arg(&bin_path),
+            &format!("{cc} tests/standalone_c_test.c -> target/standalone_c_test{exe_suffix}"),
+        )?;
+        run_cmd(
+            Command::new(&bin_path).current_dir(root),
+            &format!("target/standalone_c_test{exe_suffix}"),
+        )?;
+    }
 
     if !args.no_asan {
         let clang = sanitizer_clang();
@@ -1034,12 +1071,14 @@ fn cmd_audit(root: &Path, args: &AuditArgs) -> Result<(), String> {
         }
     }
 
-    check_tool_available(
-        "typos",
-        &["--version"],
-        "install with `cargo install typos-cli`",
-    )?;
-    run_cmd(Command::new("typos").current_dir(root), "typos")?;
+    if !args.skip_typos {
+        check_tool_available(
+            "typos",
+            &["--version"],
+            "install with `cargo install typos-cli`",
+        )?;
+        run_cmd(Command::new("typos").current_dir(root), "typos")?;
+    }
 
     check_tool_available(
         "cargo",
@@ -1219,67 +1258,73 @@ fn cmd_kani(root: &Path, args: &KaniArgs) -> Result<(), String> {
 }
 
 fn cmd_nightly(root: &Path, args: &NightlyArgs) -> Result<(), String> {
-    cmd_miri(
-        root,
-        &MiriArgs {
-            tree_borrows: false,
-            stacked_borrows: false,
-            s390x: true,
-        },
-    )?;
+    let (run_s390x, run_randomize_layout) = args.resolved();
 
-    check_tool_available(
-        "cargo",
-        &["+nightly", "--version"],
-        "install with `rustup toolchain install nightly`",
-    )?;
-    let cases = args.cases.to_string();
+    if run_s390x {
+        cmd_miri(
+            root,
+            &MiriArgs {
+                tree_borrows: false,
+                stacked_borrows: false,
+                s390x: true,
+            },
+        )?;
+    }
 
-    run_cmd(
-        clean_toolchain_cargo_cmd(root)
-            .env("RUSTFLAGS", "-Zrandomize-layout")
-            .env("PROPTEST_CASES", &cases)
-            .args([
-                "+nightly",
-                "test",
-                "-p",
-                "bamabi_sys",
-                "-p",
-                "bamabi_guest_sys",
-                "-p",
-                "bamabi_guest",
-                "--all-features",
-            ]),
-        &format!(
-            "RUSTFLAGS=\"-Zrandomize-layout\" PROPTEST_CASES={cases} cargo +nightly test -p bamabi_sys -p bamabi_guest_sys -p bamabi_guest --all-features"
-        ),
-    )?;
-    run_cmd(
-        clean_toolchain_cargo_cmd(root)
-            .env("RUSTFLAGS", "-Zrandomize-layout")
-            .env("PROPTEST_CASES", &cases)
-            .args([
-                "+nightly",
-                "test",
-                "-p",
-                "bamabi_macros",
-                "--lib",
-                "--test",
-                "mod_component_vtable",
-            ]),
-        &format!(
-            "RUSTFLAGS=\"-Zrandomize-layout\" PROPTEST_CASES={cases} cargo +nightly test -p bamabi_macros --lib --test mod_component_vtable"
-        ),
-    )?;
-    run_cmd(
-        clean_toolchain_cargo_cmd(root)
-            .env("RUSTFLAGS", "-Zrandomize-layout")
-            .env("PROPTEST_CASES", &cases)
-            .args(["+nightly", "test", "-p", "bamabi_sdk_gen"]),
-        &format!(
-            "RUSTFLAGS=\"-Zrandomize-layout\" PROPTEST_CASES={cases} cargo +nightly test -p bamabi_sdk_gen"
-        ),
-    )?;
+    if run_randomize_layout {
+        check_tool_available(
+            "cargo",
+            &["+nightly", "--version"],
+            "install with `rustup toolchain install nightly`",
+        )?;
+        let cases = args.cases.to_string();
+
+        run_cmd(
+            clean_toolchain_cargo_cmd(root)
+                .env("RUSTFLAGS", "-Zrandomize-layout")
+                .env("PROPTEST_CASES", &cases)
+                .args([
+                    "+nightly",
+                    "test",
+                    "-p",
+                    "bamabi_sys",
+                    "-p",
+                    "bamabi_guest_sys",
+                    "-p",
+                    "bamabi_guest",
+                    "--all-features",
+                ]),
+            &format!(
+                "RUSTFLAGS=\"-Zrandomize-layout\" PROPTEST_CASES={cases} cargo +nightly test -p bamabi_sys -p bamabi_guest_sys -p bamabi_guest --all-features"
+            ),
+        )?;
+        run_cmd(
+            clean_toolchain_cargo_cmd(root)
+                .env("RUSTFLAGS", "-Zrandomize-layout")
+                .env("PROPTEST_CASES", &cases)
+                .args([
+                    "+nightly",
+                    "test",
+                    "-p",
+                    "bamabi_macros",
+                    "--lib",
+                    "--test",
+                    "mod_component_vtable",
+                ]),
+            &format!(
+                "RUSTFLAGS=\"-Zrandomize-layout\" PROPTEST_CASES={cases} cargo +nightly test -p bamabi_macros --lib --test mod_component_vtable"
+            ),
+        )?;
+        run_cmd(
+            clean_toolchain_cargo_cmd(root)
+                .env("RUSTFLAGS", "-Zrandomize-layout")
+                .env("PROPTEST_CASES", &cases)
+                .args(["+nightly", "test", "-p", "bamabi_sdk_gen"]),
+            &format!(
+                "RUSTFLAGS=\"-Zrandomize-layout\" PROPTEST_CASES={cases} cargo +nightly test -p bamabi_sdk_gen"
+            ),
+        )?;
+    }
 
     Ok(())
 }
@@ -1356,7 +1401,17 @@ mod tests {
         );
         assert_eq!(
             parse_args(&s(&["c-test", "--no-asan"])).unwrap(),
-            ParsedArgs::Run(CommandSpec::CTest(CTestArgs { no_asan: true }))
+            ParsedArgs::Run(CommandSpec::CTest(CTestArgs {
+                no_asan: true,
+                asan_only: false,
+            }))
+        );
+        assert_eq!(
+            parse_args(&s(&["c-test", "--asan-only"])).unwrap(),
+            ParsedArgs::Run(CommandSpec::CTest(CTestArgs {
+                no_asan: false,
+                asan_only: true,
+            }))
         );
     }
 
@@ -1406,10 +1461,18 @@ mod tests {
     #[test]
     fn parses_audit_miri_kani_nightly_and_ci() {
         assert_eq!(
-            parse_args(&s(&["audit", "--baseline-rev", "v0.3.0", "--skip-targets"])).unwrap(),
+            parse_args(&s(&[
+                "audit",
+                "--baseline-rev",
+                "v0.3.0",
+                "--skip-targets",
+                "--skip-typos"
+            ]))
+            .unwrap(),
             ParsedArgs::Run(CommandSpec::Audit(AuditArgs {
                 baseline_rev: Some("v0.3.0".to_owned()),
                 skip_targets: true,
+                skip_typos: true,
             }))
         );
         assert_eq!(
@@ -1440,7 +1503,29 @@ mod tests {
         );
         assert_eq!(
             parse_args(&s(&["nightly", "--cases", "512"])).unwrap(),
-            ParsedArgs::Run(CommandSpec::Nightly(NightlyArgs { cases: 512 }))
+            ParsedArgs::Run(CommandSpec::Nightly(NightlyArgs {
+                cases: 512,
+                s390x: false,
+                randomize_layout: false,
+            }))
+        );
+        assert_eq!(NightlyArgs::default().resolved(), (true, true));
+        assert_eq!(
+            parse_args(&s(&["nightly", "--randomize-layout"])).unwrap(),
+            ParsedArgs::Run(CommandSpec::Nightly(NightlyArgs {
+                cases: 2048,
+                s390x: false,
+                randomize_layout: true,
+            }))
+        );
+        assert_eq!(
+            NightlyArgs {
+                cases: 2048,
+                s390x: false,
+                randomize_layout: true,
+            }
+            .resolved(),
+            (false, true)
         );
         assert_eq!(
             parse_args(&s(&["ci", "--full"])).unwrap(),
@@ -1456,6 +1541,7 @@ mod tests {
     fn rejects_invalid_subcommands_and_flags() {
         assert!(parse_args(&s(&["unknown"])).is_err());
         assert!(parse_args(&s(&["lint", "--extra"])).is_err());
+        assert!(parse_args(&s(&["c-test", "--no-asan", "--asan-only"])).is_err());
         assert!(parse_args(&s(&["test", "--cases", "0"])).is_err());
         assert!(parse_args(&s(&["test", "--cases"])).is_err());
         assert!(parse_args(&s(&["audit", "--baseline-rev="])).is_err());

@@ -29,48 +29,20 @@ jobs:
       - name: Cache Cargo artifacts
         uses: Swatinem/rust-cache@v2
 
-      - name: Formatting, clippy, rustdoc, forbid(unsafe_code) & zero-Bevy isolation
+      - name: Formatting, headers, isolation, clippy & rustdoc
         shell: bash
         run: |
           set -euo pipefail
-          cargo fmt --all -- --check
-          for crate_lib in \
-            crates/bamabi_guest/src/lib.rs \
-            crates/bamabi_macros/src/lib.rs \
-            crates/bamabi_sdk_gen/src/lib.rs; do
-            if ! grep -q '#!\[forbid(unsafe_code)\]' "$crate_lib"; then
-              echo "ERROR: $crate_lib is missing required #![forbid(unsafe_code)] declaration!"
-              exit 1
-            fi
-          done
-          if cargo tree --workspace | sed 's/ (.*//' | grep -v bamabi | grep -i bevy; then
-            echo "ERROR: Unexpected Bevy dependency found in bamabi-wire!"
-            exit 1
-          fi
-          cargo clippy --workspace --all-targets -- -D warnings
-          cargo clippy --workspace --all-targets --all-features -- -D warnings
-          RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps
-          RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps --all-features
+          cargo xtask fmt
+          cargo xtask header --check
+          cargo xtask gen-component-headers --check
+          cargo xtask lint
 
-      - name: Run Layer 0 test suites & `bamabi_sdk_gen` header parity
-        shell: bash
-        run: |
-          set -euo pipefail
-          test -f include/bamabi.h
-          test -f include/generated/testbed_components.h
-          cargo test --workspace --no-default-features
-          cargo test --workspace --all-features
-          cargo test --doc --all-features
+      - name: Run Layer 0 test suites
+        run: cargo xtask test
 
       - name: Verify standalone C99 header & layout suite
-        shell: bash
-        run: |
-          set -euo pipefail
-          mkdir -p target
-          cc -std=c99 -Wall -Wextra -Werror -pedantic -fsyntax-only -x c include/bamabi.h
-          cc -std=c99 -Wall -Wextra -Werror -pedantic -fsyntax-only -x c include/generated/testbed_components.h
-          cc -std=c99 -Wall -Wextra -Werror -pedantic -I include tests/standalone_c_test.c -o target/standalone_c_test
-          ./target/standalone_c_test
+        run: cargo xtask c-test --no-asan
 
   static-wire-and-audit:
     name: 32-bit/Wasm Wire, Typos, Deny, SemVer & C99 Sanitizers
@@ -98,29 +70,11 @@ jobs:
         with:
           tool: cargo-deny
 
-      - name: Audit advisories, licenses, bans & sources (`cargo-deny`)
-        run: cargo deny --all-features check advisories licenses bans sources
-
-      - name: 32-bit (`i686`) & `wasm32` ABI contract layout checks
-        run: |
-          cargo check -p bamabi_sys --target i686-unknown-linux-gnu
-          cargo check -p bamabi_sys --target wasm32-unknown-unknown
-
-      - name: Strict C99 `-fsyntax-only` check on `include/bamabi.h` & `testbed_components.h`
-        run: |
-          cc -std=c99 -Wall -Wextra -Werror -pedantic -fsyntax-only -x c include/bamabi.h
-          cc -std=c99 -Wall -Wextra -Werror -pedantic -fsyntax-only -x c include/generated/testbed_components.h
+      - name: Cross-target (`i686` & `wasm32`) wire checks & `cargo-deny` audit
+        run: cargo xtask audit --skip-typos
 
       - name: Run `standalone_c_test` under ASan + UBSan
-        env:
-          ASAN_OPTIONS: "detect_leaks=1:strict_string_checks=1:halt_on_error=1"
-          UBSAN_OPTIONS: "print_stacktrace=1:halt_on_error=1"
-        run: |
-          mkdir -p target
-          clang -std=c99 -Wall -Wextra -Werror -pedantic -O1 -g -fno-omit-frame-pointer \
-            -fsanitize=address,undefined -fno-sanitize-recover=all \
-            -I include tests/standalone_c_test.c -o target/standalone_c_test_san
-          ./target/standalone_c_test_san
+        run: cargo xtask c-test --asan-only
 
       - name: Install `cargo-semver-checks`
         uses: taiki-e/install-action@v2
@@ -238,19 +192,8 @@ jobs:
         with:
           key: miri-wire
 
-      - name: Run Miri (Tree Borrows + strict provenance) on `bamabi_sys`, `bamabi_guest_sys`, `bamabi_guest`, and `bamabi_macros`
-        run: |
-          MIRIFLAGS="-Zmiri-tree-borrows -Zmiri-strict-provenance" \
-            cargo +nightly miri test -p bamabi_sys -p bamabi_guest_sys -p bamabi_guest --all-features
-          MIRIFLAGS="-Zmiri-tree-borrows -Zmiri-strict-provenance" \
-            cargo +nightly miri test -p bamabi_macros --test mod_component_vtable
-
-      - name: Run Miri (Stacked Borrows + strict provenance) on `bamabi_sys`, `bamabi_guest_sys`, `bamabi_guest`, and `bamabi_macros`
-        run: |
-          MIRIFLAGS="-Zmiri-strict-provenance" \
-            cargo +nightly miri test -p bamabi_sys -p bamabi_guest_sys -p bamabi_guest --all-features
-          MIRIFLAGS="-Zmiri-strict-provenance" \
-            cargo +nightly miri test -p bamabi_macros --test mod_component_vtable
+      - name: Run Miri (Tree Borrows + Stacked Borrows) on `bamabi_sys`, `bamabi_guest_sys`, `bamabi_guest`, and `bamabi_macros`
+        run: cargo xtask miri
 
   kani:
     name: Kani Formal Verification

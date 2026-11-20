@@ -12,8 +12,6 @@ jobs:
   miri-big-endian:
     name: Miri Big-Endian (s390x-unknown-linux-gnu)
     runs-on: ubuntu-latest
-    env:
-      MIRIFLAGS: "-Zmiri-tree-borrows -Zmiri-strict-provenance"
     steps:
       - name: Checkout repository
         uses: actions/checkout@v6
@@ -32,9 +30,7 @@ jobs:
           key: miri-s390x
 
       - name: Run Layer 0 ABI and guest endianness parity tests on `s390x`
-        run: |
-          cargo +nightly miri test --target s390x-unknown-linux-gnu \
-            -p bamabi_sys -p bamabi_guest_sys -p bamabi_guest --all-features
+        run: cargo xtask miri --s390x
 
   randomize-layout-and-proptest:
     name: Randomized Rust Layout & Extended Differential Proptest
@@ -52,10 +48,4 @@ jobs:
           key: nightly-randomize-layout
 
       - name: Run Layer 0 macro, SDK-gen, and ABI suites under `-Zrandomize-layout`
-        env:
-          RUSTFLAGS: "-Zrandomize-layout"
-          PROPTEST_CASES: "2048"
-        run: |
-          cargo +nightly test -p bamabi_sys -p bamabi_guest_sys -p bamabi_guest --all-features
-          cargo +nightly test -p bamabi_macros --lib --test mod_component_vtable
-          cargo +nightly test -p bamabi_sdk_gen
+        run: cargo xtask nightly --randomize-layout

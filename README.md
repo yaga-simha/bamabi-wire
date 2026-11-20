@@ -37,53 +37,32 @@ For lower-level or generator consumers (`bamabi_sys`, `bamabi_macros`, `bamabi_s
 
 ## Local & CI Verification
 
-All checks run standalone inside `bamabi-wire` with zero sibling repositories required:
+All checks run standalone inside `bamabi-wire` with zero sibling repositories required via the workspace task runner (`cargo xtask`):
 
 ```bash
-# Formatting, clippy (default + all-features), rustdoc (default + all-features)
-cargo fmt --all -- --check
-cargo clippy --workspace --all-targets -- -D warnings
-cargo clippy --workspace --all-targets --all-features -- -D warnings
-RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps
-RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps --all-features
+# Default local CI gate: fmt, header parity checks, lint (forbid-unsafe, zero-Bevy, clippy, rustdoc), tests, C99 + ASan/UBSan
+cargo xtask ci
 
-# Unit, integration, header byte-parity, no-default-features, and doctests
-cargo test --workspace --no-default-features
-cargo test --workspace --all-features
-cargo test --doc --all-features
-cargo test -p bamabi_sdk_gen --test header_parity
+# Full gate including cross-target/typos/deny audit, dual-model Miri, and Kani formal verification
+cargo xtask ci --full
 
-# Verify strict zero-Bevy isolation (must print nothing)
-cargo tree --workspace | sed 's/ (.*//' | grep -v bamabi | grep -i bevy
+# Individual verification & codegen subcommands
+cargo xtask fmt                       # Check formatting (--fix to format)
+cargo xtask lint                      # #![forbid(unsafe_code)], zero-Bevy tree check, clippy & rustdoc
+cargo xtask test                      # --no-default-features, --all-features, doctests (--cases N, --proptest, --header-parity)
+cargo xtask c-test                    # Strict C99 header syntax + standalone_c_test (+ ASan/UBSan; --no-asan or --asan-only)
+cargo xtask header                    # Regenerate include/bamabi.h (--check for byte-parity verification)
+cargo xtask gen-component-headers     # Regenerate include/generated/testbed_components.h (--check for parity)
+cargo xtask audit                     # i686/wasm32 checks, typos, cargo-deny (--baseline-rev <rev>, --skip-targets, --skip-typos)
+cargo xtask miri                      # Tree Borrows + Stacked Borrows (--tree-borrows, --stacked-borrows, --s390x)
+cargo xtask kani                      # Kani formal verification for bamabi_sys (PO-W1..PO-W8) & bamabi_guest_sys (PO-G1..PO-G9)
+cargo xtask nightly                   # Big-endian s390x Miri + -Zrandomize-layout proptest (--s390x, --randomize-layout, --cases N)
 
-# 32-bit & Wasm wire layout checks, typos, cargo-deny, and SemVer compatibility
-cargo check -p bamabi_sys --target i686-unknown-linux-gnu
-cargo check -p bamabi_sys --target wasm32-unknown-unknown
-typos
-cargo deny --all-features check advisories licenses bans sources
-cargo semver-checks check-release -p bamabi_sys --baseline-rev <tag-or-commit>
-
-# Strict ISO C99 header syntax, layout conformance, and ASan + UBSan checks
-cc -std=c99 -Wall -Wextra -Werror -pedantic -fsyntax-only -x c include/bamabi.h
-cc -std=c99 -Wall -Wextra -Werror -pedantic -fsyntax-only -x c include/generated/testbed_components.h
-cc -std=c99 -Wall -Wextra -Werror -pedantic -I include tests/standalone_c_test.c -o /tmp/standalone_c_test && /tmp/standalone_c_test
-clang -std=c99 -Wall -Wextra -Werror -pedantic -O1 -g -fno-omit-frame-pointer \
-  -fsanitize=address,undefined -fno-sanitize-recover=all \
-  -I include tests/standalone_c_test.c -o /tmp/standalone_c_test_san && /tmp/standalone_c_test_san
-
-# Nightly Miri & randomized-layout proptests (mirrored in ci.yml & nightly.yml)
-MIRIFLAGS="-Zmiri-tree-borrows -Zmiri-strict-provenance" \
-  cargo +nightly miri test -p bamabi_sys -p bamabi_guest_sys -p bamabi_guest
-MIRIFLAGS="-Zmiri-tree-borrows" \
-  cargo +nightly miri test -p bamabi_macros --test mod_component_vtable
-MIRIFLAGS="-Zmiri-tree-borrows" \
-  cargo +nightly miri test --target s390x-unknown-linux-gnu -p bamabi_sys -p bamabi_guest_sys -p bamabi_guest
-PROPTEST_CASES=2048 RUSTFLAGS="-Zrandomize-layout" \
-  cargo +nightly test -p bamabi_sys -p bamabi_guest_sys -p bamabi_guest
-
-# Kani formal verification for `bamabi_sys` (PO-W1..PO-W8) & `bamabi_guest_sys` (PO-G1..PO-G7)
-cargo kani -p bamabi_sys -p bamabi_guest_sys -Z unstable-options --harness-timeout 15m --output-format terse -j
+# Inspect all subcommands and optional flags
+cargo xtask --help
 ```
+
+Optional flags such as `cargo xtask kani -p bamabi_sys --harness <pat>` or `cargo xtask ci --audit --miri` let you scope heavier checks locally; run `cargo xtask <subcommand> --help` for full option details.
 
 ## Federated `bamabi` Repositories
 
