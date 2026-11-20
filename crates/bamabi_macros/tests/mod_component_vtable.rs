@@ -1750,7 +1750,7 @@ fn tuple_struct_mixed_fields_vtable_and_witness_roundtrip() {
         true,
     );
     let mut_ptr = (&raw mut val).cast::<c_void>();
-    let const_ptr = (&raw const val).cast::<c_void>();
+    let const_ptr = mut_ptr.cast_const();
 
     unsafe {
         assert_eq!((vt_ref.push_0.unwrap())(mut_ptr, 99), FfiResult::OK);

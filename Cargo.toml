@@ -36,10 +36,7 @@ match_same_arms = "warn"
 [workspace.dependencies]
 bamabi_sys = { version = "0.3.0", path = "crates/bamabi_sys" }
 bamabi_macros = { version = "0.3.0", path = "crates/bamabi_macros" }
-bamabi_sdk_gen = { version = "0.3.0", path = "crates/bamabi_sdk_gen" }
 bamabi_guest_sys = { version = "0.3.0", path = "crates/bamabi_guest_sys" }
-bamabi_guest = { version = "0.3.0", path = "crates/bamabi_guest" }
-proptest = "1"
 syn = { version = "2.0", features = ["full"] }
 quote = "1.0"
 proc-macro2 = "1.0"

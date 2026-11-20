@@ -1307,9 +1307,14 @@ fn s9_dispenser_overlapping_write_then_read_and_repeat_entities_are_sound() {
             return core::ptr::null();
         }
         // SAFETY: Deliberately return an overlapping pointer (`buf[1..3]` overlaps `buf[0..2]`).
-        let st = unsafe { &*iter.cast::<OverlapHostIter>() };
-        // SAFETY: `buf` has 4 elements; offset 1 leaves 3 elements.
-        unsafe { st.buf.as_ptr().add(1).cast::<u8>() }
+        // Project directly through raw pointers so we do not retag `&OverlapHostIter` over the
+        // live mutable borrow `w: &mut [u32]` of `buf[0..2]` under Stacked Borrows.
+        unsafe {
+            core::ptr::addr_of!((*iter.cast::<OverlapHostIter>()).buf)
+                .cast::<u32>()
+                .add(1)
+                .cast::<u8>()
+        }
     }
 
     let mut api = make_mock_api();
@@ -1534,12 +1539,13 @@ fn s10_restore_state_observer_mut_reentrancy_pod_clone_overlap_and_bridged_bound
 
     // 3. `pod_clone_trampoline` overlapping and identical buffers under Miri
     let mut overlap_buf: [u8; 12] = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12];
+    let overlap_base = overlap_buf.as_mut_ptr();
     assert_eq!(
         // SAFETY: Identical `src == dst` must be UB-free (`core::ptr::copy`).
         unsafe {
             pod_clone_trampoline::<u64>(
-                overlap_buf.as_ptr().cast(),
-                overlap_buf.as_mut_ptr().cast(),
+                overlap_base.cast(),
+                overlap_base.cast(),
                 core::ptr::null_mut(),
             )
         },
@@ -1549,8 +1555,8 @@ fn s10_restore_state_observer_mut_reentrancy_pod_clone_overlap_and_bridged_bound
         // SAFETY: Partial overlap `[0..8)` -> `[4..12)` inside `overlap_buf[0..12]`.
         unsafe {
             pod_clone_trampoline::<u64>(
-                overlap_buf.as_ptr().cast(),
-                overlap_buf.as_mut_ptr().add(4).cast(),
+                overlap_base.cast(),
+                overlap_base.add(4).cast(),
                 core::ptr::null_mut(),
             )
         },

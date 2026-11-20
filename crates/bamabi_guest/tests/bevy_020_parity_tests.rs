@@ -1360,6 +1360,8 @@ fn entity_commands_child_spawner_disable_enable_and_gizmos_end_to_end() {
     assert_eq!(status, FfiResult::OK);
     assert_eq!(host.systems.len(), 1);
 
+    let cb = host.systems[0].callback;
+    let ud = host.systems[0].user_data;
     let mut sys_ctx = MockSysCtxState {
         host: core::ptr::from_mut(host.as_mut()),
         iters: Vec::new(),
@@ -1368,13 +1370,7 @@ fn entity_commands_child_spawner_disable_enable_and_gizmos_end_to_end() {
         entity_data: HashMap::new(),
         children: HashMap::new(),
     };
-    let sys = &host.systems[0];
-    let run_status = unsafe {
-        (sys.callback)(
-            core::ptr::from_mut(&mut sys_ctx).cast::<BamSystemCtx>(),
-            sys.user_data,
-        )
-    };
+    let run_status = unsafe { cb(core::ptr::from_mut(&mut sys_ctx).cast::<BamSystemCtx>(), ud) };
     assert_eq!(run_status, FfiResult::OK);
 
     // Verify expected commands: Spawn parent(1), Insert Camera2d, InsertDefault Disabled (must use
@@ -1437,8 +1433,19 @@ fn run_conditions_local_state_removed_queries_3_single_chunk_and_descendants() {
         "bam.v0.custom.flag".to_owned(),
         core::ptr::from_ref(&marker_sym).cast::<c_void>(),
     );
+    struct RawHostGuard(*mut MockHost);
+    impl Drop for RawHostGuard {
+        fn drop(&mut self) {
+            unsafe {
+                drop(Box::from_raw(self.0));
+            }
+        }
+    }
+
+    let host_guard = RawHostGuard(Box::into_raw(host));
+    let host_ptr = host_guard.0;
     let api = MockHost::api();
-    let load_ctx = core::ptr::from_mut(host.as_mut()).cast::<BamLoadCtx>();
+    let load_ctx = host_ptr.cast::<BamLoadCtx>();
     let mut inst: *mut BamInstance = core::ptr::null_mut();
 
     static LOCAL_TICKS: AtomicU32 = AtomicU32::new(0);
@@ -1558,18 +1565,25 @@ fn run_conditions_local_state_removed_queries_3_single_chunk_and_descendants() {
     assert_eq!(status, FfiResult::OK);
 
     // Evaluate run conditions on system 0 (every_n_ticks(2): T, F, T, F) and local state accumulation.
+    let (s0_run_if, s0_ru, s0_cb, s0_ud, s1_run_if, s1_ru) = {
+        let host_ref = unsafe { &*host_ptr };
+        (
+            host_ref.systems[0].run_if.unwrap(),
+            host_ref.systems[0].run_if_user_data,
+            host_ref.systems[0].callback,
+            host_ref.systems[0].user_data,
+            host_ref.systems[1].run_if.unwrap(),
+            host_ref.systems[1].run_if_user_data,
+        )
+    };
     let mut dummy_ctx = MockSysCtxState {
-        host: core::ptr::from_mut(host.as_mut()),
+        host: host_ptr,
         iters: Vec::new(),
         cmds: Vec::new(),
         next_entity: 1,
         entity_data: HashMap::new(),
         children: HashMap::new(),
     };
-    let s0_run_if = host.systems[0].run_if.unwrap();
-    let s0_ru = host.systems[0].run_if_user_data;
-    let s0_cb = host.systems[0].callback;
-    let s0_ud = host.systems[0].user_data;
     let mut fires = Vec::new();
     for _ in 0..4 {
         let should = unsafe { s0_run_if(s0_ru) }.get();
@@ -1585,19 +1599,28 @@ fn run_conditions_local_state_removed_queries_3_single_chunk_and_descendants() {
     assert_eq!(LOCAL_TICKS.load(Ordering::SeqCst), 2);
 
     // System 1: run_once -> T, F, F
-    let s1_run_if = host.systems[1].run_if.unwrap();
-    let s1_ru = host.systems[1].run_if_user_data;
     assert!(unsafe { s1_run_if(s1_ru) }.get());
     assert!(!unsafe { s1_run_if(s1_ru) }.get());
     assert!(!unsafe { s1_run_if(s1_ru) }.get());
 
     // Execute System 2 with 3 user queries + 1 system resource query (index 3)
-    let child_of_h = host.comps[0].handle;
+    let (child_of_h, q0_terms, q1_terms, q2_terms, q3_terms, s2_cb, s2_ud) = {
+        let host_ref = unsafe { &*host_ptr };
+        (
+            host_ref.comps[0].handle,
+            host_ref.systems[2].queries[0].clone(),
+            host_ref.systems[2].queries[1].clone(),
+            host_ref.systems[2].queries[2].clone(),
+            host_ref.systems[2].queries[3].clone(),
+            host_ref.systems[2].callback,
+            host_ref.systems[2].user_data,
+        )
+    };
     let mut q0_cols = HashMap::new();
     q0_cols.insert(0, vec![1u64, 2u64]);
     let q0_iter = Box::new(MockIterState {
-        host: core::ptr::from_mut(host.as_mut()),
-        terms: host.systems[2].queries[0].clone(),
+        host: host_ptr,
+        terms: q0_terms,
         entities: vec![FfiEntity::from_bits(10), FfiEntity::from_bits(11)],
         columns: q0_cols,
         removed: HashMap::new(),
@@ -1611,8 +1634,8 @@ fn run_conditions_local_state_removed_queries_3_single_chunk_and_descendants() {
     let mut q1_cols = HashMap::new();
     q1_cols.insert(0, vec![77u64]);
     let q1_iter = Box::new(MockIterState {
-        host: core::ptr::from_mut(host.as_mut()),
-        terms: host.systems[2].queries[1].clone(),
+        host: host_ptr,
+        terms: q1_terms,
         entities: vec![FfiEntity::from_bits(20)],
         columns: q1_cols,
         removed: HashMap::new(),
@@ -1624,8 +1647,8 @@ fn run_conditions_local_state_removed_queries_3_single_chunk_and_descendants() {
     });
 
     let q2_iter = Box::new(MockIterState {
-        host: core::ptr::from_mut(host.as_mut()),
-        terms: host.systems[2].queries[2].clone(),
+        host: host_ptr,
+        terms: q2_terms,
         entities: Vec::new(),
         columns: HashMap::new(),
         removed: HashMap::new(),
@@ -1642,8 +1665,8 @@ fn run_conditions_local_state_removed_queries_3_single_chunk_and_descendants() {
         vec![FfiEntity::from_bits(101), FfiEntity::from_bits(102)],
     );
     let res_iter = Box::new(MockIterState {
-        host: core::ptr::from_mut(host.as_mut()),
-        terms: host.systems[2].queries[3].clone(),
+        host: host_ptr,
+        terms: q3_terms,
         entities: Vec::new(),
         columns: HashMap::new(),
         removed: res_removed,
@@ -1674,15 +1697,13 @@ fn run_conditions_local_state_removed_queries_3_single_chunk_and_descendants() {
     );
 
     let mut s2_ctx = MockSysCtxState {
-        host: core::ptr::from_mut(host.as_mut()),
+        host: host_ptr,
         iters: vec![q0_iter, q1_iter, q2_iter, res_iter],
         cmds: Vec::new(),
         next_entity: 100,
         entity_data,
         children,
     };
-    let s2_cb = host.systems[2].callback;
-    let s2_ud = host.systems[2].user_data;
     assert_eq!(
         unsafe { s2_cb(core::ptr::from_mut(&mut s2_ctx).cast(), s2_ud) },
         FfiResult::OK
@@ -1693,6 +1714,7 @@ fn run_conditions_local_state_removed_queries_3_single_chunk_and_descendants() {
     let _ = child_of_h;
 
     unsafe { shutdown_guest_instance(inst) };
+    drop(host_guard);
 }
 
 /// Scenario: Exercises `TypedObserverBuilder`, Bevy 0.20 picking event observers, and ABI 0.3.0
@@ -2289,9 +2311,15 @@ fn derive_non_pod_dynamic_entity_access_and_non_pod_messages_end_to_end() {
     let mut incoming_msgs = HashMap::new();
     incoming_msgs.insert(0, vec![MockMsgItem::Ptr(host_msg_ptr)]);
 
+    let q0_terms = host.systems[0].queries[0].clone();
+    let q1_terms = host.systems[0].queries[1].clone();
+    let cb = host.systems[0].callback;
+    let ud = host.systems[0].user_data;
+    let host_ptr = core::ptr::from_mut(host.as_mut());
+
     let q0_iter = Box::new(MockIterState {
-        host: core::ptr::from_mut(host.as_mut()),
-        terms: host.systems[0].queries[0].clone(),
+        host: host_ptr,
+        terms: q0_terms,
         entities: Vec::new(),
         columns: HashMap::new(),
         removed: HashMap::new(),
@@ -2302,8 +2330,8 @@ fn derive_non_pod_dynamic_entity_access_and_non_pod_messages_end_to_end() {
         active_chunk: None,
     });
     let res_iter = Box::new(MockIterState {
-        host: core::ptr::from_mut(host.as_mut()),
-        terms: host.systems[0].queries[1].clone(),
+        host: host_ptr,
+        terms: q1_terms,
         entities: Vec::new(),
         columns: HashMap::new(),
         removed: HashMap::new(),
@@ -2317,15 +2345,13 @@ fn derive_non_pod_dynamic_entity_access_and_non_pod_messages_end_to_end() {
     entity_data.insert((0, 0, FfiEntity::from_bits(7)), live_words);
 
     let mut sys_ctx = MockSysCtxState {
-        host: core::ptr::from_mut(host.as_mut()),
+        host: host_ptr,
         iters: vec![q0_iter, res_iter],
         cmds: Vec::new(),
         next_entity: 1,
         entity_data,
         children: HashMap::new(),
     };
-    let cb = host.systems[0].callback;
-    let ud = host.systems[0].user_data;
     assert_eq!(
         unsafe { cb(core::ptr::from_mut(&mut sys_ctx).cast(), ud) },
         FfiResult::OK
@@ -2401,13 +2427,18 @@ fn typed_chunk_iter_single_chunk_v02_fallback_detects_multiple_1_entity_chunks()
     };
     assert_eq!(status, FfiResult::OK);
 
+    let q0_terms = host.systems[0].queries[0].clone();
+    let q1_terms = host.systems[0].queries[1].clone();
+    let q2_terms = host.systems[0].queries[2].clone();
+    let cb = host.systems[0].callback;
+    let ud = host.systems[0].user_data;
     let host_ptr = core::ptr::from_mut(host.as_mut());
     // q0: two separate chunks [0..1] and [1..2] (1 entity each, 2 total)
     let mut q0_cols = HashMap::new();
     q0_cols.insert(0, vec![10u64, 20u64]);
     let q0 = Box::new(MockIterState {
         host: host_ptr,
-        terms: host.systems[0].queries[0].clone(),
+        terms: q0_terms,
         entities: vec![FfiEntity::from_bits(1), FfiEntity::from_bits(2)],
         columns: q0_cols,
         removed: HashMap::new(),
@@ -2422,7 +2453,7 @@ fn typed_chunk_iter_single_chunk_v02_fallback_detects_multiple_1_entity_chunks()
     q1_cols.insert(0, vec![88u64]);
     let q1 = Box::new(MockIterState {
         host: host_ptr,
-        terms: host.systems[0].queries[1].clone(),
+        terms: q1_terms,
         entities: vec![FfiEntity::from_bits(3)],
         columns: q1_cols,
         removed: HashMap::new(),
@@ -2435,7 +2466,7 @@ fn typed_chunk_iter_single_chunk_v02_fallback_detects_multiple_1_entity_chunks()
     // q2: zero chunks
     let q2 = Box::new(MockIterState {
         host: host_ptr,
-        terms: host.systems[0].queries[2].clone(),
+        terms: q2_terms,
         entities: Vec::new(),
         columns: HashMap::new(),
         removed: HashMap::new(),
@@ -2454,8 +2485,6 @@ fn typed_chunk_iter_single_chunk_v02_fallback_detects_multiple_1_entity_chunks()
         entity_data: HashMap::new(),
         children: HashMap::new(),
     };
-    let cb = host.systems[0].callback;
-    let ud = host.systems[0].user_data;
     assert_eq!(
         unsafe { cb(core::ptr::from_mut(&mut sys_ctx).cast(), ud) },
         FfiResult::OK
@@ -2501,10 +2530,13 @@ fn read_removed_preserves_type_mismatch_when_zero_user_queries() {
     };
     assert_eq!(status, FfiResult::OK);
 
+    let q0_terms = host.systems[0].queries[0].clone();
+    let cb = host.systems[0].callback;
+    let ud = host.systems[0].user_data;
     let host_ptr = core::ptr::from_mut(host.as_mut());
     let res_iter = Box::new(MockIterState {
         host: host_ptr,
-        terms: host.systems[0].queries[0].clone(),
+        terms: q0_terms,
         entities: Vec::new(),
         columns: HashMap::new(),
         removed: HashMap::new(),
@@ -2522,8 +2554,6 @@ fn read_removed_preserves_type_mismatch_when_zero_user_queries() {
         entity_data: HashMap::new(),
         children: HashMap::new(),
     };
-    let cb = host.systems[0].callback;
-    let ud = host.systems[0].user_data;
     assert_eq!(
         unsafe { cb(core::ptr::from_mut(&mut sys_ctx).cast(), ud) },
         FfiResult::OK
@@ -2758,10 +2788,13 @@ fn ui_mapped_string_and_wire_bridges_and_disabled_bridge_roundtrip() {
     let mut resources = HashMap::new();
     resources.insert(3, aligned_buf_from_bytes(rem_bytes));
 
+    let q0_terms = host.systems[0].queries[0].clone();
+    let cb = host.systems[0].callback;
+    let ud = host.systems[0].user_data;
     let host_ptr = core::ptr::from_mut(host.as_mut());
     let iter0 = Box::new(MockIterState {
         host: host_ptr,
-        terms: host.systems[0].queries[0].clone(),
+        terms: q0_terms,
         entities: vec![FfiEntity::from_bits(1)],
         columns: cols,
         removed: HashMap::new(),
@@ -2779,8 +2812,6 @@ fn ui_mapped_string_and_wire_bridges_and_disabled_bridge_roundtrip() {
         entity_data: HashMap::new(),
         children: HashMap::new(),
     };
-    let cb = host.systems[0].callback;
-    let ud = host.systems[0].user_data;
     assert_eq!(
         unsafe { cb(core::ptr::from_mut(&mut sys_ctx).cast(), ud) },
         FfiResult::OK
