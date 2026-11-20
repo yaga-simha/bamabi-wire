@@ -1,0 +1,1465 @@
+#![forbid(unsafe_code)]
+
+//! Workspace build, verification, header generation, and QA automation (`cargo xtask`).
+//!
+//! Zero-external-dependency task runner covering formatting, safety/isolation lints,
+//! Rust + C99 test suites, header byte-parity checks, static audits, Miri (Tree & Stacked
+//! Borrows + big-endian `s390x`), Kani formal verification, and nightly `-Zrandomize-layout` runs.
+
+mod component_headers;
+
+use std::env;
+use std::fs;
+use std::path::{Path, PathBuf};
+use std::process::{Command, ExitCode, Stdio};
+
+/// Top-level parsed CLI outcome before execution.
+#[derive(Debug, PartialEq, Eq)]
+enum ParsedArgs {
+    /// Print general or per-subcommand usage and exit 0.
+    Help(Option<SubcommandKind>),
+    /// Execute a concrete subcommand.
+    Run(CommandSpec),
+}
+
+/// Supported `cargo xtask` subcommand names (used for targeted `--help`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SubcommandKind {
+    Fmt,
+    Lint,
+    Test,
+    CTest,
+    Header,
+    GenComponentHeaders,
+    Audit,
+    Miri,
+    Kani,
+    Nightly,
+    Ci,
+}
+
+/// Concrete subcommand and validated options.
+#[derive(Debug, PartialEq, Eq)]
+enum CommandSpec {
+    Fmt(FmtArgs),
+    Lint,
+    Test(TestArgs),
+    CTest(CTestArgs),
+    Header(CheckArgs),
+    GenComponentHeaders(CheckArgs),
+    Audit(AuditArgs),
+    Miri(MiriArgs),
+    Kani(KaniArgs),
+    Nightly(NightlyArgs),
+    Ci(CiArgs),
+}
+
+/// Options for `cargo xtask fmt`.
+#[derive(Debug, Default, PartialEq, Eq)]
+struct FmtArgs {
+    fix: bool,
+}
+
+/// Options for `cargo xtask test`.
+#[derive(Debug, Default, PartialEq, Eq)]
+struct TestArgs {
+    cases: Option<usize>,
+    no_default_features: bool,
+    all_features: bool,
+    doc: bool,
+    proptest: bool,
+    header_parity: bool,
+}
+
+impl TestArgs {
+    /// Returns `true` when no explicit suite filter flags were requested.
+    fn run_all_default(&self) -> bool {
+        !self.no_default_features
+            && !self.all_features
+            && !self.doc
+            && !self.proptest
+            && !self.header_parity
+    }
+}
+
+/// Options for `cargo xtask c-test`.
+#[derive(Debug, Default, PartialEq, Eq)]
+struct CTestArgs {
+    no_asan: bool,
+}
+
+/// Options for `cargo xtask header` and `cargo xtask gen-component-headers`.
+#[derive(Debug, Default, PartialEq, Eq)]
+struct CheckArgs {
+    check: bool,
+}
+
+/// Options for `cargo xtask audit`.
+#[derive(Debug, Default, PartialEq, Eq)]
+struct AuditArgs {
+    baseline_rev: Option<String>,
+    skip_targets: bool,
+}
+
+/// Options for `cargo xtask miri`.
+#[derive(Debug, Default, PartialEq, Eq)]
+struct MiriArgs {
+    tree_borrows: bool,
+    stacked_borrows: bool,
+    s390x: bool,
+}
+
+impl MiriArgs {
+    /// Returns effective `(tree_borrows, stacked_borrows, s390x)` flags with default `--all`.
+    fn resolved(&self) -> (bool, bool, bool) {
+        if !self.tree_borrows && !self.stacked_borrows && !self.s390x {
+            (true, true, false)
+        } else {
+            (self.tree_borrows, self.stacked_borrows, self.s390x)
+        }
+    }
+}
+
+/// Options for `cargo xtask kani`.
+#[derive(Debug, Default, PartialEq, Eq)]
+struct KaniArgs {
+    harness: Option<String>,
+    packages: Vec<String>,
+}
+
+/// Options for `cargo xtask nightly`.
+#[derive(Debug, PartialEq, Eq)]
+struct NightlyArgs {
+    cases: usize,
+}
+
+impl Default for NightlyArgs {
+    fn default() -> Self {
+        Self { cases: 2048 }
+    }
+}
+
+/// Options for `cargo xtask ci`.
+#[derive(Debug, Default, PartialEq, Eq)]
+struct CiArgs {
+    audit: bool,
+    miri: bool,
+    kani: bool,
+}
+
+fn main() -> ExitCode {
+    let raw_args: Vec<String> = env::args().skip(1).collect();
+    match parse_args(&raw_args) {
+        Ok(ParsedArgs::Help(topic)) => {
+            print_help(topic);
+            ExitCode::SUCCESS
+        }
+        Ok(ParsedArgs::Run(cmd)) => match dispatch(cmd) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(err) => {
+                eprintln!("error: {err}");
+                ExitCode::FAILURE
+            }
+        },
+        Err(err) => {
+            eprintln!("error: {err}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+/// Parses CLI arguments after the binary name into a structured [`ParsedArgs`].
+fn parse_args(args: &[String]) -> Result<ParsedArgs, String> {
+    if args.is_empty() {
+        return Ok(ParsedArgs::Help(None));
+    }
+
+    let first = args[0].as_str();
+    if is_help_flag(first) {
+        return Ok(ParsedArgs::Help(None));
+    }
+    if first == "help" {
+        return match args.get(1) {
+            None => Ok(ParsedArgs::Help(None)),
+            Some(sub) => {
+                let kind = parse_subcommand_kind(sub).ok_or_else(|| {
+                    format!("unknown help topic `{sub}`; run `cargo xtask --help`")
+                })?;
+                Ok(ParsedArgs::Help(Some(kind)))
+            }
+        };
+    }
+
+    let kind = parse_subcommand_kind(first)
+        .ok_or_else(|| format!("unknown subcommand `{first}`; run `cargo xtask --help`"))?;
+    let rest = &args[1..];
+    if rest.iter().any(|arg| is_help_flag(arg)) {
+        return Ok(ParsedArgs::Help(Some(kind)));
+    }
+
+    let spec = match kind {
+        SubcommandKind::Fmt => CommandSpec::Fmt(parse_fmt_args(rest)?),
+        SubcommandKind::Lint => {
+            reject_extra_args("lint", rest)?;
+            CommandSpec::Lint
+        }
+        SubcommandKind::Test => CommandSpec::Test(parse_test_args(rest)?),
+        SubcommandKind::CTest => CommandSpec::CTest(parse_c_test_args(rest)?),
+        SubcommandKind::Header => CommandSpec::Header(parse_check_args("header", rest)?),
+        SubcommandKind::GenComponentHeaders => {
+            CommandSpec::GenComponentHeaders(parse_check_args("gen-component-headers", rest)?)
+        }
+        SubcommandKind::Audit => CommandSpec::Audit(parse_audit_args(rest)?),
+        SubcommandKind::Miri => CommandSpec::Miri(parse_miri_args(rest)?),
+        SubcommandKind::Kani => CommandSpec::Kani(parse_kani_args(rest)?),
+        SubcommandKind::Nightly => CommandSpec::Nightly(parse_nightly_args(rest)?),
+        SubcommandKind::Ci => CommandSpec::Ci(parse_ci_args(rest)?),
+    };
+    Ok(ParsedArgs::Run(spec))
+}
+
+fn is_help_flag(arg: &str) -> bool {
+    matches!(arg, "-h" | "--help")
+}
+
+fn parse_subcommand_kind(name: &str) -> Option<SubcommandKind> {
+    match name {
+        "fmt" => Some(SubcommandKind::Fmt),
+        "lint" => Some(SubcommandKind::Lint),
+        "test" => Some(SubcommandKind::Test),
+        "c-test" => Some(SubcommandKind::CTest),
+        "header" => Some(SubcommandKind::Header),
+        "gen-component-headers" => Some(SubcommandKind::GenComponentHeaders),
+        "audit" => Some(SubcommandKind::Audit),
+        "miri" => Some(SubcommandKind::Miri),
+        "kani" => Some(SubcommandKind::Kani),
+        "nightly" => Some(SubcommandKind::Nightly),
+        "ci" => Some(SubcommandKind::Ci),
+        _ => None,
+    }
+}
+
+fn reject_extra_args(cmd: &str, args: &[String]) -> Result<(), String> {
+    if let Some(arg) = args.first() {
+        return Err(format!(
+            "unexpected argument `{arg}` for `{cmd}`; run `cargo xtask {cmd} --help`"
+        ));
+    }
+    Ok(())
+}
+
+fn parse_fmt_args(args: &[String]) -> Result<FmtArgs, String> {
+    let mut parsed = FmtArgs::default();
+    for arg in args {
+        match arg.as_str() {
+            "--fix" => parsed.fix = true,
+            other => {
+                return Err(format!(
+                    "unknown `fmt` flag `{other}`; run `cargo xtask fmt --help`"
+                ));
+            }
+        }
+    }
+    Ok(parsed)
+}
+
+fn parse_positive_usize(flag: &str, value: &str) -> Result<usize, String> {
+    let n: usize = value
+        .parse()
+        .map_err(|_| format!("invalid integer `{value}` for `{flag}`"))?;
+    if n == 0 {
+        return Err(format!("`{flag}` must be greater than 0"));
+    }
+    Ok(n)
+}
+
+fn next_flag_value<'a>(args: &'a [String], idx: &mut usize, flag: &str) -> Result<&'a str, String> {
+    let next = *idx + 1;
+    let val = args
+        .get(next)
+        .ok_or_else(|| format!("missing value after `{flag}`"))?;
+    if val.is_empty() {
+        return Err(format!("empty value for `{flag}`"));
+    }
+    *idx = next;
+    Ok(val.as_str())
+}
+
+fn parse_test_args(args: &[String]) -> Result<TestArgs, String> {
+    let mut parsed = TestArgs::default();
+    let mut i = 0;
+    while i < args.len() {
+        let arg = args[i].as_str();
+        if let Some(val) = arg.strip_prefix("--cases=") {
+            parsed.cases = Some(parse_positive_usize("--cases", val)?);
+        } else {
+            match arg {
+                "--cases" => {
+                    let val = next_flag_value(args, &mut i, "--cases")?;
+                    parsed.cases = Some(parse_positive_usize("--cases", val)?);
+                }
+                "--no-default-features" => parsed.no_default_features = true,
+                "--all-features" => parsed.all_features = true,
+                "--doc" => parsed.doc = true,
+                "--proptest" => parsed.proptest = true,
+                "--header-parity" => parsed.header_parity = true,
+                other => {
+                    return Err(format!(
+                        "unknown `test` flag `{other}`; run `cargo xtask test --help`"
+                    ));
+                }
+            }
+        }
+        i += 1;
+    }
+    Ok(parsed)
+}
+
+fn parse_c_test_args(args: &[String]) -> Result<CTestArgs, String> {
+    let mut parsed = CTestArgs::default();
+    for arg in args {
+        match arg.as_str() {
+            "--no-asan" => parsed.no_asan = true,
+            other => {
+                return Err(format!(
+                    "unknown `c-test` flag `{other}`; run `cargo xtask c-test --help`"
+                ));
+            }
+        }
+    }
+    Ok(parsed)
+}
+
+fn parse_check_args(cmd: &str, args: &[String]) -> Result<CheckArgs, String> {
+    let mut parsed = CheckArgs::default();
+    for arg in args {
+        match arg.as_str() {
+            "--check" => parsed.check = true,
+            other => {
+                return Err(format!(
+                    "unknown `{cmd}` flag `{other}`; run `cargo xtask {cmd} --help`"
+                ));
+            }
+        }
+    }
+    Ok(parsed)
+}
+
+fn parse_audit_args(args: &[String]) -> Result<AuditArgs, String> {
+    let mut parsed = AuditArgs::default();
+    let mut i = 0;
+    while i < args.len() {
+        let arg = args[i].as_str();
+        if let Some(rev) = arg.strip_prefix("--baseline-rev=") {
+            if rev.is_empty() {
+                return Err("empty value for `--baseline-rev`".to_owned());
+            }
+            parsed.baseline_rev = Some(rev.to_owned());
+        } else {
+            match arg {
+                "--baseline-rev" => {
+                    let rev = next_flag_value(args, &mut i, "--baseline-rev")?;
+                    parsed.baseline_rev = Some(rev.to_owned());
+                }
+                "--skip-targets" => parsed.skip_targets = true,
+                other => {
+                    return Err(format!(
+                        "unknown `audit` flag `{other}`; run `cargo xtask audit --help`"
+                    ));
+                }
+            }
+        }
+        i += 1;
+    }
+    Ok(parsed)
+}
+
+fn parse_miri_args(args: &[String]) -> Result<MiriArgs, String> {
+    let mut parsed = MiriArgs::default();
+    for arg in args {
+        match arg.as_str() {
+            "--tree-borrows" => parsed.tree_borrows = true,
+            "--stacked-borrows" => parsed.stacked_borrows = true,
+            "--all" => {
+                parsed.tree_borrows = true;
+                parsed.stacked_borrows = true;
+            }
+            "--s390x" => parsed.s390x = true,
+            other => {
+                return Err(format!(
+                    "unknown `miri` flag `{other}`; run `cargo xtask miri --help`"
+                ));
+            }
+        }
+    }
+    Ok(parsed)
+}
+
+fn parse_kani_args(args: &[String]) -> Result<KaniArgs, String> {
+    let mut parsed = KaniArgs::default();
+    let mut i = 0;
+    while i < args.len() {
+        let arg = args[i].as_str();
+        if let Some(pat) = arg.strip_prefix("--harness=") {
+            if pat.is_empty() {
+                return Err("empty value for `--harness`".to_owned());
+            }
+            parsed.harness = Some(pat.to_owned());
+        } else if let Some(pkg) = arg.strip_prefix("--package=") {
+            if pkg.is_empty() {
+                return Err("empty value for `--package`".to_owned());
+            }
+            parsed.packages.push(pkg.to_owned());
+        } else {
+            match arg {
+                "--harness" => {
+                    let pat = next_flag_value(args, &mut i, "--harness")?;
+                    parsed.harness = Some(pat.to_owned());
+                }
+                "-p" | "--package" => {
+                    let pkg = next_flag_value(args, &mut i, arg)?;
+                    parsed.packages.push(pkg.to_owned());
+                }
+                other => {
+                    return Err(format!(
+                        "unknown `kani` flag `{other}`; run `cargo xtask kani --help`"
+                    ));
+                }
+            }
+        }
+        i += 1;
+    }
+    Ok(parsed)
+}
+
+fn parse_nightly_args(args: &[String]) -> Result<NightlyArgs, String> {
+    let mut parsed = NightlyArgs::default();
+    let mut i = 0;
+    while i < args.len() {
+        let arg = args[i].as_str();
+        if let Some(val) = arg.strip_prefix("--cases=") {
+            parsed.cases = parse_positive_usize("--cases", val)?;
+        } else {
+            match arg {
+                "--cases" => {
+                    let val = next_flag_value(args, &mut i, "--cases")?;
+                    parsed.cases = parse_positive_usize("--cases", val)?;
+                }
+                other => {
+                    return Err(format!(
+                        "unknown `nightly` flag `{other}`; run `cargo xtask nightly --help`"
+                    ));
+                }
+            }
+        }
+        i += 1;
+    }
+    Ok(parsed)
+}
+
+fn parse_ci_args(args: &[String]) -> Result<CiArgs, String> {
+    let mut parsed = CiArgs::default();
+    for arg in args {
+        match arg.as_str() {
+            "--full" => {
+                parsed.audit = true;
+                parsed.miri = true;
+                parsed.kani = true;
+            }
+            "--audit" => parsed.audit = true,
+            "--miri" => parsed.miri = true,
+            "--kani" => parsed.kani = true,
+            other => {
+                return Err(format!(
+                    "unknown `ci` flag `{other}`; run `cargo xtask ci --help`"
+                ));
+            }
+        }
+    }
+    Ok(parsed)
+}
+
+fn print_help(topic: Option<SubcommandKind>) {
+    match topic {
+        None => println!(
+            "\
+bamabi-wire task runner (`cargo xtask`)
+
+USAGE:
+    cargo xtask <SUBCOMMAND> [OPTIONS]
+
+SUBCOMMANDS:
+    fmt                    Check or fix workspace Rust formatting
+    lint                   Verify #![forbid(unsafe_code)], zero-Bevy, clippy, and rustdoc
+    test                   Run workspace tests (--no-default-features, --all-features, doctests)
+    c-test                 Run strict C99 header checks and standalone_c_test (+ ASan/UBSan)
+    header                 Regenerate or check include/bamabi.h byte parity
+    gen-component-headers  Regenerate or check include/generated/testbed_components.h parity
+    audit                  Run cross-target checks, typos, cargo-deny, and optional semver-checks
+    miri                   Run Miri (Tree Borrows, Stacked Borrows, and/or s390x)
+    kani                   Run Kani formal verification proofs
+    nightly                Run s390x Miri and -Zrandomize-layout extended suites
+    ci                     Run the local CI gate (fmt, headers, lint, test, c-test)
+
+Run `cargo xtask <SUBCOMMAND> --help` for subcommand options."
+        ),
+        Some(SubcommandKind::Fmt) => println!(
+            "\
+USAGE:
+    cargo xtask fmt [--fix]
+
+OPTIONS:
+    --fix    Apply formatting changes instead of checking"
+        ),
+        Some(SubcommandKind::Lint) => println!(
+            "\
+USAGE:
+    cargo xtask lint
+
+CHECKS:
+    - #![forbid(unsafe_code)] on bamabi_guest, bamabi_macros, bamabi_sdk_gen, and xtask
+    - Zero non-bamabi Bevy dependencies in `cargo tree --workspace`
+    - `cargo clippy --workspace --all-targets -- -D warnings` (default & --all-features)
+    - `RUSTDOCFLAGS=\"-D warnings\" cargo doc --workspace --no-deps` (default & --all-features)"
+        ),
+        Some(SubcommandKind::Test) => println!(
+            "\
+USAGE:
+    cargo xtask test [--cases N] [--no-default-features] [--all-features] [--doc] [--proptest] [--header-parity]
+
+OPTIONS:
+    --cases N                Set PROPTEST_CASES=N
+    --no-default-features    Run `cargo test --workspace --no-default-features`
+    --all-features           Run `cargo test --workspace --all-features`
+    --doc                    Run `cargo test --doc --all-features`
+    --proptest               Run the proptest integration suites
+    --header-parity          Run `cargo test -p bamabi_sdk_gen --test header_parity`
+
+Defaults to running --no-default-features, --all-features, and --doc."
+        ),
+        Some(SubcommandKind::CTest) => println!(
+            "\
+USAGE:
+    cargo xtask c-test [--no-asan]
+
+OPTIONS:
+    --no-asan    Skip the ASan + UBSan clang build and run of tests/standalone_c_test.c"
+        ),
+        Some(SubcommandKind::Header) => println!(
+            "\
+USAGE:
+    cargo xtask header [--check]
+
+OPTIONS:
+    --check    Verify include/bamabi.h matches bamabi_sdk_gen::render_c99_header() without modifying disk"
+        ),
+        Some(SubcommandKind::GenComponentHeaders) => println!(
+            "\
+USAGE:
+    cargo xtask gen-component-headers [--check]
+
+OPTIONS:
+    --check    Verify include/generated/testbed_components.h matches ModComponent::C_DECL byte-for-byte"
+        ),
+        Some(SubcommandKind::Audit) => println!(
+            "\
+USAGE:
+    cargo xtask audit [--baseline-rev <rev>] [--skip-targets]
+
+OPTIONS:
+    --baseline-rev <rev>    Run `cargo semver-checks check-release -p bamabi_sys --baseline-rev <rev>`
+    --skip-targets          Skip i686-unknown-linux-gnu and wasm32-unknown-unknown checks"
+        ),
+        Some(SubcommandKind::Miri) => println!(
+            "\
+USAGE:
+    cargo xtask miri [--tree-borrows | --stacked-borrows | --all | --s390x]
+
+OPTIONS:
+    --tree-borrows       Run Miri with -Zmiri-tree-borrows -Zmiri-strict-provenance
+    --stacked-borrows    Run Miri with -Zmiri-strict-provenance
+    --all                Run both Tree Borrows and Stacked Borrows (default)
+    --s390x              Run big-endian s390x-unknown-linux-gnu Miri tests"
+        ),
+        Some(SubcommandKind::Kani) => println!(
+            "\
+USAGE:
+    cargo xtask kani [--harness <pat>] [-p <pkg>]
+
+OPTIONS:
+    --harness <pat>    Filter Kani proofs by harness name pattern
+    -p, --package <pkg>  Restrict Kani to specific package(s) (repeatable; defaults to bamabi_sys + bamabi_guest_sys)"
+        ),
+        Some(SubcommandKind::Nightly) => println!(
+            "\
+USAGE:
+    cargo xtask nightly [--cases N]
+
+OPTIONS:
+    --cases N    Set PROPTEST_CASES=N for -Zrandomize-layout runs (default: 2048)"
+        ),
+        Some(SubcommandKind::Ci) => println!(
+            "\
+USAGE:
+    cargo xtask ci [--full] [--audit] [--miri] [--kani]
+
+OPTIONS:
+    --audit    Also run `cargo xtask audit`
+    --miri     Also run `cargo xtask miri`
+    --kani     Also run `cargo xtask kani`
+    --full     Enable --audit, --miri, and --kani
+
+Default runs fmt, header --check, gen-component-headers --check, lint, test, and c-test."
+        ),
+    }
+}
+
+fn workspace_root() -> Result<PathBuf, String> {
+    Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .map(Path::to_path_buf)
+        .ok_or_else(|| "failed to resolve workspace root from CARGO_MANIFEST_DIR".to_owned())
+}
+
+fn dispatch(cmd: CommandSpec) -> Result<(), String> {
+    let root = workspace_root()?;
+    match cmd {
+        CommandSpec::Fmt(args) => cmd_fmt(&root, &args),
+        CommandSpec::Lint => cmd_lint(&root),
+        CommandSpec::Test(args) => cmd_test(&root, &args),
+        CommandSpec::CTest(args) => cmd_c_test(&root, &args),
+        CommandSpec::Header(args) => cmd_header(&root, &args),
+        CommandSpec::GenComponentHeaders(args) => {
+            component_headers::write_or_check_component_headers(&root, args.check)
+        }
+        CommandSpec::Audit(args) => cmd_audit(&root, &args),
+        CommandSpec::Miri(args) => cmd_miri(&root, &args),
+        CommandSpec::Kani(args) => cmd_kani(&root, &args),
+        CommandSpec::Nightly(args) => cmd_nightly(&root, &args),
+        CommandSpec::Ci(args) => cmd_ci(&root, &args),
+    }
+}
+
+/// Runs a command inheriting stdio, returning a descriptive error on non-zero exit.
+fn run_cmd(cmd: &mut Command, label: &str) -> Result<(), String> {
+    println!("==> {label}");
+    let status = cmd
+        .status()
+        .map_err(|e| format!("failed to spawn `{label}`: {e}"))?;
+    if !status.success() {
+        return Err(format!("`{label}` failed with exit status {status}"));
+    }
+    Ok(())
+}
+
+/// Builds a `cargo` command anchored at `root`.
+///
+/// Uses `"cargo"` (the rustup proxy) rather than `env!("CARGO")` so `+nightly` and
+/// subcommands like `cargo kani` or `cargo deny` resolve their proper toolchains.
+fn cargo_cmd(root: &Path) -> Command {
+    let mut cmd = Command::new("cargo");
+    cmd.current_dir(root);
+    cmd
+}
+
+/// Builds a `cargo` command cleared of active `RUSTUP_TOOLCHAIN` / `RUSTC` overrides.
+fn clean_toolchain_cargo_cmd(root: &Path) -> Command {
+    let mut cmd = cargo_cmd(root);
+    cmd.env_remove("RUSTUP_TOOLCHAIN");
+    cmd.env_remove("RUSTC");
+    cmd
+}
+
+/// Probes whether a tool command succeeds silently.
+fn check_tool_available(program: &str, args: &[&str], install_hint: &str) -> Result<(), String> {
+    let mut cmd = Command::new(program);
+    cmd.args(args)
+        .env_remove("RUSTUP_TOOLCHAIN")
+        .env_remove("RUSTC")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    match cmd.status() {
+        Ok(status) if status.success() => Ok(()),
+        Ok(status) => Err(format!(
+            "`{program} {}` exited with {status}; {install_hint}",
+            args.join(" ")
+        )),
+        Err(err) => Err(format!("`{program}` not available ({err}); {install_hint}")),
+    }
+}
+
+fn cmd_fmt(root: &Path, args: &FmtArgs) -> Result<(), String> {
+    let mut cmd = cargo_cmd(root);
+    cmd.args(["fmt", "--all"]);
+    if args.fix {
+        run_cmd(&mut cmd, "cargo fmt --all")
+    } else {
+        cmd.args(["--", "--check"]);
+        run_cmd(&mut cmd, "cargo fmt --all -- --check")
+    }
+}
+
+fn cmd_lint(root: &Path) -> Result<(), String> {
+    verify_forbid_unsafe(root)?;
+    verify_zero_bevy(root)?;
+
+    run_cmd(
+        cargo_cmd(root).args([
+            "clippy",
+            "--workspace",
+            "--all-targets",
+            "--",
+            "-D",
+            "warnings",
+        ]),
+        "cargo clippy --workspace --all-targets -- -D warnings",
+    )?;
+    run_cmd(
+        cargo_cmd(root).args([
+            "clippy",
+            "--workspace",
+            "--all-targets",
+            "--all-features",
+            "--",
+            "-D",
+            "warnings",
+        ]),
+        "cargo clippy --workspace --all-targets --all-features -- -D warnings",
+    )?;
+    run_cmd(
+        cargo_cmd(root).env("RUSTDOCFLAGS", "-D warnings").args([
+            "doc",
+            "--workspace",
+            "--no-deps",
+        ]),
+        "RUSTDOCFLAGS=\"-D warnings\" cargo doc --workspace --no-deps",
+    )?;
+    run_cmd(
+        cargo_cmd(root).env("RUSTDOCFLAGS", "-D warnings").args([
+            "doc",
+            "--workspace",
+            "--no-deps",
+            "--all-features",
+        ]),
+        "RUSTDOCFLAGS=\"-D warnings\" cargo doc --workspace --no-deps --all-features",
+    )?;
+    Ok(())
+}
+
+fn verify_forbid_unsafe(root: &Path) -> Result<(), String> {
+    println!("==> Verifying #![forbid(unsafe_code)] on safe crates");
+    let required = [
+        "crates/bamabi_guest/src/lib.rs",
+        "crates/bamabi_macros/src/lib.rs",
+        "crates/bamabi_sdk_gen/src/lib.rs",
+        "xtask/src/main.rs",
+    ];
+    for rel in required {
+        let path = root.join(rel);
+        let content = fs::read_to_string(&path)
+            .map_err(|e| format!("failed to read {}: {e}", path.display()))?;
+        let has_forbid = content
+            .lines()
+            .any(|line| line.trim() == "#![forbid(unsafe_code)]");
+        if !has_forbid {
+            return Err(format!(
+                "{} is missing required `#![forbid(unsafe_code)]` declaration",
+                path.display()
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn verify_zero_bevy(root: &Path) -> Result<(), String> {
+    println!("==> Verifying zero-Bevy isolation (`cargo tree --workspace`)");
+    let output = cargo_cmd(root)
+        .args(["tree", "--workspace"])
+        .output()
+        .map_err(|e| format!("failed to run `cargo tree --workspace`: {e}"))?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(format!("`cargo tree --workspace` failed: {stderr}"));
+    }
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let mut offenders = Vec::new();
+    for line in stdout.lines() {
+        let stripped = line.split(" (").next().unwrap_or(line);
+        let lower = stripped.to_ascii_lowercase();
+        if lower.contains("bevy") && !lower.contains("bamabi") {
+            offenders.push(stripped.trim().to_owned());
+        }
+    }
+    if !offenders.is_empty() {
+        return Err(format!(
+            "unexpected Bevy dependency found in bamabi-wire:\n{}",
+            offenders.join("\n")
+        ));
+    }
+    Ok(())
+}
+
+fn cmd_test(root: &Path, args: &TestArgs) -> Result<(), String> {
+    let apply_cases = |cmd: &mut Command| {
+        if let Some(n) = args.cases {
+            cmd.env("PROPTEST_CASES", n.to_string());
+        }
+    };
+
+    if args.run_all_default() {
+        let mut c1 = cargo_cmd(root);
+        c1.args(["test", "--workspace", "--no-default-features"]);
+        apply_cases(&mut c1);
+        run_cmd(&mut c1, "cargo test --workspace --no-default-features")?;
+
+        let mut c2 = cargo_cmd(root);
+        c2.args(["test", "--workspace", "--all-features"]);
+        apply_cases(&mut c2);
+        run_cmd(&mut c2, "cargo test --workspace --all-features")?;
+
+        let mut c3 = cargo_cmd(root);
+        c3.args(["test", "--doc", "--all-features"]);
+        apply_cases(&mut c3);
+        run_cmd(&mut c3, "cargo test --doc --all-features")?;
+        return Ok(());
+    }
+
+    if args.no_default_features {
+        let mut cmd = cargo_cmd(root);
+        cmd.args(["test", "--workspace", "--no-default-features"]);
+        apply_cases(&mut cmd);
+        run_cmd(&mut cmd, "cargo test --workspace --no-default-features")?;
+    }
+    if args.all_features {
+        let mut cmd = cargo_cmd(root);
+        cmd.args(["test", "--workspace", "--all-features"]);
+        apply_cases(&mut cmd);
+        run_cmd(&mut cmd, "cargo test --workspace --all-features")?;
+    }
+    if args.doc {
+        let mut cmd = cargo_cmd(root);
+        cmd.args(["test", "--doc", "--all-features"]);
+        apply_cases(&mut cmd);
+        run_cmd(&mut cmd, "cargo test --doc --all-features")?;
+    }
+    if args.proptest {
+        let proptests = [
+            ("bamabi_sys", "proptest_wire"),
+            ("bamabi_guest_sys", "proptest_guest_sys"),
+            ("bamabi_macros", "proptest_witness"),
+        ];
+        for (pkg, target) in proptests {
+            let mut cmd = cargo_cmd(root);
+            cmd.args(["test", "-p", pkg, "--test", target]);
+            apply_cases(&mut cmd);
+            run_cmd(&mut cmd, &format!("cargo test -p {pkg} --test {target}"))?;
+        }
+    }
+    if args.header_parity {
+        let mut cmd = cargo_cmd(root);
+        cmd.args(["test", "-p", "bamabi_sdk_gen", "--test", "header_parity"]);
+        apply_cases(&mut cmd);
+        run_cmd(
+            &mut cmd,
+            "cargo test -p bamabi_sdk_gen --test header_parity",
+        )?;
+    }
+
+    Ok(())
+}
+
+fn c_compiler() -> String {
+    env::var("CC").unwrap_or_else(|_| "cc".to_owned())
+}
+
+fn sanitizer_clang() -> String {
+    if let Ok(cc) = env::var("CLANG") {
+        return cc;
+    }
+    // On macOS, a Swift toolchain (`swiftly`) shim for `clang` on PATH can stall on ASan runs;
+    // prefer the system Apple Xcode `/usr/bin/clang` when present.
+    if cfg!(target_os = "macos") && Path::new("/usr/bin/clang").is_file() {
+        return "/usr/bin/clang".to_owned();
+    }
+    "clang".to_owned()
+}
+
+fn portable_asan_options() -> &'static str {
+    // Apple Clang ASan on macOS ARM64 aborts if `detect_leaks=1` is passed.
+    if cfg!(target_os = "linux") {
+        "detect_leaks=1:strict_string_checks=1:halt_on_error=1"
+    } else {
+        "strict_string_checks=1:halt_on_error=1"
+    }
+}
+
+fn cmd_c_test(root: &Path, args: &CTestArgs) -> Result<(), String> {
+    let target_dir = root.join("target");
+    fs::create_dir_all(&target_dir)
+        .map_err(|e| format!("failed to create {}: {e}", target_dir.display()))?;
+
+    let cc = c_compiler();
+    let bamabi_h = root.join("include").join("bamabi.h");
+    let testbed_h = root
+        .join("include")
+        .join("generated")
+        .join("testbed_components.h");
+    let c_test_src = root.join("tests").join("standalone_c_test.c");
+    let include_dir = root.join("include");
+
+    run_cmd(
+        Command::new(&cc)
+            .current_dir(root)
+            .args([
+                "-std=c99",
+                "-Wall",
+                "-Wextra",
+                "-Werror",
+                "-pedantic",
+                "-fsyntax-only",
+                "-x",
+                "c",
+            ])
+            .arg(&bamabi_h),
+        &format!("{cc} -std=c99 -Wall -Wextra -Werror -pedantic -fsyntax-only include/bamabi.h"),
+    )?;
+
+    run_cmd(
+        Command::new(&cc)
+            .current_dir(root)
+            .args([
+                "-std=c99",
+                "-Wall",
+                "-Wextra",
+                "-Werror",
+                "-pedantic",
+                "-fsyntax-only",
+                "-x",
+                "c",
+            ])
+            .arg(&testbed_h),
+        &format!(
+            "{cc} -std=c99 -Wall -Wextra -Werror -pedantic -fsyntax-only include/generated/testbed_components.h"
+        ),
+    )?;
+
+    let exe_suffix = env::consts::EXE_SUFFIX;
+    let bin_path = target_dir.join(format!("standalone_c_test{exe_suffix}"));
+    run_cmd(
+        Command::new(&cc)
+            .current_dir(root)
+            .args(["-std=c99", "-Wall", "-Wextra", "-Werror", "-pedantic", "-I"])
+            .arg(&include_dir)
+            .arg(&c_test_src)
+            .arg("-o")
+            .arg(&bin_path),
+        &format!("{cc} tests/standalone_c_test.c -> target/standalone_c_test{exe_suffix}"),
+    )?;
+    run_cmd(
+        Command::new(&bin_path).current_dir(root),
+        &format!("target/standalone_c_test{exe_suffix}"),
+    )?;
+
+    if !args.no_asan {
+        let clang = sanitizer_clang();
+        let san_path = target_dir.join(format!("standalone_c_test_san{exe_suffix}"));
+        run_cmd(
+            Command::new(&clang)
+                .current_dir(root)
+                .args([
+                    "-std=c99",
+                    "-Wall",
+                    "-Wextra",
+                    "-Werror",
+                    "-pedantic",
+                    "-O1",
+                    "-g",
+                    "-fno-omit-frame-pointer",
+                    "-fsanitize=address,undefined",
+                    "-fno-sanitize-recover=all",
+                    "-I",
+                ])
+                .arg(&include_dir)
+                .arg(&c_test_src)
+                .arg("-o")
+                .arg(&san_path),
+            &format!(
+                "{clang} -fsanitize=address,undefined tests/standalone_c_test.c -> target/standalone_c_test_san{exe_suffix}"
+            ),
+        )?;
+        run_cmd(
+            Command::new(&san_path)
+                .current_dir(root)
+                .env("ASAN_OPTIONS", portable_asan_options())
+                .env("UBSAN_OPTIONS", "print_stacktrace=1:halt_on_error=1"),
+            &format!("target/standalone_c_test_san{exe_suffix} (ASan + UBSan)"),
+        )?;
+    }
+
+    Ok(())
+}
+
+fn cmd_header(root: &Path, args: &CheckArgs) -> Result<(), String> {
+    if args.check {
+        let rendered = bamabi_sdk_gen::render_c99_header()?;
+        let header_path = root.join("include").join("bamabi.h");
+        let existing = fs::read_to_string(&header_path)
+            .map_err(|e| format!("failed to read {}: {e}", header_path.display()))?
+            .replace("\r\n", "\n");
+        if existing != rendered {
+            let diff = component_headers::first_line_diff(&rendered, &existing);
+            return Err(format!(
+                "{} is out of date with crates/bamabi_sys ({diff}); run `cargo xtask header`",
+                header_path.display()
+            ));
+        }
+        println!(
+            "==> Verified {} matches render_c99_header() byte-for-byte",
+            header_path.display()
+        );
+        return Ok(());
+    }
+    bamabi_sdk_gen::write_or_check_header(root, false)
+}
+
+fn cmd_audit(root: &Path, args: &AuditArgs) -> Result<(), String> {
+    if !args.skip_targets {
+        let targets = ["i686-unknown-linux-gnu", "wasm32-unknown-unknown"];
+        verify_rustup_targets(&targets)?;
+        for target in targets {
+            run_cmd(
+                cargo_cmd(root).args(["check", "-p", "bamabi_sys", "--target", target]),
+                &format!("cargo check -p bamabi_sys --target {target}"),
+            )?;
+        }
+    }
+
+    check_tool_available(
+        "typos",
+        &["--version"],
+        "install with `cargo install typos-cli`",
+    )?;
+    run_cmd(Command::new("typos").current_dir(root), "typos")?;
+
+    check_tool_available(
+        "cargo",
+        &["deny", "--version"],
+        "install with `cargo install cargo-deny`",
+    )?;
+    run_cmd(
+        clean_toolchain_cargo_cmd(root).args([
+            "deny",
+            "--all-features",
+            "check",
+            "advisories",
+            "licenses",
+            "bans",
+            "sources",
+        ]),
+        "cargo deny --all-features check advisories licenses bans sources",
+    )?;
+
+    if let Some(rev) = &args.baseline_rev {
+        check_tool_available(
+            "cargo",
+            &["semver-checks", "--version"],
+            "install with `cargo install cargo-semver-checks`",
+        )?;
+        run_cmd(
+            clean_toolchain_cargo_cmd(root).args([
+                "semver-checks",
+                "check-release",
+                "-p",
+                "bamabi_sys",
+                "--baseline-rev",
+                rev,
+            ]),
+            &format!("cargo semver-checks check-release -p bamabi_sys --baseline-rev {rev}"),
+        )?;
+    }
+
+    Ok(())
+}
+
+fn verify_rustup_targets(required: &[&str]) -> Result<(), String> {
+    let output = Command::new("rustup")
+        .args(["target", "list", "--installed"])
+        .env_remove("RUSTUP_TOOLCHAIN")
+        .output();
+    let Ok(output) = output else {
+        // If `rustup` is not present (e.g. distro-packaged toolchain), let `cargo check` decide.
+        return Ok(());
+    };
+    if !output.status.success() {
+        return Ok(());
+    }
+    let installed = String::from_utf8_lossy(&output.stdout);
+    let missing: Vec<&str> = required
+        .iter()
+        .copied()
+        .filter(|target| !installed.lines().any(|line| line.trim() == *target))
+        .collect();
+    if !missing.is_empty() {
+        return Err(format!(
+            "missing Rust target(s): {}; install with `rustup target add {}` (or pass `--skip-targets`)",
+            missing.join(", "),
+            missing.join(" ")
+        ));
+    }
+    Ok(())
+}
+
+fn cmd_miri(root: &Path, args: &MiriArgs) -> Result<(), String> {
+    check_tool_available(
+        "cargo",
+        &["+nightly", "miri", "--version"],
+        "install with `rustup toolchain install nightly --component miri`",
+    )?;
+    let (tree_borrows, stacked_borrows, s390x) = args.resolved();
+
+    if tree_borrows {
+        let flags = "-Zmiri-tree-borrows -Zmiri-strict-provenance";
+        run_miri_suite(root, flags, "Tree Borrows")?;
+    }
+    if stacked_borrows {
+        let flags = "-Zmiri-strict-provenance";
+        run_miri_suite(root, flags, "Stacked Borrows")?;
+    }
+    if s390x {
+        let flags = "-Zmiri-tree-borrows -Zmiri-strict-provenance";
+        run_cmd(
+            clean_toolchain_cargo_cmd(root)
+                .env("MIRIFLAGS", flags)
+                .args([
+                    "+nightly",
+                    "miri",
+                    "test",
+                    "--target",
+                    "s390x-unknown-linux-gnu",
+                    "-p",
+                    "bamabi_sys",
+                    "-p",
+                    "bamabi_guest_sys",
+                    "-p",
+                    "bamabi_guest",
+                    "--all-features",
+                ]),
+            "cargo +nightly miri test --target s390x-unknown-linux-gnu (Tree Borrows + strict provenance)",
+        )?;
+    }
+
+    Ok(())
+}
+
+fn run_miri_suite(root: &Path, miriflags: &str, label: &str) -> Result<(), String> {
+    run_cmd(
+        clean_toolchain_cargo_cmd(root)
+            .env("MIRIFLAGS", miriflags)
+            .args([
+                "+nightly",
+                "miri",
+                "test",
+                "-p",
+                "bamabi_sys",
+                "-p",
+                "bamabi_guest_sys",
+                "-p",
+                "bamabi_guest",
+                "--all-features",
+            ]),
+        &format!(
+            "cargo +nightly miri test ({label}) -p bamabi_sys -p bamabi_guest_sys -p bamabi_guest --all-features"
+        ),
+    )?;
+    run_cmd(
+        clean_toolchain_cargo_cmd(root)
+            .env("MIRIFLAGS", miriflags)
+            .args([
+                "+nightly",
+                "miri",
+                "test",
+                "-p",
+                "bamabi_macros",
+                "--test",
+                "mod_component_vtable",
+            ]),
+        &format!("cargo +nightly miri test ({label}) -p bamabi_macros --test mod_component_vtable"),
+    )?;
+    Ok(())
+}
+
+fn cmd_kani(root: &Path, args: &KaniArgs) -> Result<(), String> {
+    check_tool_available(
+        "cargo",
+        &["kani", "--version"],
+        "install Kani (`cargo install --locked kani-verifier && cargo kani setup`)",
+    )?;
+    let mut cmd = clean_toolchain_cargo_cmd(root);
+    cmd.arg("kani");
+    if args.packages.is_empty() {
+        cmd.args(["-p", "bamabi_sys", "-p", "bamabi_guest_sys"]);
+    } else {
+        for pkg in &args.packages {
+            cmd.args(["-p", pkg]);
+        }
+    }
+    if let Some(pat) = &args.harness {
+        cmd.args(["--harness", pat]);
+    }
+    cmd.args([
+        "-Z",
+        "unstable-options",
+        "--harness-timeout",
+        "15m",
+        "--output-format",
+        "terse",
+        "-j",
+    ]);
+    run_cmd(&mut cmd, "cargo kani")
+}
+
+fn cmd_nightly(root: &Path, args: &NightlyArgs) -> Result<(), String> {
+    cmd_miri(
+        root,
+        &MiriArgs {
+            tree_borrows: false,
+            stacked_borrows: false,
+            s390x: true,
+        },
+    )?;
+
+    check_tool_available(
+        "cargo",
+        &["+nightly", "--version"],
+        "install with `rustup toolchain install nightly`",
+    )?;
+    let cases = args.cases.to_string();
+
+    run_cmd(
+        clean_toolchain_cargo_cmd(root)
+            .env("RUSTFLAGS", "-Zrandomize-layout")
+            .env("PROPTEST_CASES", &cases)
+            .args([
+                "+nightly",
+                "test",
+                "-p",
+                "bamabi_sys",
+                "-p",
+                "bamabi_guest_sys",
+                "-p",
+                "bamabi_guest",
+                "--all-features",
+            ]),
+        &format!(
+            "RUSTFLAGS=\"-Zrandomize-layout\" PROPTEST_CASES={cases} cargo +nightly test -p bamabi_sys -p bamabi_guest_sys -p bamabi_guest --all-features"
+        ),
+    )?;
+    run_cmd(
+        clean_toolchain_cargo_cmd(root)
+            .env("RUSTFLAGS", "-Zrandomize-layout")
+            .env("PROPTEST_CASES", &cases)
+            .args([
+                "+nightly",
+                "test",
+                "-p",
+                "bamabi_macros",
+                "--lib",
+                "--test",
+                "mod_component_vtable",
+            ]),
+        &format!(
+            "RUSTFLAGS=\"-Zrandomize-layout\" PROPTEST_CASES={cases} cargo +nightly test -p bamabi_macros --lib --test mod_component_vtable"
+        ),
+    )?;
+    run_cmd(
+        clean_toolchain_cargo_cmd(root)
+            .env("RUSTFLAGS", "-Zrandomize-layout")
+            .env("PROPTEST_CASES", &cases)
+            .args(["+nightly", "test", "-p", "bamabi_sdk_gen"]),
+        &format!(
+            "RUSTFLAGS=\"-Zrandomize-layout\" PROPTEST_CASES={cases} cargo +nightly test -p bamabi_sdk_gen"
+        ),
+    )?;
+
+    Ok(())
+}
+
+fn cmd_ci(root: &Path, args: &CiArgs) -> Result<(), String> {
+    cmd_fmt(root, &FmtArgs { fix: false })?;
+    cmd_header(root, &CheckArgs { check: true })?;
+    component_headers::write_or_check_component_headers(root, true)?;
+    cmd_lint(root)?;
+    cmd_test(root, &TestArgs::default())?;
+    cmd_c_test(root, &CTestArgs::default())?;
+
+    if args.audit {
+        cmd_audit(root, &AuditArgs::default())?;
+    }
+    if args.miri {
+        cmd_miri(root, &MiriArgs::default())?;
+    }
+    if args.kani {
+        cmd_kani(root, &KaniArgs::default())?;
+    }
+    println!("==> All CI checks passed!");
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn s(items: &[&str]) -> Vec<String> {
+        items.iter().map(|item| (*item).to_owned()).collect()
+    }
+
+    #[test]
+    fn parses_help_variants() {
+        assert_eq!(parse_args(&s(&[])).unwrap(), ParsedArgs::Help(None));
+        assert_eq!(parse_args(&s(&["--help"])).unwrap(), ParsedArgs::Help(None));
+        assert_eq!(parse_args(&s(&["-h"])).unwrap(), ParsedArgs::Help(None));
+        assert_eq!(
+            parse_args(&s(&["help", "miri"])).unwrap(),
+            ParsedArgs::Help(Some(SubcommandKind::Miri))
+        );
+        assert_eq!(
+            parse_args(&s(&["gen-component-headers", "--help"])).unwrap(),
+            ParsedArgs::Help(Some(SubcommandKind::GenComponentHeaders))
+        );
+        assert_eq!(
+            parse_args(&s(&["c-test", "-h"])).unwrap(),
+            ParsedArgs::Help(Some(SubcommandKind::CTest))
+        );
+    }
+
+    #[test]
+    fn parses_fmt_lint_header_and_c_test() {
+        assert_eq!(
+            parse_args(&s(&["fmt"])).unwrap(),
+            ParsedArgs::Run(CommandSpec::Fmt(FmtArgs { fix: false }))
+        );
+        assert_eq!(
+            parse_args(&s(&["fmt", "--fix"])).unwrap(),
+            ParsedArgs::Run(CommandSpec::Fmt(FmtArgs { fix: true }))
+        );
+        assert_eq!(
+            parse_args(&s(&["lint"])).unwrap(),
+            ParsedArgs::Run(CommandSpec::Lint)
+        );
+        assert_eq!(
+            parse_args(&s(&["header", "--check"])).unwrap(),
+            ParsedArgs::Run(CommandSpec::Header(CheckArgs { check: true }))
+        );
+        assert_eq!(
+            parse_args(&s(&["gen-component-headers"])).unwrap(),
+            ParsedArgs::Run(CommandSpec::GenComponentHeaders(CheckArgs { check: false }))
+        );
+        assert_eq!(
+            parse_args(&s(&["c-test", "--no-asan"])).unwrap(),
+            ParsedArgs::Run(CommandSpec::CTest(CTestArgs { no_asan: true }))
+        );
+    }
+
+    #[test]
+    fn parses_test_filters_and_cases() {
+        assert_eq!(
+            parse_args(&s(&["test"])).unwrap(),
+            ParsedArgs::Run(CommandSpec::Test(TestArgs::default()))
+        );
+        assert_eq!(
+            parse_args(&s(&[
+                "test",
+                "--cases",
+                "64",
+                "--proptest",
+                "--header-parity"
+            ]))
+            .unwrap(),
+            ParsedArgs::Run(CommandSpec::Test(TestArgs {
+                cases: Some(64),
+                no_default_features: false,
+                all_features: false,
+                doc: false,
+                proptest: true,
+                header_parity: true,
+            }))
+        );
+        assert_eq!(
+            parse_args(&s(&[
+                "test",
+                "--cases=128",
+                "--no-default-features",
+                "--doc"
+            ]))
+            .unwrap(),
+            ParsedArgs::Run(CommandSpec::Test(TestArgs {
+                cases: Some(128),
+                no_default_features: true,
+                all_features: false,
+                doc: true,
+                proptest: false,
+                header_parity: false,
+            }))
+        );
+    }
+
+    #[test]
+    fn parses_audit_miri_kani_nightly_and_ci() {
+        assert_eq!(
+            parse_args(&s(&["audit", "--baseline-rev", "v0.3.0", "--skip-targets"])).unwrap(),
+            ParsedArgs::Run(CommandSpec::Audit(AuditArgs {
+                baseline_rev: Some("v0.3.0".to_owned()),
+                skip_targets: true,
+            }))
+        );
+        assert_eq!(
+            parse_args(&s(&["miri"])).unwrap(),
+            ParsedArgs::Run(CommandSpec::Miri(MiriArgs::default()))
+        );
+        assert_eq!(MiriArgs::default().resolved(), (true, true, false));
+        assert_eq!(
+            parse_args(&s(&["miri", "--s390x"])).unwrap(),
+            ParsedArgs::Run(CommandSpec::Miri(MiriArgs {
+                tree_borrows: false,
+                stacked_borrows: false,
+                s390x: true,
+            }))
+        );
+        assert_eq!(
+            parse_args(&s(&[
+                "kani",
+                "-p",
+                "bamabi_sys",
+                "--harness=po_w1_abi_constants"
+            ]))
+            .unwrap(),
+            ParsedArgs::Run(CommandSpec::Kani(KaniArgs {
+                harness: Some("po_w1_abi_constants".to_owned()),
+                packages: vec!["bamabi_sys".to_owned()],
+            }))
+        );
+        assert_eq!(
+            parse_args(&s(&["nightly", "--cases", "512"])).unwrap(),
+            ParsedArgs::Run(CommandSpec::Nightly(NightlyArgs { cases: 512 }))
+        );
+        assert_eq!(
+            parse_args(&s(&["ci", "--full"])).unwrap(),
+            ParsedArgs::Run(CommandSpec::Ci(CiArgs {
+                audit: true,
+                miri: true,
+                kani: true,
+            }))
+        );
+    }
+
+    #[test]
+    fn rejects_invalid_subcommands_and_flags() {
+        assert!(parse_args(&s(&["unknown"])).is_err());
+        assert!(parse_args(&s(&["lint", "--extra"])).is_err());
+        assert!(parse_args(&s(&["test", "--cases", "0"])).is_err());
+        assert!(parse_args(&s(&["test", "--cases"])).is_err());
+        assert!(parse_args(&s(&["audit", "--baseline-rev="])).is_err());
+        assert!(parse_args(&s(&["kani", "-p"])).is_err());
+        assert!(parse_args(&s(&["ci", "--bogus"])).is_err());
+    }
+}

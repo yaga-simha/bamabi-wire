@@ -6,6 +6,7 @@ members = [
     "crates/bamabi_sdk_gen",
     "crates/bamabi_guest_sys",
     "crates/bamabi_guest",
+    "xtask",
 ]
 
 [workspace.package]

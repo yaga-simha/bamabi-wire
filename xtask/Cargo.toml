@@ -1,0 +1,16 @@
+[package]
+name = "xtask"
+version.workspace = true
+edition.workspace = true
+rust-version = "1.95"
+license.workspace = true
+authors.workspace = true
+publish = false
+
+[dependencies]
+bamabi_macros = { workspace = true }
+bamabi_sdk_gen = { path = "../crates/bamabi_sdk_gen" }
+bamabi_sys = { workspace = true }
+
+[lints]
+workspace = true
