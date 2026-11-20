@@ -202,8 +202,20 @@ fn witness_enum_strategy() -> impl Strategy<Value = WitnessEnum> {
     ]
 }
 
+fn proptest_config() -> ProptestConfig {
+    if cfg!(miri) {
+        ProptestConfig {
+            cases: 4,
+            failure_persistence: None,
+            ..ProptestConfig::default()
+        }
+    } else {
+        ProptestConfig::with_cases(512)
+    }
+}
+
 proptest! {
-    #![proptest_config(ProptestConfig::with_cases(512))]
+    #![proptest_config(proptest_config())]
 
     #[test]
     fn mod_component_struct_witness_roundtrip(

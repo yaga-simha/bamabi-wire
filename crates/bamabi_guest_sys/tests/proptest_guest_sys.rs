@@ -278,6 +278,18 @@ enum HeldRead<'a> {
     Entities(&'a [FfiEntity]),
 }
 
+fn proptest_config() -> ProptestConfig {
+    if cfg!(miri) {
+        ProptestConfig {
+            cases: 4,
+            failure_persistence: None,
+            ..ProptestConfig::default()
+        }
+    } else {
+        ProptestConfig::with_cases(512)
+    }
+}
+
 enum HeldWrite<'a> {
     U8(&'a mut [u8]),
     U32(&'a mut [u32]),
@@ -286,7 +298,7 @@ enum HeldWrite<'a> {
 }
 
 proptest! {
-    #![proptest_config(ProptestConfig::with_cases(512))]
+    #![proptest_config(proptest_config())]
 
     #[test]
     fn chunk_column_dispenser_random_sequences_never_alias_mutably(
@@ -815,7 +827,7 @@ unsafe extern "C" fn msg_read_batch(
 }
 
 proptest! {
-    #![proptest_config(ProptestConfig::with_cases(512))]
+    #![proptest_config(proptest_config())]
 
     #[test]
     fn read_messages_batch_checked_clamps_hostile_read_count_and_guards_metadata(
@@ -978,7 +990,7 @@ fn outer_array_plan_strategy() -> impl Strategy<Value = OuterArrayPlan> {
 }
 
 proptest! {
-    #![proptest_config(ProptestConfig::with_cases(512))]
+    #![proptest_config(proptest_config())]
 
     #[test]
     fn sparse_rows_and_mut_hostile_pointer_array_fuzzing(

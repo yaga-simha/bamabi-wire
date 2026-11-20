@@ -190,7 +190,21 @@ fn apply_mutation(s: &mut String, m: HexMutation) {
     *s = chars.into_iter().collect();
 }
 
+fn proptest_config() -> ProptestConfig {
+    if cfg!(miri) {
+        ProptestConfig {
+            cases: 4,
+            failure_persistence: None,
+            ..ProptestConfig::default()
+        }
+    } else {
+        ProptestConfig::default()
+    }
+}
+
 proptest! {
+    #![proptest_config(proptest_config())]
+
     #[test]
     fn siphash24_128_matches_reference(
         k0 in any::<u64>(),

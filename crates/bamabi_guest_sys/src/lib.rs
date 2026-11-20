@@ -47,6 +47,8 @@ pub mod trampoline;
 pub mod wire_types;
 
 #[cfg(kani)]
+mod kani_bounds_proofs;
+#[cfg(kani)]
 mod kani_proofs;
 
 pub use bamabi_sys::{BamSystemCtx, FfiBool, FfiResult};
