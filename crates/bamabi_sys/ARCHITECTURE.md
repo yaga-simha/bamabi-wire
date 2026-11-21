@@ -20,7 +20,7 @@
 | `bamabi_guest_sys` | Layer 0 | Wraps all 68 `BamHostApi` slots with `covers_slot` checks, `extern "C"` panic guards, and validated slice/descriptor helpers |
 | `bamabi_guest` | Layer 0 | Exposes safe `#![forbid(unsafe_code)]` Rust guest abstractions over `bamabi_sys` primitives and descriptors |
 | `bamabi-tools` (`bamabi_manifest`, `cargo-bam`) | Layer 1 | Reuses `ABI_VERSION` and wire primitives without pulling in Bevy |
-| `bamabi-core` (`bamabi_host_sys`, `bamabi_host`) | Layer 2 | Populates the 68-slot `BamHostApi` table, validates `BamManifest` / descriptors via `read_descriptor`, and resolves `ComponentUuid` |
+| `bamabi-core` (`bamabi_host_sys`, `bamabi_host`) | Layer 2 | Populates the 73-slot `BamHostApi` table, validates `BamManifest` / descriptors via `read_descriptor`, and resolves `ComponentUuid` |
 | `bql_jit` / `bevy_bql` | External compiler | Uses `bamabi_sys::offsets::{OFF64_*, OFF32_*}` and `ComponentUuid` SipHash-2-4-128 for AOT/JIT lowering |
 
 ---
@@ -41,12 +41,12 @@ Only [`src/host_api.rs`](src/host_api.rs) is `pub mod host_api`; all other modul
 | ↳ *Assets* | [`src/primitives/asset.rs`](src/primitives/asset.rs) | `FfiAssetHandle` (`KIND_NONE`, `KIND_INDEX`, `KIND_UUID`), `FfiAssetLoadState` (`NOT_LOADED..=FAILED`) |
 | ↳ *UUIDs & Hashing* | [`src/primitives/uuid.rs`](src/primitives/uuid.rs) | `ConstSipHasher128`, `siphash24_128`, `SIPHASH_KEY_{0,1}`, `ComponentUuid`, `FNV1A_64_{OFFSET_BASIS,PRIME}`, `fnv1a_64_*` |
 | **Extensibility** | [`src/extensible.rs`](src/extensible.rs) | `ExtensibleStruct` trait, `read_extensible_struct`, `read_descriptor` |
-| **Access & Schedules** | [`src/access.rs`](src/access.rs) | `MAX_TERMS_PER_QUERY = 32`, `MAX_QUERIES_PER_SYSTEM = 8`, `AccessMode(u32)` (`0..=14`), `ScheduleId(u32)` (`0..=5`, `CUSTOM_BASE = 1024`), `BamTermDesc` |
+| **Access & Schedules** | [`src/access.rs`](src/access.rs) | `MAX_TERMS_PER_QUERY = 32`, `MAX_QUERIES_PER_SYSTEM = 16`, `AccessMode(u32)` (`0..=14`), `ScheduleId(u32)` (`0..=5`, `CUSTOM_BASE = 1024`), `BamTermDesc` (`BAM_TERM_FLAG_CHANGED/ADDED`) |
 | **Components & Relations** | [`src/component.rs`](src/component.rs) | `ComponentDesc`, `BAM_COMPONENT_*`, `VTableHeader`, `MappedWireVTable<W>`, `MappedStringVTable`, `BamFieldKind`, `BamFieldDesc`, `BamRequiredComponent`, `BAM_REQUIRED_*`, `BamRelationDesc`, `BAM_RELATION_*`, `BamLayoutInfo`, `BamRowMigrateFn`, `BamScheduleSetDesc`, `BAM_SCHEDULE_SET_*` |
 | **Systems & Observers** | [`src/system.rs`](src/system.rs) | `BamHostCtx`, `BamLoadCtx`, `BamSystemCtx`, `BamSystemFn`, `BamRunIfFn`, `BamQueryDesc`, `BamSystemDesc`, `BAM_SYSTEM_*`, `BamEventKind`, `BamObserverFn`, `BamObserverMutFn`, `BamObserverDesc`, `BAM_OBSERVER_*` |
 | **Commands & Triggers** | [`src/commands.rs`](src/commands.rs) | `BamCommands`, `BamTriggerDesc`, `BAM_TRIGGER_*`, and `BamCmd*Fn` function typedefs |
 | **Iteration & Ticks** | [`src/iter.rs`](src/iter.rs) | `BamIter`, `BAM_STORAGE_FLAG_*`, `BAM_MAX_CHANGE_AGE`, `BamChangeTicks`, `BamColumnInfo`, and `BamIter*Fn` / `BamRes*Fn` / `BamMsg*Fn` / `BamParForEachChunkFn` typedefs |
-| **Host API & Offsets** | [`src/host_api.rs`](src/host_api.rs) | `BamInstance`, `BamManifest`, `BamHostApi` (68 slots), `BAM_HOST_API_SLOT_COUNT = 68`, `pub mod offsets`, and `offset_tests` |
+| **Host API & Offsets** | [`src/host_api.rs`](src/host_api.rs) | `BamInstance`, `BamManifest`, `BamHostApi` (73 slots), `BAM_HOST_API_SLOT_COUNT = 73`, `pub mod offsets`, and `offset_tests` |
 | **Traits** | [`src/traits.rs`](src/traits.rs) | `RawInsertable`, `AbiPod`, `assert_abi_pod`, `assert_raw_insertable`, `SymbolEntry`, `ModComponent` |
 | **Unit Tests** | [`src/tests/mod.rs`](src/tests/mod.rs), [`src/tests/layout.rs`](src/tests/layout.rs) | `#[cfg(test)]` layout, validation, versioning, SipHash, slice, and ABI 0.2/0.3 unit tests |
 | **Property Tests** | [`tests/proptest_wire.rs`](tests/proptest_wire.rs) | `proptest` suites comparing `siphash24_128`, streaming `ComponentUuid`, and `try_parse_hex` against independent references |
@@ -100,7 +100,7 @@ Every cross-boundary struct in `bamabi_sys` is either `#[repr(transparent)]` ove
 | `BamRelationDesc` | 56 B / 8 B | 44 B / 4 B | `MIN_V0_3_SIZE` | 56 / 44 |
 | `BamLayoutInfo` | 64 B / 8 B | 48 B / `align_of::<u64>()` | `MIN_V0_3_SIZE` | 64 / 48 |
 | `BamScheduleSetDesc` | 48 B / 8 B | 36 B / 4 B | `MIN_V0_3_SIZE` | 48 / 36 |
-| `BamHostApi` | 552 B / 8 B | 280 B / 4 B | 224 / 116 | 552 / 280 |
+| `BamHostApi` | 592 B / 8 B | 300 B / 4 B | 224 / 116 | 552 / 280 |
 
 ---
 
@@ -115,9 +115,10 @@ Every cross-boundary struct in `bamabi_sys` is either `#[repr(transparent)]` ove
   - `224` bytes on 64-bit (`8 + 27 * 8`).
   - `116` bytes on 32-bit (`8 + 27 * 4`).
 - **Slots `27..50` (Extended `0.2.x`):** `par_for_each_chunk` through `cmd_spawn_scene` (23 slots at offsets `224..408` on 64-bit / `116..208` on 32-bit).
-- **Slots `50..68` (ABI `0.3.0`):** `log_diagnostic` through `migrate_component_column` (18 slots at offsets `408..552` on 64-bit / `208..280` on 32-bit). Terminates at `BamHostApi::MIN_V0_3_SIZE == size_of::<BamHostApi>()`:
+- **Slots `50..68` (ABI `0.3.0`):** `log_diagnostic` through `migrate_component_column` (18 slots at offsets `408..552` on 64-bit / `208..280` on 32-bit). Terminates at frozen `BamHostApi::MIN_V0_3_SIZE`:
   - `552` bytes on 64-bit (`8 + 68 * 8`).
   - `280` bytes on 32-bit (`8 + 68 * 4`).
+- **Slots `68..73` (ABI `0.3.0` batching & parity tail):** `iter_next_chunk_batch`, `iter_column_ticks`, `cmd_clone_entity`, `cmd_insert_resource`, `cmd_remove_resource` (`552..592` on 64-bit / `280..300` on 32-bit), bringing `size_of::<BamHostApi>()` to `592` bytes (64-bit) / `300` bytes (32-bit).
 
 ### Safe Header Probing & `covers_slot`
 
@@ -130,7 +131,7 @@ Because an older host could pass a `BamHostApi` allocation smaller than `size_of
 
 ### The `offsets` Module
 
-`bamabi_sys::offsets` (defined by `define_host_api_offsets!` in [`src/host_api.rs`](src/host_api.rs)) exports three constant families for all 70 fields (`struct_size`, `abi_version`, and slots `0..68`), plus `SLOT_COUNT = 68`, `SIZE_64 = 552`, and `SIZE_32 = 280`:
+`bamabi_sys::offsets` (defined by `define_host_api_offsets!` in [`src/host_api.rs`](src/host_api.rs)) exports three constant families for all 75 fields (`struct_size`, `abi_version`, and slots `0..73`), plus `SLOT_COUNT = 73`, `SIZE_64 = 592`, and `SIZE_32 = 300`:
 
 - `<FIELD>`: Target-native byte offset (`core::mem::offset_of!(BamHostApi, <field>)`).
 - `OFF64_<FIELD>`: Architecture-independent 64-bit offset (`8 + 8 * slot_idx`).

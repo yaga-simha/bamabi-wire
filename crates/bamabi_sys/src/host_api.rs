@@ -8,8 +8,9 @@ use core::{
 use crate::{
     access::ScheduleId,
     commands::{
-        BamCmdDespawnAllFn, BamCmdDespawnFn, BamCmdInsertDefaultFn, BamCmdInsertFn,
-        BamCmdObserveFn, BamCmdRemoveFn, BamCmdSpawnBatchFn, BamCmdSpawnEmptyFn, BamCmdSpawnFn,
+        BamCmdCloneEntityFn, BamCmdDespawnAllFn, BamCmdDespawnFn, BamCmdInsertDefaultFn,
+        BamCmdInsertFn, BamCmdInsertResourceFn, BamCmdObserveFn, BamCmdRemoveFn,
+        BamCmdRemoveResourceFn, BamCmdSpawnBatchFn, BamCmdSpawnEmptyFn, BamCmdSpawnFn,
         BamCmdSpawnSceneFn, BamCmdTriggerExFn, BamCmdTriggerFn, BamCommands,
     },
     component::{
@@ -19,10 +20,10 @@ use crate::{
     iter::{
         BamChangeTicks, BamIter, BamIterColumnInfoFn, BamIterColumnMutableFn,
         BamIterColumnMutableUntrackedFn, BamIterColumnReadonlyFn, BamIterColumnRowsMutableFn,
-        BamIterColumnRowsReadonlyFn, BamIterEntitiesFn, BamIterMarkChangedRangeFn,
-        BamIterNextChunkBatchFn, BamIterNextChunkFn, BamIterReadRemovedFn, BamIterResetFn,
-        BamMsgReadBatchFn, BamMsgSendFn, BamMsgWriteBatchFn, BamParForEachChunkFn, BamResMutPtrFn,
-        BamResPtrFn, BamResTicksFn,
+        BamIterColumnRowsReadonlyFn, BamIterColumnTicksFn, BamIterEntitiesFn,
+        BamIterMarkChangedRangeFn, BamIterNextChunkBatchFn, BamIterNextChunkFn,
+        BamIterReadRemovedFn, BamIterResetFn, BamMsgReadBatchFn, BamMsgSendFn, BamMsgWriteBatchFn,
+        BamParForEachChunkFn, BamResMutPtrFn, BamResPtrFn, BamResTicksFn,
     },
     primitives::{
         BamComponent, BamSymbol, BamSystem, BamSystemSet, ComponentUuid, FfiAssetHandle,
@@ -637,8 +638,8 @@ pub type BamMigrateComponentColumnFn = unsafe extern "C" fn(
     user_data: *mut c_void,
 ) -> FfiResult;
 
-/// Total number of function-pointer slots in the ABI `0.3.0` [`BamHostApi`] table (`69`).
-pub const BAM_HOST_API_SLOT_COUNT: usize = 69;
+/// Total number of function-pointer slots in the ABI `0.3.0` [`BamHostApi`] table (`73`).
+pub const BAM_HOST_API_SLOT_COUNT: usize = 73;
 
 /// Complete versioned host function table passed to `bamabi_init`
 /// (`typedef struct BamHostApi BamHostApi;`).
@@ -647,8 +648,8 @@ pub const BAM_HOST_API_SLOT_COUNT: usize = 69;
 /// null-pointer checks are sound without raw pointer byte-probing.
 ///
 /// Layout:
-/// - 64-bit: `MIN_V0_2_SIZE = 224` bytes (`8`B header + `27 * 8`B core slots; `MIN_V0_3_SIZE = 552` bytes for the first 68 slots; `size_of = 560` bytes with all 69 slots), `8`-byte alignment.
-/// - 32-bit: `MIN_V0_2_SIZE = 116` bytes (`8`B header + `27 * 4`B core slots; `MIN_V0_3_SIZE = 280` bytes for the first 68 slots; `size_of = 284` bytes with all 69 slots), `4`-byte alignment.
+/// - 64-bit: `MIN_V0_2_SIZE = 224` bytes (`8`B header + `27 * 8`B core slots; `MIN_V0_3_SIZE = 552` bytes for the first 68 slots; `size_of = 592` bytes with all 73 slots), `8`-byte alignment.
+/// - 32-bit: `MIN_V0_2_SIZE = 116` bytes (`8`B header + `27 * 4`B core slots; `MIN_V0_3_SIZE = 280` bytes for the first 68 slots; `size_of = 300` bytes with all 73 slots), `4`-byte alignment.
 #[repr(C)]
 #[derive(Debug, Copy, Clone)]
 pub struct BamHostApi {
@@ -812,6 +813,14 @@ pub struct BamHostApi {
     pub migrate_component_column: Option<BamMigrateComponentColumnFn>,
     /// Advance iterator and fetch chunk length, entities pointer, and column pointers in one FFI call (`offset 552` / `280`).
     pub iter_next_chunk_batch: Option<BamIterNextChunkBatchFn>,
+    /// Retrieve per-row `added` and `changed` tick arrays and system tick window for dense column `term_index` (`offset 560` / `284`).
+    pub iter_column_ticks: Option<BamIterColumnTicksFn>,
+    /// Queue deferred entity component cloning from `src_entity` onto `dst_entity` (`offset 568` / `288`).
+    pub cmd_clone_entity: Option<BamCmdCloneEntityFn>,
+    /// Queue deferred singleton resource insertion or replacement (`offset 576` / `292`).
+    pub cmd_insert_resource: Option<BamCmdInsertResourceFn>,
+    /// Queue deferred singleton resource removal (`offset 584` / `296`).
+    pub cmd_remove_resource: Option<BamCmdRemoveResourceFn>,
 }
 
 impl BamHostApi {
@@ -947,12 +956,16 @@ impl BamHostApi {
             && self.migrate_component_column.is_some()
     }
 
-    /// Returns `true` if all 69 ABI `0.3` function-pointer slots are `Some`.
+    /// Returns `true` if all 73 ABI `0.3` function-pointer slots are `Some`.
     #[inline]
     pub const fn has_all_slots(&self) -> bool {
         self.has_all_v0_2_extended_slots()
             && self.has_all_v0_3_slots()
             && self.iter_next_chunk_batch.is_some()
+            && self.iter_column_ticks.is_some()
+            && self.cmd_clone_entity.is_some()
+            && self.cmd_insert_resource.is_some()
+            && self.cmd_remove_resource.is_some()
     }
 
     /// Validates `struct_size >= MIN_V0_2_SIZE`, SemVer compatibility against `guest_version`,
@@ -979,7 +992,7 @@ const _: () = {
     {
         assert!(BamHostApi::MIN_V0_2_SIZE == 224);
         assert!(BamHostApi::MIN_V0_3_SIZE == 552);
-        assert!(core::mem::size_of::<BamHostApi>() == 560);
+        assert!(core::mem::size_of::<BamHostApi>() == 592);
         assert!(core::mem::align_of::<BamHostApi>() == 8);
         assert!(core::mem::offset_of!(BamHostApi, struct_size) == 0);
         assert!(core::mem::offset_of!(BamHostApi, abi_version) == 4);
@@ -1052,12 +1065,16 @@ const _: () = {
         assert!(core::mem::offset_of!(BamHostApi, cmd_remove_relation) == 536);
         assert!(core::mem::offset_of!(BamHostApi, migrate_component_column) == 544);
         assert!(core::mem::offset_of!(BamHostApi, iter_next_chunk_batch) == 552);
+        assert!(core::mem::offset_of!(BamHostApi, iter_column_ticks) == 560);
+        assert!(core::mem::offset_of!(BamHostApi, cmd_clone_entity) == 568);
+        assert!(core::mem::offset_of!(BamHostApi, cmd_insert_resource) == 576);
+        assert!(core::mem::offset_of!(BamHostApi, cmd_remove_resource) == 584);
     }
     #[cfg(target_pointer_width = "32")]
     {
         assert!(BamHostApi::MIN_V0_2_SIZE == 116);
         assert!(BamHostApi::MIN_V0_3_SIZE == 280);
-        assert!(core::mem::size_of::<BamHostApi>() == 284);
+        assert!(core::mem::size_of::<BamHostApi>() == 300);
         assert!(core::mem::align_of::<BamHostApi>() == 4);
         assert!(core::mem::offset_of!(BamHostApi, struct_size) == 0);
         assert!(core::mem::offset_of!(BamHostApi, abi_version) == 4);
@@ -1130,6 +1147,10 @@ const _: () = {
         assert!(core::mem::offset_of!(BamHostApi, cmd_remove_relation) == 272);
         assert!(core::mem::offset_of!(BamHostApi, migrate_component_column) == 276);
         assert!(core::mem::offset_of!(BamHostApi, iter_next_chunk_batch) == 280);
+        assert!(core::mem::offset_of!(BamHostApi, iter_column_ticks) == 284);
+        assert!(core::mem::offset_of!(BamHostApi, cmd_clone_entity) == 288);
+        assert!(core::mem::offset_of!(BamHostApi, cmd_insert_resource) == 292);
+        assert!(core::mem::offset_of!(BamHostApi, cmd_remove_resource) == 296);
     }
 };
 
@@ -1141,15 +1162,15 @@ unsafe impl ExtensibleStruct for BamHostApi {
 
 /// Compile-time byte offsets for every header field and function-pointer slot of [`BamHostApi`].
 ///
-/// Exports three constant families for all 71 fields of [`BamHostApi`] (`struct_size`,
-/// `abi_version`, and all 69 function-pointer slots):
+/// Exports three constant families for all 75 fields of [`BamHostApi`] (`struct_size`,
+/// `abi_version`, and all 73 function-pointer slots):
 ///
 /// - `<FIELD>`: Pointer-width-native byte offset (`core::mem::offset_of!(BamHostApi, <field>)`)
 ///   for the active compilation target.
 /// - `OFF64_<FIELD>`: Architecture-independent 64-bit byte offset (`struct_size` at `0`,
-///   `abi_version` at `4`, slot `k` at `8 + 8 * k`, total [`offsets::SIZE_64`] = `560` bytes).
+///   `abi_version` at `4`, slot `k` at `8 + 8 * k`, total [`offsets::SIZE_64`] = `592` bytes).
 /// - `OFF32_<FIELD>`: Architecture-independent 32-bit byte offset (`struct_size` at `0`,
-///   `abi_version` at `4`, slot `k` at `8 + 4 * k`, total [`offsets::SIZE_32`] = `284` bytes).
+///   `abi_version` at `4`, slot `k` at `8 + 4 * k`, total [`offsets::SIZE_32`] = `300` bytes).
 ///
 /// Cross-target code generators and JIT backends (such as `bql_jit`) can import exact slot
 /// offsets without hardcoding magic numbers, while compile-time assertions guarantee agreement
@@ -1157,14 +1178,14 @@ unsafe impl ExtensibleStruct for BamHostApi {
 pub mod offsets {
     use super::{BAM_HOST_API_SLOT_COUNT, BamHostApi};
 
-    /// Total number of function-pointer slots in ABI `0.3.0` [`BamHostApi`] (`69`).
+    /// Total number of function-pointer slots in ABI `0.3.0` [`BamHostApi`] (`73`).
     pub const SLOT_COUNT: usize = BAM_HOST_API_SLOT_COUNT;
 
-    /// Total byte size of ABI `0.3.0` [`BamHostApi`] on 64-bit targets (`560` bytes).
-    pub const SIZE_64: usize = 560;
+    /// Total byte size of ABI `0.3.0` [`BamHostApi`] on 64-bit targets (`592` bytes).
+    pub const SIZE_64: usize = 592;
 
-    /// Total byte size of ABI `0.3.0` [`BamHostApi`] on 32-bit targets (`284` bytes).
-    pub const SIZE_32: usize = 284;
+    /// Total byte size of ABI `0.3.0` [`BamHostApi`] on 32-bit targets (`300` bytes).
+    pub const SIZE_32: usize = 300;
 
     macro_rules! define_host_api_offsets {
         (
@@ -1244,7 +1265,7 @@ pub mod offsets {
             )*
 
             const _: () = {
-                assert!(SLOT_COUNT == 69);
+                assert!(SLOT_COUNT == 73);
                 assert!(SIZE_64 == 8 + 8 * SLOT_COUNT);
                 assert!(SIZE_32 == 8 + 4 * SLOT_COUNT);
                 $(
@@ -1352,6 +1373,10 @@ pub mod offsets {
             (66, cmd_remove_relation, CMD_REMOVE_RELATION, OFF64_CMD_REMOVE_RELATION, 536, OFF32_CMD_REMOVE_RELATION, 272),
             (67, migrate_component_column, MIGRATE_COMPONENT_COLUMN, OFF64_MIGRATE_COMPONENT_COLUMN, 544, OFF32_MIGRATE_COMPONENT_COLUMN, 276),
             (68, iter_next_chunk_batch, ITER_NEXT_CHUNK_BATCH, OFF64_ITER_NEXT_CHUNK_BATCH, 552, OFF32_ITER_NEXT_CHUNK_BATCH, 280),
+            (69, iter_column_ticks, ITER_COLUMN_TICKS, OFF64_ITER_COLUMN_TICKS, 560, OFF32_ITER_COLUMN_TICKS, 284),
+            (70, cmd_clone_entity, CMD_CLONE_ENTITY, OFF64_CMD_CLONE_ENTITY, 568, OFF32_CMD_CLONE_ENTITY, 288),
+            (71, cmd_insert_resource, CMD_INSERT_RESOURCE, OFF64_CMD_INSERT_RESOURCE, 576, OFF32_CMD_INSERT_RESOURCE, 292),
+            (72, cmd_remove_resource, CMD_REMOVE_RESOURCE, OFF64_CMD_REMOVE_RESOURCE, 584, OFF32_CMD_REMOVE_RESOURCE, 296),
         ]
     }
 }
@@ -1360,17 +1385,17 @@ pub mod offsets {
 mod offset_tests {
     use super::{BAM_HOST_API_SLOT_COUNT, BamHostApi, offsets};
 
-    /// Test scenario (Proof Obligation PO-W6): verifies that `BAM_HOST_API_SLOT_COUNT == 69`,
-    /// `SIZE_64 == 560`, `SIZE_32 == 284`, header offsets sit at `0`/`4`, every slot `k` in
-    /// `0..69` satisfies `OFF64_k == 8 + 8*k` and `OFF32_k == 8 + 4*k` matching native
+    /// Test scenario (Proof Obligation PO-W6): verifies that `BAM_HOST_API_SLOT_COUNT == 73`,
+    /// `SIZE_64 == 592`, `SIZE_32 == 300`, header offsets sit at `0`/`4`, every slot `k` in
+    /// `0..73` satisfies `OFF64_k == 8 + 8*k` and `OFF32_k == 8 + 4*k` matching native
     /// `offset_of!`, and `MIN_V0_2_SIZE`/`MIN_V0_3_SIZE` terminate exactly after `cmd_remove`
     /// and `migrate_component_column` respectively.
     #[test]
-    fn host_api_offset_constants_cover_all_69_slots_monotonically() {
-        assert_eq!(BAM_HOST_API_SLOT_COUNT, 69);
-        assert_eq!(offsets::SLOT_COUNT, 69);
-        assert_eq!(offsets::SIZE_64, 560);
-        assert_eq!(offsets::SIZE_32, 284);
+    fn host_api_offset_constants_cover_all_73_slots_monotonically() {
+        assert_eq!(BAM_HOST_API_SLOT_COUNT, 73);
+        assert_eq!(offsets::SLOT_COUNT, 73);
+        assert_eq!(offsets::SIZE_64, 592);
+        assert_eq!(offsets::SIZE_32, 300);
         assert_eq!(offsets::STRUCT_SIZE, 0);
         assert_eq!(offsets::OFF64_STRUCT_SIZE, 0);
         assert_eq!(offsets::OFF32_STRUCT_SIZE, 0);
@@ -1723,6 +1748,26 @@ mod offset_tests {
                 offsets::ITER_NEXT_CHUNK_BATCH,
                 offsets::OFF64_ITER_NEXT_CHUNK_BATCH,
                 offsets::OFF32_ITER_NEXT_CHUNK_BATCH,
+            ),
+            (
+                offsets::ITER_COLUMN_TICKS,
+                offsets::OFF64_ITER_COLUMN_TICKS,
+                offsets::OFF32_ITER_COLUMN_TICKS,
+            ),
+            (
+                offsets::CMD_CLONE_ENTITY,
+                offsets::OFF64_CMD_CLONE_ENTITY,
+                offsets::OFF32_CMD_CLONE_ENTITY,
+            ),
+            (
+                offsets::CMD_INSERT_RESOURCE,
+                offsets::OFF64_CMD_INSERT_RESOURCE,
+                offsets::OFF32_CMD_INSERT_RESOURCE,
+            ),
+            (
+                offsets::CMD_REMOVE_RESOURCE,
+                offsets::OFF64_CMD_REMOVE_RESOURCE,
+                offsets::OFF32_CMD_REMOVE_RESOURCE,
             ),
         ];
 

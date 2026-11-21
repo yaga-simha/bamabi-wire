@@ -1,4 +1,4 @@
-//! Layer-0 concrete C-ABI `0.3.0` (`0x0003_0000`) host world and 68-slot [`BamHostApi`] table.
+//! Layer-0 concrete C-ABI `0.3.0` (`0x0003_0000`) host world and 73-slot [`BamHostApi`] table.
 //!
 //! Provides zero-Bevy, zero-external-dependency dense SoA chunk storage, singleton resource
 //! storage with [`BamChangeTicks`], a rollback-capable deferred [`CommandQueue`], symbol
@@ -195,6 +195,17 @@ pub(crate) enum RecordedCmd {
     Observe,
     InsertRelation,
     RemoveRelation,
+    CloneEntity {
+        _src: FfiEntity,
+        _dst: FfiEntity,
+    },
+    InsertResource {
+        _resource: BamComponent,
+        _byte_len: usize,
+    },
+    RemoveResource {
+        _resource: BamComponent,
+    },
 }
 
 /// Deferred command queue backing `*mut BamCommands`.
@@ -350,10 +361,13 @@ pub(crate) struct ChunkStorage {
     pub(crate) chunk_marked_changed: Vec<UnsafeCell<bool>>,
     pub(crate) marked_rows: Vec<UnsafeCell<Vec<usize>>>,
     pub(crate) sparse_columns: Vec<Option<Vec<Option<Vec<UnsafeCell<u64>>>>>>,
+    pub(crate) added_ticks: Vec<u32>,
+    pub(crate) changed_ticks: Vec<u32>,
 }
 
 impl ChunkStorage {
     pub(crate) fn new(entities: Vec<FfiEntity>, comp_capacity: usize) -> Self {
+        let tick_len = entities.len();
         let mut dense_columns = Vec::with_capacity(comp_capacity);
         let mut chunk_marked_changed = Vec::with_capacity(comp_capacity);
         let mut marked_rows = Vec::with_capacity(comp_capacity);
@@ -370,6 +384,8 @@ impl ChunkStorage {
             chunk_marked_changed,
             marked_rows,
             sparse_columns,
+            added_ticks: vec![1; tick_len],
+            changed_ticks: vec![1; tick_len],
         }
     }
 
@@ -3376,7 +3392,135 @@ unsafe extern "C" fn host_migrate_component_column(
     FfiResult::UNSUPPORTED
 }
 
-/// Constructs a complete 68-slot ABI `0.3.0` [`BamHostApi`] table wired to [`HostWorld`].
+/// Slot 69: `iter_column_ticks`.
+unsafe extern "C" fn host_iter_column_ticks(
+    iter: *const BamIter,
+    term_index: usize,
+    out_added: *mut *const u32,
+    out_changed: *mut *const u32,
+    out_last_run: *mut u32,
+    out_this_run: *mut u32,
+) -> FfiResult {
+    if iter.is_null()
+        || out_added.is_null()
+        || out_changed.is_null()
+        || out_last_run.is_null()
+        || out_this_run.is_null()
+    {
+        return FfiResult::NULL_POINTER;
+    }
+    // SAFETY: `iter` points to an active `IterState`.
+    let state = unsafe { &*iter.cast::<IterState>() };
+    let Some(c_idx) = state.active_chunk_idx else {
+        return FfiResult::INVALID_STATE;
+    };
+    let Some(term) = state.terms.get(term_index) else {
+        return FfiResult::OUT_OF_RANGE;
+    };
+    if !term.mode.has_entity_column_data() {
+        return FfiResult::PERMISSION_DENIED;
+    }
+    // SAFETY: `state.world` is valid during system execution.
+    let world = unsafe { &*state.world };
+    let Some(meta) = world.comp_meta(term.component) else {
+        return FfiResult::INVALID_COMPONENT;
+    };
+    if (meta.flags & BAM_COMPONENT_FLAG_SPARSE_SET) != 0 {
+        return FfiResult::UNSUPPORTED;
+    }
+    let Some(comp_idx) = term.component.to_raw().checked_sub(1) else {
+        return FfiResult::INVALID_COMPONENT;
+    };
+    let chunk = &world.chunks[c_idx];
+    if chunk
+        .dense_columns
+        .get(comp_idx as usize)
+        .and_then(Option::as_ref)
+        .is_none()
+    {
+        return FfiResult::NOT_FOUND;
+    }
+    // SAFETY: All out-pointers were verified non-null and point to valid writable storage.
+    // `chunk.added_ticks` and `chunk.changed_ticks` each contain `chunk.entities.len()` `u32`
+    // entries and remain valid for the duration of system execution.
+    unsafe {
+        *out_added = chunk.added_ticks.as_ptr();
+        *out_changed = chunk.changed_ticks.as_ptr();
+        *out_last_run = 0;
+        *out_this_run = 1;
+    }
+    FfiResult::OK
+}
+
+/// Slot 70: `cmd_clone_entity`.
+unsafe extern "C" fn host_cmd_clone_entity(
+    cmds: *mut BamCommands,
+    src_entity: FfiEntity,
+    dst_entity: FfiEntity,
+) -> FfiResult {
+    if cmds.is_null() {
+        return FfiResult::NULL_POINTER;
+    }
+    if src_entity.is_null() || dst_entity.is_null() {
+        return FfiResult::INVALID_ENTITY;
+    }
+    // SAFETY: `cmds` points to the system's active `CommandQueue`.
+    let queue = unsafe { &mut *cmds.cast::<CommandQueue>() };
+    queue.ops.push(RecordedCmd::CloneEntity {
+        _src: src_entity,
+        _dst: dst_entity,
+    });
+    FfiResult::OK
+}
+
+/// Slot 71: `cmd_insert_resource`.
+unsafe extern "C" fn host_cmd_insert_resource(
+    cmds: *mut BamCommands,
+    resource: BamComponent,
+    data_ptr: *const u8,
+    data_len: usize,
+) -> FfiResult {
+    if cmds.is_null() {
+        return FfiResult::NULL_POINTER;
+    }
+    // SAFETY: `cmds` points to the system's active `CommandQueue`.
+    let queue = unsafe { &mut *cmds.cast::<CommandQueue>() };
+    let Some(meta) = queue.meta_for(resource) else {
+        return FfiResult::INVALID_COMPONENT;
+    };
+    if data_len > 0 && data_ptr.is_null() {
+        return FfiResult::NULL_POINTER;
+    }
+    if meta.size != data_len {
+        return FfiResult::TYPE_MISMATCH;
+    }
+    queue.ops.push(RecordedCmd::InsertResource {
+        _resource: resource,
+        _byte_len: data_len,
+    });
+    FfiResult::OK
+}
+
+/// Slot 72: `cmd_remove_resource`.
+unsafe extern "C" fn host_cmd_remove_resource(
+    cmds: *mut BamCommands,
+    resource: BamComponent,
+) -> FfiResult {
+    if cmds.is_null() {
+        return FfiResult::NULL_POINTER;
+    }
+    // SAFETY: `cmds` points to the system's active `CommandQueue`.
+    let queue = unsafe { &mut *cmds.cast::<CommandQueue>() };
+    if queue.meta_for(resource).is_none() {
+        return FfiResult::INVALID_COMPONENT;
+    }
+    queue.ops.push(RecordedCmd::RemoveResource {
+        _resource: resource,
+    });
+    FfiResult::OK
+}
+
+/// Constructs a complete 73-slot ABI `0.3.0` [`BamHostApi`] table wired to [`HostWorld`].
 pub(crate) fn make_host_api() -> BamHostApi {
     let api = BamHostApi {
         struct_size: core::mem::size_of::<BamHostApi>() as u32,
@@ -3450,6 +3594,10 @@ pub(crate) fn make_host_api() -> BamHostApi {
         cmd_remove_relation: Some(host_cmd_remove_relation),
         migrate_component_column: Some(host_migrate_component_column),
         iter_next_chunk_batch: Some(host_iter_next_chunk_batch),
+        iter_column_ticks: Some(host_iter_column_ticks),
+        cmd_clone_entity: Some(host_cmd_clone_entity),
+        cmd_insert_resource: Some(host_cmd_insert_resource),
+        cmd_remove_resource: Some(host_cmd_remove_resource),
     };
     debug_assert!(api.has_all_slots());
     api

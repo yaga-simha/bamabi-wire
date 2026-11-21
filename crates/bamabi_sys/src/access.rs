@@ -7,8 +7,8 @@ use crate::primitives::{BamComponent, FfiResult};
 pub const MAX_TERMS_PER_QUERY: usize = 32;
 
 /// Maximum number of [`crate::BamQueryDesc`] clauses permitted in a single [`crate::BamSystemDesc`]
-/// (`8`, C `BAM_MAX_QUERIES_PER_SYSTEM`).
-pub const MAX_QUERIES_PER_SYSTEM: usize = 8;
+/// (`16`, C `BAM_MAX_QUERIES_PER_SYSTEM`).
+pub const MAX_QUERIES_PER_SYSTEM: usize = 16;
 
 /// FFI-safe query term access mode (`typedef uint32_t BamAccessMode;`).
 ///
@@ -259,8 +259,20 @@ impl core::fmt::Display for ScheduleId {
     }
 }
 
-/// Mask of recognized [`BamTermDesc::flags`] bits in ABI `0.2` (`0`).
-pub const BAM_TERM_KNOWN_FLAGS: u16 = 0;
+/// Row-level change-tick filter flag on [`BamTermDesc::flags`] (`Changed<T>`, C `BAM_TERM_FLAG_CHANGED`).
+///
+/// Decouples change filtering from [`AccessMode`], allowing `Changed<T>` to be combined with
+/// `READ`, `WRITE`, `FILTER_ONLY`, `OPTIONAL_READ`, or `OPTIONAL_WRITE`.
+pub const BAM_TERM_FLAG_CHANGED: u16 = 1 << 0;
+
+/// Row-level added-tick filter flag on [`BamTermDesc::flags`] (`Added<T>`, C `BAM_TERM_FLAG_ADDED`).
+///
+/// Decouples added filtering from [`AccessMode`], allowing `Added<T>` to be combined with
+/// `READ`, `WRITE`, `FILTER_ONLY`, `OPTIONAL_READ`, or `OPTIONAL_WRITE`.
+pub const BAM_TERM_FLAG_ADDED: u16 = 1 << 1;
+
+/// Mask of recognized [`BamTermDesc::flags`] bits (`BAM_TERM_FLAG_CHANGED | BAM_TERM_FLAG_ADDED`).
+pub const BAM_TERM_KNOWN_FLAGS: u16 = BAM_TERM_FLAG_CHANGED | BAM_TERM_FLAG_ADDED;
 
 /// Handle-based query or resource term declaration inside [`crate::BamQueryDesc`].
 ///
@@ -272,7 +284,7 @@ pub struct BamTermDesc {
     pub component: BamComponent,
     /// Access mode (`READ`..=`REMOVED_READ`).
     pub mode: AccessMode,
-    /// Term bitflags (`0` in ABI `0.2`; unknown bits are rejected with [`FfiResult::UNSUPPORTED`]).
+    /// Term bitflags (`BAM_TERM_FLAG_*`; unknown bits are rejected with [`FfiResult::UNSUPPORTED`]).
     pub flags: u16,
     /// Disjunctive `Or<(...)>` filter group (`0` = conjunctive top-level term; `1..=255` groups
     /// terms sharing the same `or_group` ID into a single `Or<(...)>` filter clause).
@@ -299,6 +311,32 @@ impl BamTermDesc {
     pub const fn with_flags(mut self, flags: u16) -> Self {
         self.flags = flags;
         self
+    }
+
+    /// Enables the row-level `Changed<T>` filter flag ([`BAM_TERM_FLAG_CHANGED`]) on this term.
+    #[inline]
+    pub const fn with_changed(mut self) -> Self {
+        self.flags |= BAM_TERM_FLAG_CHANGED;
+        self
+    }
+
+    /// Enables the row-level `Added<T>` filter flag ([`BAM_TERM_FLAG_ADDED`]) on this term.
+    #[inline]
+    pub const fn with_added(mut self) -> Self {
+        self.flags |= BAM_TERM_FLAG_ADDED;
+        self
+    }
+
+    /// Returns `true` if [`BAM_TERM_FLAG_CHANGED`] is set or `mode == AccessMode::CHANGED`.
+    #[inline]
+    pub const fn is_changed(&self) -> bool {
+        (self.flags & BAM_TERM_FLAG_CHANGED) != 0 || self.mode.0 == AccessMode::CHANGED.0
+    }
+
+    /// Returns `true` if [`BAM_TERM_FLAG_ADDED`] is set or `mode == AccessMode::ADDED`.
+    #[inline]
+    pub const fn is_added(&self) -> bool {
+        (self.flags & BAM_TERM_FLAG_ADDED) != 0 || self.mode.0 == AccessMode::ADDED.0
     }
 
     /// Assigns this filter term to disjunctive `Or<(...)>` group `or_group` (`1..=255`, or `0` for conjunctive).

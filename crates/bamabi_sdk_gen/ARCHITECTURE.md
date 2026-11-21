@@ -44,7 +44,7 @@ Before formatting any C99 text, `render_c99_header()` builds `wire_struct_specs(
 
 1. **Primitive newtype invariants:** `FfiBool` (1 B), 32-bit handles/enums (`BamComponent`, `BamSystem`, `BamSystemSet`, `BamSymbol`, `BamFieldKind`, `FfiResult`, `AccessMode`, `ScheduleId`, `BamEventKind`, `FfiAssetLoadState` = 4 B), 64-bit handles (`FfiEntity`, `FfiChildOf` = 8 B), and `FfiOption<u32>` (8 B, `is_some` at 0, `value` at 4).
 2. **All 20 wire structs on the active host (`usize::BITS` = 64 or 32):** Checks `rust_host_size`, `rust_host_align`, and every field's `rust_host_offset`. Any mismatch aborts header generation with an explicit diagnostic `Err(String)`.
-3. **68-slot `BamHostApi` count check:** Counts non-header fields in `BamHostApi` (excluding `struct_size` and `abi_version`) and asserts equality with `bamabi_sys::BAM_HOST_API_SLOT_COUNT` (`68`).
+3. **73-slot `BamHostApi` count check:** Counts non-header fields in `BamHostApi` (excluding `struct_size` and `abi_version`) and asserts equality with `bamabi_sys::BAM_HOST_API_SLOT_COUNT` (`73`).
 
 ### 3.2 All 20 Wire Structs Covered
 
@@ -69,7 +69,7 @@ Before formatting any C99 text, `render_c99_header()` builds `wire_struct_specs(
 | `BamColumnInfo` | `BamColumnInfo` | 48 / 8 | 40 / `Fixed(4)` | — |
 | `BamVTableHeader` | `VTableHeader` | 40 / 8 | 32 / `Fixed(4)` | 40 / 32 (`v0.2`) |
 | `BamMappedStringVTable` | `MappedStringVTable` | 56 / 8 | 40 / `Fixed(4)` | — |
-| `BamHostApi` | `BamHostApi` | 552 / 8 | 280 / `Fixed(4)` | 224 / 116 (`v0.2`), 552 / 280 (`v0.3`) |
+| `BamHostApi` | `BamHostApi` | 592 / 8 | 300 / `Fixed(4)` | 224 / 116 (`v0.2`), 552 / 280 (`v0.3` floor) |
 
 ### 3.3 Six Ordered C99 Sections
 
@@ -82,7 +82,7 @@ Before formatting any C99 text, `render_c99_header()` builds `wire_struct_specs(
    - `BAM_ALIGNOF(type)`: uses C++11 `alignof`, C11 `_Alignof`, GCC/Clang `__extension__ __alignof__`, MSVC `__alignof`, or an ISO C99 `offsetof(struct { char _bam_pad; type _bam_val; }, _bam_val)` fallback.
    - `BAM_STATIC_ASSERT(cond, name)`: uses C++11 `static_assert`, C11 `_Static_assert`, GCC/Clang `__extension__ _Static_assert`, or a `typedef char bam_static_assert_##name[(cond) ? 1 : -1]` fallback.
 2. **ABI SemVer Version, Architectural Limits & Domain Constants:**
-   - `BAM_ABI_VERSION` (`0x00030000u`), `BAM_PACK_ABI_VERSION`, `BAM_MAX_TERMS_PER_QUERY`, `BAM_MAX_QUERIES_PER_SYSTEM`, `BAM_HOST_API_SLOT_COUNT` (`68u`), `BAM_SIPHASH_KEY_0`/`1`, `BAM_MAX_CHANGE_AGE`, and canonical names `BAM_CHILD_OF_NAME`, `BAM_CHILDREN_NAME`, `BAM_DISABLED_NAME`.
+   - `BAM_ABI_VERSION` (`0x00030000u`), `BAM_PACK_ABI_VERSION`, `BAM_MAX_TERMS_PER_QUERY`, `BAM_MAX_QUERIES_PER_SYSTEM` (`16u`), `BAM_HOST_API_SLOT_COUNT` (`73u`), `BAM_SIPHASH_KEY_0`/`1`, `BAM_MAX_CHANGE_AGE`, and canonical names `BAM_CHILD_OF_NAME`, `BAM_CHILDREN_NAME`, `BAM_DISABLED_NAME`.
 3. **Primitive Newtypes, Handles, Status Codes, Modes & Flags:**
    - `BamBool`, `BamComponent`, `BamSystem`, `BamSystemSet`, `BamSymbol`, `BamEntity`, `BamResult` (18 status codes including `BAM_RESULT_CYCLE_DETECTED`), `BamAccessMode`, `BamEventKind`, `BamFieldKind`, `BAM_LOG_*`, `BAM_ASSET_HANDLE_KIND_*`, `BamAssetLoadState`, `BamScheduleId`, and all `BAM_*_FLAGS` bitmasks.
 4. **Opaque Context Handles, Wire Descriptors & Function Pointer Typedefs:**
@@ -105,7 +105,7 @@ Before formatting any C99 text, `render_c99_header()` builds `wire_struct_specs(
 
 - **Slots 0..=26 (27 slots, ABI 0.2 baseline):** `get_proc_address` through `cmd_remove`. Tail ends at `BAM_HOST_API_MIN_V0_2_SIZE` (`224` B on 64-bit, `116` B on 32-bit).
 - **Slots 27..=49 (23 slots, ABI 0.2.x extensions):** `par_for_each_chunk` through `cmd_spawn_scene`.
-- **Slots 50..=67 (18 slots, ABI 0.3.0 extensions):** `log_diagnostic` through `migrate_component_column`. Tail ends at `BAM_HOST_API_MIN_V0_3_SIZE` (`552` B on 64-bit, `280` B on 32-bit).
+- **Slots 50..=72 (23 slots, ABI 0.3.0 extensions):** `log_diagnostic` through `migrate_component_column` (ending at `BAM_HOST_API_MIN_V0_3_SIZE`, `552` B / `280` B), plus tail slots `iter_next_chunk_batch`, `iter_column_ticks`, `cmd_clone_entity`, `cmd_insert_resource`, `cmd_remove_resource` (`592` B / `300` B).
 
 For 32-bit targets, `Align32` handles a critical cross-platform subtlety: `i686-unknown-linux-gnu` aligns `uint64_t` to **4 bytes**, whereas 32-bit ARM and `wasm32` align `uint64_t` to **8 bytes**. Structs containing `uint64_t` fields (`BamLayoutInfo` and `BamComponentDesc`) therefore specify `Align32::U64`, causing `header_gen.rs` to verify against `align_of::<u64>()` in Rust and emit `BAM_ALIGNOF(uint64_t)` in C99 rather than hardcoding `4` or `8`.
 
@@ -124,21 +124,21 @@ For 32-bit targets, `Align32` handles a critical cross-platform subtlety: `i686-
 
 ### 4.1 C++17 Header (`CPP17_HEADER` -> `bamabi.hpp`)
 
-- **Namespace `bam::offsets`:** Mirrors `BAM_HOST_API_SLOT_COUNT` and every `BAM_HOST_API_OFFSET_*` as `inline constexpr std::size_t` constants, guarded by `static_assert` checks on `STRUCT_SIZE == 0u`, `ABI_VERSION == 4u`, `GET_PROC_ADDRESS == 8u`, and `MIGRATE_COMPONENT_COLUMN + sizeof(BamMigrateComponentColumnFn) == sizeof(BamHostApi)`.
+- **Namespace `bam::offsets`:** Programmatically mirrors `BAM_HOST_API_SLOT_COUNT` and every `BAM_HOST_API_OFFSET_*` as `inline constexpr std::size_t` constants, guarded by `static_assert` checks on `STRUCT_SIZE == 0u`, `ABI_VERSION == 4u`, `GET_PROC_ADDRESS == 8u`, and `CMD_REMOVE_RESOURCE + sizeof(BamCmdRemoveResourceFn) == sizeof(BamHostApi)`.
 - **Aliasing & Boundary Helpers:**
   - `bam::copy_column_restricted<T>(T* BAM_RESTRICT dst, const T* BAM_RESTRICT src, std::size_t count)` leverages `BAM_RESTRICT` (`__restrict` on MSVC) for non-aliasing SoA column loops.
   - `bam::guard_boundary(fn)` wraps guest callbacks in `try { ... } catch (const std::exception&) { return BAM_RESULT_PANIC_CAUGHT; } catch (...) { return BAM_RESULT_PANIC_CAUGHT; }` so C++ exceptions never unwind across `extern "C"`.
   - `bam::host_api_covers_slot` / `bam::is_ok` wrap the C prefix-coverage and status checks.
-- **68/68 Slot View Wrappers:** `HostContextView`, `LoadContextView`, `ChunkView`, `CommandsView`, and `SystemContextView` expose zero-overhead, `noexcept` typed wrappers over all 68 slots, checking `bam_host_api_covers_slot` before calling any slot beyond the `v0.2` floor (`BAM_RESULT_UNSUPPORTED` if absent).
+- **73/73 Slot View Wrappers:** `HostContextView`, `LoadContextView`, `ChunkView`, `CommandsView`, and `SystemContextView` expose zero-overhead, `noexcept` typed wrappers over all 73 slots, checking `bam_host_api_covers_slot` before calling any slot beyond the `v0.2` floor (`BAM_RESULT_UNSUPPORTED` if absent).
 - **RAII `ScopedTransaction`:** Calls `cmds.checkpoint(token_)` in its constructor, marks itself `active_` on `BAM_RESULT_OK`, is non-copyable and move-constructible (clearing `other.active_`), and automatically calls `cmds_.rollback(token_)` in `~ScopedTransaction()` unless `commit()` or `rollback_now()` was called.
 
 ### 4.2 Zig `0.16` Module (`ZIG_SDK` -> `bamabi.zig`)
 
 - **`b.addTranslateC` `"bam_c"` Integration:** Uses `pub const c = @import("bam_c");` rather than legacy `@cImport`/`@cInclude`, matching Zig `0.16` build-graph module conventions.
-- **Offsets & `comptime` Verification:** Exposes `offsets.*` (`@offsetOf(c.BamHostApi, ...)` for header fields and all 68 slots) plus top-level `BAM_HOST_API_OFFSET_*` aliases, verified by a `comptime` block asserting `STRUCT_SIZE == 0`, `ABI_VERSION == 4`, `GET_PROC_ADDRESS == 8`, and `MIGRATE_COMPONENT_COLUMN + @sizeOf(usize) == @sizeOf(c.BamHostApi)`.
+- **Offsets & `comptime` Verification:** Programmatically exposes `offsets.*` (`@offsetOf(c.BamHostApi, ...)` for header fields and all 73 slots) plus top-level `BAM_HOST_API_OFFSET_*` aliases, verified by a `comptime` block asserting `STRUCT_SIZE == 0`, `ABI_VERSION == 4`, `GET_PROC_ADDRESS == 8`, and `CMD_REMOVE_RESOURCE + @sizeOf(usize) == @sizeOf(c.BamHostApi)`.
 - **Aliasing (`noalias`):** Defines `pub const BAM_RESTRICT_QUALIFIER = "noalias";` and `copyColumnNoAlias(comptime T: type, noalias dst: [*]T, noalias src: [*]const T, len: usize)`.
 - **Lossless 18-Code `BamError`:** Maps every `BamResult` code (`BAM_RESULT_OK` -> void, 17 error codes -> distinct `BamError` variants, plus `OutOfMemory`) via `checkResult(res) BamError!void` and `mapError(err) c.BamResult` (note: `error.OutOfMemory` and `error.InternalError` both map back to `BAM_RESULT_INTERNAL_ERROR`).
-- **68/68 Slot Views:** `HostContextView`, `LoadContextView`, `ChunkView`, `CommandsView`, and `SystemContextView` wrap all 68 slots using `coversHostApiSlot` and `checkResult`.
+- **73/73 Slot Views & `ScopedTransaction`:** `HostContextView`, `LoadContextView`, `ChunkView`, `CommandsView`, and `SystemContextView` wrap all 73 slots using `coversHostApiSlot` and `checkResult`, alongside `ScopedTransaction` for `defer tx.deinit()` auto-rollback.
 
 ---
 

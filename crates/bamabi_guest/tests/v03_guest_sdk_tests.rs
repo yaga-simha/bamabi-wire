@@ -64,6 +64,9 @@ struct RegisteredSystem {
     user_data: *mut c_void,
     run_if: Option<BamRunIfFn>,
     run_if_user_data: *mut c_void,
+    run_if_ctx: Option<BamSystemFn>,
+    run_if_query: Vec<BamTermDesc>,
+    run_if_ctx_user_data: *mut c_void,
 }
 
 /// Registered ABI 0.3.0 schedule system-set configuration stored in [`MockV03World`].
@@ -102,12 +105,25 @@ enum RecordedCmd {
         relation: BamComponent,
         target: FfiEntity,
     },
+    CloneEntity {
+        src: FfiEntity,
+        dst: FfiEntity,
+    },
+    InsertResource {
+        resource: BamComponent,
+        bytes: Vec<u8>,
+    },
+    RemoveResource {
+        resource: BamComponent,
+    },
 }
 
 /// Simulated dense archetype chunk inside [`MockV03World`].
 struct MockChunk {
     entities: Vec<FfiEntity>,
     columns: HashMap<BamComponent, Vec<u64>>,
+    column_added_ticks: HashMap<BamComponent, Vec<u32>>,
+    column_changed_ticks: HashMap<BamComponent, Vec<u32>>,
 }
 
 impl MockChunk {
@@ -116,7 +132,17 @@ impl MockChunk {
         Self {
             entities,
             columns: HashMap::new(),
+            column_added_ticks: HashMap::new(),
+            column_changed_ticks: HashMap::new(),
         }
+    }
+
+    /// Sets per-row `(added, changed)` change-detection ticks for `comp` in this chunk.
+    fn insert_column_ticks(&mut self, comp: BamComponent, added: &[u32], changed: &[u32]) {
+        assert_eq!(added.len(), self.entities.len());
+        assert_eq!(changed.len(), self.entities.len());
+        self.column_added_ticks.insert(comp, added.to_vec());
+        self.column_changed_ticks.insert(comp, changed.to_vec());
     }
 
     /// Populates a dense column buffer for `comp` from `values`.
@@ -196,6 +222,10 @@ struct MockV03World {
     symbols: Vec<String>,
     symbol_to_id: HashMap<String, BamSymbol>,
     named_objects: HashMap<String, FfiEntity>,
+    tick_last_run: u32,
+    tick_this_run: u32,
+    resources: HashMap<BamComponent, (Vec<u64>, BamChangeTicks)>,
+    messages: HashMap<BamComponent, Vec<Vec<u8>>>,
 }
 
 /// Owning pointer wrapper around heap-allocated [`MockV03World`] with stable provenance.
@@ -260,6 +290,10 @@ impl V03TestHost {
                 symbols: Vec::new(),
                 symbol_to_id: HashMap::new(),
                 named_objects: HashMap::new(),
+                tick_last_run: 5,
+                tick_this_run: 10,
+                resources: HashMap::new(),
+                messages: HashMap::new(),
             })),
         }
     }
@@ -299,12 +333,24 @@ impl V03TestHost {
 
     /// Executes registered system `sys_idx` against this mock world.
     fn run_system(&self, sys_idx: usize) -> FfiResult {
-        let (run_if, run_if_data, callback, user_data, queries) = unsafe {
+        let (
+            run_if,
+            run_if_data,
+            run_if_ctx,
+            run_if_query,
+            run_if_ctx_data,
+            callback,
+            user_data,
+            queries,
+        ) = unsafe {
             let world = &*self.raw;
             let sys = &world.systems[sys_idx];
             (
                 sys.run_if,
                 sys.run_if_user_data,
+                sys.run_if_ctx,
+                sys.run_if_query.clone(),
+                sys.run_if_ctx_user_data,
                 sys.callback,
                 sys.user_data,
                 sys.queries.clone(),
@@ -316,6 +362,32 @@ impl V03TestHost {
             }
         }
         let world_ptr = self.raw;
+        if let Some(pred_ctx) = run_if_ctx {
+            let cond_iters = if run_if_query.is_empty() {
+                Vec::new()
+            } else {
+                vec![Box::new(MockIterState {
+                    world: world_ptr,
+                    terms: run_if_query,
+                    next_chunk_idx: 0,
+                    end_chunk_idx: None,
+                    active_chunk_idx: None,
+                })]
+            };
+            let mut cond_frame = MockSystemFrame {
+                world: world_ptr,
+                iters: cond_iters,
+            };
+            let cond_res = unsafe {
+                pred_ctx(
+                    (&raw mut cond_frame).cast::<BamSystemCtx>(),
+                    run_if_ctx_data,
+                )
+            };
+            if !cond_res.is_ok() {
+                return FfiResult::OK;
+            }
+        }
         let iters = queries
             .into_iter()
             .map(|terms| {
@@ -337,6 +409,44 @@ impl V03TestHost {
 }
 
 impl MockV03World {
+    /// Sets a mock singleton resource value and change ticks for `comp`.
+    fn set_resource<R: Copy>(&mut self, comp: BamComponent, value: R, ticks: BamChangeTicks) {
+        let byte_len = core::mem::size_of::<R>();
+        let word_len = byte_len.div_ceil(8).max(1);
+        let mut words = vec![0u64; word_len];
+        if byte_len > 0 {
+            unsafe {
+                core::ptr::copy_nonoverlapping(
+                    (&raw const value).cast::<u8>(),
+                    words.as_mut_ptr().cast::<u8>(),
+                    byte_len,
+                );
+            }
+        }
+        self.resources.insert(comp, (words, ticks));
+    }
+
+    /// Removes a mock singleton resource for `comp`.
+    fn remove_mock_resource(&mut self, comp: BamComponent) {
+        self.resources.remove(&comp);
+    }
+
+    /// Enqueues a mock buffered message payload for `comp`.
+    fn push_message<M: Copy>(&mut self, comp: BamComponent, msg: M) {
+        let byte_len = core::mem::size_of::<M>();
+        let mut bytes = vec![0u8; byte_len];
+        if byte_len > 0 {
+            unsafe {
+                core::ptr::copy_nonoverlapping(
+                    (&raw const msg).cast::<u8>(),
+                    bytes.as_mut_ptr(),
+                    byte_len,
+                );
+            }
+        }
+        self.messages.entry(comp).or_default().push(bytes);
+    }
+
     /// Pre-registers a host component type `T` with explicit UUID and schema fingerprint.
     fn expose_component<T: 'static>(
         &mut self,
@@ -565,6 +675,20 @@ fn push_system(world: &mut MockV03World, desc: &BamSystemDesc) -> Result<BamSyst
             queries.push(terms);
         }
     }
+    let run_if_query = if !desc.run_if_query.is_null() {
+        let q = unsafe { &*desc.run_if_query };
+        let q_st = q.validate();
+        if !q_st.is_ok() {
+            return Err(q_st);
+        }
+        if q.term_count > 0 && !q.terms.is_null() {
+            unsafe { core::slice::from_raw_parts(q.terms, q.term_count) }.to_vec()
+        } else {
+            Vec::new()
+        }
+    } else {
+        Vec::new()
+    };
     let handle = BamSystem::from_raw(world.systems.len() as u32);
     world.systems.push(RegisteredSystem {
         handle,
@@ -575,6 +699,9 @@ fn push_system(world: &mut MockV03World, desc: &BamSystemDesc) -> Result<BamSyst
         user_data: desc.user_data,
         run_if: desc.run_if,
         run_if_user_data: desc.run_if_user_data,
+        run_if_ctx: desc.run_if_ctx,
+        run_if_query,
+        run_if_ctx_user_data: desc.run_if_ctx_user_data,
     });
     Ok(handle)
 }
@@ -744,27 +871,240 @@ unsafe extern "C" fn host_iter_col_info(
     let Some(meta) = world.comp_meta(term.component) else {
         return FfiResult::NOT_FOUND;
     };
+    let storage_flags = if term.mode.is_resource() {
+        bamabi_sys::BAM_STORAGE_FLAG_RESOURCE
+    } else if term.mode.is_message() {
+        bamabi_sys::BAM_STORAGE_FLAG_MESSAGE
+    } else {
+        0
+    };
     let info = BamColumnInfo {
         component: term.component,
         mode: term.mode,
         uuid: meta.uuid,
         size: meta.size,
         align: meta.align,
-        storage_flags: 0,
+        storage_flags,
         reserved0: 0,
     };
     unsafe { *out_info = info };
     FfiResult::OK
 }
 
-/// Stub `BamHostApi::res_ptr` (unused in v0.3 harness).
-unsafe extern "C" fn host_res_ptr(_iter: *const BamIter, _idx: usize) -> *const u8 {
-    core::ptr::null()
+/// Mock `BamHostApi::res_ptr` returning the mock singleton resource buffer for `term_index`.
+unsafe extern "C" fn host_res_ptr(iter: *const BamIter, idx: usize) -> *const u8 {
+    if iter.is_null() {
+        return core::ptr::null();
+    }
+    let state = unsafe { &*iter.cast::<MockIterState>() };
+    let Some(term) = state.terms.get(idx) else {
+        return core::ptr::null();
+    };
+    let world = unsafe { &*state.world };
+    world
+        .resources
+        .get(&term.component)
+        .map_or(core::ptr::null(), |(words, _)| words.as_ptr().cast::<u8>())
 }
 
 /// Stub `BamHostApi::res_mut_ptr` (unused in v0.3 harness).
 unsafe extern "C" fn host_res_mut_ptr(_iter: *mut BamIter, _idx: usize) -> *mut u8 {
     core::ptr::null_mut()
+}
+
+/// Mock `BamHostApi::res_ticks` returning change ticks for the singleton resource at `idx`.
+unsafe extern "C" fn host_res_ticks(
+    iter: *const BamIter,
+    idx: usize,
+    out_ticks: *mut BamChangeTicks,
+) -> FfiResult {
+    if iter.is_null() || out_ticks.is_null() {
+        return FfiResult::NULL_POINTER;
+    }
+    let state = unsafe { &*iter.cast::<MockIterState>() };
+    let Some(term) = state.terms.get(idx) else {
+        return FfiResult::OUT_OF_RANGE;
+    };
+    let world = unsafe { &*state.world };
+    let Some((_, ticks)) = world.resources.get(&term.component) else {
+        return FfiResult::NOT_FOUND;
+    };
+    unsafe { *out_ticks = *ticks };
+    FfiResult::OK
+}
+
+/// Mock `BamHostApi::msg_read_batch` draining queued mock messages for `term_index`.
+unsafe extern "C" fn host_msg_read_batch(
+    iter: *mut BamIter,
+    idx: usize,
+    out_buf: *mut u8,
+    max_count: usize,
+    out_count: *mut usize,
+) -> FfiResult {
+    if iter.is_null() || out_count.is_null() {
+        return FfiResult::NULL_POINTER;
+    }
+    let state = unsafe { &mut *iter.cast::<MockIterState>() };
+    let Some(term) = state.terms.get(idx) else {
+        return FfiResult::OUT_OF_RANGE;
+    };
+    let world = unsafe { &mut *state.world };
+    let Some(meta) = world.comp_meta(term.component) else {
+        return FfiResult::INVALID_COMPONENT;
+    };
+    let elem_size = meta.size;
+    let queue = world.messages.entry(term.component).or_default();
+    let take = queue.len().min(max_count);
+    if take > 0 && elem_size > 0 {
+        if out_buf.is_null() {
+            return FfiResult::NULL_POINTER;
+        }
+        for (i, payload) in queue.drain(..take).enumerate() {
+            unsafe {
+                core::ptr::copy_nonoverlapping(
+                    payload.as_ptr(),
+                    out_buf.add(i * elem_size),
+                    elem_size,
+                );
+            }
+        }
+    } else {
+        queue.drain(..take);
+    }
+    unsafe { *out_count = take };
+    FfiResult::OK
+}
+
+/// Mock `BamHostApi::sys_entity_get_mut` locating `(entity, comp)` in mock chunks.
+unsafe extern "C" fn host_sys_entity_get_mut(
+    sys_ctx: *mut BamSystemCtx,
+    query_index: usize,
+    entity: FfiEntity,
+    term_index: usize,
+) -> *mut u8 {
+    if sys_ctx.is_null() {
+        return core::ptr::null_mut();
+    }
+    let frame = unsafe { &mut *sys_ctx.cast::<MockSystemFrame>() };
+    let Some(iter_box) = frame.iters.get(query_index) else {
+        return core::ptr::null_mut();
+    };
+    let Some(term) = iter_box.terms.get(term_index) else {
+        return core::ptr::null_mut();
+    };
+    let world = unsafe { &mut *frame.world };
+    let Some(meta) = world.comp_meta(term.component) else {
+        return core::ptr::null_mut();
+    };
+    let elem_size = meta.size;
+    for chunk in &mut world.chunks {
+        if let Some(row) = chunk.entities.iter().position(|&e| e == entity) {
+            if let Some(words) = chunk.columns.get_mut(&term.component) {
+                return unsafe { words.as_mut_ptr().cast::<u8>().add(row * elem_size) };
+            }
+        }
+    }
+    core::ptr::null_mut()
+}
+
+/// Mock `BamHostApi::iter_column_ticks` (slot 69) returning per-row tick slices for the active chunk.
+unsafe extern "C" fn host_iter_column_ticks(
+    iter: *const BamIter,
+    term_index: usize,
+    out_added: *mut *const u32,
+    out_changed: *mut *const u32,
+    out_last_run: *mut u32,
+    out_this_run: *mut u32,
+) -> FfiResult {
+    if iter.is_null()
+        || out_added.is_null()
+        || out_changed.is_null()
+        || out_last_run.is_null()
+        || out_this_run.is_null()
+    {
+        return FfiResult::NULL_POINTER;
+    }
+    let state = unsafe { &*iter.cast::<MockIterState>() };
+    let Some(chunk_idx) = state.active_chunk_idx else {
+        return FfiResult::OUT_OF_RANGE;
+    };
+    let Some(term) = state.terms.get(term_index) else {
+        return FfiResult::OUT_OF_RANGE;
+    };
+    let world = unsafe { &*state.world };
+    let chunk = &world.chunks[chunk_idx];
+    let (Some(added), Some(changed)) = (
+        chunk.column_added_ticks.get(&term.component),
+        chunk.column_changed_ticks.get(&term.component),
+    ) else {
+        return FfiResult::NOT_FOUND;
+    };
+    unsafe {
+        *out_added = added.as_ptr();
+        *out_changed = changed.as_ptr();
+        *out_last_run = world.tick_last_run;
+        *out_this_run = world.tick_this_run;
+    }
+    FfiResult::OK
+}
+
+/// Mock `BamHostApi::cmd_clone_entity` (slot 70).
+unsafe extern "C" fn host_cmd_clone_entity(
+    cmds: *mut BamCommands,
+    src_entity: FfiEntity,
+    dst_entity: FfiEntity,
+) -> FfiResult {
+    if cmds.is_null() {
+        return FfiResult::NULL_POINTER;
+    }
+    if src_entity.is_null() || dst_entity.is_null() {
+        return FfiResult::INVALID_ENTITY;
+    }
+    let world = unsafe { &mut *cmds.cast::<MockV03World>() };
+    world.commands.push(RecordedCmd::CloneEntity {
+        src: src_entity,
+        dst: dst_entity,
+    });
+    FfiResult::OK
+}
+
+/// Mock `BamHostApi::cmd_insert_resource` (slot 71).
+unsafe extern "C" fn host_cmd_insert_resource(
+    cmds: *mut BamCommands,
+    resource: BamComponent,
+    data: *const u8,
+    size: usize,
+) -> FfiResult {
+    if cmds.is_null() {
+        return FfiResult::NULL_POINTER;
+    }
+    let world = unsafe { &mut *cmds.cast::<MockV03World>() };
+    let bytes = if size == 0 {
+        Vec::new()
+    } else if data.is_null() {
+        return FfiResult::NULL_POINTER;
+    } else {
+        unsafe { core::slice::from_raw_parts(data, size) }.to_vec()
+    };
+    world
+        .commands
+        .push(RecordedCmd::InsertResource { resource, bytes });
+    FfiResult::OK
+}
+
+/// Mock `BamHostApi::cmd_remove_resource` (slot 72).
+unsafe extern "C" fn host_cmd_remove_resource(
+    cmds: *mut BamCommands,
+    resource: BamComponent,
+) -> FfiResult {
+    if cmds.is_null() {
+        return FfiResult::NULL_POINTER;
+    }
+    let world = unsafe { &mut *cmds.cast::<MockV03World>() };
+    world
+        .commands
+        .push(RecordedCmd::RemoveResource { resource });
+    FfiResult::OK
 }
 
 /// Mock `BamHostApi::cmd_spawn_empty` allocating an entity ID and logging `RecordedCmd::SpawnEmpty`.
@@ -1505,6 +1845,10 @@ fn make_v02_only_host_api(truncated_struct_size: bool) -> BamHostApi {
         cmd_remove_relation: None,
         migrate_component_column: None,
         iter_next_chunk_batch: None,
+        iter_column_ticks: None,
+        cmd_clone_entity: None,
+        cmd_insert_resource: None,
+        cmd_remove_resource: None,
     }
 }
 
@@ -1529,6 +1873,13 @@ fn make_v03_host_api() -> BamHostApi {
     api.cmd_insert_relation = Some(host_cmd_insert_relation);
     api.cmd_remove_relation = Some(host_cmd_remove_relation);
     api.migrate_component_column = Some(host_migrate_component_column);
+    api.res_ticks = Some(host_res_ticks);
+    api.msg_read_batch = Some(host_msg_read_batch);
+    api.sys_entity_get_mut = Some(host_sys_entity_get_mut);
+    api.iter_column_ticks = Some(host_iter_column_ticks);
+    api.cmd_clone_entity = Some(host_cmd_clone_entity);
+    api.cmd_insert_resource = Some(host_cmd_insert_resource);
+    api.cmd_remove_resource = Some(host_cmd_remove_resource);
     api
 }
 
@@ -3222,6 +3573,521 @@ fn system_context_defers_sys_host_ctx_and_sys_commands_on_noop_and_queries() {
     assert_eq!(host.run_system(2), FfiResult::OK);
     assert_eq!(host.sys_host_ctx_calls.load(Ordering::Relaxed), 1);
     assert_eq!(host.sys_commands_calls.load(Ordering::Relaxed), 1);
+
+    host.unload(inst);
+}
+
+// ============================================================================
+// Wave 3 Parity Tests: P1.4, P1.5, P1.7, P2.8
+// ============================================================================
+
+/// Scenario (P1.4): Verifies `ChangedMut<T>`, `AddedMut<T>`, `WithChanged<T>`, `WithAdded<T>`
+/// emit the exact `AccessMode` + `BAM_TERM_FLAG_CHANGED`/`BAM_TERM_FLAG_ADDED` descriptors,
+/// verifies `Ref<T>`/`RefSlice<T>` and `Mut<T>`/`MutSlice<T>` per-row tick inspection via slot 69
+/// (`iter_column_ticks`) alongside `Chunk::column_ticks`/`ChunkIter::column_ticks`, and verifies
+/// graceful fallback when slot 69 is absent on older hosts.
+#[test]
+fn changed_mut_added_mut_with_changed_with_added_and_ref_mut_slices() {
+    define_pod_component!(struct TickPos { x: f32, y: f32 } => c"wave3::TickPos");
+    define_pod_component!(struct TickTag { v: u32 } => c"wave3::TickTag");
+
+    let mut host = V03TestHost::new();
+    let h_pos = host.expose_component::<TickPos>("wave3::TickPos", TickPos::UUID, 0, &[]);
+    let h_tag = host.expose_component::<TickTag>("wave3::TickTag", TickTag::UUID, 0, &[]);
+
+    let mut chunk = MockChunk::new(vec![
+        FfiEntity::from_bits(1),
+        FfiEntity::from_bits(2),
+        FfiEntity::from_bits(3),
+    ]);
+    chunk.insert_dense(
+        h_pos,
+        &[
+            TickPos { x: 1.0, y: 0.0 },
+            TickPos { x: 2.0, y: 0.0 },
+            TickPos { x: 3.0, y: 0.0 },
+        ],
+    );
+    chunk.insert_dense(
+        h_tag,
+        &[TickTag { v: 10 }, TickTag { v: 20 }, TickTag { v: 30 }],
+    );
+    // Window is last_run = 5, this_run = 10:
+    // row 0: added=2, changed=3 -> neither added nor changed
+    // row 1: added=2, changed=7 -> changed only
+    // row 2: added=8, changed=8 -> both added and changed
+    chunk.insert_column_ticks(h_pos, &[2, 2, 8], &[3, 7, 8]);
+    host.chunks.push(chunk);
+
+    let inst = host
+        .load_fn(c"wave3_ticks_mod", |app| {
+            // System 0: ChangedMut + WithAdded descriptor check & mutable slice write.
+            let rc = app
+                .system(c"changed_mut_sys")
+                .query_typed::<(ChangedMut<TickPos>, WithAdded<TickTag>)>()
+                .build(|ctx| {
+                    ctx.single_query::<(ChangedMut<TickPos>, WithAdded<TickTag>)>()
+                        .for_each(|(pos, ())| {
+                            for p in pos {
+                                p.x += 10.0;
+                            }
+                        })
+                });
+            assert_eq!(rc, FfiResult::OK);
+
+            // System 1: AddedMut + WithChanged descriptor check.
+            let rc = app
+                .system(c"added_mut_sys")
+                .query_typed::<(AddedMut<TickPos>, WithChanged<TickTag>)>()
+                .build(|ctx| {
+                    ctx.single_query::<(AddedMut<TickPos>, WithChanged<TickTag>)>()
+                        .for_each(|(pos, ())| {
+                            for p in pos {
+                                p.y += 1.0;
+                            }
+                        })
+                });
+            assert_eq!(rc, FfiResult::OK);
+
+            // System 2: Ref<TickPos> per-row tick inspection + Chunk/ChunkIter column_ticks.
+            let rc = app
+                .system(c"ref_slice_sys")
+                .query_typed::<Ref<TickPos>>()
+                .build(|ctx| {
+                    ctx.single_query::<Ref<TickPos>>().for_each(|r| {
+                        assert!(r.has_ticks());
+                        assert_eq!(r.len(), 3);
+                        assert!(!r.is_added(0));
+                        assert!(!r.is_changed(0));
+                        assert!(!r.is_added(1));
+                        assert!(r.is_changed(1));
+                        assert!(r.is_added(2));
+                        assert!(r.is_changed(2));
+                        assert_eq!(r.row_ticks(1).unwrap().changed, 7);
+                        assert!(!r.is_changed(99));
+                    })
+                });
+            assert_eq!(rc, FfiResult::OK);
+
+            // System 3: Mut<TickPos> per-row tick inspection + mutation + Chunk::column_ticks.
+            app.system(c"mut_slice_sys")
+                .query_typed::<Mut<TickPos>>()
+                .build(|ctx| {
+                    let iter = ctx.iter();
+                    let chunk = iter.next_chunk_view().expect("chunk");
+                    let (added, changed, last_run, this_run) =
+                        chunk.column_ticks(0).expect("chunk.column_ticks");
+                    assert_eq!(added, &[2, 2, 8]);
+                    assert_eq!(changed, &[3, 7, 8]);
+                    assert_eq!((last_run, this_run), (5, 10));
+                    assert_eq!(iter.reset(), FfiResult::OK);
+                    iter.typed::<Mut<TickPos>>().for_each(|mut m| {
+                        assert!(m.has_ticks());
+                        assert!(m.is_changed(1));
+                        assert!(m.is_added(2));
+                        m[1].y = 42.0;
+                    })
+                })
+        })
+        .unwrap();
+
+    // Verify emitted BamTermDesc flags for ChangedMut / WithAdded / AddedMut / WithChanged.
+    let s0_terms = &host.systems[0].queries[0];
+    assert_eq!(s0_terms[0].mode, AccessMode::WRITE);
+    assert!(s0_terms[0].is_changed());
+    assert_eq!(s0_terms[1].mode, AccessMode::FILTER_ONLY);
+    assert!(s0_terms[1].is_added());
+
+    let s1_terms = &host.systems[1].queries[0];
+    assert_eq!(s1_terms[0].mode, AccessMode::WRITE);
+    assert!(s1_terms[0].is_added());
+    assert_eq!(s1_terms[1].mode, AccessMode::FILTER_ONLY);
+    assert!(s1_terms[1].is_changed());
+
+    assert_eq!(host.run_system(0), FfiResult::OK);
+    assert_eq!(host.run_system(1), FfiResult::OK);
+    assert_eq!(host.run_system(2), FfiResult::OK);
+    assert_eq!(host.run_system(3), FfiResult::OK);
+
+    let final_pos = host.chunks[0].read_dense::<TickPos>(h_pos);
+    assert_eq!(final_pos[0], TickPos { x: 11.0, y: 1.0 });
+    assert_eq!(final_pos[1], TickPos { x: 12.0, y: 42.0 });
+    assert_eq!(final_pos[2], TickPos { x: 13.0, y: 1.0 });
+
+    host.unload(inst);
+
+    // Graceful fallback when slot 69 (`iter_column_ticks`) is absent on an older host.
+    let mut old_api = make_v03_host_api();
+    old_api.iter_column_ticks = None;
+    let mut old_host = V03TestHost::with_api(old_api);
+    let h_pos_old = old_host.expose_component::<TickPos>("wave3::TickPos", TickPos::UUID, 0, &[]);
+    let mut c_old = MockChunk::new(vec![FfiEntity::from_bits(1)]);
+    c_old.insert_dense(h_pos_old, &[TickPos { x: 5.0, y: 6.0 }]);
+    old_host.chunks.push(c_old);
+    let inst_old = old_host
+        .load_fn(c"wave3_old_ticks_mod", |app| {
+            app.system(c"ref_fallback_sys")
+                .query_typed::<Ref<TickPos>>()
+                .build(|ctx| {
+                    ctx.single_query::<Ref<TickPos>>().for_each(|r| {
+                        assert!(!r.has_ticks());
+                        assert!(!r.is_added(0));
+                        assert!(!r.is_changed(0));
+                        assert!(r.row_ticks(0).is_none());
+                        assert_eq!(r[0], TickPos { x: 5.0, y: 6.0 });
+                    })
+                })
+        })
+        .unwrap();
+    assert_eq!(old_host.run_system(0), FfiResult::OK);
+    old_host.unload(inst_old);
+}
+
+/// Scenario (P1.5): Verifies `SystemBuilder::run_if_with`, `SystemBuilder::run_if_condition`,
+/// `RunConditionSystemContext`, and `conditions::{resource_exists, resource_changed, on_message,
+/// in_state}` end-to-end, plus rejection of mutable terms in `run_if_with`.
+#[test]
+fn ecs_aware_run_if_conditions_resource_message_and_state() {
+    define_pod_component!(struct GameCfg { speed: u32 } => c"wave3::GameCfg");
+    define_pod_component!(struct GameState { mode: u32 } => c"wave3::GameState");
+    define_pod_component!(struct JumpMsg { power: u32 } => c"wave3::JumpMsg");
+
+    static RES_EXISTS_RUNS: AtomicU32 = AtomicU32::new(0);
+    static RES_CHANGED_RUNS: AtomicU32 = AtomicU32::new(0);
+    static MSG_RUNS: AtomicU32 = AtomicU32::new(0);
+    static STATE_RUNS: AtomicU32 = AtomicU32::new(0);
+    static CUSTOM_WITH_RUNS: AtomicU32 = AtomicU32::new(0);
+    RES_EXISTS_RUNS.store(0, Ordering::Relaxed);
+    RES_CHANGED_RUNS.store(0, Ordering::Relaxed);
+    MSG_RUNS.store(0, Ordering::Relaxed);
+    STATE_RUNS.store(0, Ordering::Relaxed);
+    CUSTOM_WITH_RUNS.store(0, Ordering::Relaxed);
+
+    let mut host = V03TestHost::new();
+    let h_cfg = host.expose_component::<GameCfg>("wave3::GameCfg", GameCfg::UUID, 0, &[]);
+    let h_state = host.expose_component::<GameState>("wave3::GameState", GameState::UUID, 0, &[]);
+    let h_msg = host.expose_component::<JumpMsg>("wave3::JumpMsg", JumpMsg::UUID, 0, &[]);
+
+    let inst = host
+        .load_fn(c"wave3_cond_mod", |app| {
+            // System 0: resource_exists::<GameCfg>()
+            let rc = app
+                .system(c"cond_res_exists")
+                .run_if_condition(conditions::resource_exists::<GameCfg>())
+                .build(|_ctx| {
+                    RES_EXISTS_RUNS.fetch_add(1, Ordering::Relaxed);
+                });
+            assert_eq!(rc, FfiResult::OK);
+
+            // System 1: resource_changed::<GameCfg>()
+            let rc = app
+                .system(c"cond_res_changed")
+                .run_if_condition(conditions::resource_changed::<GameCfg>())
+                .build(|_ctx| {
+                    RES_CHANGED_RUNS.fetch_add(1, Ordering::Relaxed);
+                });
+            assert_eq!(rc, FfiResult::OK);
+
+            // System 2: on_message::<JumpMsg>()
+            let rc = app
+                .system(c"cond_on_msg")
+                .run_if_condition(conditions::on_message::<JumpMsg>())
+                .build(|_ctx| {
+                    MSG_RUNS.fetch_add(1, Ordering::Relaxed);
+                });
+            assert_eq!(rc, FfiResult::OK);
+
+            // System 3: in_state::<GameState>(GameState { mode: 2 })
+            let rc = app
+                .system(c"cond_in_state")
+                .run_if_condition(conditions::in_state(GameState { mode: 2 }))
+                .build(|_ctx| {
+                    STATE_RUNS.fetch_add(1, Ordering::Relaxed);
+                });
+            assert_eq!(rc, FfiResult::OK);
+
+            // System 4: custom run_if_with reading GameCfg resource directly
+            let rc = app
+                .system(c"cond_custom_with")
+                .run_if_with(
+                    |q| q.resource_read::<GameCfg>(),
+                    |ctx| ctx.res::<GameCfg>(0).is_some_and(|c| c.speed >= 5),
+                )
+                .build(|_ctx| {
+                    CUSTOM_WITH_RUNS.fetch_add(1, Ordering::Relaxed);
+                });
+            assert_eq!(rc, FfiResult::OK);
+
+            // Mutable terms in run_if_with must be rejected with PERMISSION_DENIED.
+            let bad = app
+                .system(c"cond_mutable_rejected")
+                .run_if_with(|q| q.resource_write::<GameCfg>(), |_ctx| true)
+                .build(|_ctx| {});
+            assert_eq!(bad, FfiResult::PERMISSION_DENIED);
+
+            FfiResult::OK
+        })
+        .unwrap();
+
+    // Initially no resources or messages exist -> all 5 systems skip.
+    for idx in 0..5 {
+        assert_eq!(host.run_system(idx), FfiResult::OK);
+    }
+    assert_eq!(RES_EXISTS_RUNS.load(Ordering::Relaxed), 0);
+    assert_eq!(RES_CHANGED_RUNS.load(Ordering::Relaxed), 0);
+    assert_eq!(MSG_RUNS.load(Ordering::Relaxed), 0);
+    assert_eq!(STATE_RUNS.load(Ordering::Relaxed), 0);
+    assert_eq!(CUSTOM_WITH_RUNS.load(Ordering::Relaxed), 0);
+
+    // Insert unchanged GameCfg { speed: 3 } (changed tick 2 <= last_run 5) -> exists runs, changed & custom skip.
+    let stale_ticks = BamChangeTicks {
+        added: 1,
+        changed: 2,
+        last_run: 5,
+        this_run: 10,
+    };
+    host.set_resource(h_cfg, GameCfg { speed: 3 }, stale_ticks);
+    assert_eq!(host.run_system(0), FfiResult::OK);
+    assert_eq!(host.run_system(1), FfiResult::OK);
+    assert_eq!(host.run_system(4), FfiResult::OK);
+    assert_eq!(RES_EXISTS_RUNS.load(Ordering::Relaxed), 1);
+    assert_eq!(RES_CHANGED_RUNS.load(Ordering::Relaxed), 0);
+    assert_eq!(CUSTOM_WITH_RUNS.load(Ordering::Relaxed), 0);
+
+    // Update GameCfg { speed: 10 } with fresh changed tick 8 -> changed & custom both run!
+    let fresh_ticks = BamChangeTicks {
+        added: 1,
+        changed: 8,
+        last_run: 5,
+        this_run: 10,
+    };
+    host.set_resource(h_cfg, GameCfg { speed: 10 }, fresh_ticks);
+    assert_eq!(host.run_system(1), FfiResult::OK);
+    assert_eq!(host.run_system(4), FfiResult::OK);
+    assert_eq!(RES_CHANGED_RUNS.load(Ordering::Relaxed), 1);
+    assert_eq!(CUSTOM_WITH_RUNS.load(Ordering::Relaxed), 1);
+
+    // Push a JumpMsg -> on_message runs once, then skips on next tick (queue drained).
+    host.push_message(h_msg, JumpMsg { power: 99 });
+    assert_eq!(host.run_system(2), FfiResult::OK);
+    assert_eq!(host.run_system(2), FfiResult::OK);
+    assert_eq!(MSG_RUNS.load(Ordering::Relaxed), 1);
+
+    // Set GameState mode=1 (skips), then mode=2 (runs).
+    host.set_resource(h_state, GameState { mode: 1 }, fresh_ticks);
+    assert_eq!(host.run_system(3), FfiResult::OK);
+    assert_eq!(STATE_RUNS.load(Ordering::Relaxed), 0);
+    host.set_resource(h_state, GameState { mode: 2 }, fresh_ticks);
+    assert_eq!(host.run_system(3), FfiResult::OK);
+    assert_eq!(STATE_RUNS.load(Ordering::Relaxed), 1);
+
+    host.unload(inst);
+}
+
+/// Scenario (P1.7): Verifies `SystemContext::get_many_mut`, `TypedChunkIter::for_each_combination`
+/// (within-chunk & cross-chunk), `TypedChunkIter::for_each_combination_mut` (within-chunk mutable
+/// pairs), and `SystemBuilder::param_set`.
+#[test]
+fn get_many_mut_combinations_and_param_set() {
+    define_pod_component!(struct Score { val: i32 } => c"wave3::Score");
+
+    let mut host = V03TestHost::new();
+    let h_score = host.expose_component::<Score>("wave3::Score", Score::UUID, 0, &[]);
+
+    let e1 = FfiEntity::from_bits(11);
+    let e2 = FfiEntity::from_bits(12);
+    let e3 = FfiEntity::from_bits(13);
+    let e4 = FfiEntity::from_bits(14);
+
+    // Two chunks: [e1, e2, e3] and [e4] so we test both within-chunk and cross-chunk combinations.
+    let mut c0 = MockChunk::new(vec![e1, e2, e3]);
+    c0.insert_dense(
+        h_score,
+        &[Score { val: 1 }, Score { val: 2 }, Score { val: 3 }],
+    );
+    let mut c1 = MockChunk::new(vec![e4]);
+    c1.insert_dense(h_score, &[Score { val: 4 }]);
+    host.chunks.push(c0);
+    host.chunks.push(c1);
+
+    let inst = host
+        .load_fn(c"wave3_p17_mod", |app| {
+            // System 0: get_many_mut (disjoint, duplicate, null, missing)
+            let rc = app
+                .system(c"get_many_mut_sys")
+                .query_typed::<&mut Score>()
+                .build(move |ctx| {
+                    // Duplicate entity rejected with ACCESS_CONFLICT.
+                    assert_eq!(
+                        ctx.get_many_mut::<2, Score>(0, 0, [e1, e1]),
+                        Err(FfiResult::ACCESS_CONFLICT)
+                    );
+                    // Null entity rejected with INVALID_ENTITY.
+                    assert_eq!(
+                        ctx.get_many_mut::<2, Score>(0, 0, [e1, FfiEntity::NULL]),
+                        Err(FfiResult::INVALID_ENTITY)
+                    );
+                    // Missing entity rejected with NOT_FOUND.
+                    assert_eq!(
+                        ctx.get_many_mut::<2, Score>(0, 0, [e1, FfiEntity::from_bits(999)]),
+                        Err(FfiResult::NOT_FOUND)
+                    );
+                    // Disjoint entities across chunks succeed and mutate in place.
+                    let [a, b] = ctx.get_many_mut::<2, Score>(0, 0, [e1, e4])?;
+                    a.val += 100;
+                    b.val += 400;
+                    Ok(())
+                });
+            assert_eq!(rc, FfiResult::OK);
+
+            // System 1: for_each_combination::<2> (cross-chunk + within-chunk: C(4,2) = 6 pairs)
+            let rc = app
+                .system(c"combo_read_sys")
+                .query_typed::<(FfiEntity, &Score)>()
+                .build(|ctx| {
+                    let mut pairs = Vec::new();
+                    let status = ctx
+                        .single_query::<(FfiEntity, &Score)>()
+                        .for_each_combination::<2, _, _>(|[(ea, sa), (eb, sb)]| {
+                            pairs.push((ea.to_bits(), sa.val, eb.to_bits(), sb.val));
+                        });
+                    assert_eq!(status, FfiResult::OK);
+                    assert_eq!(pairs.len(), 6);
+                    assert_eq!(pairs[0], (11, 101, 12, 2));
+                    assert_eq!(pairs[5], (13, 3, 14, 404));
+                    FfiResult::OK
+                });
+            assert_eq!(rc, FfiResult::OK);
+
+            // System 2: for_each_combination_mut within chunk 0 (C(3,2) = 3 pairs)
+            let rc = app
+                .system(c"combo_mut_sys")
+                .query_typed::<(FfiEntity, &mut Score)>()
+                .build(|ctx| {
+                    let mut pair_count = 0usize;
+                    let status = ctx
+                        .single_query::<(FfiEntity, &mut Score)>()
+                        .for_each_combination_mut(|(ea, sa), (eb, sb)| {
+                            assert_ne!(ea, eb);
+                            sa.val += 1;
+                            sb.val += 10;
+                            pair_count += 1;
+                        });
+                    assert_eq!(status, FfiResult::OK);
+                    // Chunk 0 has 3 entities -> 3 pairs; Chunk 1 has 1 entity -> 0 pairs.
+                    assert_eq!(pair_count, 3);
+                    FfiResult::OK
+                });
+            assert_eq!(rc, FfiResult::OK);
+
+            // System 3: ParamSetBuilder groups mutually exclusive queries under shared non-zero IDs.
+            let sb = app
+                .system(c"param_set_sys")
+                .query_typed::<&Score>()
+                .param_set(|ps| {
+                    assert_eq!(ps.group_id(), 1);
+                    ps.query_typed::<&mut Score>().query_typed::<&mut Score>();
+                })
+                .param_set(|ps| {
+                    assert_eq!(ps.group_id(), 2);
+                    ps.query(|q| q.write::<Score>())
+                        .query(|q| q.read::<Score>());
+                });
+            assert_eq!(sb.param_set_groups(), &[0, 1, 1, 2, 2]);
+            sb.build(|_ctx| FfiResult::OK)
+        })
+        .unwrap();
+
+    assert_eq!(host.run_system(0), FfiResult::OK);
+    assert_eq!(host.run_system(1), FfiResult::OK);
+    assert_eq!(host.run_system(2), FfiResult::OK);
+    assert_eq!(host.run_system(3), FfiResult::OK);
+
+    // Chunk 0 pairs: (0,1), (0,2), (1,2):
+    // idx 0: +1 +1 = +2 -> 101 + 2 = 103
+    // idx 1: +10 +1 = +11 -> 2 + 11 = 13
+    // idx 2: +10 +10 = +20 -> 3 + 20 = 23
+    let c0_scores = host.chunks[0].read_dense::<Score>(h_score);
+    assert_eq!(
+        c0_scores,
+        vec![Score { val: 103 }, Score { val: 13 }, Score { val: 23 }]
+    );
+    let c1_scores = host.chunks[1].read_dense::<Score>(h_score);
+    assert_eq!(c1_scores, vec![Score { val: 404 }]);
+
+    host.unload(inst);
+}
+
+/// Scenario (P2.8): Verifies `GuestCommands::{clone_entity, insert_resource,
+/// insert_resource_typed, insert_guest_resource, remove_resource, remove_guest_resource}` and
+/// `GuestEntityCommands::clone_to` over slots `70..=72`.
+#[test]
+fn commands_clone_entity_resource_insert_remove_and_clone_to() {
+    define_pod_component!(struct GlobalScore { points: u32 } => c"wave3::GlobalScore");
+
+    let mut host = V03TestHost::new();
+    let h_res =
+        host.expose_component::<GlobalScore>("wave3::GlobalScore", GlobalScore::UUID, 0, &[]);
+
+    let inst = host
+        .load_fn(c"wave3_p28_mod", move |app| {
+            let typed_res = TypedComponent::<GlobalScore>::validate(app.host(), h_res)
+                .expect("typed resource handle");
+            app.system(c"cmds_p28_sys").build(move |ctx| {
+                let cmds = ctx.commands();
+                let src = FfiEntity::from_bits(50);
+                let dst1 = FfiEntity::from_bits(51);
+                let dst2 = FfiEntity::from_bits(52);
+
+                assert_eq!(cmds.clone_entity(src, dst1), FfiResult::OK);
+                assert_eq!(cmds.entity(src).clone_to(dst2).status(), FfiResult::OK);
+                assert_eq!(
+                    cmds.insert_resource(h_res, &GlobalScore { points: 10 }),
+                    FfiResult::OK
+                );
+                assert_eq!(
+                    cmds.insert_resource_typed(typed_res, &GlobalScore { points: 20 }),
+                    FfiResult::OK
+                );
+                assert_eq!(
+                    cmds.insert_guest_resource(&GlobalScore { points: 30 }),
+                    FfiResult::OK
+                );
+                assert_eq!(cmds.remove_resource(h_res), FfiResult::OK);
+                assert_eq!(cmds.remove_guest_resource::<GlobalScore>(), FfiResult::OK);
+                FfiResult::OK
+            })
+        })
+        .unwrap();
+
+    assert_eq!(host.run_system(0), FfiResult::OK);
+    assert_eq!(
+        host.commands,
+        vec![
+            RecordedCmd::CloneEntity {
+                src: FfiEntity::from_bits(50),
+                dst: FfiEntity::from_bits(51),
+            },
+            RecordedCmd::CloneEntity {
+                src: FfiEntity::from_bits(50),
+                dst: FfiEntity::from_bits(52),
+            },
+            RecordedCmd::InsertResource {
+                resource: h_res,
+                bytes: 10u32.to_ne_bytes().to_vec(),
+            },
+            RecordedCmd::InsertResource {
+                resource: h_res,
+                bytes: 20u32.to_ne_bytes().to_vec(),
+            },
+            RecordedCmd::InsertResource {
+                resource: h_res,
+                bytes: 30u32.to_ne_bytes().to_vec(),
+            },
+            RecordedCmd::RemoveResource { resource: h_res },
+            RecordedCmd::RemoveResource { resource: h_res },
+        ]
+    );
 
     host.unload(inst);
 }

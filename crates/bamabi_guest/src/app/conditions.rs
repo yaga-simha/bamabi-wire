@@ -4,7 +4,13 @@
 
 use core::ffi::CStr;
 
-use crate::{app::RunConditionContext, component::GuestComponent};
+use bamabi_guest_sys::Host;
+use bamabi_sys::{AccessMode, BamTermDesc, FfiResult};
+
+use crate::{
+    app::{RunConditionContext, RunConditionSystemContext},
+    component::{GuestComponent, resolve_guest_component},
+};
 
 /// Returns a run condition that evaluates to `true` on its first invocation and `false` on every
 /// subsequent invocation (mirroring `bevy_ecs::schedule::common_conditions::run_once`).
@@ -107,4 +113,121 @@ pub fn symbol_exists(
     symbol: &'static CStr,
 ) -> impl FnMut(&RunConditionContext<'_>) -> bool + Send + 'static {
     move |ctx| ctx.resolve_custom_symbol(symbol).is_ok()
+}
+
+/// Boxed term-builder closure resolving the read-only [`BamTermDesc`] list for an [`EcsRunCondition`].
+type EcsConditionTermsBuilder = Box<dyn FnOnce(&Host, &str) -> Result<Vec<BamTermDesc>, FfiResult>>;
+
+/// Boxed evaluator closure for an [`EcsRunCondition`] receiving `(ctx, base_term_offset)`.
+type EcsConditionEval =
+    Box<dyn FnMut(&mut RunConditionSystemContext<'_>, usize) -> bool + Send + 'static>;
+
+/// Type-erased read-only ECS run condition pairing its [`BamTermDesc`] query terms with a
+/// predicate over [`RunConditionSystemContext`] (receiving its base `term_offset` inside the
+/// combined `run_if_query`).
+///
+/// Pass to [`SystemBuilder::run_if_condition`](crate::SystemBuilder::run_if_condition). Multiple
+/// calls to `.run_if_condition(...)` merge their read-only terms into a single `run_if_query`
+/// and evaluate with short-circuit logical AND semantics.
+pub struct EcsRunCondition {
+    pub(crate) build_terms: EcsConditionTermsBuilder,
+    pub(crate) eval: EcsConditionEval,
+}
+
+impl EcsRunCondition {
+    /// Creates an [`EcsRunCondition`] from a term-builder closure and a predicate receiving
+    /// `(&mut RunConditionSystemContext<'_>, base_term_offset)`.
+    pub fn new<B, F>(build_terms: B, eval: F) -> Self
+    where
+        B: FnOnce(&Host, &str) -> Result<Vec<BamTermDesc>, FfiResult> + 'static,
+        F: FnMut(&mut RunConditionSystemContext<'_>, usize) -> bool + Send + 'static,
+    {
+        Self {
+            build_terms: Box::new(build_terms),
+            eval: Box::new(eval),
+        }
+    }
+
+    /// Negates this ECS run condition (`!self`).
+    #[inline]
+    pub fn negated(self) -> Self {
+        let mut inner = self.eval;
+        Self {
+            build_terms: self.build_terms,
+            eval: Box::new(move |ctx, offset| !inner(ctx, offset)),
+        }
+    }
+}
+
+/// Returns an ECS-aware run condition that evaluates to `true` iff singleton resource
+/// `R: GuestComponent` currently exists in the host `World`
+/// (mirroring `bevy_ecs::schedule::common_conditions::resource_exists`).
+pub fn resource_exists<R: GuestComponent>() -> EcsRunCondition {
+    EcsRunCondition::new(
+        |host, manifest| {
+            let comp = resolve_guest_component::<R>(host, manifest)?;
+            Ok(vec![BamTermDesc::new(comp, AccessMode::RESOURCE_READ)])
+        },
+        |ctx, offset| ctx.has_resource::<R>(offset),
+    )
+}
+
+/// Returns an ECS-aware run condition that evaluates to `true` iff singleton resource
+/// `R: GuestComponent` exists and has changed since this condition last ran
+/// (mirroring `bevy_ecs::schedule::common_conditions::resource_changed`).
+pub fn resource_changed<R: GuestComponent>() -> EcsRunCondition {
+    EcsRunCondition::new(
+        |host, manifest| {
+            let comp = resolve_guest_component::<R>(host, manifest)?;
+            Ok(vec![BamTermDesc::new(comp, AccessMode::RESOURCE_READ)])
+        },
+        |ctx, offset| ctx.is_resource_changed::<R>(offset),
+    )
+}
+
+/// Returns an ECS-aware run condition that evaluates to `true` iff singleton resource
+/// `R: GuestComponent` was newly added since this condition last ran
+/// (mirroring `bevy_ecs::schedule::common_conditions::resource_added`).
+pub fn resource_added<R: GuestComponent>() -> EcsRunCondition {
+    EcsRunCondition::new(
+        |host, manifest| {
+            let comp = resolve_guest_component::<R>(host, manifest)?;
+            Ok(vec![BamTermDesc::new(comp, AccessMode::RESOURCE_READ)])
+        },
+        |ctx, offset| ctx.is_resource_added::<R>(offset),
+    )
+}
+
+/// Returns an ECS-aware run condition that evaluates to `true` iff singleton resource
+/// `R: GuestComponent + PartialEq` exists and equals `expected`
+/// (mirroring `bevy_ecs::schedule::common_conditions::resource_equals`).
+pub fn resource_equals<R: GuestComponent + PartialEq + Send + 'static>(
+    expected: R,
+) -> EcsRunCondition {
+    EcsRunCondition::new(
+        |host, manifest| {
+            let comp = resolve_guest_component::<R>(host, manifest)?;
+            Ok(vec![BamTermDesc::new(comp, AccessMode::RESOURCE_READ)])
+        },
+        move |ctx, offset| ctx.res::<R>(offset).is_some_and(|cur| *cur == expected),
+    )
+}
+
+/// Returns an ECS-aware run condition that evaluates to `true` iff at least one unread buffered
+/// message `M: GuestComponent` is available (mirroring `common_conditions::on_message`).
+pub fn on_message<M: GuestComponent>() -> EcsRunCondition {
+    EcsRunCondition::new(
+        |host, manifest| {
+            let comp = resolve_guest_component::<M>(host, manifest)?;
+            Ok(vec![BamTermDesc::new(comp, AccessMode::MESSAGE_READ)])
+        },
+        |ctx, offset| ctx.has_messages::<M>(offset),
+    )
+}
+
+/// Returns an ECS-aware run condition that evaluates to `true` iff singleton state resource
+/// `S: GuestComponent + PartialEq` exists and equals `expected`
+/// (mirroring `bevy_state::condition::in_state`).
+pub fn in_state<S: GuestComponent + PartialEq + Send + 'static>(expected: S) -> EcsRunCondition {
+    resource_equals(expected)
 }

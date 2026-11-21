@@ -1304,4 +1304,101 @@ impl<'a> ValidatedCommands<'a> {
         // SAFETY: `self.raw` is active and `entity`/`target`/`relation` were validated non-null/valid.
         unsafe { remove_rel_fn(self.raw, entity, relation, target) }
     }
+
+    /// Queues deferred cloning of all cloneable components from `src_entity` onto `dst_entity`
+    /// via `BamHostApi::cmd_clone_entity` (slot 70).
+    #[inline]
+    pub fn clone_entity(&mut self, src_entity: FfiEntity, dst_entity: FfiEntity) -> FfiResult {
+        if self.raw.is_null() {
+            return FfiResult::NULL_POINTER;
+        }
+        if src_entity.is_null() || dst_entity.is_null() {
+            return FfiResult::INVALID_ENTITY;
+        }
+        let Some(clone_fn) = host_slot!(self.host.api(), cmd_clone_entity) else {
+            return FfiResult::UNSUPPORTED;
+        };
+        // SAFETY: `self.raw` is an active `BamCommands` handle for `'a` and both entities were
+        // verified non-null.
+        unsafe { clone_fn(self.raw, src_entity, dst_entity) }
+    }
+
+    /// Queues deferred insertion or replacement of singleton `resource` (`R: AbiPod`) via
+    /// `BamHostApi::cmd_insert_resource` (slot 71), validating `resource` layout against
+    /// `Host::component_layout_info`.
+    #[inline]
+    pub fn insert_resource<R: AbiPod>(&mut self, resource: BamComponent, value: &R) -> FfiResult {
+        if self.raw.is_null() {
+            return FfiResult::NULL_POINTER;
+        }
+        if !resource.is_valid() {
+            return FfiResult::INVALID_COMPONENT;
+        }
+        let Some(insert_res_fn) = host_slot!(self.host.api(), cmd_insert_resource) else {
+            return FfiResult::UNSUPPORTED;
+        };
+        let info = match self.host.component_layout_info(resource) {
+            Ok(info) => info,
+            Err(err) => return err,
+        };
+        if info.size != core::mem::size_of::<R>() || info.align != core::mem::align_of::<R>() {
+            return FfiResult::TYPE_MISMATCH;
+        }
+        let data_len = core::mem::size_of::<R>();
+        let data_ptr = if data_len == 0 {
+            core::ptr::NonNull::<u8>::dangling().as_ptr().cast_const()
+        } else {
+            core::ptr::from_ref(value).cast::<u8>()
+        };
+        // SAFETY: `self.raw` is active, `component_layout_info` verified `R`'s exact size and
+        // alignment, and `value` is a live `&R` (`R: AbiPod`) readable for `data_len` bytes.
+        unsafe { insert_res_fn(self.raw, resource, data_ptr, data_len) }
+    }
+
+    /// Queues deferred insertion or replacement of singleton `resource` using an init-validated
+    /// [`TypedComponent<R>`] handle via `BamHostApi::cmd_insert_resource` (slot 71), skipping
+    /// the per-command `Host::component_layout_info` FFI round-trip.
+    #[inline]
+    pub fn insert_resource_typed<R: AbiPod>(
+        &mut self,
+        resource: TypedComponent<R>,
+        value: &R,
+    ) -> FfiResult {
+        if self.raw.is_null() {
+            return FfiResult::NULL_POINTER;
+        }
+        let handle = resource.handle();
+        if !handle.is_valid() {
+            return FfiResult::INVALID_COMPONENT;
+        }
+        let Some(insert_res_fn) = host_slot!(self.host.api(), cmd_insert_resource) else {
+            return FfiResult::UNSUPPORTED;
+        };
+        let data_len = core::mem::size_of::<R>();
+        let data_ptr = if data_len == 0 {
+            core::ptr::NonNull::<u8>::dangling().as_ptr().cast_const()
+        } else {
+            core::ptr::from_ref(value).cast::<u8>()
+        };
+        // SAFETY: `self.raw` is active, `TypedComponent<R>` guarantees `handle` matches `R`'s
+        // registered layout, and `value` is a live `&R` (`R: AbiPod`) readable for `data_len` bytes.
+        unsafe { insert_res_fn(self.raw, handle, data_ptr, data_len) }
+    }
+
+    /// Queues deferred removal of singleton `resource` from the `World` via
+    /// `BamHostApi::cmd_remove_resource` (slot 72).
+    #[inline]
+    pub fn remove_resource(&mut self, resource: BamComponent) -> FfiResult {
+        if self.raw.is_null() {
+            return FfiResult::NULL_POINTER;
+        }
+        if !resource.is_valid() {
+            return FfiResult::INVALID_COMPONENT;
+        }
+        let Some(remove_res_fn) = host_slot!(self.host.api(), cmd_remove_resource) else {
+            return FfiResult::UNSUPPORTED;
+        };
+        // SAFETY: `self.raw` is active and `resource` was validated non-zero.
+        unsafe { remove_res_fn(self.raw, resource) }
+    }
 }

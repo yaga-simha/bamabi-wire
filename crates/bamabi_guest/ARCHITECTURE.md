@@ -3,7 +3,7 @@
 `bamabi_guest` (`v0.3.0`, targeting `ABI 0.3.0` / `0x0003_0000`, Rust `edition = "2024"`, MSRV `1.87`) is the safe (`#![forbid(unsafe_code)]`), **zero-Bevy-dependency** Layer 0 guest SDK for writing native `.cdylib` mods in Rust.
 
 Its sole runtime dependencies are:
-- `bamabi_sys` (`#![no_std]`, zero dependencies): frozen C-ABI wire types, 68-slot `BamHostApi`, `ComponentUuid` (SipHash-2-4-128), `FfiResult`, and descriptors.
+- `bamabi_sys` (`#![no_std]`, zero dependencies): frozen C-ABI wire types, 73-slot `BamHostApi`, `ComponentUuid` (SipHash-2-4-128), `FfiResult`, and descriptors.
 - `bamabi_guest_sys`: the guest-side `unsafe` boundary housing `GuestInstance`, `Host`, `ReentrantCell`, panic-catching `extern "C"` trampolines, checked `BamHostApi` wrappers, `ChunkColumnDispenser`, `ValidatedIter` / `ValidatedCommands` / `ValidatedSlice*`, and unconditional `wire_types`.
 - `bamabi_macros` (optional, behind `feature = "derive"`, `default = []`): `#[derive(AbiPod, GuestComponent, ModComponent)]`.
 

@@ -2173,3 +2173,115 @@ fn schema_fingerprint_bam_fields_and_custom_require_init_work() {
     assert_eq!(reqs[1].flags, BAM_REQUIRED_FLAG_RESOLVE_BY_UUID);
     assert!(reqs[1].init_fn.is_none());
 }
+
+/// Test scenario: verifies `FfiChildOf`, `FfiAssetHandle`, and `BamChangeTicks` are classified
+/// as by-value `Primitive` fields generating `get_*`/`set_*` VTable slots (instead of `ptr_*`)
+/// and exact C99/Zig VTable typedef signatures.
+#[test]
+fn promoted_abi_primitives_generate_by_value_get_set_slots() {
+    use bamabi_sys::{BamChangeTicks, BamComponent, FfiAssetHandle, FfiChildOf, FfiEntity};
+
+    #[repr(C)]
+    #[derive(Debug, Copy, Clone, PartialEq, ModComponent)]
+    #[mod_component(name = "test::PromotedAbiPrimitives")]
+    struct PromotedAbiPrimitives {
+        parent: FfiChildOf,
+        asset: FfiAssetHandle,
+        ticks: BamChangeTicks,
+    }
+
+    const {
+        assert!(PromotedAbiPrimitives::IS_ABI_POD);
+        assert!(PromotedAbiPrimitives::IS_RAW_INSERTABLE);
+    }
+    bamabi_sys::assert_abi_pod::<PromotedAbiPrimitives>();
+
+    let mut comp = PromotedAbiPrimitives {
+        parent: FfiChildOf::default(),
+        asset: FfiAssetHandle::default(),
+        ticks: BamChangeTicks::default(),
+    };
+    let vt = PromotedAbiPrimitives::vtable();
+    let ptr = (&raw mut comp).cast::<c_void>();
+    let cptr = ptr.cast_const();
+
+    let get_parent = vt.get_parent.expect("get_parent slot");
+    let set_parent = vt.set_parent.expect("set_parent slot");
+    let get_asset = vt.get_asset.expect("get_asset slot");
+    let set_asset = vt.set_asset.expect("set_asset slot");
+    let get_ticks = vt.get_ticks.expect("get_ticks slot");
+    let set_ticks = vt.set_ticks.expect("set_ticks slot");
+
+    let new_parent = FfiChildOf::new(FfiEntity::from_bits(42));
+    let new_asset = FfiAssetHandle::from_index(BamComponent::from_raw(7), 12, 3);
+    let new_ticks = BamChangeTicks {
+        added: 10,
+        changed: 25,
+        last_run: 20,
+        this_run: 30,
+    };
+
+    unsafe {
+        // Null-pointer safety returns Default::default() for getters and NULL_POINTER for setters.
+        assert_eq!(get_parent(core::ptr::null()), FfiChildOf::default());
+        assert_eq!(get_asset(core::ptr::null()), FfiAssetHandle::default());
+        assert_eq!(get_ticks(core::ptr::null()), BamChangeTicks::default());
+        assert_eq!(
+            set_parent(core::ptr::null_mut(), new_parent),
+            FfiResult::NULL_POINTER
+        );
+        assert_eq!(
+            set_asset(core::ptr::null_mut(), new_asset),
+            FfiResult::NULL_POINTER
+        );
+        assert_eq!(
+            set_ticks(core::ptr::null_mut(), new_ticks),
+            FfiResult::NULL_POINTER
+        );
+
+        // Round-trip set and get by value.
+        assert_eq!(set_parent(ptr, new_parent), FfiResult::OK);
+        assert_eq!(set_asset(ptr, new_asset), FfiResult::OK);
+        assert_eq!(set_ticks(ptr, new_ticks), FfiResult::OK);
+
+        assert_eq!(get_parent(cptr), new_parent);
+        assert_eq!(get_asset(cptr), new_asset);
+        assert_eq!(get_ticks(cptr), new_ticks);
+    }
+
+    assert_eq!(comp.parent, new_parent);
+    assert_eq!(comp.asset, new_asset);
+    assert_eq!(comp.ticks, new_ticks);
+
+    // Verify C99 and Zig VTable declarations emit by-value `get_*`/`set_*` signatures.
+    let c_decl = PromotedAbiPrimitives::C_DECL;
+    assert!(c_decl.contains("BamChildOf (*get_parent)(const void* ptr);"));
+    assert!(c_decl.contains("BamResult (*set_parent)(void* ptr, BamChildOf val);"));
+    assert!(c_decl.contains("BamAssetHandle (*get_asset)(const void* ptr);"));
+    assert!(c_decl.contains("BamResult (*set_asset)(void* ptr, BamAssetHandle val);"));
+    assert!(c_decl.contains("BamChangeTicks (*get_ticks)(const void* ptr);"));
+    assert!(c_decl.contains("BamResult (*set_ticks)(void* ptr, BamChangeTicks val);"));
+
+    let zig_decl = PromotedAbiPrimitives::ZIG_DECL;
+    assert!(
+        zig_decl
+            .contains("get_parent: ?*const fn (?*const anyopaque) callconv(.c) bam.BamChildOf,")
+    );
+    assert!(zig_decl.contains(
+        "set_parent: ?*const fn (?*anyopaque, bam.BamChildOf) callconv(.c) bam.BamResult,"
+    ));
+    assert!(
+        zig_decl
+            .contains("get_asset: ?*const fn (?*const anyopaque) callconv(.c) bam.BamAssetHandle,")
+    );
+    assert!(zig_decl.contains(
+        "set_asset: ?*const fn (?*anyopaque, bam.BamAssetHandle) callconv(.c) bam.BamResult,"
+    ));
+    assert!(
+        zig_decl
+            .contains("get_ticks: ?*const fn (?*const anyopaque) callconv(.c) bam.BamChangeTicks,")
+    );
+    assert!(zig_decl.contains(
+        "set_ticks: ?*const fn (?*anyopaque, bam.BamChangeTicks) callconv(.c) bam.BamResult,"
+    ));
+}

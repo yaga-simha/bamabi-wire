@@ -68,6 +68,13 @@ impl<'iter, 'ctx> Chunk<'iter, 'ctx> {
         self.iter.column_info(col)
     }
 
+    /// Retrieves per-row `(added_ticks, changed_ticks, last_run, this_run)` for dense column `col`
+    /// via `BamHostApi::iter_column_ticks` (slot 69).
+    #[inline]
+    pub fn column_ticks(&self, col: usize) -> Result<(&[u32], &[u32], u32, u32), FfiResult> {
+        self.iter.column_ticks(col)
+    }
+
     /// Borrows the contiguous `[FfiEntity; len]` slice for this chunk.
     #[inline]
     pub fn entities(&self) -> &[FfiEntity] {

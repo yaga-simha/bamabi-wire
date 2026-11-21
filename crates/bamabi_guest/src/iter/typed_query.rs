@@ -5,11 +5,15 @@
 //! [`Added<T>`], [`Allow<T>`], [`Has<T>`], [`Or<(T0, T1, ...)>`] (2..=8 filter terms, with
 //! [`Or2`] and [`Or3`] type aliases), and [`FfiEntity`] where `T: GuestComponent`.
 
-use core::marker::PhantomData;
+use core::{
+    marker::PhantomData,
+    ops::{Deref, DerefMut},
+};
 
 use bamabi_guest_sys::{ChunkColumnDispenser, Host};
 use bamabi_sys::{
-    AccessMode, BamComponent, BamTermDesc, FfiEntity, FfiResult, MAX_TERMS_PER_QUERY,
+    AccessMode, BamChangeTicks, BamComponent, BamTermDesc, FfiEntity, FfiResult,
+    MAX_TERMS_PER_QUERY,
 };
 
 use crate::{
@@ -40,6 +44,212 @@ pub struct Changed<T>(PhantomData<fn() -> T>);
 
 /// Row-level added-tick filter with read-only slice access (`AccessMode::ADDED`) for [`QueryTuple`].
 pub struct Added<T>(PhantomData<fn() -> T>);
+
+/// Row-level change-tick filter with mutable slice access (`AccessMode::WRITE` + `BAM_TERM_FLAG_CHANGED`)
+/// for [`QueryTuple`], yielding `&mut [T]`.
+pub struct ChangedMut<T>(PhantomData<fn() -> T>);
+
+/// Row-level added-tick filter with mutable slice access (`AccessMode::WRITE` + `BAM_TERM_FLAG_ADDED`)
+/// for [`QueryTuple`], yielding `&mut [T]`.
+pub struct AddedMut<T>(PhantomData<fn() -> T>);
+
+/// Row-level change-tick filter without borrowing component data (`AccessMode::FILTER_ONLY` +
+/// `BAM_TERM_FLAG_CHANGED`), yielding `()`.
+pub struct WithChanged<T>(PhantomData<fn() -> T>);
+
+/// Row-level added-tick filter without borrowing component data (`AccessMode::FILTER_ONLY` +
+/// `BAM_TERM_FLAG_ADDED`), yielding `()`.
+pub struct WithAdded<T>(PhantomData<fn() -> T>);
+
+/// Read-only column query term yielding a [`RefSlice<'chunk, T>`] with per-row change-detection
+/// inspection (`is_added`, `is_changed`, `row_ticks`) via `BamHostApi::iter_column_ticks` (slot 69).
+pub struct Ref<T>(PhantomData<fn() -> T>);
+
+/// Mutable column query term yielding a [`MutSlice<'chunk, T>`] with per-row change-detection
+/// inspection (`is_added`, `is_changed`, `row_ticks`) via `BamHostApi::iter_column_ticks` (slot 69).
+pub struct Mut<T>(PhantomData<fn() -> T>);
+
+/// Read-only dense column slice paired with optional per-row change-detection tick metadata
+/// retrieved via `BamHostApi::iter_column_ticks` (slot 69).
+///
+/// On older hosts where slot 69 is absent (`FfiResult::UNSUPPORTED`), [`Self::has_ticks`] returns
+/// `false` and [`Self::is_added`] / [`Self::is_changed`] gracefully return `false`.
+pub struct RefSlice<'chunk, T> {
+    data: &'chunk [T],
+    ticks: Option<(&'chunk [u32], &'chunk [u32], u32, u32)>,
+}
+
+impl<'chunk, T> RefSlice<'chunk, T> {
+    /// Returns the underlying immutable component slice `&'chunk [T]`.
+    #[inline]
+    pub const fn as_slice(&self) -> &'chunk [T] {
+        self.data
+    }
+
+    /// Returns the number of entity rows in this chunk slice.
+    #[inline]
+    pub const fn len(&self) -> usize {
+        self.data.len()
+    }
+
+    /// Returns `true` if this chunk slice contains zero rows.
+    #[inline]
+    pub const fn is_empty(&self) -> bool {
+        self.data.is_empty()
+    }
+
+    /// Returns `true` if per-row change ticks were provided by the host (slot 69 available).
+    #[inline]
+    pub const fn has_ticks(&self) -> bool {
+        self.ticks.is_some()
+    }
+
+    /// Returns the [`BamChangeTicks`] snapshot for `row`, or `None` if `row >= self.len()` or
+    /// the host does not support `iter_column_ticks`.
+    #[inline]
+    pub fn row_ticks(&self, row: usize) -> Option<BamChangeTicks> {
+        let (added, changed, last_run, this_run) = self.ticks?;
+        Some(BamChangeTicks {
+            added: *added.get(row)?,
+            changed: *changed.get(row)?,
+            last_run,
+            this_run,
+        })
+    }
+
+    /// Returns `true` if `row` was newly added since the system's previous run.
+    #[inline]
+    pub fn is_added(&self, row: usize) -> bool {
+        let Some((added, _changed, last_run, this_run)) = self.ticks else {
+            return false;
+        };
+        added
+            .get(row)
+            .is_some_and(|&tick| BamChangeTicks::is_tick_newer(tick, last_run, this_run))
+    }
+
+    /// Returns `true` if `row` was mutated since the system's previous run.
+    #[inline]
+    pub fn is_changed(&self, row: usize) -> bool {
+        let Some((_added, changed, last_run, this_run)) = self.ticks else {
+            return false;
+        };
+        changed
+            .get(row)
+            .is_some_and(|&tick| BamChangeTicks::is_tick_newer(tick, last_run, this_run))
+    }
+}
+
+impl<T> Deref for RefSlice<'_, T> {
+    type Target = [T];
+
+    /// Dereferences to the underlying immutable component slice `&[T]`.
+    #[inline]
+    fn deref(&self) -> &Self::Target {
+        self.data
+    }
+}
+
+/// Mutable dense column slice paired with optional per-row change-detection tick metadata
+/// retrieved via `BamHostApi::iter_column_ticks` (slot 69).
+///
+/// On older hosts where slot 69 is absent (`FfiResult::UNSUPPORTED`), [`Self::has_ticks`] returns
+/// `false` and [`Self::is_added`] / [`Self::is_changed`] gracefully return `false`.
+pub struct MutSlice<'chunk, T> {
+    data: &'chunk mut [T],
+    ticks: Option<(&'chunk [u32], &'chunk [u32], u32, u32)>,
+}
+
+impl<'chunk, T> MutSlice<'chunk, T> {
+    /// Returns the underlying immutable component slice `&[T]`.
+    #[inline]
+    pub const fn as_slice(&self) -> &[T] {
+        self.data
+    }
+
+    /// Returns the underlying mutable component slice `&mut [T]`.
+    #[inline]
+    pub const fn as_mut_slice(&mut self) -> &mut [T] {
+        self.data
+    }
+
+    /// Consumes this wrapper and returns the underlying `'chunk`-lived `&'chunk mut [T]`.
+    #[inline]
+    pub const fn into_mut_slice(self) -> &'chunk mut [T] {
+        self.data
+    }
+
+    /// Returns the number of entity rows in this chunk slice.
+    #[inline]
+    pub const fn len(&self) -> usize {
+        self.data.len()
+    }
+
+    /// Returns `true` if this chunk slice contains zero rows.
+    #[inline]
+    pub const fn is_empty(&self) -> bool {
+        self.data.is_empty()
+    }
+
+    /// Returns `true` if per-row change ticks were provided by the host (slot 69 available).
+    #[inline]
+    pub const fn has_ticks(&self) -> bool {
+        self.ticks.is_some()
+    }
+
+    /// Returns the [`BamChangeTicks`] snapshot for `row`, or `None` if `row >= self.len()` or
+    /// the host does not support `iter_column_ticks`.
+    #[inline]
+    pub fn row_ticks(&self, row: usize) -> Option<BamChangeTicks> {
+        let (added, changed, last_run, this_run) = self.ticks?;
+        Some(BamChangeTicks {
+            added: *added.get(row)?,
+            changed: *changed.get(row)?,
+            last_run,
+            this_run,
+        })
+    }
+
+    /// Returns `true` if `row` was newly added since the system's previous run.
+    #[inline]
+    pub fn is_added(&self, row: usize) -> bool {
+        let Some((added, _changed, last_run, this_run)) = self.ticks else {
+            return false;
+        };
+        added
+            .get(row)
+            .is_some_and(|&tick| BamChangeTicks::is_tick_newer(tick, last_run, this_run))
+    }
+
+    /// Returns `true` if `row` was mutated since the system's previous run.
+    #[inline]
+    pub fn is_changed(&self, row: usize) -> bool {
+        let Some((_added, changed, last_run, this_run)) = self.ticks else {
+            return false;
+        };
+        changed
+            .get(row)
+            .is_some_and(|&tick| BamChangeTicks::is_tick_newer(tick, last_run, this_run))
+    }
+}
+
+impl<T> Deref for MutSlice<'_, T> {
+    type Target = [T];
+
+    /// Dereferences to the underlying immutable component slice `&[T]`.
+    #[inline]
+    fn deref(&self) -> &Self::Target {
+        self.data
+    }
+}
+
+impl<T> DerefMut for MutSlice<'_, T> {
+    /// Mutably dereferences to the underlying component slice `&mut [T]`.
+    #[inline]
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        self.data
+    }
+}
 
 /// Archetype filter bypass marker (`AccessMode::ALLOW`) suppressing `DefaultQueryFilters`
 /// (such as `Disabled`) for `T` without requiring `T` to be present on matched entities.
@@ -424,6 +634,192 @@ impl<T: GuestComponent> QueryTerm for Added<T> {
     }
 }
 
+impl<T: GuestComponent> private::TermSealed for ChangedMut<T> {}
+impl<T: GuestComponent> QueryTerm for ChangedMut<T> {
+    type Slice<'chunk> = &'chunk mut [T];
+    const IS_READ_ONLY: bool = false;
+    const MARK_CHANGED_MASK: u32 = 1;
+
+    /// Appends an [`AccessMode::WRITE`] descriptor tagged with `BAM_TERM_FLAG_CHANGED` for `T`.
+    #[inline]
+    fn push_desc(
+        host: &Host,
+        manifest_name: &str,
+        out: &mut Vec<BamTermDesc>,
+    ) -> Result<(), FfiResult> {
+        if out.len() >= MAX_TERMS_PER_QUERY {
+            return Err(FfiResult::CAPACITY_EXCEEDED);
+        }
+        let comp = resolve_guest_component::<T>(host, manifest_name)?;
+        out.push(BamTermDesc::new(comp, AccessMode::WRITE).with_changed());
+        Ok(())
+    }
+
+    /// Dispenses the UUID-verified exclusive `&mut [T]` slice for rows matching `ChangedMut<T>`.
+    #[inline]
+    fn fetch_slice<'chunk>(
+        dispenser: &mut ChunkColumnDispenser<'chunk, '_>,
+    ) -> Result<Self::Slice<'chunk>, FfiResult> {
+        let filter = guest_uuid_filter::<T>(dispenser.base_host().manifest_name());
+        dispenser.next_write::<T>(Some(filter))
+    }
+}
+
+impl<T: GuestComponent> private::TermSealed for AddedMut<T> {}
+impl<T: GuestComponent> QueryTerm for AddedMut<T> {
+    type Slice<'chunk> = &'chunk mut [T];
+    const IS_READ_ONLY: bool = false;
+    const MARK_CHANGED_MASK: u32 = 1;
+
+    /// Appends an [`AccessMode::WRITE`] descriptor tagged with `BAM_TERM_FLAG_ADDED` for `T`.
+    #[inline]
+    fn push_desc(
+        host: &Host,
+        manifest_name: &str,
+        out: &mut Vec<BamTermDesc>,
+    ) -> Result<(), FfiResult> {
+        if out.len() >= MAX_TERMS_PER_QUERY {
+            return Err(FfiResult::CAPACITY_EXCEEDED);
+        }
+        let comp = resolve_guest_component::<T>(host, manifest_name)?;
+        out.push(BamTermDesc::new(comp, AccessMode::WRITE).with_added());
+        Ok(())
+    }
+
+    /// Dispenses the UUID-verified exclusive `&mut [T]` slice for rows matching `AddedMut<T>`.
+    #[inline]
+    fn fetch_slice<'chunk>(
+        dispenser: &mut ChunkColumnDispenser<'chunk, '_>,
+    ) -> Result<Self::Slice<'chunk>, FfiResult> {
+        let filter = guest_uuid_filter::<T>(dispenser.base_host().manifest_name());
+        dispenser.next_write::<T>(Some(filter))
+    }
+}
+
+impl<T: GuestComponent> private::TermSealed for WithChanged<T> {}
+impl<T: GuestComponent> QueryTerm for WithChanged<T> {
+    type Slice<'chunk> = ();
+
+    /// Appends an [`AccessMode::FILTER_ONLY`] descriptor tagged with `BAM_TERM_FLAG_CHANGED`.
+    #[inline]
+    fn push_desc(
+        host: &Host,
+        manifest_name: &str,
+        out: &mut Vec<BamTermDesc>,
+    ) -> Result<(), FfiResult> {
+        if out.len() >= MAX_TERMS_PER_QUERY {
+            return Err(FfiResult::CAPACITY_EXCEEDED);
+        }
+        let comp = resolve_guest_component::<T>(host, manifest_name)?;
+        out.push(BamTermDesc::new(comp, AccessMode::FILTER_ONLY).with_changed());
+        Ok(())
+    }
+
+    /// Validates the `FILTER_ONLY` column descriptor without borrowing component data.
+    #[inline]
+    fn fetch_slice<'chunk>(
+        dispenser: &mut ChunkColumnDispenser<'chunk, '_>,
+    ) -> Result<Self::Slice<'chunk>, FfiResult> {
+        let filter = guest_uuid_filter::<T>(dispenser.base_host().manifest_name());
+        dispenser.next_filter::<T>(AccessMode::FILTER_ONLY, Some(filter))
+    }
+}
+
+impl<T: GuestComponent> private::TermSealed for WithAdded<T> {}
+impl<T: GuestComponent> QueryTerm for WithAdded<T> {
+    type Slice<'chunk> = ();
+
+    /// Appends an [`AccessMode::FILTER_ONLY`] descriptor tagged with `BAM_TERM_FLAG_ADDED`.
+    #[inline]
+    fn push_desc(
+        host: &Host,
+        manifest_name: &str,
+        out: &mut Vec<BamTermDesc>,
+    ) -> Result<(), FfiResult> {
+        if out.len() >= MAX_TERMS_PER_QUERY {
+            return Err(FfiResult::CAPACITY_EXCEEDED);
+        }
+        let comp = resolve_guest_component::<T>(host, manifest_name)?;
+        out.push(BamTermDesc::new(comp, AccessMode::FILTER_ONLY).with_added());
+        Ok(())
+    }
+
+    /// Validates the `FILTER_ONLY` column descriptor without borrowing component data.
+    #[inline]
+    fn fetch_slice<'chunk>(
+        dispenser: &mut ChunkColumnDispenser<'chunk, '_>,
+    ) -> Result<Self::Slice<'chunk>, FfiResult> {
+        let filter = guest_uuid_filter::<T>(dispenser.base_host().manifest_name());
+        dispenser.next_filter::<T>(AccessMode::FILTER_ONLY, Some(filter))
+    }
+}
+
+impl<T: GuestComponent> private::TermSealed for Ref<T> {}
+impl<T: GuestComponent> QueryTerm for Ref<T> {
+    type Slice<'chunk> = RefSlice<'chunk, T>;
+
+    /// Appends an [`AccessMode::READ`] descriptor for `T`.
+    #[inline]
+    fn push_desc(
+        host: &Host,
+        manifest_name: &str,
+        out: &mut Vec<BamTermDesc>,
+    ) -> Result<(), FfiResult> {
+        push_resolved_term::<T>(host, manifest_name, AccessMode::READ, out)
+    }
+
+    /// Dispenses a [`RefSlice`] pairing `&[T]` with per-row change-detection ticks (slot 69),
+    /// falling back gracefully to `has_ticks() == false` on hosts without slot 69.
+    #[inline]
+    fn fetch_slice<'chunk>(
+        dispenser: &mut ChunkColumnDispenser<'chunk, '_>,
+    ) -> Result<Self::Slice<'chunk>, FfiResult> {
+        let term_index = dispenser.next_term_index();
+        let filter = guest_uuid_filter::<T>(dispenser.base_host().manifest_name());
+        let data = dispenser.next_read::<T>(AccessMode::READ, Some(filter))?;
+        let ticks = match dispenser.column_ticks(term_index) {
+            Ok(t) => Some(t),
+            Err(FfiResult::UNSUPPORTED) => None,
+            Err(err) => return Err(err),
+        };
+        Ok(RefSlice { data, ticks })
+    }
+}
+
+impl<T: GuestComponent> private::TermSealed for Mut<T> {}
+impl<T: GuestComponent> QueryTerm for Mut<T> {
+    type Slice<'chunk> = MutSlice<'chunk, T>;
+    const IS_READ_ONLY: bool = false;
+    const MARK_CHANGED_MASK: u32 = 1;
+
+    /// Appends an [`AccessMode::WRITE`] descriptor for `T`.
+    #[inline]
+    fn push_desc(
+        host: &Host,
+        manifest_name: &str,
+        out: &mut Vec<BamTermDesc>,
+    ) -> Result<(), FfiResult> {
+        push_resolved_term::<T>(host, manifest_name, AccessMode::WRITE, out)
+    }
+
+    /// Dispenses a [`MutSlice`] pairing `&mut [T]` with per-row change-detection ticks (slot 69),
+    /// falling back gracefully to `has_ticks() == false` on hosts without slot 69.
+    #[inline]
+    fn fetch_slice<'chunk>(
+        dispenser: &mut ChunkColumnDispenser<'chunk, '_>,
+    ) -> Result<Self::Slice<'chunk>, FfiResult> {
+        let term_index = dispenser.next_term_index();
+        let filter = guest_uuid_filter::<T>(dispenser.base_host().manifest_name());
+        let data = dispenser.next_write::<T>(Some(filter))?;
+        let ticks = match dispenser.column_ticks(term_index) {
+            Ok(t) => Some(t),
+            Err(FfiResult::UNSUPPORTED) => None,
+            Err(err) => return Err(err),
+        };
+        Ok(MutSlice { data, ticks })
+    }
+}
+
 impl<T: GuestComponent> private::TermSealed for Allow<T> {}
 impl<T: GuestComponent> QueryTerm for Allow<T> {
     type Slice<'chunk> = ();
@@ -504,6 +900,70 @@ impl_or_filter_term!(With<T>, AccessMode::FILTER_ONLY);
 impl_or_filter_term!(Without<T>, AccessMode::WITHOUT);
 impl_or_filter_term!(Changed<T>, AccessMode::CHANGED);
 impl_or_filter_term!(Added<T>, AccessMode::ADDED);
+
+impl<T: GuestComponent> private::OrFilterSealed for WithChanged<T> {}
+impl<T: GuestComponent> OrFilterTerm for WithChanged<T> {
+    /// Appends a `FILTER_ONLY` + `BAM_TERM_FLAG_CHANGED` descriptor tagged with `or_group`.
+    #[inline]
+    fn push_filter_desc(
+        host: &Host,
+        manifest_name: &str,
+        or_group: u8,
+        out: &mut Vec<BamTermDesc>,
+    ) -> Result<(), FfiResult> {
+        if out.len() >= MAX_TERMS_PER_QUERY {
+            return Err(FfiResult::CAPACITY_EXCEEDED);
+        }
+        let comp = resolve_guest_component::<T>(host, manifest_name)?;
+        out.push(
+            BamTermDesc::new(comp, AccessMode::FILTER_ONLY)
+                .with_changed()
+                .with_or_group(or_group),
+        );
+        Ok(())
+    }
+
+    /// Validates the `FILTER_ONLY` descriptor in the active chunk without borrowing data.
+    #[inline]
+    fn fetch_filter<'chunk>(
+        dispenser: &mut ChunkColumnDispenser<'chunk, '_>,
+    ) -> Result<(), FfiResult> {
+        let filter = guest_uuid_filter::<T>(dispenser.base_host().manifest_name());
+        dispenser.next_filter::<T>(AccessMode::FILTER_ONLY, Some(filter))
+    }
+}
+
+impl<T: GuestComponent> private::OrFilterSealed for WithAdded<T> {}
+impl<T: GuestComponent> OrFilterTerm for WithAdded<T> {
+    /// Appends a `FILTER_ONLY` + `BAM_TERM_FLAG_ADDED` descriptor tagged with `or_group`.
+    #[inline]
+    fn push_filter_desc(
+        host: &Host,
+        manifest_name: &str,
+        or_group: u8,
+        out: &mut Vec<BamTermDesc>,
+    ) -> Result<(), FfiResult> {
+        if out.len() >= MAX_TERMS_PER_QUERY {
+            return Err(FfiResult::CAPACITY_EXCEEDED);
+        }
+        let comp = resolve_guest_component::<T>(host, manifest_name)?;
+        out.push(
+            BamTermDesc::new(comp, AccessMode::FILTER_ONLY)
+                .with_added()
+                .with_or_group(or_group),
+        );
+        Ok(())
+    }
+
+    /// Validates the `FILTER_ONLY` descriptor in the active chunk without borrowing data.
+    #[inline]
+    fn fetch_filter<'chunk>(
+        dispenser: &mut ChunkColumnDispenser<'chunk, '_>,
+    ) -> Result<(), FfiResult> {
+        let filter = guest_uuid_filter::<T>(dispenser.base_host().manifest_name());
+        dispenser.next_filter::<T>(AccessMode::FILTER_ONLY, Some(filter))
+    }
+}
 
 /// Implements [`OrFilterTuple`] for fixed-arity tuples of 2..=8 [`OrFilterTerm`] branches.
 macro_rules! impl_or_filter_tuple {
@@ -665,6 +1125,12 @@ impl_single_query_tuple!(T: GuestComponent => With<T>);
 impl_single_query_tuple!(T: GuestComponent => Without<T>);
 impl_single_query_tuple!(T: GuestComponent => Changed<T>);
 impl_single_query_tuple!(T: GuestComponent => Added<T>);
+impl_single_query_tuple!(T: GuestComponent => ChangedMut<T>);
+impl_single_query_tuple!(T: GuestComponent => AddedMut<T>);
+impl_single_query_tuple!(T: GuestComponent => WithChanged<T>);
+impl_single_query_tuple!(T: GuestComponent => WithAdded<T>);
+impl_single_query_tuple!(T: GuestComponent => Ref<T>);
+impl_single_query_tuple!(T: GuestComponent => Mut<T>);
 impl_single_query_tuple!(T: GuestComponent => Allow<T>);
 impl_single_query_tuple!(T: GuestComponent => Has<T>);
 
@@ -983,4 +1449,767 @@ impl<'iter, 'ctx, Q: QueryTuple> TypedChunkIter<'iter, 'ctx, Q> {
             f(slices).into_ffi_result()
         })
     }
+
+    /// Iterates over all unordered `K`-combinations of matching entities across all chunks
+    /// (both within-chunk and cross-chunk) for read-only [`CopyableQueryTuple`] queries,
+    /// mirroring Bevy's `Query::iter_combinations::<K>()`.
+    ///
+    /// Each `K`-tuple is yielded as `[Q::OwnedItem; K]` in lexicographical entity order.
+    /// Short-circuits and returns the first non-`OK` [`FfiResult`] from either chunk fetching or
+    /// `f`.
+    pub fn for_each_combination<const K: usize, F, R>(&mut self, mut f: F) -> FfiResult
+    where
+        Q: CopyableQueryTuple,
+        F: FnMut([Q::OwnedItem; K]) -> R,
+        R: IntoSystemResult,
+    {
+        if K == 0 {
+            return FfiResult::OK;
+        }
+        let mut items: Vec<Q::OwnedItem> = Vec::new();
+        while let Some(chunk_len) =
+            self.iter
+                .inner
+                .advance_batch(Q::TERM_COUNT, Q::NEEDS_ENTITIES, Q::MARK_CHANGED_MASK)
+        {
+            if chunk_len == 0 {
+                continue;
+            }
+            let mut dispenser = ChunkColumnDispenser::new(&mut self.iter.inner);
+            let slices = match Q::fetch_slices(&mut dispenser) {
+                Ok(s) => s,
+                Err(err) => return err,
+            };
+            Q::push_chunk_items(slices, chunk_len, &mut items);
+        }
+        let n = items.len();
+        if n < K {
+            return FfiResult::OK;
+        }
+        let mut indices: [usize; K] = core::array::from_fn(|i| i);
+        loop {
+            let combo = core::array::from_fn(|j| items[indices[j]]);
+            let status = f(combo).into_ffi_result();
+            if !status.is_ok() {
+                return status;
+            }
+            // Advance lexicographical K-combination indices.
+            let mut pos = K;
+            while pos > 0 {
+                pos -= 1;
+                if indices[pos] < n - (K - pos) {
+                    indices[pos] += 1;
+                    for next in (pos + 1)..K {
+                        indices[next] = indices[next - 1] + 1;
+                    }
+                    break;
+                }
+                if pos == 0 {
+                    return FfiResult::OK;
+                }
+            }
+        }
+    }
+
+    /// Iterates over all unordered within-chunk pairs `(a, b)` with disjoint mutable borrows
+    /// (`slice::split_at_mut`, 100% `#![forbid(unsafe_code)]`, zero allocation), mirroring Bevy's
+    /// `Query::iter_combinations_mut::<2>()` on each archetype chunk.
+    ///
+    /// Short-circuits and returns the first non-`OK` [`FfiResult`] from either chunk fetching or
+    /// `f`.
+    pub fn for_each_combination_mut<F, R>(&mut self, mut f: F) -> FfiResult
+    where
+        Q: PairwiseQueryTuple,
+        F: FnMut(Q::PairItem<'_>, Q::PairItem<'_>) -> R,
+        R: IntoSystemResult,
+    {
+        while let Some(chunk_len) =
+            self.iter
+                .inner
+                .advance_batch(Q::TERM_COUNT, Q::NEEDS_ENTITIES, Q::MARK_CHANGED_MASK)
+        {
+            if chunk_len < 2 {
+                continue;
+            }
+            let mut dispenser = ChunkColumnDispenser::new(&mut self.iter.inner);
+            let slices = match Q::fetch_slices(&mut dispenser) {
+                Ok(s) => s,
+                Err(err) => return err,
+            };
+            let status = Q::for_each_pair_in_chunk(slices, chunk_len, &mut f);
+            if !status.is_ok() {
+                return status;
+            }
+        }
+        FfiResult::OK
+    }
 }
+
+/// Sealed trait for read-only [`QueryTerm`] types whose per-row values are `Copy`, enabling
+/// cross-chunk [`TypedChunkIter::for_each_combination`].
+pub trait CopyableQueryTerm: QueryTerm {
+    /// Owned `Copy` per-row item extracted from `Self::Slice<'_>`.
+    type OwnedItem: Copy;
+
+    /// Reads the `Copy` item at `row` from `slice`, or `None` if out of bounds.
+    fn get_row(slice: &Self::Slice<'_>, row: usize) -> Option<Self::OwnedItem>;
+}
+
+impl CopyableQueryTerm for FfiEntity {
+    type OwnedItem = FfiEntity;
+    #[inline]
+    fn get_row(slice: &Self::Slice<'_>, row: usize) -> Option<Self::OwnedItem> {
+        slice.get(row).copied()
+    }
+}
+
+impl<T: GuestComponent> CopyableQueryTerm for &T {
+    type OwnedItem = T;
+    #[inline]
+    fn get_row(slice: &Self::Slice<'_>, row: usize) -> Option<Self::OwnedItem> {
+        slice.get(row).copied()
+    }
+}
+
+impl<T: GuestComponent> CopyableQueryTerm for Option<&T> {
+    type OwnedItem = Option<T>;
+    #[inline]
+    fn get_row(slice: &Self::Slice<'_>, row: usize) -> Option<Self::OwnedItem> {
+        match slice {
+            Some(s) => s.get(row).copied().map(Some),
+            None => Some(None),
+        }
+    }
+}
+
+impl<T: GuestComponent> CopyableQueryTerm for Changed<T> {
+    type OwnedItem = T;
+    #[inline]
+    fn get_row(slice: &Self::Slice<'_>, row: usize) -> Option<Self::OwnedItem> {
+        slice.get(row).copied()
+    }
+}
+
+impl<T: GuestComponent> CopyableQueryTerm for Added<T> {
+    type OwnedItem = T;
+    #[inline]
+    fn get_row(slice: &Self::Slice<'_>, row: usize) -> Option<Self::OwnedItem> {
+        slice.get(row).copied()
+    }
+}
+
+impl<T: GuestComponent> CopyableQueryTerm for Ref<T> {
+    type OwnedItem = T;
+    #[inline]
+    fn get_row(slice: &Self::Slice<'_>, row: usize) -> Option<Self::OwnedItem> {
+        slice.as_slice().get(row).copied()
+    }
+}
+
+impl<T: GuestComponent> CopyableQueryTerm for With<T> {
+    type OwnedItem = ();
+    #[inline]
+    fn get_row(_slice: &Self::Slice<'_>, _row: usize) -> Option<Self::OwnedItem> {
+        Some(())
+    }
+}
+
+impl<T: GuestComponent> CopyableQueryTerm for Without<T> {
+    type OwnedItem = ();
+    #[inline]
+    fn get_row(_slice: &Self::Slice<'_>, _row: usize) -> Option<Self::OwnedItem> {
+        Some(())
+    }
+}
+
+impl<T: GuestComponent> CopyableQueryTerm for WithChanged<T> {
+    type OwnedItem = ();
+    #[inline]
+    fn get_row(_slice: &Self::Slice<'_>, _row: usize) -> Option<Self::OwnedItem> {
+        Some(())
+    }
+}
+
+impl<T: GuestComponent> CopyableQueryTerm for WithAdded<T> {
+    type OwnedItem = ();
+    #[inline]
+    fn get_row(_slice: &Self::Slice<'_>, _row: usize) -> Option<Self::OwnedItem> {
+        Some(())
+    }
+}
+
+impl<T: GuestComponent> CopyableQueryTerm for Allow<T> {
+    type OwnedItem = ();
+    #[inline]
+    fn get_row(_slice: &Self::Slice<'_>, _row: usize) -> Option<Self::OwnedItem> {
+        Some(())
+    }
+}
+
+impl<T: GuestComponent> CopyableQueryTerm for Has<T> {
+    type OwnedItem = bool;
+    #[inline]
+    fn get_row(slice: &Self::Slice<'_>, _row: usize) -> Option<Self::OwnedItem> {
+        Some(*slice)
+    }
+}
+
+impl<T: OrFilterTuple> CopyableQueryTerm for Or<T> {
+    type OwnedItem = ();
+    #[inline]
+    fn get_row(_slice: &Self::Slice<'_>, _row: usize) -> Option<Self::OwnedItem> {
+        Some(())
+    }
+}
+
+/// Sealed trait for read-only [`QueryTuple`] types supporting cross-chunk `K`-combinations via
+/// [`TypedChunkIter::for_each_combination`].
+pub trait CopyableQueryTuple: QueryTuple {
+    /// Owned `Copy` item representing one entity row.
+    type OwnedItem: Copy;
+
+    /// Appends all `chunk_len` copied entity items from `slices` into `out`.
+    fn push_chunk_items(slices: Self::Slices<'_>, chunk_len: usize, out: &mut Vec<Self::OwnedItem>);
+}
+
+macro_rules! impl_single_copyable_tuple {
+    ($($lifetime:lifetime,)? $ty_param:ident : $bound:ident => $target:ty) => {
+        impl<$($lifetime,)? $ty_param: $bound> CopyableQueryTuple for $target {
+            type OwnedItem = <Self as CopyableQueryTerm>::OwnedItem;
+
+            #[inline]
+            fn push_chunk_items(
+                slices: Self::Slices<'_>,
+                chunk_len: usize,
+                out: &mut Vec<Self::OwnedItem>,
+            ) {
+                out.reserve(chunk_len);
+                for row in 0..chunk_len {
+                    if let Some(item) = <Self as CopyableQueryTerm>::get_row(&slices, row) {
+                        out.push(item);
+                    }
+                }
+            }
+        }
+    };
+}
+
+impl CopyableQueryTuple for FfiEntity {
+    type OwnedItem = FfiEntity;
+    #[inline]
+    fn push_chunk_items(
+        slices: Self::Slices<'_>,
+        chunk_len: usize,
+        out: &mut Vec<Self::OwnedItem>,
+    ) {
+        out.extend_from_slice(&slices[..chunk_len.min(slices.len())]);
+    }
+}
+
+impl_single_copyable_tuple!('q, T: GuestComponent => &'q T);
+impl_single_copyable_tuple!('q, T: GuestComponent => Option<&'q T>);
+impl_single_copyable_tuple!(T: GuestComponent => Changed<T>);
+impl_single_copyable_tuple!(T: GuestComponent => Added<T>);
+impl_single_copyable_tuple!(T: GuestComponent => Ref<T>);
+impl_single_copyable_tuple!(T: GuestComponent => With<T>);
+impl_single_copyable_tuple!(T: GuestComponent => Without<T>);
+impl_single_copyable_tuple!(T: GuestComponent => WithChanged<T>);
+impl_single_copyable_tuple!(T: GuestComponent => WithAdded<T>);
+impl_single_copyable_tuple!(T: GuestComponent => Allow<T>);
+impl_single_copyable_tuple!(T: GuestComponent => Has<T>);
+impl_single_copyable_tuple!(T: OrFilterTuple => Or<T>);
+
+macro_rules! impl_copyable_query_tuple {
+    ($($term:ident : $var:ident),+ $(,)?) => {
+        impl<$($term: CopyableQueryTerm),+> CopyableQueryTuple for ($($term,)+) {
+            type OwnedItem = ($($term::OwnedItem,)+);
+
+            #[inline]
+            fn push_chunk_items(
+                slices: Self::Slices<'_>,
+                chunk_len: usize,
+                out: &mut Vec<Self::OwnedItem>,
+            ) {
+                let ($($var,)+) = slices;
+                out.reserve(chunk_len);
+                for row in 0..chunk_len {
+                    if let ($(Some($var),)+) = ($($term::get_row(&$var, row),)+) {
+                        out.push(($($var,)+));
+                    }
+                }
+            }
+        }
+    };
+}
+
+impl_copyable_query_tuple!(T0: s0);
+impl_copyable_query_tuple!(T0: s0, T1: s1);
+impl_copyable_query_tuple!(T0: s0, T1: s1, T2: s2);
+impl_copyable_query_tuple!(T0: s0, T1: s1, T2: s2, T3: s3);
+impl_copyable_query_tuple!(T0: s0, T1: s1, T2: s2, T3: s3, T4: s4);
+impl_copyable_query_tuple!(T0: s0, T1: s1, T2: s2, T3: s3, T4: s4, T5: s5);
+impl_copyable_query_tuple!(T0: s0, T1: s1, T2: s2, T3: s3, T4: s4, T5: s5, T6: s6);
+impl_copyable_query_tuple!(T0: s0, T1: s1, T2: s2, T3: s3, T4: s4, T5: s5, T6: s6, T7: s7);
+
+/// Sealed trait for [`QueryTerm`] types supporting zero-allocation within-chunk pairwise
+/// splitting via `slice::split_at` / `slice::split_at_mut`.
+pub trait PairwiseQueryTerm: QueryTerm {
+    /// Per-row borrowed item yielded for each half of a pair.
+    type PairItem<'a>;
+
+    /// Remaining tail view over rows `(row + 1)..chunk_len`.
+    type PairTail<'a>;
+
+    /// Splits row `row` and its suffix `(row + 1)..` out of `slice`.
+    fn split_at_row<'a>(
+        slice: &'a mut Self::Slice<'_>,
+        row: usize,
+    ) -> Option<(Self::PairItem<'a>, Self::PairTail<'a>)>;
+
+    /// Reborrows the left-hand item for a single inner-loop pair callback.
+    fn reborrow_item<'b, 'a: 'b>(item: &'b mut Self::PairItem<'a>) -> Self::PairItem<'b>;
+
+    /// Pops the next right-hand item from `tail`.
+    fn next_tail_item<'a>(tail: &mut Self::PairTail<'a>) -> Option<Self::PairItem<'a>>;
+}
+
+impl PairwiseQueryTerm for FfiEntity {
+    type PairItem<'a> = FfiEntity;
+    type PairTail<'a> = &'a [FfiEntity];
+
+    #[inline]
+    fn split_at_row<'a>(
+        slice: &'a mut Self::Slice<'_>,
+        row: usize,
+    ) -> Option<(Self::PairItem<'a>, Self::PairTail<'a>)> {
+        let mid = row.checked_add(1)?;
+        if mid > slice.len() {
+            return None;
+        }
+        let (left, right) = slice.split_at(mid);
+        Some((left[row], right))
+    }
+
+    #[inline]
+    fn reborrow_item<'b, 'a: 'b>(item: &'b mut Self::PairItem<'a>) -> Self::PairItem<'b> {
+        *item
+    }
+
+    #[inline]
+    fn next_tail_item<'a>(tail: &mut Self::PairTail<'a>) -> Option<Self::PairItem<'a>> {
+        let (&first, rest) = tail.split_first()?;
+        *tail = rest;
+        Some(first)
+    }
+}
+
+macro_rules! impl_pairwise_read_slice {
+    ($($lifetime:lifetime,)? $ty_param:ident => $target:ty) => {
+        impl<$($lifetime,)? $ty_param: GuestComponent> PairwiseQueryTerm for $target {
+            type PairItem<'a> = &'a $ty_param;
+            type PairTail<'a> = &'a [$ty_param];
+
+            #[inline]
+            fn split_at_row<'a>(
+                slice: &'a mut Self::Slice<'_>,
+                row: usize,
+            ) -> Option<(Self::PairItem<'a>, Self::PairTail<'a>)> {
+                let mid = row.checked_add(1)?;
+                if mid > slice.len() {
+                    return None;
+                }
+                let (left, right) = slice.split_at(mid);
+                Some((&left[row], right))
+            }
+
+            #[inline]
+            fn reborrow_item<'b, 'a: 'b>(item: &'b mut Self::PairItem<'a>) -> Self::PairItem<'b> {
+                *item
+            }
+
+            #[inline]
+            fn next_tail_item<'a>(tail: &mut Self::PairTail<'a>) -> Option<Self::PairItem<'a>> {
+                let (first, rest) = tail.split_first()?;
+                *tail = rest;
+                Some(first)
+            }
+        }
+    };
+}
+
+macro_rules! impl_pairwise_write_slice {
+    ($($lifetime:lifetime,)? $ty_param:ident => $target:ty) => {
+        impl<$($lifetime,)? $ty_param: GuestComponent> PairwiseQueryTerm for $target {
+            type PairItem<'a> = &'a mut $ty_param;
+            type PairTail<'a> = &'a mut [$ty_param];
+
+            #[inline]
+            fn split_at_row<'a>(
+                slice: &'a mut Self::Slice<'_>,
+                row: usize,
+            ) -> Option<(Self::PairItem<'a>, Self::PairTail<'a>)> {
+                let mid = row.checked_add(1)?;
+                if mid > slice.len() {
+                    return None;
+                }
+                let (left, right) = slice.split_at_mut(mid);
+                Some((&mut left[row], right))
+            }
+
+            #[inline]
+            fn reborrow_item<'b, 'a: 'b>(item: &'b mut Self::PairItem<'a>) -> Self::PairItem<'b> {
+                *item
+            }
+
+            #[inline]
+            fn next_tail_item<'a>(tail: &mut Self::PairTail<'a>) -> Option<Self::PairItem<'a>> {
+                let slice = core::mem::take(tail);
+                let (first, rest) = slice.split_first_mut()?;
+                *tail = rest;
+                Some(first)
+            }
+        }
+    };
+}
+
+impl_pairwise_read_slice!('q, T => &'q T);
+impl_pairwise_read_slice!(T => Changed<T>);
+impl_pairwise_read_slice!(T => Added<T>);
+impl_pairwise_write_slice!('q, T => &'q mut T);
+impl_pairwise_write_slice!(T => ChangedMut<T>);
+impl_pairwise_write_slice!(T => AddedMut<T>);
+
+impl<T: GuestComponent> PairwiseQueryTerm for Ref<T> {
+    type PairItem<'a> = &'a T;
+    type PairTail<'a> = &'a [T];
+
+    #[inline]
+    fn split_at_row<'a>(
+        slice: &'a mut Self::Slice<'_>,
+        row: usize,
+    ) -> Option<(Self::PairItem<'a>, Self::PairTail<'a>)> {
+        let data = slice.as_slice();
+        let mid = row.checked_add(1)?;
+        if mid > data.len() {
+            return None;
+        }
+        let (left, right) = data.split_at(mid);
+        Some((&left[row], right))
+    }
+
+    #[inline]
+    fn reborrow_item<'b, 'a: 'b>(item: &'b mut Self::PairItem<'a>) -> Self::PairItem<'b> {
+        *item
+    }
+
+    #[inline]
+    fn next_tail_item<'a>(tail: &mut Self::PairTail<'a>) -> Option<Self::PairItem<'a>> {
+        let (first, rest) = tail.split_first()?;
+        *tail = rest;
+        Some(first)
+    }
+}
+
+impl<T: GuestComponent> PairwiseQueryTerm for Mut<T> {
+    type PairItem<'a> = &'a mut T;
+    type PairTail<'a> = &'a mut [T];
+
+    #[inline]
+    fn split_at_row<'a>(
+        slice: &'a mut Self::Slice<'_>,
+        row: usize,
+    ) -> Option<(Self::PairItem<'a>, Self::PairTail<'a>)> {
+        let data = slice.as_mut_slice();
+        let mid = row.checked_add(1)?;
+        if mid > data.len() {
+            return None;
+        }
+        let (left, right) = data.split_at_mut(mid);
+        Some((&mut left[row], right))
+    }
+
+    #[inline]
+    fn reborrow_item<'b, 'a: 'b>(item: &'b mut Self::PairItem<'a>) -> Self::PairItem<'b> {
+        *item
+    }
+
+    #[inline]
+    fn next_tail_item<'a>(tail: &mut Self::PairTail<'a>) -> Option<Self::PairItem<'a>> {
+        let slice = core::mem::take(tail);
+        let (first, rest) = slice.split_first_mut()?;
+        *tail = rest;
+        Some(first)
+    }
+}
+
+impl<T: GuestComponent> PairwiseQueryTerm for Option<&T> {
+    type PairItem<'a> = Option<&'a T>;
+    type PairTail<'a> = Option<&'a [T]>;
+
+    #[inline]
+    fn split_at_row<'a>(
+        slice: &'a mut Self::Slice<'_>,
+        row: usize,
+    ) -> Option<(Self::PairItem<'a>, Self::PairTail<'a>)> {
+        match slice {
+            Some(s) => {
+                let mid = row.checked_add(1)?;
+                if mid > s.len() {
+                    return None;
+                }
+                let (left, right) = s.split_at(mid);
+                Some((Some(&left[row]), Some(right)))
+            }
+            None => Some((None, None)),
+        }
+    }
+
+    #[inline]
+    fn reborrow_item<'b, 'a: 'b>(item: &'b mut Self::PairItem<'a>) -> Self::PairItem<'b> {
+        *item
+    }
+
+    #[inline]
+    fn next_tail_item<'a>(tail: &mut Self::PairTail<'a>) -> Option<Self::PairItem<'a>> {
+        match tail {
+            Some(s) => {
+                let (first, rest) = s.split_first()?;
+                *s = rest;
+                Some(Some(first))
+            }
+            None => Some(None),
+        }
+    }
+}
+
+impl<T: GuestComponent> PairwiseQueryTerm for Option<&mut T> {
+    type PairItem<'a> = Option<&'a mut T>;
+    type PairTail<'a> = Option<&'a mut [T]>;
+
+    #[inline]
+    fn split_at_row<'a>(
+        slice: &'a mut Self::Slice<'_>,
+        row: usize,
+    ) -> Option<(Self::PairItem<'a>, Self::PairTail<'a>)> {
+        match slice {
+            Some(s) => {
+                let mid = row.checked_add(1)?;
+                if mid > s.len() {
+                    return None;
+                }
+                let (left, right) = s.split_at_mut(mid);
+                Some((Some(&mut left[row]), Some(right)))
+            }
+            None => Some((None, None)),
+        }
+    }
+
+    #[inline]
+    fn reborrow_item<'b, 'a: 'b>(item: &'b mut Self::PairItem<'a>) -> Self::PairItem<'b> {
+        item.as_deref_mut()
+    }
+
+    #[inline]
+    fn next_tail_item<'a>(tail: &mut Self::PairTail<'a>) -> Option<Self::PairItem<'a>> {
+        match tail {
+            Some(s) => {
+                let slice = core::mem::take(s);
+                let (first, rest) = slice.split_first_mut()?;
+                *s = rest;
+                Some(Some(first))
+            }
+            None => Some(None),
+        }
+    }
+}
+
+macro_rules! impl_pairwise_copy_marker {
+    ($bound:ident => $target:ty, $item:ty) => {
+        impl<T: $bound> PairwiseQueryTerm for $target {
+            type PairItem<'a> = $item;
+            type PairTail<'a> = $item;
+
+            #[inline]
+            fn split_at_row<'a>(
+                slice: &'a mut Self::Slice<'_>,
+                _row: usize,
+            ) -> Option<(Self::PairItem<'a>, Self::PairTail<'a>)> {
+                Some((*slice, *slice))
+            }
+
+            #[inline]
+            fn reborrow_item<'b, 'a: 'b>(item: &'b mut Self::PairItem<'a>) -> Self::PairItem<'b> {
+                *item
+            }
+
+            #[inline]
+            fn next_tail_item<'a>(tail: &mut Self::PairTail<'a>) -> Option<Self::PairItem<'a>> {
+                Some(*tail)
+            }
+        }
+    };
+}
+
+impl_pairwise_copy_marker!(GuestComponent => With<T>, ());
+impl_pairwise_copy_marker!(GuestComponent => Without<T>, ());
+impl_pairwise_copy_marker!(GuestComponent => WithChanged<T>, ());
+impl_pairwise_copy_marker!(GuestComponent => WithAdded<T>, ());
+impl_pairwise_copy_marker!(GuestComponent => Allow<T>, ());
+impl_pairwise_copy_marker!(GuestComponent => Has<T>, bool);
+impl_pairwise_copy_marker!(OrFilterTuple => Or<T>, ());
+
+/// Sealed trait for [`QueryTuple`] types supporting zero-allocation within-chunk mutable pairwise
+/// iteration via [`TypedChunkIter::for_each_combination_mut`].
+pub trait PairwiseQueryTuple: QueryTuple {
+    /// Per-row borrowed item tuple yielded for each entity in a pair.
+    type PairItem<'a>;
+
+    /// Invokes `f(a, b)` for every unordered pair `0 <= i < j < chunk_len` inside the active chunk.
+    fn for_each_pair_in_chunk<F, R>(
+        slices: Self::Slices<'_>,
+        chunk_len: usize,
+        f: &mut F,
+    ) -> FfiResult
+    where
+        F: FnMut(Self::PairItem<'_>, Self::PairItem<'_>) -> R,
+        R: IntoSystemResult;
+}
+
+macro_rules! impl_single_pairwise_tuple {
+    ($($lifetime:lifetime,)? $ty_param:ident : $bound:ident => $target:ty) => {
+        impl<$($lifetime,)? $ty_param: $bound> PairwiseQueryTuple for $target {
+            type PairItem<'a> = <Self as PairwiseQueryTerm>::PairItem<'a>;
+
+            fn for_each_pair_in_chunk<F, R>(
+                mut slices: Self::Slices<'_>,
+                chunk_len: usize,
+                f: &mut F,
+            ) -> FfiResult
+            where
+                F: FnMut(Self::PairItem<'_>, Self::PairItem<'_>) -> R,
+                R: IntoSystemResult,
+            {
+                for row in 0..chunk_len.saturating_sub(1) {
+                    let Some((mut left, mut right)) =
+                        <Self as PairwiseQueryTerm>::split_at_row(&mut slices, row)
+                    else {
+                        break;
+                    };
+                    for _ in (row + 1)..chunk_len {
+                        let Some(b) = <Self as PairwiseQueryTerm>::next_tail_item(&mut right) else {
+                            break;
+                        };
+                        let a = <Self as PairwiseQueryTerm>::reborrow_item(&mut left);
+                        let status = f(a, b).into_ffi_result();
+                        if !status.is_ok() {
+                            return status;
+                        }
+                    }
+                }
+                FfiResult::OK
+            }
+        }
+    };
+}
+
+impl PairwiseQueryTuple for FfiEntity {
+    type PairItem<'a> = FfiEntity;
+
+    fn for_each_pair_in_chunk<F, R>(
+        mut slices: Self::Slices<'_>,
+        chunk_len: usize,
+        f: &mut F,
+    ) -> FfiResult
+    where
+        F: FnMut(Self::PairItem<'_>, Self::PairItem<'_>) -> R,
+        R: IntoSystemResult,
+    {
+        for row in 0..chunk_len.saturating_sub(1) {
+            let Some((mut left, mut right)) =
+                <Self as PairwiseQueryTerm>::split_at_row(&mut slices, row)
+            else {
+                break;
+            };
+            for _ in (row + 1)..chunk_len {
+                let Some(b) = <Self as PairwiseQueryTerm>::next_tail_item(&mut right) else {
+                    break;
+                };
+                let a = <Self as PairwiseQueryTerm>::reborrow_item(&mut left);
+                let status = f(a, b).into_ffi_result();
+                if !status.is_ok() {
+                    return status;
+                }
+            }
+        }
+        FfiResult::OK
+    }
+}
+
+impl_single_pairwise_tuple!('q, T: GuestComponent => &'q T);
+impl_single_pairwise_tuple!('q, T: GuestComponent => &'q mut T);
+impl_single_pairwise_tuple!('q, T: GuestComponent => Option<&'q T>);
+impl_single_pairwise_tuple!('q, T: GuestComponent => Option<&'q mut T>);
+impl_single_pairwise_tuple!(T: GuestComponent => Changed<T>);
+impl_single_pairwise_tuple!(T: GuestComponent => Added<T>);
+impl_single_pairwise_tuple!(T: GuestComponent => ChangedMut<T>);
+impl_single_pairwise_tuple!(T: GuestComponent => AddedMut<T>);
+impl_single_pairwise_tuple!(T: GuestComponent => Ref<T>);
+impl_single_pairwise_tuple!(T: GuestComponent => Mut<T>);
+impl_single_pairwise_tuple!(T: GuestComponent => With<T>);
+impl_single_pairwise_tuple!(T: GuestComponent => Without<T>);
+impl_single_pairwise_tuple!(T: GuestComponent => WithChanged<T>);
+impl_single_pairwise_tuple!(T: GuestComponent => WithAdded<T>);
+impl_single_pairwise_tuple!(T: GuestComponent => Allow<T>);
+impl_single_pairwise_tuple!(T: GuestComponent => Has<T>);
+impl_single_pairwise_tuple!(T: OrFilterTuple => Or<T>);
+
+macro_rules! impl_pairwise_query_tuple {
+    ($($term:ident : $s:ident : $l:ident : $r:ident : $a:ident : $b:ident),+ $(,)?) => {
+        impl<$($term: PairwiseQueryTerm),+> PairwiseQueryTuple for ($($term,)+) {
+            type PairItem<'a> = ($($term::PairItem<'a>,)+);
+
+            fn for_each_pair_in_chunk<F, R>(
+                slices: Self::Slices<'_>,
+                chunk_len: usize,
+                f: &mut F,
+            ) -> FfiResult
+            where
+                F: FnMut(Self::PairItem<'_>, Self::PairItem<'_>) -> R,
+                R: IntoSystemResult,
+            {
+                let ($(mut $s,)+) = slices;
+                for row in 0..chunk_len.saturating_sub(1) {
+                    $(
+                        let Some((mut $l, mut $r)) = $term::split_at_row(&mut $s, row) else {
+                            break;
+                        };
+                    )+
+                    for _ in (row + 1)..chunk_len {
+                        $(
+                            let Some($b) = $term::next_tail_item(&mut $r) else {
+                                break;
+                            };
+                        )+
+                        $(
+                            let $a = $term::reborrow_item(&mut $l);
+                        )+
+                        let status = f(($($a,)+), ($($b,)+)).into_ffi_result();
+                        if !status.is_ok() {
+                            return status;
+                        }
+                    }
+                }
+                FfiResult::OK
+            }
+        }
+    };
+}
+
+impl_pairwise_query_tuple!(T0: s0: l0: r0: a0: b0);
+impl_pairwise_query_tuple!(T0: s0: l0: r0: a0: b0, T1: s1: l1: r1: a1: b1);
+impl_pairwise_query_tuple!(T0: s0: l0: r0: a0: b0, T1: s1: l1: r1: a1: b1, T2: s2: l2: r2: a2: b2);
+impl_pairwise_query_tuple!(T0: s0: l0: r0: a0: b0, T1: s1: l1: r1: a1: b1, T2: s2: l2: r2: a2: b2, T3: s3: l3: r3: a3: b3);
+impl_pairwise_query_tuple!(T0: s0: l0: r0: a0: b0, T1: s1: l1: r1: a1: b1, T2: s2: l2: r2: a2: b2, T3: s3: l3: r3: a3: b3, T4: s4: l4: r4: a4: b4);
+impl_pairwise_query_tuple!(T0: s0: l0: r0: a0: b0, T1: s1: l1: r1: a1: b1, T2: s2: l2: r2: a2: b2, T3: s3: l3: r3: a3: b3, T4: s4: l4: r4: a4: b4, T5: s5: l5: r5: a5: b5);
+impl_pairwise_query_tuple!(T0: s0: l0: r0: a0: b0, T1: s1: l1: r1: a1: b1, T2: s2: l2: r2: a2: b2, T3: s3: l3: r3: a3: b3, T4: s4: l4: r4: a4: b4, T5: s5: l5: r5: a5: b5, T6: s6: l6: r6: a6: b6);
+impl_pairwise_query_tuple!(T0: s0: l0: r0: a0: b0, T1: s1: l1: r1: a1: b1, T2: s2: l2: r2: a2: b2, T3: s3: l3: r3: a3: b3, T4: s4: l4: r4: a4: b4, T5: s5: l5: r5: a5: b5, T6: s6: l6: r6: a6: b6, T7: s7: l7: r7: a7: b7);

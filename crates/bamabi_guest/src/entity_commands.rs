@@ -330,6 +330,17 @@ impl<'cmd, 'a> GuestEntityCommands<'cmd, 'a> {
         self
     }
 
+    /// Clones all cloneable components from this entity onto `dst` via
+    /// `BamHostApi::cmd_clone_entity` (slot 70).
+    #[inline]
+    pub fn clone_to(&mut self, dst: FfiEntity) -> &mut Self {
+        if self.first_error.is_none() {
+            let status = self.commands.clone_entity(self.entity, dst);
+            self.record(status);
+        }
+        self
+    }
+
     /// Attaches a pre-resolved `DespawnOnExit` state-scoped lifetime marker to this entity.
     #[inline]
     pub fn despawn_on_exit(&mut self, exit_marker: BamComponent) -> &mut Self {

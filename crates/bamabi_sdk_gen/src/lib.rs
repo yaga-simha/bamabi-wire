@@ -79,7 +79,7 @@
 //!
 //! let c99 = render_c99_header().expect("bamabi_sys layouts must be valid");
 //! assert!(c99.contains("#define BAM_ABI_VERSION 0x00030000u"));
-//! assert!(c99.contains("#define BAM_HOST_API_SLOT_COUNT    69u"));
+//! assert!(c99.contains("#define BAM_HOST_API_SLOT_COUNT    73u"));
 //! assert!(c99.contains("#define BAM_HOST_API_OFFSET_MIGRATE_COMPONENT_COLUMN"));
 //!
 //! let out_dir = std::env::temp_dir().join(format!("bamabi_sdk_doctest_{}", std::process::id()));
@@ -164,4 +164,4 @@ pub mod sdk;
 
 pub use component_header::{render_component_header, section_for};
 pub use header_gen::{render_c99_header, write_or_check_header};
-pub use sdk::{CPP17_HEADER, ZIG_SDK, export_sdk};
+pub use sdk::{CPP17_HEADER, ZIG_SDK, cpp17_header, export_sdk, zig_sdk};

@@ -442,3 +442,20 @@ pub type BamIterReadRemovedFn = unsafe extern "C" fn(
     max_count: usize,
     out_read: *mut usize,
 ) -> FfiResult;
+
+/// Retrieves per-row `added` and `changed` tick array pointers (`[u32; chunk_len]`) alongside the
+/// enclosing system's `(last_run, this_run)` tick window for dense column `term_index` in the
+/// current chunk.
+///
+/// # Safety
+/// - `iter` must point to an active [`BamIter`] positioned at a valid chunk.
+/// - Non-null out-pointers (`out_added`, `out_changed`, `out_last_run`, `out_this_run`) must point
+///   to valid writable storage of their respective types.
+pub type BamIterColumnTicksFn = unsafe extern "C" fn(
+    iter: *const BamIter,
+    term_index: usize,
+    out_added: *mut *const u32,
+    out_changed: *mut *const u32,
+    out_last_run: *mut u32,
+    out_this_run: *mut u32,
+) -> FfiResult;

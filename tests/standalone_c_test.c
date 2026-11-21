@@ -1165,12 +1165,42 @@ static void test_extended_wire_descriptors(void) {
     assert((sys_desc.flags & BAM_SYSTEM_KNOWN_FLAGS) == BAM_SYSTEM_FLAG_AMBIGUOUS_WITH_ALL);
 
     api = build_mock_host_api();
-    assert(BAM_HOST_API_SLOT_COUNT == 69u);
-    assert(api.struct_size >= (uint32_t)(offsetof(BamHostApi, iter_next_chunk_batch) + sizeof(BamIterNextChunkBatchFn)));
+    assert(BAM_MAX_QUERIES_PER_SYSTEM == 16u);
+    assert(BAM_TERM_FLAG_CHANGED == 0x0001u);
+    assert(BAM_TERM_FLAG_ADDED == 0x0002u);
+    assert(BAM_TERM_KNOWN_FLAGS == (BAM_TERM_FLAG_CHANGED | BAM_TERM_FLAG_ADDED));
+    assert(BAM_QUERY_FLAG_PARAM_SET == 0x00000001u);
+    assert(BAM_QUERY_KNOWN_FLAGS == BAM_QUERY_FLAG_PARAM_SET);
+    {
+        BamQueryDesc param_set_q;
+        memset(&param_set_q, 0, sizeof(param_set_q));
+        param_set_q.struct_size = (uint32_t)sizeof(BamQueryDesc);
+        param_set_q.flags = BAM_QUERY_FLAG_PARAM_SET;
+        param_set_q.param_set_group = 1u;
+        param_set_q.reserved0 = 0u;
+        assert(param_set_q.param_set_group == 1u && param_set_q.reserved0 == 0u);
+
+        sys_desc.run_if_ctx = mock_guest_system;
+        sys_desc.run_if_query = &param_set_q;
+        sys_desc.run_if_ctx_user_data = NULL;
+        assert(sys_desc.run_if_ctx == mock_guest_system);
+        assert(sys_desc.run_if_query == &param_set_q);
+        assert(sys_desc.run_if_ctx_user_data == NULL);
+    }
+    assert(BAM_HOST_API_SLOT_COUNT == 73u);
+    assert(api.struct_size >= (uint32_t)(offsetof(BamHostApi, cmd_remove_resource) + sizeof(BamCmdRemoveResourceFn)));
     assert(bam_host_api_covers_slot(&api, BAM_HOST_API_OFFSET_LOG_DIAGNOSTIC, sizeof(BamLogDiagnosticFn)));
     assert(bam_host_api_covers_slot(&api, BAM_HOST_API_OFFSET_MIGRATE_COMPONENT_COLUMN, sizeof(BamMigrateComponentColumnFn)));
     assert(bam_host_api_covers_slot(&api, BAM_HOST_API_OFFSET_ITER_NEXT_CHUNK_BATCH, sizeof(BamIterNextChunkBatchFn)));
+    assert(bam_host_api_covers_slot(&api, BAM_HOST_API_OFFSET_ITER_COLUMN_TICKS, sizeof(BamIterColumnTicksFn)));
+    assert(bam_host_api_covers_slot(&api, BAM_HOST_API_OFFSET_CMD_CLONE_ENTITY, sizeof(BamCmdCloneEntityFn)));
+    assert(bam_host_api_covers_slot(&api, BAM_HOST_API_OFFSET_CMD_INSERT_RESOURCE, sizeof(BamCmdInsertResourceFn)));
+    assert(bam_host_api_covers_slot(&api, BAM_HOST_API_OFFSET_CMD_REMOVE_RESOURCE, sizeof(BamCmdRemoveResourceFn)));
     assert(api.iter_next_chunk_batch == NULL);
+    assert(api.iter_column_ticks == NULL);
+    assert(api.cmd_clone_entity == NULL);
+    assert(api.cmd_insert_resource == NULL);
+    assert(api.cmd_remove_resource == NULL);
     assert(api.cmd_spawn_persistent == NULL);
     assert(api.cmd_spawn_batch == NULL);
     assert(api.cmd_despawn_all == NULL);

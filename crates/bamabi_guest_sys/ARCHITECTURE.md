@@ -21,7 +21,7 @@
 
 ```text
   Host (.exe / World)
-         │  BamHostApi (68 slots) + BamLoadCtx / BamSystemCtx
+         │  BamHostApi (73 slots) + BamLoadCtx / BamSystemCtx
          ▼
   ┌──────────────────────────────────────────────────────────────────────┐
   │                         bamabi_guest_sys                             │
@@ -51,7 +51,7 @@
 
 - **Bounded `BamHostApi` Copy & SemVer Check:**
   - `Host::from_raw(api_ptr, host_ctx)` and `Host::from_load_ctx(api_ptr, load_ctx)` check pointer nullness and alignment (`align_of::<BamHostApi>()`) before calling `bamabi_sys::read_descriptor::<BamHostApi>`.
-  - `read_descriptor` reads `struct_size` at offset `0` first and copies `min(struct_size, size_of::<BamHostApi>())` bytes, zero-filling trailing bytes if the host is an older ABI `0.2` table (`BamHostApi::MIN_V0_2_SIZE` = `224` B on 64-bit / `116` B on 32-bit) vs full ABI `0.3.0` (`MIN_V0_3_SIZE` = `552` B on 64-bit / `280` B on 32-bit).
+  - `read_descriptor` reads `struct_size` at offset `0` first and copies `min(struct_size, size_of::<BamHostApi>())` bytes, zero-filling trailing bytes if the host is an older ABI `0.2` table (`BamHostApi::MIN_V0_2_SIZE` = `224` B on 64-bit / `116` B on 32-bit) or `MIN_V0_3_SIZE` (`552` B on 64-bit / `280` B on 32-bit) vs full 73-slot ABI `0.3.0` (`592` B on 64-bit / `300` B on 32-bit).
   - `api.validate_for_guest(ABI_VERSION)` verifies major/minor SemVer compatibility and confirms all **27 core ABI `0.2` slots** (ending at `cmd_remove`) are populated.
 - **68-Slot `covers_slot` + `UNSUPPORTED` Fallback (`host_slot!`):**
   - All **41 extended/ABI-`0.3.0` slots** (23 extended `0.2` slots + 18 `0.3.0` slots) are accessed exclusively through the crate-private `host_slot!($api, $slot)` macro in `src/lib.rs`.
@@ -106,7 +106,7 @@
   - Re-entrant or concurrent invocation observes `Err` and returns `None` *before* forming `&mut *self.value.get()`, mapping to `FfiResult::ACCESS_CONFLICT` (or `FfiBool::FALSE`).
 - **System Execution Frame (`ValidatedSystemInvocation`, `ValidatedSystemRef`, & `LazyCommands`):**
   - `system_closure_trampoline` borrows `GuestInstance`'s pinned `Host` directly via `PinnedHostPtr` without copying 584 bytes or calling `BamHostApi::sys_host_ctx(sys_ctx)` eagerly; a stack-pinned `LazyInvocationHost` resolves and caches `sys_host_ctx(sys_ctx)` at most once per tick on first `host()` / `commands()` demand (preserving `raw_ctx` pointer provenance under Miri Stacked/Tree Borrows) before building `ValidatedSystemInvocation<'a>` (clamping `total_query_count` to `MAX_QUERIES_PER_SYSTEM`).
-  - Query slots (`queries: [MaybeUninit<ValidatedIter<'a>>; MAX_QUERIES_PER_SYSTEM]` tracked by `u8` init/taken bitmasks) and `commands` (or single-use `LazyCommands<'a>` via `take_lazy_commands()`) are fetched lazily on first access; `queries_2_mut` / `queries_2_and_commands_mut` reject `idx_a == idx_b` and use `split_at_mut` for disjoint `&mut ValidatedIter` borrows.
+  - Query slots (`queries: [MaybeUninit<ValidatedIter<'a>>; MAX_QUERIES_PER_SYSTEM]` tracked by `u16` init/taken bitmasks for up to 16 queries) and `commands` (or single-use `LazyCommands<'a>` via `take_lazy_commands()`) are fetched lazily on first access; `queries_2_mut` / `queries_2_and_commands_mut` reject `idx_a == idx_b` and use `split_at_mut` for disjoint `&mut ValidatedIter` borrows.
   - `ValidatedSystemRef<'a>` is intentionally **non-`Copy` and non-`Clone`** (`take_system_ref` succeeds at most once). Its `&mut self` methods (`entity_get_mut_checked`, `res_mut_ptr_by_handle_with_uuid_checked`, `write_mapped_wire_resource_by_handle`) prevent duplicate `&mut` aliasing to the same resource or entity component.
   - All handle-based resource lookups fail closed via `Host::component_layout_info`: if `component_layout_info` is `UNSUPPORTED` (ABI `0.2`), or if `(size, align, uuid, !immutable)` disagree, they return `None` / `Err(...)`.
 - **Descriptor Ownership (`OwnedDescriptorStorage`):**

@@ -73,8 +73,15 @@ fn exported_cpp17_header_compiles_and_passes_strict_checks() {
 
 struct BamHostCtx { int id; };
 struct BamLoadCtx { BamHostCtx* h; };
-struct BamIter { size_t step; BamEntity ents[1]; float col[1]; };
-struct BamCommands { size_t checkpoints; size_t rollbacks; size_t last_token; };
+struct BamIter { size_t step; BamEntity ents[1]; float col[1]; uint32_t added[1]; uint32_t changed[1]; };
+struct BamCommands {
+    size_t checkpoints;
+    size_t rollbacks;
+    size_t last_token;
+    size_t cloned;
+    size_t inserted_resources;
+    size_t removed_resources;
+};
 struct BamSystemCtx { BamHostCtx* h; BamIter* it; BamCommands* cmds; };
 
 static const BamHostCtx* mock_load_host_ctx(const BamLoadCtx* lc) { return lc ? lc->h : nullptr; }
@@ -97,6 +104,20 @@ static BamResult mock_iter_reset(BamIter* it) { it->step = 0u; return BAM_RESULT
 static const BamEntity* mock_iter_entities(const BamIter* it) { return it->ents; }
 static const uint8_t* mock_iter_col_ro(const BamIter* it, size_t) { return reinterpret_cast<const uint8_t*>(it->col); }
 static uint8_t* mock_iter_col_mut(BamIter* it, size_t) { return reinterpret_cast<uint8_t*>(it->col); }
+static BamResult mock_iter_column_ticks(
+    const BamIter* it,
+    size_t,
+    const uint32_t** out_added,
+    const uint32_t** out_changed,
+    uint32_t* out_last_run,
+    uint32_t* out_this_run
+) {
+    *out_added = it->added;
+    *out_changed = it->changed;
+    *out_last_run = 10u;
+    *out_this_run = 12u;
+    return BAM_RESULT_OK;
+}
 static BamResult mock_cmd_checkpoint(BamCommands* c, size_t* out_tok) {
     c->checkpoints += 1u;
     *out_tok = c->checkpoints;
@@ -105,6 +126,27 @@ static BamResult mock_cmd_checkpoint(BamCommands* c, size_t* out_tok) {
 static BamResult mock_cmd_rollback(BamCommands* c, size_t tok) {
     c->rollbacks += 1u;
     c->last_token = tok;
+    return BAM_RESULT_OK;
+}
+static BamResult mock_cmd_clone_entity(BamCommands* c, BamEntity src, BamEntity dst) {
+    if (bam_entity_is_null(src) || bam_entity_is_null(dst)) return BAM_RESULT_INVALID_ENTITY;
+    c->cloned += 1u;
+    return BAM_RESULT_OK;
+}
+static BamResult mock_cmd_insert_resource(
+    BamCommands* c,
+    BamComponent res,
+    const uint8_t* ptr,
+    size_t len
+) {
+    if (!bam_component_is_valid(res)) return BAM_RESULT_INVALID_COMPONENT;
+    if (len > 0u && ptr == nullptr) return BAM_RESULT_NULL_POINTER;
+    c->inserted_resources += 1u;
+    return BAM_RESULT_OK;
+}
+static BamResult mock_cmd_remove_resource(BamCommands* c, BamComponent res) {
+    if (!bam_component_is_valid(res)) return BAM_RESULT_INVALID_COMPONENT;
+    c->removed_resources += 1u;
     return BAM_RESULT_OK;
 }
 
@@ -123,13 +165,17 @@ int main() {
     api.iter_column_readonly = mock_iter_col_ro;
     api.iter_column_mutable = mock_iter_col_mut;
     api.iter_column_mutable_untracked = mock_iter_col_mut;
+    api.iter_column_ticks = mock_iter_column_ticks;
     api.cmd_checkpoint = mock_cmd_checkpoint;
     api.cmd_rollback = mock_cmd_rollback;
+    api.cmd_clone_entity = mock_cmd_clone_entity;
+    api.cmd_insert_resource = mock_cmd_insert_resource;
+    api.cmd_remove_resource = mock_cmd_remove_resource;
 
     BamHostCtx h{42};
     BamLoadCtx lc{&h};
-    BamIter it{0u, {7ull}, {3.5f}};
-    BamCommands cmds{0u, 0u, 0u};
+    BamIter it{0u, {7ull}, {3.5f}, {11u}, {12u}};
+    BamCommands cmds{0u, 0u, 0u, 0u, 0u, 0u};
     BamSystemCtx sc{&h, &it, &cmds};
 
     bam::LoadContextView lview(api, &lc);
@@ -154,10 +200,21 @@ int main() {
     assert(cview.column_readonly<float>(0u)[0] == 3.5f);
     cview.column_mutable<float>(0u)[0] = 9.0f;
     assert(cview.column_mutable_untracked<float>(0u)[0] == 9.0f);
+    const uint32_t* added_ticks = nullptr;
+    const uint32_t* changed_ticks = nullptr;
+    uint32_t last_run = 0u;
+    uint32_t this_run = 0u;
+    assert(bam::is_ok(cview.column_ticks(0u, added_ticks, changed_ticks, last_run, this_run)));
+    assert(added_ticks[0] == 11u && changed_ticks[0] == 12u && last_run == 10u && this_run == 12u);
     assert(bam::is_ok(cview.reset()));
 
     bam::CommandsView cmd_view;
     assert(bam::is_ok(sview.commands_view(cmd_view)));
+    assert(bam::is_ok(cmd_view.clone_entity(7ull, 8ull)));
+    float res_val = 4.25f;
+    assert(bam::is_ok(cmd_view.insert_resource_pod(3u, res_val)));
+    assert(bam::is_ok(cmd_view.remove_resource(3u)));
+    assert(cmds.cloned == 1u && cmds.inserted_resources == 1u && cmds.removed_resources == 1u);
     {
         bam::ScopedTransaction tx(cmd_view);
         assert(tx.active() && tx.token() == 1u);
@@ -349,6 +406,7 @@ test "all Zig views compile and enforce unsupported/null guards" {
     _ = &bam.LoadContextView.migrateComponentColumn;
 
     _ = &bam.ChunkView.nextChunk;
+    _ = &bam.ChunkView.nextChunkBatch;
     _ = &bam.ChunkView.reset;
     _ = &bam.ChunkView.entities;
     _ = &bam.ChunkView.markChangedRange;
@@ -362,6 +420,7 @@ test "all Zig views compile and enforce unsupported/null guards" {
     _ = &bam.ChunkView.readRemoved;
     _ = &bam.ChunkView.totalCount;
     _ = &bam.ChunkView.upCascade;
+    _ = &bam.ChunkView.columnTicks;
 
     _ = &bam.CommandsView.spawnEmpty;
     _ = &bam.CommandsView.spawn;
@@ -381,6 +440,14 @@ test "all Zig views compile and enforce unsupported/null guards" {
     _ = &bam.CommandsView.rollback;
     _ = &bam.CommandsView.insertRelation;
     _ = &bam.CommandsView.removeRelation;
+    _ = &bam.CommandsView.cloneEntity;
+    _ = &bam.CommandsView.insertResource;
+    _ = &bam.CommandsView.removeResource;
+
+    _ = &bam.ScopedTransaction.init;
+    _ = &bam.ScopedTransaction.commit;
+    _ = &bam.ScopedTransaction.rollbackNow;
+    _ = &bam.ScopedTransaction.deinit;
 
     _ = &bam.SystemContextView.hostCtx;
     _ = &bam.SystemContextView.query;
@@ -410,6 +477,102 @@ test "all Zig views compile and enforce unsupported/null guards" {
     try std.testing.expectEqual(@as(?*f32, null), sv.entityGetMut(f32, 0, 1, 0));
     try std.testing.expectEqual(@as(?*const f32, null), sv.resPtr(f32, 1, null));
     try std.testing.expectEqual(@as(?*f32, null), sv.resMutPtr(f32, 1, null));
+
+    try std.testing.expectError(error.Unsupported, cv.columnTicks(0));
+    const cmds_ptr: *c.BamCommands = @ptrCast(&dummy_byte);
+    const cmds_view = bam.CommandsView{ .api = &api, .cmds = cmds_ptr };
+    try std.testing.expectError(error.Unsupported, cmds_view.cloneEntity(1, 2));
+    try std.testing.expectError(error.Unsupported, cmds_view.insertResource(1, "ab"));
+    try std.testing.expectError(error.Unsupported, cmds_view.removeResource(1));
+    try std.testing.expectError(error.Unsupported, bam.ScopedTransaction.init(cmds_view));
+}
+
+const MockCmdState = struct {
+    checkpoints: usize = 0,
+    rollbacks: usize = 0,
+    last_token: usize = 0,
+    cloned: usize = 0,
+    inserted_res: usize = 0,
+    removed_res: usize = 0,
+};
+
+fn zigMockCheckpoint(cmds: ?*c.BamCommands, out_tok: [*c]usize) callconv(.c) c.BamResult {
+    const st: *MockCmdState = @ptrCast(@alignCast(cmds.?));
+    st.checkpoints += 1;
+    out_tok[0] = st.checkpoints;
+    return c.BAM_RESULT_OK;
+}
+
+fn zigMockRollback(cmds: ?*c.BamCommands, tok: usize) callconv(.c) c.BamResult {
+    const st: *MockCmdState = @ptrCast(@alignCast(cmds.?));
+    st.rollbacks += 1;
+    st.last_token = tok;
+    return c.BAM_RESULT_OK;
+}
+
+fn zigMockCloneEntity(cmds: ?*c.BamCommands, _: c.BamEntity, _: c.BamEntity) callconv(.c) c.BamResult {
+    const st: *MockCmdState = @ptrCast(@alignCast(cmds.?));
+    st.cloned += 1;
+    return c.BAM_RESULT_OK;
+}
+
+fn zigMockInsertResource(cmds: ?*c.BamCommands, _: c.BamComponent, _: [*c]const u8, _: usize) callconv(.c) c.BamResult {
+    const st: *MockCmdState = @ptrCast(@alignCast(cmds.?));
+    st.inserted_res += 1;
+    return c.BAM_RESULT_OK;
+}
+
+fn zigMockRemoveResource(cmds: ?*c.BamCommands, _: c.BamComponent) callconv(.c) c.BamResult {
+    const st: *MockCmdState = @ptrCast(@alignCast(cmds.?));
+    st.removed_res += 1;
+    return c.BAM_RESULT_OK;
+}
+
+test "Zig ScopedTransaction and new command wrappers execute cleanly" {
+    var api: c.BamHostApi = std.mem.zeroes(c.BamHostApi);
+    api.struct_size = @sizeOf(c.BamHostApi);
+    api.abi_version = c.BAM_ABI_VERSION;
+    api.cmd_checkpoint = zigMockCheckpoint;
+    api.cmd_rollback = zigMockRollback;
+    api.cmd_clone_entity = zigMockCloneEntity;
+    api.cmd_insert_resource = zigMockInsertResource;
+    api.cmd_remove_resource = zigMockRemoveResource;
+
+    var state = MockCmdState{};
+    const cmds = bam.CommandsView{ .api = &api, .cmds = @ptrCast(&state) };
+
+    try cmds.cloneEntity(7, 8);
+    try cmds.insertResource(3, "data");
+    try cmds.removeResource(3);
+    try std.testing.expectEqual(@as(usize, 1), state.cloned);
+    try std.testing.expectEqual(@as(usize, 1), state.inserted_res);
+    try std.testing.expectEqual(@as(usize, 1), state.removed_res);
+
+    {
+        var tx = try bam.ScopedTransaction.init(cmds);
+        defer tx.deinit();
+        try std.testing.expectEqual(@as(usize, 1), tx.token);
+    }
+    try std.testing.expectEqual(@as(usize, 1), state.rollbacks);
+    try std.testing.expectEqual(@as(usize, 1), state.last_token);
+
+    {
+        var tx = try bam.ScopedTransaction.init(cmds);
+        defer tx.deinit();
+        try std.testing.expectEqual(@as(usize, 2), tx.token);
+        tx.commit();
+    }
+    try std.testing.expectEqual(@as(usize, 1), state.rollbacks);
+
+    {
+        var tx = try bam.ScopedTransaction.init(cmds);
+        defer tx.deinit();
+        try std.testing.expectEqual(@as(usize, 3), tx.token);
+        try tx.rollbackNow();
+        try tx.rollbackNow(); // idempotent
+    }
+    try std.testing.expectEqual(@as(usize, 2), state.rollbacks);
+    try std.testing.expectEqual(@as(usize, 3), state.last_token);
 }
 "#,
     )

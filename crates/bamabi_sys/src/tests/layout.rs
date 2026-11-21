@@ -10,24 +10,26 @@ use crate::{
     ABI_VERSION, ABI_VERSION_MAJOR, ABI_VERSION_MINOR, ABI_VERSION_PATCH, AccessMode,
     BAM_COMPONENT_FLAG_IMMUTABLE, BAM_COMPONENT_FLAG_SPARSE_SET, BAM_COMPONENT_FLAG_SUMMARY_TICK,
     BAM_DISABLED_NAME, BAM_LOG_DEBUG, BAM_LOG_ERROR, BAM_LOG_INFO, BAM_LOG_TRACE, BAM_LOG_WARN,
-    BAM_OBSERVER_FLAG_PROPAGATE, BAM_RELATION_FLAG_ACYCLIC, BAM_RELATION_FLAG_CASCADE_DELETE,
-    BAM_RELATION_FLAG_CASCADE_DESPAWN, BAM_RELATION_FLAG_CLEANUP_REMOVE,
-    BAM_RELATION_FLAG_EXCLUSIVE, BAM_RELATION_FLAG_SYMMETRIC, BAM_RELATION_KNOWN_FLAGS,
-    BAM_REQUIRED_FLAG_CUSTOM_BYTES, BAM_REQUIRED_FLAG_INIT_FN, BAM_REQUIRED_FLAG_RESOLVE_BY_UUID,
-    BAM_SCHEDULE_SET_FLAG_AFTER_WEAK, BAM_SCHEDULE_SET_FLAG_BEFORE_WEAK,
-    BAM_SCHEDULE_SET_FLAG_PARALLEL, BAM_SCHEDULE_SET_FLAG_SEQUENCE,
-    BAM_SCHEDULE_SET_FLAG_SEQUENCE_WEAK, BAM_SCHEDULE_SET_KNOWN_FLAGS,
-    BAM_STORAGE_FLAG_ENTITY_EVENT, BAM_STORAGE_FLAG_EVENT, BAM_STORAGE_FLAG_IMMUTABLE,
-    BAM_STORAGE_FLAG_MESSAGE, BAM_STORAGE_FLAG_RESOURCE, BAM_STORAGE_FLAG_SPARSE_SET,
-    BAM_STORAGE_FLAG_SUMMARY_TICK, BAM_SYSTEM_FLAG_AMBIGUOUS_WITH_ALL, BAM_SYSTEM_FLAG_MAIN_THREAD,
+    BAM_OBSERVER_FLAG_PROPAGATE, BAM_QUERY_FLAG_PARAM_SET, BAM_RELATION_FLAG_ACYCLIC,
+    BAM_RELATION_FLAG_CASCADE_DELETE, BAM_RELATION_FLAG_CASCADE_DESPAWN,
+    BAM_RELATION_FLAG_CLEANUP_REMOVE, BAM_RELATION_FLAG_EXCLUSIVE, BAM_RELATION_FLAG_SYMMETRIC,
+    BAM_RELATION_KNOWN_FLAGS, BAM_REQUIRED_FLAG_CUSTOM_BYTES, BAM_REQUIRED_FLAG_INIT_FN,
+    BAM_REQUIRED_FLAG_RESOLVE_BY_UUID, BAM_SCHEDULE_SET_FLAG_AFTER_WEAK,
+    BAM_SCHEDULE_SET_FLAG_BEFORE_WEAK, BAM_SCHEDULE_SET_FLAG_PARALLEL,
+    BAM_SCHEDULE_SET_FLAG_SEQUENCE, BAM_SCHEDULE_SET_FLAG_SEQUENCE_WEAK,
+    BAM_SCHEDULE_SET_KNOWN_FLAGS, BAM_STORAGE_FLAG_ENTITY_EVENT, BAM_STORAGE_FLAG_EVENT,
+    BAM_STORAGE_FLAG_IMMUTABLE, BAM_STORAGE_FLAG_MESSAGE, BAM_STORAGE_FLAG_RESOURCE,
+    BAM_STORAGE_FLAG_SPARSE_SET, BAM_STORAGE_FLAG_SUMMARY_TICK, BAM_SYSTEM_FLAG_AMBIGUOUS_WITH_ALL,
+    BAM_SYSTEM_FLAG_MAIN_THREAD, BAM_TERM_FLAG_ADDED, BAM_TERM_FLAG_CHANGED,
     BAM_TRIGGER_FLAG_PROPAGATE, BamAssetGetLoadStateFn, BamAssetLoadFn, BamAssetReleaseFn,
-    BamChangeTicks, BamChunkTaskFn, BamCmdDespawnAllFn, BamCmdDespawnFn, BamCmdInsertDefaultFn,
-    BamCmdInsertFn, BamCmdObserveFn, BamCmdRemoveFn, BamCmdSpawnBatchFn, BamCmdSpawnEmptyFn,
-    BamCmdSpawnFn, BamCmdSpawnSceneFn, BamCmdTriggerExFn, BamCmdTriggerFn, BamColumnInfo,
-    BamCommands, BamComponent, BamEventKind, BamFieldDesc, BamFieldKind, BamGetProcAddressFn,
-    BamHostApi, BamHostCtx, BamInitFn, BamInstance, BamIter, BamIterColumnInfoFn,
-    BamIterColumnMutableFn, BamIterColumnMutableUntrackedFn, BamIterColumnReadonlyFn,
-    BamIterColumnRowsMutableFn, BamIterColumnRowsReadonlyFn, BamIterEntitiesFn,
+    BamChangeTicks, BamChunkTaskFn, BamCmdCloneEntityFn, BamCmdDespawnAllFn, BamCmdDespawnFn,
+    BamCmdInsertDefaultFn, BamCmdInsertFn, BamCmdInsertResourceFn, BamCmdObserveFn, BamCmdRemoveFn,
+    BamCmdRemoveResourceFn, BamCmdSpawnBatchFn, BamCmdSpawnEmptyFn, BamCmdSpawnFn,
+    BamCmdSpawnSceneFn, BamCmdTriggerExFn, BamCmdTriggerFn, BamColumnInfo, BamCommands,
+    BamComponent, BamEventKind, BamFieldDesc, BamFieldKind, BamGetProcAddressFn, BamHostApi,
+    BamHostCtx, BamInitFn, BamInstance, BamIter, BamIterColumnInfoFn, BamIterColumnMutableFn,
+    BamIterColumnMutableUntrackedFn, BamIterColumnReadonlyFn, BamIterColumnRowsMutableFn,
+    BamIterColumnRowsReadonlyFn, BamIterColumnTicksFn, BamIterEntitiesFn,
     BamIterMarkChangedRangeFn, BamIterNextChunkFn, BamIterReadRemovedFn, BamIterResetFn,
     BamLastErrorFn, BamLayoutInfo, BamLoadCtx, BamLoadHostCtxFn, BamManifest, BamManifestFn,
     BamMsgReadBatchFn, BamMsgSendFn, BamMsgWriteBatchFn, BamObserverDesc, BamObserverFn,
@@ -399,6 +401,10 @@ fn populated_host_api() -> BamHostApi {
         cmd_remove_relation: None,
         migrate_component_column: None,
         iter_next_chunk_batch: None,
+        iter_column_ticks: None,
+        cmd_clone_entity: None,
+        cmd_insert_resource: None,
+        cmd_remove_resource: None,
     }
 }
 
@@ -508,6 +514,10 @@ fn abi_v0_2_exact_sizes_alignments_and_offsets() {
     assert_eq!(size_of::<Option<BamAssetGetLoadStateFn>>(), ptr_sz);
     assert_eq!(size_of::<Option<BamAssetReleaseFn>>(), ptr_sz);
     assert_eq!(size_of::<Option<BamCmdSpawnSceneFn>>(), ptr_sz);
+    assert_eq!(size_of::<Option<BamIterColumnTicksFn>>(), ptr_sz);
+    assert_eq!(size_of::<Option<BamCmdCloneEntityFn>>(), ptr_sz);
+    assert_eq!(size_of::<Option<BamCmdInsertResourceFn>>(), ptr_sz);
+    assert_eq!(size_of::<Option<BamCmdRemoveResourceFn>>(), ptr_sz);
 
     #[cfg(target_pointer_width = "64")]
     {
@@ -515,9 +525,9 @@ fn abi_v0_2_exact_sizes_alignments_and_offsets() {
         assert_eq!(align_of::<StrView>(), 8);
         assert_eq!(size_of::<BamManifest>(), 48);
         assert_eq!(BamManifest::MIN_V0_2_SIZE, 32);
-        assert_eq!(size_of::<BamQueryDesc>(), 24);
+        assert_eq!(size_of::<BamQueryDesc>(), 32);
         assert_eq!(BamQueryDesc::MIN_V0_2_SIZE, 24);
-        assert_eq!(size_of::<BamSystemDesc>(), 168);
+        assert_eq!(size_of::<BamSystemDesc>(), 192);
         assert_eq!(BamSystemDesc::MIN_V0_2_SIZE, 104);
         assert_eq!(size_of::<BamObserverDesc>(), 88);
         assert_eq!(BamObserverDesc::MIN_V0_2_SIZE, 48);
@@ -529,7 +539,7 @@ fn abi_v0_2_exact_sizes_alignments_and_offsets() {
         assert_eq!(size_of::<BamColumnInfo>(), 48);
         assert_eq!(size_of::<VTableHeader>(), 40);
         assert_eq!(VTableHeader::MIN_V0_2_SIZE, 40);
-        assert_eq!(size_of::<BamHostApi>(), 560);
+        assert_eq!(size_of::<BamHostApi>(), 592);
         assert_eq!(BamHostApi::MIN_V0_2_SIZE, 224);
         assert_eq!(BamHostApi::MIN_V0_3_SIZE, 552);
     }
@@ -540,9 +550,9 @@ fn abi_v0_2_exact_sizes_alignments_and_offsets() {
         assert_eq!(align_of::<StrView>(), 4);
         assert_eq!(size_of::<BamManifest>(), 32);
         assert_eq!(BamManifest::MIN_V0_2_SIZE, 24);
-        assert_eq!(size_of::<BamQueryDesc>(), 16);
+        assert_eq!(size_of::<BamQueryDesc>(), 24);
         assert_eq!(BamQueryDesc::MIN_V0_2_SIZE, 16);
-        assert_eq!(size_of::<BamSystemDesc>(), 92);
+        assert_eq!(size_of::<BamSystemDesc>(), 104);
         assert_eq!(BamSystemDesc::MIN_V0_2_SIZE, 60);
         assert_eq!(size_of::<BamObserverDesc>(), 64);
         assert_eq!(BamObserverDesc::MIN_V0_2_SIZE, 36);
@@ -554,7 +564,7 @@ fn abi_v0_2_exact_sizes_alignments_and_offsets() {
         assert_eq!(size_of::<BamColumnInfo>(), 40);
         assert_eq!(size_of::<VTableHeader>(), 32);
         assert_eq!(VTableHeader::MIN_V0_2_SIZE, 32);
-        assert_eq!(size_of::<BamHostApi>(), 284);
+        assert_eq!(size_of::<BamHostApi>(), 300);
         assert_eq!(BamHostApi::MIN_V0_2_SIZE, 116);
         assert_eq!(BamHostApi::MIN_V0_3_SIZE, 280);
     }
@@ -784,6 +794,20 @@ fn unknown_flags_and_nonzero_reserved_rejected() {
     let comp = BamComponent::from_raw(1);
     let term = BamTermDesc::read(comp);
     assert_eq!(term.validate(), FfiResult::OK);
+    assert!(!term.is_changed());
+    assert!(!term.is_added());
+    let changed_write = BamTermDesc::write(comp).with_changed();
+    assert_eq!(changed_write.flags, BAM_TERM_FLAG_CHANGED);
+    assert!(changed_write.is_changed());
+    assert!(!changed_write.is_added());
+    assert_eq!(changed_write.validate(), FfiResult::OK);
+    let added_read = BamTermDesc::read(comp).with_added();
+    assert_eq!(added_read.flags, BAM_TERM_FLAG_ADDED);
+    assert!(added_read.is_added());
+    assert!(!added_read.is_changed());
+    assert_eq!(added_read.validate(), FfiResult::OK);
+    assert!(BamTermDesc::changed(comp).is_changed());
+    assert!(BamTermDesc::added(comp).is_added());
     assert_eq!(term.with_flags(1 << 3).validate(), FfiResult::UNSUPPORTED);
     assert_eq!(
         BamTermDesc::read(BamComponent::INVALID).validate(),
@@ -798,7 +822,14 @@ fn unknown_flags_and_nonzero_reserved_rejected() {
     let query = BamQueryDesc::new(&raw const term, 1);
     assert_eq!(query.validate(), FfiResult::OK);
     assert_eq!(BamQueryDesc::empty().validate(), FfiResult::OK);
-    assert_eq!(query.with_flags(1 << 0).validate(), FfiResult::UNSUPPORTED);
+    let ps_query = query.with_param_set_group(1);
+    assert_eq!(ps_query.param_set_group, 1);
+    assert_eq!(ps_query.flags, BAM_QUERY_FLAG_PARAM_SET);
+    assert_eq!(ps_query.validate(), FfiResult::OK);
+    let mut bad_query_res = ps_query;
+    bad_query_res.reserved0 = 1;
+    assert_eq!(bad_query_res.validate(), FfiResult::INVALID_ARGUMENT);
+    assert_eq!(query.with_flags(1 << 1).validate(), FfiResult::UNSUPPORTED);
     assert_eq!(
         BamQueryDesc::new(core::ptr::null(), 1).validate(),
         FfiResult::NULL_POINTER
@@ -807,8 +838,9 @@ fn unknown_flags_and_nonzero_reserved_rejected() {
         BamQueryDesc::new(&raw const term, MAX_TERMS_PER_QUERY + 1).validate(),
         FfiResult::CAPACITY_EXCEEDED
     );
+    assert_eq!(MAX_QUERIES_PER_SYSTEM, 16);
 
-    // BamSystemDesc (`custom schedule + `main thread + `flags/reserved)
+    // BamSystemDesc (`custom schedule + `main thread + `flags/reserved + `run_if_ctx)
     let after_names = [c"input_set".as_ptr()];
     let before_names = [c"render_set".as_ptr()];
     let sys = BamSystemDesc::new(
@@ -822,8 +854,11 @@ fn unknown_flags_and_nonzero_reserved_rejected() {
     .with_schedule(ScheduleId::custom(ScheduleId::CUSTOM_BASE + 7))
     .with_after(after_names.as_ptr(), after_names.len())
     .with_before(before_names.as_ptr(), before_names.len())
-    .with_run_if(stub_run_if, core::ptr::null_mut());
+    .with_run_if(stub_run_if, core::ptr::null_mut())
+    .with_run_if_ctx(stub_system_cb, &raw const query, core::ptr::null_mut());
     assert!(sys.is_main_thread());
+    assert!(sys.run_if_ctx.is_some());
+    assert_eq!(sys.run_if_query, &raw const query);
     assert_eq!(sys.flags, BAM_SYSTEM_FLAG_MAIN_THREAD);
     assert_eq!(sys.validate(), FfiResult::OK);
 

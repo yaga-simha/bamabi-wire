@@ -1,7 +1,48 @@
 //! Multi-language SDK exporter (`bamabi.h`, `bamabi.hpp`, `bamabi.zig`).
 
+use std::fmt::Write as _;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::LazyLock;
+
+use bamabi_sys::FfiResult;
+
+/// Canonical ordered list of all 18 `bamabi_sys::FfiResult` status codes.
+const ALL_FFI_RESULTS: [FfiResult; 18] = [
+    FfiResult::OK,
+    FfiResult::INVALID_COMPONENT,
+    FfiResult::ACCESS_CONFLICT,
+    FfiResult::PANIC_CAUGHT,
+    FfiResult::NULL_POINTER,
+    FfiResult::INVALID_UTF8,
+    FfiResult::PERMISSION_DENIED,
+    FfiResult::INVALID_VERSION,
+    FfiResult::INVALID_ARGUMENT,
+    FfiResult::OUT_OF_RANGE,
+    FfiResult::NOT_FOUND,
+    FfiResult::INVALID_STATE,
+    FfiResult::INVALID_ENTITY,
+    FfiResult::CAPACITY_EXCEEDED,
+    FfiResult::UNSUPPORTED,
+    FfiResult::TYPE_MISMATCH,
+    FfiResult::CYCLE_DETECTED,
+    FfiResult::INTERNAL_ERROR,
+];
+
+/// Converts a `SCREAMING_SNAKE_CASE` identifier (such as `FfiResult::name()`) to `PascalCase`.
+fn screaming_snake_to_pascal(name: &str) -> String {
+    let mut out = String::with_capacity(name.len());
+    for part in name.split('_') {
+        let mut chars = part.chars();
+        if let Some(first) = chars.next() {
+            out.push(first.to_ascii_uppercase());
+            for ch in chars {
+                out.push(ch.to_ascii_lowercase());
+            }
+        }
+    }
+    out
+}
 
 /// Generates the canonical strict ISO C99 header directly from `bamabi_sys`.
 ///
@@ -17,8 +58,194 @@ pub fn c99_header() -> String {
     crate::render_c99_header().expect("valid bamabi_sys wire layouts")
 }
 
-/// Ergonomic ISO C++17 RAII wrapper header over `bamabi.h` (`ABI 0.3.0`).
-pub const CPP17_HEADER: &str = r#"#ifndef BAMABI_HPP
+/// Synthesizes the ergonomic ISO C++17 RAII wrapper header over `bamabi.h` (`ABI 0.3.0`).
+///
+/// Programmatically emits all `bam::offsets::*` compile-time constants directly from
+/// `header_gen::host_api_slot_names` so C++17 offset definitions cannot drift from
+/// `bamabi_sys` or `include/bamabi.h`.
+#[must_use]
+pub fn cpp17_header() -> String {
+    let slots = crate::header_gen::host_api_slot_names();
+    let last_slot = slots
+        .last()
+        .copied()
+        .expect("BamHostApi must have at least one slot");
+    let last_upper = last_slot.to_ascii_uppercase();
+
+    let mut out = String::with_capacity(32 * 1024);
+    out.push_str(CPP17_HEADER_PREFIX);
+    for slot in &slots {
+        let upper = slot.to_ascii_uppercase();
+        let _ = writeln!(
+            out,
+            "inline constexpr std::size_t {upper} = BAM_HOST_API_OFFSET_{upper};"
+        );
+    }
+    let _ = writeln!(
+        out,
+        "\n\
+static_assert(STRUCT_SIZE == 0u, \"BamHostApi::struct_size must be at offset 0\");\n\
+static_assert(ABI_VERSION == 4u, \"BamHostApi::abi_version must be at offset 4\");\n\
+static_assert(GET_PROC_ADDRESS == 8u, \"BamHostApi slot 0 must be at offset 8\");\n\
+static_assert(\n\
+    {last_upper} + sizeof(BamHostApi::{last_slot}) == sizeof(BamHostApi),\n\
+    \"BamHostApi tail slot must end at sizeof(BamHostApi)\"\n\
+);"
+    );
+    out.push_str(CPP17_HEADER_BODY);
+    out
+}
+
+/// Synthesizes the Zig SDK wrapper over `bamabi.h` (`ABI 0.3.0` `b.addTranslateC` `"bam_c"` module).
+///
+/// Programmatically emits all `offsets.*` / `BAM_HOST_API_OFFSET_*` constants directly from
+/// `header_gen::host_api_slot_names` and the 18-code `BamError` / `checkResult` /
+/// `mapError` mappings directly from `bamabi_sys::FfiResult` metadata.
+#[must_use]
+pub fn zig_sdk() -> String {
+    let slots = crate::header_gen::host_api_slot_names();
+    let slot_count = slots.len();
+    let last_slot = slots
+        .last()
+        .copied()
+        .expect("BamHostApi must have at least one slot");
+    let last_upper = last_slot.to_ascii_uppercase();
+
+    let mut out = String::with_capacity(36 * 1024);
+    let _ = write!(
+        out,
+        r#"//! Zig SDK bindings for `bamabi` (`ABI 0.3.0`).
+//!
+//! Expects `build.zig` to translate `bamabi.h` via `b.addTranslateC(...)`
+//! and attach the resulting module as `"bam_c"` (`mod.addImport("bam_c", bam_c_mod)`).
+
+pub const c = @import("bam_c");
+
+/// Zig expresses C99/MSVC `BAM_RESTRICT` non-aliasing guarantees on SoA column pointers via the
+/// built-in `noalias` parameter qualifier (for example:
+/// `fn integrate(noalias pos: [*]Pos, noalias vel: [*]const Vel, len: usize) void`).
+pub const BAM_RESTRICT_QUALIFIER = "noalias";
+
+/// Compile-time byte offsets for `c.BamHostApi` header fields and all {slot_count} function-pointer slots,
+/// mirroring `bamabi_sys::offsets` and `BAM_HOST_API_OFFSET_*` via `@offsetOf`.
+pub const offsets = struct {{
+    pub const SLOT_COUNT: usize = {slot_count};
+    pub const STRUCT_SIZE: usize = @offsetOf(c.BamHostApi, "struct_size");
+    pub const ABI_VERSION: usize = @offsetOf(c.BamHostApi, "abi_version");
+
+"#
+    );
+
+    for slot in &slots {
+        let upper = slot.to_ascii_uppercase();
+        let _ = writeln!(
+            out,
+            "    pub const {upper}: usize = @offsetOf(c.BamHostApi, \"{slot}\");"
+        );
+    }
+    out.push_str("};\n\n");
+
+    for slot in &slots {
+        let upper = slot.to_ascii_uppercase();
+        let _ = writeln!(
+            out,
+            "pub const BAM_HOST_API_OFFSET_{upper}: usize = offsets.{upper};"
+        );
+    }
+
+    let _ = write!(
+        out,
+        r#"
+comptime {{
+    if (offsets.STRUCT_SIZE != 0 or offsets.ABI_VERSION != 4 or offsets.GET_PROC_ADDRESS != 8) {{
+        @compileError("BamHostApi header offsets mismatch");
+    }}
+    if (offsets.{last_upper} + @sizeOf(usize) != @sizeOf(c.BamHostApi)) {{
+        @compileError("BamHostApi tail slot offset mismatch");
+    }}
+}}
+
+/// Returns `true` when `api.struct_size` covers a slot of `slot_size` bytes at `slot_offset`.
+pub inline fn coversHostApiSlot(api: *const c.BamHostApi, slot_offset: usize, slot_size: usize) bool {{
+    const sz: usize = @as(usize, api.struct_size);
+    return slot_offset <= sz and slot_size <= (sz - slot_offset);
+}}
+
+/// Copies `len` elements between non-overlapping SoA columns using Zig's `noalias`
+/// parameter qualifier (the Zig equivalent of C99/MSVC `BAM_RESTRICT`).
+pub fn copyColumnNoAlias(
+    comptime T: type,
+    noalias dst: [*]T,
+    noalias src: [*]const T,
+    len: usize,
+) void {{
+    @memcpy(dst[0..len], src[0..len]);
+}}
+
+pub const BamError = error{{
+"#
+    );
+
+    for res in ALL_FFI_RESULTS {
+        if res.is_ok() {
+            continue;
+        }
+        if res == FfiResult::INTERNAL_ERROR {
+            out.push_str("    OutOfMemory,\n");
+        }
+        let pascal = screaming_snake_to_pascal(res.name());
+        let _ = writeln!(out, "    {pascal},");
+    }
+    out.push_str("};\n\n");
+
+    out.push_str("pub fn checkResult(res: c.BamResult) BamError!void {\n");
+    out.push_str("    return switch (res) {\n");
+    for res in ALL_FFI_RESULTS {
+        let name = res.name();
+        if res.is_ok() {
+            let _ = writeln!(out, "        c.BAM_RESULT_{name} => {{}},");
+        } else {
+            let pascal = screaming_snake_to_pascal(name);
+            let _ = writeln!(out, "        c.BAM_RESULT_{name} => error.{pascal},");
+        }
+    }
+    out.push_str("        else => error.InternalError,\n");
+    out.push_str("    };\n");
+    out.push_str("}\n\n");
+
+    out.push_str("pub fn mapError(err: BamError) c.BamResult {\n");
+    out.push_str("    return switch (err) {\n");
+    for res in ALL_FFI_RESULTS {
+        if res.is_ok() {
+            continue;
+        }
+        let name = res.name();
+        let pascal = screaming_snake_to_pascal(name);
+        if res == FfiResult::INTERNAL_ERROR {
+            let _ = writeln!(
+                out,
+                "        error.OutOfMemory, error.{pascal} => c.BAM_RESULT_{name},"
+            );
+        } else {
+            let _ = writeln!(out, "        error.{pascal} => c.BAM_RESULT_{name},");
+        }
+    }
+    out.push_str("    };\n");
+    out.push_str("}\n");
+
+    out.push_str(ZIG_SDK_BODY);
+    out
+}
+
+/// Ergonomic ISO C++17 RAII wrapper header over `bamabi.h` (`ABI 0.3.0`), lazily synthesized via
+/// [`cpp17_header`].
+pub static CPP17_HEADER: LazyLock<String> = LazyLock::new(cpp17_header);
+
+/// Zig SDK wrapper over `bamabi.h` (`ABI 0.3.0` `b.addTranslateC` `"bam_c"` module), lazily
+/// synthesized via [`zig_sdk`].
+pub static ZIG_SDK: LazyLock<String> = LazyLock::new(zig_sdk);
+
+const CPP17_HEADER_PREFIX: &str = r#"#ifndef BAMABI_HPP
 #define BAMABI_HPP
 
 #include "bamabi.h"
@@ -45,84 +272,9 @@ inline constexpr std::size_t SLOT_COUNT = BAM_HOST_API_SLOT_COUNT;
 inline constexpr std::size_t STRUCT_SIZE = offsetof(BamHostApi, struct_size);
 inline constexpr std::size_t ABI_VERSION = offsetof(BamHostApi, abi_version);
 
-inline constexpr std::size_t GET_PROC_ADDRESS = BAM_HOST_API_OFFSET_GET_PROC_ADDRESS;
-inline constexpr std::size_t LAST_ERROR = BAM_HOST_API_OFFSET_LAST_ERROR;
-inline constexpr std::size_t LOAD_HOST_CTX = BAM_HOST_API_OFFSET_LOAD_HOST_CTX;
-inline constexpr std::size_t REGISTER_COMPONENT = BAM_HOST_API_OFFSET_REGISTER_COMPONENT;
-inline constexpr std::size_t RESOLVE_COMPONENT = BAM_HOST_API_OFFSET_RESOLVE_COMPONENT;
-inline constexpr std::size_t REGISTER_SYSTEM = BAM_HOST_API_OFFSET_REGISTER_SYSTEM;
-inline constexpr std::size_t SYS_HOST_CTX = BAM_HOST_API_OFFSET_SYS_HOST_CTX;
-inline constexpr std::size_t SYS_QUERY = BAM_HOST_API_OFFSET_SYS_QUERY;
-inline constexpr std::size_t SYS_COMMANDS = BAM_HOST_API_OFFSET_SYS_COMMANDS;
-inline constexpr std::size_t ITER_NEXT_CHUNK = BAM_HOST_API_OFFSET_ITER_NEXT_CHUNK;
-inline constexpr std::size_t ITER_RESET = BAM_HOST_API_OFFSET_ITER_RESET;
-inline constexpr std::size_t ITER_ENTITIES = BAM_HOST_API_OFFSET_ITER_ENTITIES;
-inline constexpr std::size_t ITER_COLUMN_READONLY = BAM_HOST_API_OFFSET_ITER_COLUMN_READONLY;
-inline constexpr std::size_t ITER_COLUMN_MUTABLE = BAM_HOST_API_OFFSET_ITER_COLUMN_MUTABLE;
-inline constexpr std::size_t ITER_COLUMN_MUTABLE_UNTRACKED = BAM_HOST_API_OFFSET_ITER_COLUMN_MUTABLE_UNTRACKED;
-inline constexpr std::size_t ITER_MARK_CHANGED_RANGE = BAM_HOST_API_OFFSET_ITER_MARK_CHANGED_RANGE;
-inline constexpr std::size_t ITER_COLUMN_ROWS_READONLY = BAM_HOST_API_OFFSET_ITER_COLUMN_ROWS_READONLY;
-inline constexpr std::size_t ITER_COLUMN_ROWS_MUTABLE = BAM_HOST_API_OFFSET_ITER_COLUMN_ROWS_MUTABLE;
-inline constexpr std::size_t ITER_COLUMN_INFO = BAM_HOST_API_OFFSET_ITER_COLUMN_INFO;
-inline constexpr std::size_t RES_PTR = BAM_HOST_API_OFFSET_RES_PTR;
-inline constexpr std::size_t RES_MUT_PTR = BAM_HOST_API_OFFSET_RES_MUT_PTR;
-inline constexpr std::size_t CMD_SPAWN_EMPTY = BAM_HOST_API_OFFSET_CMD_SPAWN_EMPTY;
-inline constexpr std::size_t CMD_SPAWN = BAM_HOST_API_OFFSET_CMD_SPAWN;
-inline constexpr std::size_t CMD_DESPAWN = BAM_HOST_API_OFFSET_CMD_DESPAWN;
-inline constexpr std::size_t CMD_INSERT = BAM_HOST_API_OFFSET_CMD_INSERT;
-inline constexpr std::size_t CMD_INSERT_DEFAULT = BAM_HOST_API_OFFSET_CMD_INSERT_DEFAULT;
-inline constexpr std::size_t CMD_REMOVE = BAM_HOST_API_OFFSET_CMD_REMOVE;
-inline constexpr std::size_t PAR_FOR_EACH_CHUNK = BAM_HOST_API_OFFSET_PAR_FOR_EACH_CHUNK;
-inline constexpr std::size_t SYS_ENTITY_GET = BAM_HOST_API_OFFSET_SYS_ENTITY_GET;
-inline constexpr std::size_t SYS_ENTITY_GET_MUT = BAM_HOST_API_OFFSET_SYS_ENTITY_GET_MUT;
-inline constexpr std::size_t MSG_READ_BATCH = BAM_HOST_API_OFFSET_MSG_READ_BATCH;
-inline constexpr std::size_t MSG_SEND = BAM_HOST_API_OFFSET_MSG_SEND;
-inline constexpr std::size_t MSG_WRITE_BATCH = BAM_HOST_API_OFFSET_MSG_WRITE_BATCH;
-inline constexpr std::size_t RES_TICKS = BAM_HOST_API_OFFSET_RES_TICKS;
-inline constexpr std::size_t SYS_RES_PTR = BAM_HOST_API_OFFSET_SYS_RES_PTR;
-inline constexpr std::size_t SYS_RES_MUT_PTR = BAM_HOST_API_OFFSET_SYS_RES_MUT_PTR;
-inline constexpr std::size_t REGISTER_OBSERVER = BAM_HOST_API_OFFSET_REGISTER_OBSERVER;
-inline constexpr std::size_t CMD_TRIGGER = BAM_HOST_API_OFFSET_CMD_TRIGGER;
-inline constexpr std::size_t CMD_SPAWN_PERSISTENT = BAM_HOST_API_OFFSET_CMD_SPAWN_PERSISTENT;
-inline constexpr std::size_t CMD_SPAWN_BATCH = BAM_HOST_API_OFFSET_CMD_SPAWN_BATCH;
-inline constexpr std::size_t CMD_DESPAWN_ALL = BAM_HOST_API_OFFSET_CMD_DESPAWN_ALL;
-inline constexpr std::size_t CMD_INSERT_IF_NEW = BAM_HOST_API_OFFSET_CMD_INSERT_IF_NEW;
-inline constexpr std::size_t CMD_TRIGGER_EX = BAM_HOST_API_OFFSET_CMD_TRIGGER_EX;
-inline constexpr std::size_t CMD_OBSERVE = BAM_HOST_API_OFFSET_CMD_OBSERVE;
-inline constexpr std::size_t ITER_READ_REMOVED = BAM_HOST_API_OFFSET_ITER_READ_REMOVED;
-inline constexpr std::size_t SYS_ENTITY_CHILDREN = BAM_HOST_API_OFFSET_SYS_ENTITY_CHILDREN;
-inline constexpr std::size_t ASSET_LOAD = BAM_HOST_API_OFFSET_ASSET_LOAD;
-inline constexpr std::size_t ASSET_GET_LOAD_STATE = BAM_HOST_API_OFFSET_ASSET_GET_LOAD_STATE;
-inline constexpr std::size_t ASSET_RELEASE = BAM_HOST_API_OFFSET_ASSET_RELEASE;
-inline constexpr std::size_t CMD_SPAWN_SCENE = BAM_HOST_API_OFFSET_CMD_SPAWN_SCENE;
-inline constexpr std::size_t LOG_DIAGNOSTIC = BAM_HOST_API_OFFSET_LOG_DIAGNOSTIC;
-inline constexpr std::size_t REPORT_GUEST_FAULT = BAM_HOST_API_OFFSET_REPORT_GUEST_FAULT;
-inline constexpr std::size_t RESOLVE_COMPONENT_BY_UUID = BAM_HOST_API_OFFSET_RESOLVE_COMPONENT_BY_UUID;
-inline constexpr std::size_t COMPONENT_LAYOUT_INFO = BAM_HOST_API_OFFSET_COMPONENT_LAYOUT_INFO;
-inline constexpr std::size_t REGISTER_RELATION = BAM_HOST_API_OFFSET_REGISTER_RELATION;
-inline constexpr std::size_t INTERN_SYMBOL = BAM_HOST_API_OFFSET_INTERN_SYMBOL;
-inline constexpr std::size_t BIND_NAMED_OBJECT = BAM_HOST_API_OFFSET_BIND_NAMED_OBJECT;
-inline constexpr std::size_t ITER_COUNT = BAM_HOST_API_OFFSET_ITER_COUNT;
-inline constexpr std::size_t ITER_UP_CASCADE = BAM_HOST_API_OFFSET_ITER_UP_CASCADE;
-inline constexpr std::size_t PAR_FOR_EACH_CHUNK_READONLY = BAM_HOST_API_OFFSET_PAR_FOR_EACH_CHUNK_READONLY;
-inline constexpr std::size_t REGISTER_SYSTEM_HANDLE = BAM_HOST_API_OFFSET_REGISTER_SYSTEM_HANDLE;
-inline constexpr std::size_t CONFIGURE_SCHEDULE_SET = BAM_HOST_API_OFFSET_CONFIGURE_SCHEDULE_SET;
-inline constexpr std::size_t MOUNT_SYSTEM_IN_SCHEDULE = BAM_HOST_API_OFFSET_MOUNT_SYSTEM_IN_SCHEDULE;
-inline constexpr std::size_t CMD_CHECKPOINT = BAM_HOST_API_OFFSET_CMD_CHECKPOINT;
-inline constexpr std::size_t CMD_ROLLBACK = BAM_HOST_API_OFFSET_CMD_ROLLBACK;
-inline constexpr std::size_t CMD_INSERT_RELATION = BAM_HOST_API_OFFSET_CMD_INSERT_RELATION;
-inline constexpr std::size_t CMD_REMOVE_RELATION = BAM_HOST_API_OFFSET_CMD_REMOVE_RELATION;
-inline constexpr std::size_t MIGRATE_COMPONENT_COLUMN = BAM_HOST_API_OFFSET_MIGRATE_COMPONENT_COLUMN;
-inline constexpr std::size_t ITER_NEXT_CHUNK_BATCH = BAM_HOST_API_OFFSET_ITER_NEXT_CHUNK_BATCH;
+"#;
 
-static_assert(STRUCT_SIZE == 0u, "BamHostApi::struct_size must be at offset 0");
-static_assert(ABI_VERSION == 4u, "BamHostApi::abi_version must be at offset 4");
-static_assert(GET_PROC_ADDRESS == 8u, "BamHostApi slot 0 must be at offset 8");
-static_assert(
-    ITER_NEXT_CHUNK_BATCH + sizeof(BamIterNextChunkBatchFn) == sizeof(BamHostApi),
-    "BamHostApi tail slot must end at sizeof(BamHostApi)"
-);
-
+const CPP17_HEADER_BODY: &str = r#"
 } // namespace offsets
 
 inline bool is_ok(BamResult res) noexcept {
@@ -666,6 +818,28 @@ public:
         return api_->iter_up_cascade(iter_, relation, entity, term_index, &out_ptr, &out_owner);
     }
 
+    BamResult column_ticks(
+        size_t term_index,
+        const uint32_t*& out_added,
+        const uint32_t*& out_changed,
+        uint32_t& out_last_run,
+        uint32_t& out_this_run
+    ) const noexcept {
+        if (api_ == nullptr || iter_ == nullptr ||
+            !bam_host_api_covers_slot(api_, BAM_HOST_API_OFFSET_ITER_COLUMN_TICKS, sizeof(BamIterColumnTicksFn)) ||
+            api_->iter_column_ticks == nullptr) {
+            return BAM_RESULT_UNSUPPORTED;
+        }
+        return api_->iter_column_ticks(
+            iter_,
+            term_index,
+            &out_added,
+            &out_changed,
+            &out_last_run,
+            &out_this_run
+        );
+    }
+
 private:
     const BamHostApi* api_ = nullptr;
     BamIter* iter_ = nullptr;
@@ -888,6 +1062,42 @@ public:
         return api_->cmd_remove_relation(cmds_, entity, relation, target);
     }
 
+    BamResult clone_entity(BamEntity src_entity, BamEntity dst_entity) const noexcept {
+        if (api_ == nullptr || cmds_ == nullptr ||
+            !bam_host_api_covers_slot(api_, BAM_HOST_API_OFFSET_CMD_CLONE_ENTITY, sizeof(BamCmdCloneEntityFn)) ||
+            api_->cmd_clone_entity == nullptr) {
+            return BAM_RESULT_UNSUPPORTED;
+        }
+        return api_->cmd_clone_entity(cmds_, src_entity, dst_entity);
+    }
+
+    BamResult insert_resource(
+        BamComponent resource,
+        const uint8_t* data_ptr,
+        size_t data_len
+    ) const noexcept {
+        if (api_ == nullptr || cmds_ == nullptr ||
+            !bam_host_api_covers_slot(api_, BAM_HOST_API_OFFSET_CMD_INSERT_RESOURCE, sizeof(BamCmdInsertResourceFn)) ||
+            api_->cmd_insert_resource == nullptr) {
+            return BAM_RESULT_UNSUPPORTED;
+        }
+        return api_->cmd_insert_resource(cmds_, resource, data_ptr, data_len);
+    }
+
+    template <typename T>
+    BamResult insert_resource_pod(BamComponent resource, const T& value) const noexcept {
+        return insert_resource(resource, reinterpret_cast<const uint8_t*>(&value), sizeof(T));
+    }
+
+    BamResult remove_resource(BamComponent resource) const noexcept {
+        if (api_ == nullptr || cmds_ == nullptr ||
+            !bam_host_api_covers_slot(api_, BAM_HOST_API_OFFSET_CMD_REMOVE_RESOURCE, sizeof(BamCmdRemoveResourceFn)) ||
+            api_->cmd_remove_resource == nullptr) {
+            return BAM_RESULT_UNSUPPORTED;
+        }
+        return api_->cmd_remove_resource(cmds_, resource);
+    }
+
 private:
     const BamHostApi* api_ = nullptr;
     BamCommands* cmds_ = nullptr;
@@ -1055,260 +1265,7 @@ private:
 #endif // BAMABI_HPP
 "#;
 
-/// Zig SDK wrapper over `bamabi.h` (`ABI 0.3.0` `b.addTranslateC` `"bam_c"` module).
-pub const ZIG_SDK: &str = r#"//! Zig SDK bindings for `bamabi` (`ABI 0.3.0`).
-//!
-//! Expects `build.zig` to translate `bamabi.h` via `b.addTranslateC(...)`
-//! and attach the resulting module as `"bam_c"` (`mod.addImport("bam_c", bam_c_mod)`).
-
-pub const c = @import("bam_c");
-
-/// Zig expresses C99/MSVC `BAM_RESTRICT` non-aliasing guarantees on SoA column pointers via the
-/// built-in `noalias` parameter qualifier (for example:
-/// `fn integrate(noalias pos: [*]Pos, noalias vel: [*]const Vel, len: usize) void`).
-pub const BAM_RESTRICT_QUALIFIER = "noalias";
-
-/// Compile-time byte offsets for `c.BamHostApi` header fields and all 68 function-pointer slots,
-/// mirroring `bamabi_sys::offsets` and `BAM_HOST_API_OFFSET_*` via `@offsetOf`.
-pub const offsets = struct {
-    pub const SLOT_COUNT: usize = 68;
-    pub const STRUCT_SIZE: usize = @offsetOf(c.BamHostApi, "struct_size");
-    pub const ABI_VERSION: usize = @offsetOf(c.BamHostApi, "abi_version");
-
-    pub const GET_PROC_ADDRESS: usize = @offsetOf(c.BamHostApi, "get_proc_address");
-    pub const LAST_ERROR: usize = @offsetOf(c.BamHostApi, "last_error");
-    pub const LOAD_HOST_CTX: usize = @offsetOf(c.BamHostApi, "load_host_ctx");
-    pub const REGISTER_COMPONENT: usize = @offsetOf(c.BamHostApi, "register_component");
-    pub const RESOLVE_COMPONENT: usize = @offsetOf(c.BamHostApi, "resolve_component");
-    pub const REGISTER_SYSTEM: usize = @offsetOf(c.BamHostApi, "register_system");
-    pub const SYS_HOST_CTX: usize = @offsetOf(c.BamHostApi, "sys_host_ctx");
-    pub const SYS_QUERY: usize = @offsetOf(c.BamHostApi, "sys_query");
-    pub const SYS_COMMANDS: usize = @offsetOf(c.BamHostApi, "sys_commands");
-    pub const ITER_NEXT_CHUNK: usize = @offsetOf(c.BamHostApi, "iter_next_chunk");
-    pub const ITER_RESET: usize = @offsetOf(c.BamHostApi, "iter_reset");
-    pub const ITER_ENTITIES: usize = @offsetOf(c.BamHostApi, "iter_entities");
-    pub const ITER_COLUMN_READONLY: usize = @offsetOf(c.BamHostApi, "iter_column_readonly");
-    pub const ITER_COLUMN_MUTABLE: usize = @offsetOf(c.BamHostApi, "iter_column_mutable");
-    pub const ITER_COLUMN_MUTABLE_UNTRACKED: usize = @offsetOf(c.BamHostApi, "iter_column_mutable_untracked");
-    pub const ITER_MARK_CHANGED_RANGE: usize = @offsetOf(c.BamHostApi, "iter_mark_changed_range");
-    pub const ITER_COLUMN_ROWS_READONLY: usize = @offsetOf(c.BamHostApi, "iter_column_rows_readonly");
-    pub const ITER_COLUMN_ROWS_MUTABLE: usize = @offsetOf(c.BamHostApi, "iter_column_rows_mutable");
-    pub const ITER_COLUMN_INFO: usize = @offsetOf(c.BamHostApi, "iter_column_info");
-    pub const RES_PTR: usize = @offsetOf(c.BamHostApi, "res_ptr");
-    pub const RES_MUT_PTR: usize = @offsetOf(c.BamHostApi, "res_mut_ptr");
-    pub const CMD_SPAWN_EMPTY: usize = @offsetOf(c.BamHostApi, "cmd_spawn_empty");
-    pub const CMD_SPAWN: usize = @offsetOf(c.BamHostApi, "cmd_spawn");
-    pub const CMD_DESPAWN: usize = @offsetOf(c.BamHostApi, "cmd_despawn");
-    pub const CMD_INSERT: usize = @offsetOf(c.BamHostApi, "cmd_insert");
-    pub const CMD_INSERT_DEFAULT: usize = @offsetOf(c.BamHostApi, "cmd_insert_default");
-    pub const CMD_REMOVE: usize = @offsetOf(c.BamHostApi, "cmd_remove");
-    pub const PAR_FOR_EACH_CHUNK: usize = @offsetOf(c.BamHostApi, "par_for_each_chunk");
-    pub const SYS_ENTITY_GET: usize = @offsetOf(c.BamHostApi, "sys_entity_get");
-    pub const SYS_ENTITY_GET_MUT: usize = @offsetOf(c.BamHostApi, "sys_entity_get_mut");
-    pub const MSG_READ_BATCH: usize = @offsetOf(c.BamHostApi, "msg_read_batch");
-    pub const MSG_SEND: usize = @offsetOf(c.BamHostApi, "msg_send");
-    pub const MSG_WRITE_BATCH: usize = @offsetOf(c.BamHostApi, "msg_write_batch");
-    pub const RES_TICKS: usize = @offsetOf(c.BamHostApi, "res_ticks");
-    pub const SYS_RES_PTR: usize = @offsetOf(c.BamHostApi, "sys_res_ptr");
-    pub const SYS_RES_MUT_PTR: usize = @offsetOf(c.BamHostApi, "sys_res_mut_ptr");
-    pub const REGISTER_OBSERVER: usize = @offsetOf(c.BamHostApi, "register_observer");
-    pub const CMD_TRIGGER: usize = @offsetOf(c.BamHostApi, "cmd_trigger");
-    pub const CMD_SPAWN_PERSISTENT: usize = @offsetOf(c.BamHostApi, "cmd_spawn_persistent");
-    pub const CMD_SPAWN_BATCH: usize = @offsetOf(c.BamHostApi, "cmd_spawn_batch");
-    pub const CMD_DESPAWN_ALL: usize = @offsetOf(c.BamHostApi, "cmd_despawn_all");
-    pub const CMD_INSERT_IF_NEW: usize = @offsetOf(c.BamHostApi, "cmd_insert_if_new");
-    pub const CMD_TRIGGER_EX: usize = @offsetOf(c.BamHostApi, "cmd_trigger_ex");
-    pub const CMD_OBSERVE: usize = @offsetOf(c.BamHostApi, "cmd_observe");
-    pub const ITER_READ_REMOVED: usize = @offsetOf(c.BamHostApi, "iter_read_removed");
-    pub const SYS_ENTITY_CHILDREN: usize = @offsetOf(c.BamHostApi, "sys_entity_children");
-    pub const ASSET_LOAD: usize = @offsetOf(c.BamHostApi, "asset_load");
-    pub const ASSET_GET_LOAD_STATE: usize = @offsetOf(c.BamHostApi, "asset_get_load_state");
-    pub const ASSET_RELEASE: usize = @offsetOf(c.BamHostApi, "asset_release");
-    pub const CMD_SPAWN_SCENE: usize = @offsetOf(c.BamHostApi, "cmd_spawn_scene");
-    pub const LOG_DIAGNOSTIC: usize = @offsetOf(c.BamHostApi, "log_diagnostic");
-    pub const REPORT_GUEST_FAULT: usize = @offsetOf(c.BamHostApi, "report_guest_fault");
-    pub const RESOLVE_COMPONENT_BY_UUID: usize = @offsetOf(c.BamHostApi, "resolve_component_by_uuid");
-    pub const COMPONENT_LAYOUT_INFO: usize = @offsetOf(c.BamHostApi, "component_layout_info");
-    pub const REGISTER_RELATION: usize = @offsetOf(c.BamHostApi, "register_relation");
-    pub const INTERN_SYMBOL: usize = @offsetOf(c.BamHostApi, "intern_symbol");
-    pub const BIND_NAMED_OBJECT: usize = @offsetOf(c.BamHostApi, "bind_named_object");
-    pub const ITER_COUNT: usize = @offsetOf(c.BamHostApi, "iter_count");
-    pub const ITER_UP_CASCADE: usize = @offsetOf(c.BamHostApi, "iter_up_cascade");
-    pub const PAR_FOR_EACH_CHUNK_READONLY: usize = @offsetOf(c.BamHostApi, "par_for_each_chunk_readonly");
-    pub const REGISTER_SYSTEM_HANDLE: usize = @offsetOf(c.BamHostApi, "register_system_handle");
-    pub const CONFIGURE_SCHEDULE_SET: usize = @offsetOf(c.BamHostApi, "configure_schedule_set");
-    pub const MOUNT_SYSTEM_IN_SCHEDULE: usize = @offsetOf(c.BamHostApi, "mount_system_in_schedule");
-    pub const CMD_CHECKPOINT: usize = @offsetOf(c.BamHostApi, "cmd_checkpoint");
-    pub const CMD_ROLLBACK: usize = @offsetOf(c.BamHostApi, "cmd_rollback");
-    pub const CMD_INSERT_RELATION: usize = @offsetOf(c.BamHostApi, "cmd_insert_relation");
-    pub const CMD_REMOVE_RELATION: usize = @offsetOf(c.BamHostApi, "cmd_remove_relation");
-    pub const MIGRATE_COMPONENT_COLUMN: usize = @offsetOf(c.BamHostApi, "migrate_component_column");
-    pub const ITER_NEXT_CHUNK_BATCH: usize = @offsetOf(c.BamHostApi, "iter_next_chunk_batch");
-};
-
-pub const BAM_HOST_API_OFFSET_GET_PROC_ADDRESS: usize = offsets.GET_PROC_ADDRESS;
-pub const BAM_HOST_API_OFFSET_LAST_ERROR: usize = offsets.LAST_ERROR;
-pub const BAM_HOST_API_OFFSET_LOAD_HOST_CTX: usize = offsets.LOAD_HOST_CTX;
-pub const BAM_HOST_API_OFFSET_REGISTER_COMPONENT: usize = offsets.REGISTER_COMPONENT;
-pub const BAM_HOST_API_OFFSET_RESOLVE_COMPONENT: usize = offsets.RESOLVE_COMPONENT;
-pub const BAM_HOST_API_OFFSET_REGISTER_SYSTEM: usize = offsets.REGISTER_SYSTEM;
-pub const BAM_HOST_API_OFFSET_SYS_HOST_CTX: usize = offsets.SYS_HOST_CTX;
-pub const BAM_HOST_API_OFFSET_SYS_QUERY: usize = offsets.SYS_QUERY;
-pub const BAM_HOST_API_OFFSET_SYS_COMMANDS: usize = offsets.SYS_COMMANDS;
-pub const BAM_HOST_API_OFFSET_ITER_NEXT_CHUNK: usize = offsets.ITER_NEXT_CHUNK;
-pub const BAM_HOST_API_OFFSET_ITER_RESET: usize = offsets.ITER_RESET;
-pub const BAM_HOST_API_OFFSET_ITER_ENTITIES: usize = offsets.ITER_ENTITIES;
-pub const BAM_HOST_API_OFFSET_ITER_COLUMN_READONLY: usize = offsets.ITER_COLUMN_READONLY;
-pub const BAM_HOST_API_OFFSET_ITER_COLUMN_MUTABLE: usize = offsets.ITER_COLUMN_MUTABLE;
-pub const BAM_HOST_API_OFFSET_ITER_COLUMN_MUTABLE_UNTRACKED: usize = offsets.ITER_COLUMN_MUTABLE_UNTRACKED;
-pub const BAM_HOST_API_OFFSET_ITER_MARK_CHANGED_RANGE: usize = offsets.ITER_MARK_CHANGED_RANGE;
-pub const BAM_HOST_API_OFFSET_ITER_COLUMN_ROWS_READONLY: usize = offsets.ITER_COLUMN_ROWS_READONLY;
-pub const BAM_HOST_API_OFFSET_ITER_COLUMN_ROWS_MUTABLE: usize = offsets.ITER_COLUMN_ROWS_MUTABLE;
-pub const BAM_HOST_API_OFFSET_ITER_COLUMN_INFO: usize = offsets.ITER_COLUMN_INFO;
-pub const BAM_HOST_API_OFFSET_RES_PTR: usize = offsets.RES_PTR;
-pub const BAM_HOST_API_OFFSET_RES_MUT_PTR: usize = offsets.RES_MUT_PTR;
-pub const BAM_HOST_API_OFFSET_CMD_SPAWN_EMPTY: usize = offsets.CMD_SPAWN_EMPTY;
-pub const BAM_HOST_API_OFFSET_CMD_SPAWN: usize = offsets.CMD_SPAWN;
-pub const BAM_HOST_API_OFFSET_CMD_DESPAWN: usize = offsets.CMD_DESPAWN;
-pub const BAM_HOST_API_OFFSET_CMD_INSERT: usize = offsets.CMD_INSERT;
-pub const BAM_HOST_API_OFFSET_CMD_INSERT_DEFAULT: usize = offsets.CMD_INSERT_DEFAULT;
-pub const BAM_HOST_API_OFFSET_CMD_REMOVE: usize = offsets.CMD_REMOVE;
-pub const BAM_HOST_API_OFFSET_PAR_FOR_EACH_CHUNK: usize = offsets.PAR_FOR_EACH_CHUNK;
-pub const BAM_HOST_API_OFFSET_SYS_ENTITY_GET: usize = offsets.SYS_ENTITY_GET;
-pub const BAM_HOST_API_OFFSET_SYS_ENTITY_GET_MUT: usize = offsets.SYS_ENTITY_GET_MUT;
-pub const BAM_HOST_API_OFFSET_MSG_READ_BATCH: usize = offsets.MSG_READ_BATCH;
-pub const BAM_HOST_API_OFFSET_MSG_SEND: usize = offsets.MSG_SEND;
-pub const BAM_HOST_API_OFFSET_MSG_WRITE_BATCH: usize = offsets.MSG_WRITE_BATCH;
-pub const BAM_HOST_API_OFFSET_RES_TICKS: usize = offsets.RES_TICKS;
-pub const BAM_HOST_API_OFFSET_SYS_RES_PTR: usize = offsets.SYS_RES_PTR;
-pub const BAM_HOST_API_OFFSET_SYS_RES_MUT_PTR: usize = offsets.SYS_RES_MUT_PTR;
-pub const BAM_HOST_API_OFFSET_REGISTER_OBSERVER: usize = offsets.REGISTER_OBSERVER;
-pub const BAM_HOST_API_OFFSET_CMD_TRIGGER: usize = offsets.CMD_TRIGGER;
-pub const BAM_HOST_API_OFFSET_CMD_SPAWN_PERSISTENT: usize = offsets.CMD_SPAWN_PERSISTENT;
-pub const BAM_HOST_API_OFFSET_CMD_SPAWN_BATCH: usize = offsets.CMD_SPAWN_BATCH;
-pub const BAM_HOST_API_OFFSET_CMD_DESPAWN_ALL: usize = offsets.CMD_DESPAWN_ALL;
-pub const BAM_HOST_API_OFFSET_CMD_INSERT_IF_NEW: usize = offsets.CMD_INSERT_IF_NEW;
-pub const BAM_HOST_API_OFFSET_CMD_TRIGGER_EX: usize = offsets.CMD_TRIGGER_EX;
-pub const BAM_HOST_API_OFFSET_CMD_OBSERVE: usize = offsets.CMD_OBSERVE;
-pub const BAM_HOST_API_OFFSET_ITER_READ_REMOVED: usize = offsets.ITER_READ_REMOVED;
-pub const BAM_HOST_API_OFFSET_SYS_ENTITY_CHILDREN: usize = offsets.SYS_ENTITY_CHILDREN;
-pub const BAM_HOST_API_OFFSET_ASSET_LOAD: usize = offsets.ASSET_LOAD;
-pub const BAM_HOST_API_OFFSET_ASSET_GET_LOAD_STATE: usize = offsets.ASSET_GET_LOAD_STATE;
-pub const BAM_HOST_API_OFFSET_ASSET_RELEASE: usize = offsets.ASSET_RELEASE;
-pub const BAM_HOST_API_OFFSET_CMD_SPAWN_SCENE: usize = offsets.CMD_SPAWN_SCENE;
-pub const BAM_HOST_API_OFFSET_LOG_DIAGNOSTIC: usize = offsets.LOG_DIAGNOSTIC;
-pub const BAM_HOST_API_OFFSET_REPORT_GUEST_FAULT: usize = offsets.REPORT_GUEST_FAULT;
-pub const BAM_HOST_API_OFFSET_RESOLVE_COMPONENT_BY_UUID: usize = offsets.RESOLVE_COMPONENT_BY_UUID;
-pub const BAM_HOST_API_OFFSET_COMPONENT_LAYOUT_INFO: usize = offsets.COMPONENT_LAYOUT_INFO;
-pub const BAM_HOST_API_OFFSET_REGISTER_RELATION: usize = offsets.REGISTER_RELATION;
-pub const BAM_HOST_API_OFFSET_INTERN_SYMBOL: usize = offsets.INTERN_SYMBOL;
-pub const BAM_HOST_API_OFFSET_BIND_NAMED_OBJECT: usize = offsets.BIND_NAMED_OBJECT;
-pub const BAM_HOST_API_OFFSET_ITER_COUNT: usize = offsets.ITER_COUNT;
-pub const BAM_HOST_API_OFFSET_ITER_UP_CASCADE: usize = offsets.ITER_UP_CASCADE;
-pub const BAM_HOST_API_OFFSET_PAR_FOR_EACH_CHUNK_READONLY: usize = offsets.PAR_FOR_EACH_CHUNK_READONLY;
-pub const BAM_HOST_API_OFFSET_REGISTER_SYSTEM_HANDLE: usize = offsets.REGISTER_SYSTEM_HANDLE;
-pub const BAM_HOST_API_OFFSET_CONFIGURE_SCHEDULE_SET: usize = offsets.CONFIGURE_SCHEDULE_SET;
-pub const BAM_HOST_API_OFFSET_MOUNT_SYSTEM_IN_SCHEDULE: usize = offsets.MOUNT_SYSTEM_IN_SCHEDULE;
-pub const BAM_HOST_API_OFFSET_CMD_CHECKPOINT: usize = offsets.CMD_CHECKPOINT;
-pub const BAM_HOST_API_OFFSET_CMD_ROLLBACK: usize = offsets.CMD_ROLLBACK;
-pub const BAM_HOST_API_OFFSET_CMD_INSERT_RELATION: usize = offsets.CMD_INSERT_RELATION;
-pub const BAM_HOST_API_OFFSET_CMD_REMOVE_RELATION: usize = offsets.CMD_REMOVE_RELATION;
-pub const BAM_HOST_API_OFFSET_MIGRATE_COMPONENT_COLUMN: usize = offsets.MIGRATE_COMPONENT_COLUMN;
-pub const BAM_HOST_API_OFFSET_ITER_NEXT_CHUNK_BATCH: usize = offsets.ITER_NEXT_CHUNK_BATCH;
-
-comptime {
-    if (offsets.STRUCT_SIZE != 0 or offsets.ABI_VERSION != 4 or offsets.GET_PROC_ADDRESS != 8) {
-        @compileError("BamHostApi header offsets mismatch");
-    }
-    if (offsets.ITER_NEXT_CHUNK_BATCH + @sizeOf(usize) != @sizeOf(c.BamHostApi)) {
-        @compileError("BamHostApi tail slot offset mismatch");
-    }
-}
-
-/// Returns `true` when `api.struct_size` covers a slot of `slot_size` bytes at `slot_offset`.
-pub inline fn coversHostApiSlot(api: *const c.BamHostApi, slot_offset: usize, slot_size: usize) bool {
-    const sz: usize = @as(usize, api.struct_size);
-    return slot_offset <= sz and slot_size <= (sz - slot_offset);
-}
-
-/// Copies `len` elements between non-overlapping SoA columns using Zig's `noalias`
-/// parameter qualifier (the Zig equivalent of C99/MSVC `BAM_RESTRICT`).
-pub fn copyColumnNoAlias(
-    comptime T: type,
-    noalias dst: [*]T,
-    noalias src: [*]const T,
-    len: usize,
-) void {
-    @memcpy(dst[0..len], src[0..len]);
-}
-
-pub const BamError = error{
-    InvalidComponent,
-    AccessConflict,
-    PanicCaught,
-    NullPointer,
-    InvalidUtf8,
-    PermissionDenied,
-    InvalidVersion,
-    InvalidArgument,
-    OutOfRange,
-    NotFound,
-    InvalidState,
-    InvalidEntity,
-    CapacityExceeded,
-    Unsupported,
-    TypeMismatch,
-    CycleDetected,
-    OutOfMemory,
-    InternalError,
-};
-
-pub fn checkResult(res: c.BamResult) BamError!void {
-    return switch (res) {
-        c.BAM_RESULT_OK => {},
-        c.BAM_RESULT_INVALID_COMPONENT => error.InvalidComponent,
-        c.BAM_RESULT_ACCESS_CONFLICT => error.AccessConflict,
-        c.BAM_RESULT_PANIC_CAUGHT => error.PanicCaught,
-        c.BAM_RESULT_NULL_POINTER => error.NullPointer,
-        c.BAM_RESULT_INVALID_UTF8 => error.InvalidUtf8,
-        c.BAM_RESULT_PERMISSION_DENIED => error.PermissionDenied,
-        c.BAM_RESULT_INVALID_VERSION => error.InvalidVersion,
-        c.BAM_RESULT_INVALID_ARGUMENT => error.InvalidArgument,
-        c.BAM_RESULT_OUT_OF_RANGE => error.OutOfRange,
-        c.BAM_RESULT_NOT_FOUND => error.NotFound,
-        c.BAM_RESULT_INVALID_STATE => error.InvalidState,
-        c.BAM_RESULT_INVALID_ENTITY => error.InvalidEntity,
-        c.BAM_RESULT_CAPACITY_EXCEEDED => error.CapacityExceeded,
-        c.BAM_RESULT_UNSUPPORTED => error.Unsupported,
-        c.BAM_RESULT_TYPE_MISMATCH => error.TypeMismatch,
-        c.BAM_RESULT_CYCLE_DETECTED => error.CycleDetected,
-        c.BAM_RESULT_INTERNAL_ERROR => error.InternalError,
-        else => error.InternalError,
-    };
-}
-
-pub fn mapError(err: BamError) c.BamResult {
-    return switch (err) {
-        error.InvalidComponent => c.BAM_RESULT_INVALID_COMPONENT,
-        error.AccessConflict => c.BAM_RESULT_ACCESS_CONFLICT,
-        error.PanicCaught => c.BAM_RESULT_PANIC_CAUGHT,
-        error.NullPointer => c.BAM_RESULT_NULL_POINTER,
-        error.InvalidUtf8 => c.BAM_RESULT_INVALID_UTF8,
-        error.PermissionDenied => c.BAM_RESULT_PERMISSION_DENIED,
-        error.InvalidVersion => c.BAM_RESULT_INVALID_VERSION,
-        error.InvalidArgument => c.BAM_RESULT_INVALID_ARGUMENT,
-        error.OutOfRange => c.BAM_RESULT_OUT_OF_RANGE,
-        error.NotFound => c.BAM_RESULT_NOT_FOUND,
-        error.InvalidState => c.BAM_RESULT_INVALID_STATE,
-        error.InvalidEntity => c.BAM_RESULT_INVALID_ENTITY,
-        error.CapacityExceeded => c.BAM_RESULT_CAPACITY_EXCEEDED,
-        error.Unsupported => c.BAM_RESULT_UNSUPPORTED,
-        error.TypeMismatch => c.BAM_RESULT_TYPE_MISMATCH,
-        error.CycleDetected => c.BAM_RESULT_CYCLE_DETECTED,
-        error.OutOfMemory, error.InternalError => c.BAM_RESULT_INTERNAL_ERROR,
-    };
-}
-
+const ZIG_SDK_BODY: &str = r#"
 pub inline fn strView(slice: []const u8) c.BamStrView {
     return .{ .ptr = slice.ptr, .len = slice.len };
 }
@@ -1539,6 +1496,13 @@ pub const LoadContextView = struct {
     }
 };
 
+pub const ColumnTicks = struct {
+    added: ?[*]const u32,
+    changed: ?[*]const u32,
+    last_run: u32,
+    this_run: u32,
+};
+
 pub const ChunkView = struct {
     api: *const c.BamHostApi,
     iter: *c.BamIter,
@@ -1758,6 +1722,24 @@ pub const ChunkView = struct {
         const f = self.api.iter_up_cascade orelse return error.Unsupported;
         try checkResult(f(self.iter, relation, entity, term_index, out_ptr, out_owner));
     }
+
+    pub fn columnTicks(self: ChunkView, term_index: usize) BamError!ColumnTicks {
+        if (!coversHostApiSlot(self.api, offsets.ITER_COLUMN_TICKS, @sizeOf(c.BamIterColumnTicksFn))) {
+            return error.Unsupported;
+        }
+        const f = self.api.iter_column_ticks orelse return error.Unsupported;
+        var added: ?[*]const u32 = null;
+        var changed: ?[*]const u32 = null;
+        var last_run: u32 = 0;
+        var this_run: u32 = 0;
+        try checkResult(f(self.iter, term_index, @ptrCast(&added), @ptrCast(&changed), &last_run, &this_run));
+        return .{
+            .added = added,
+            .changed = changed,
+            .last_run = last_run,
+            .this_run = this_run,
+        };
+    }
 };
 
 pub const CommandsView = struct {
@@ -1956,6 +1938,74 @@ pub const CommandsView = struct {
         const f = self.api.cmd_remove_relation orelse return error.Unsupported;
         try checkResult(f(self.cmds, entity, relation, target));
     }
+
+    pub fn cloneEntity(
+        self: CommandsView,
+        src_entity: c.BamEntity,
+        dst_entity: c.BamEntity,
+    ) BamError!void {
+        if (!coversHostApiSlot(self.api, offsets.CMD_CLONE_ENTITY, @sizeOf(c.BamCmdCloneEntityFn))) {
+            return error.Unsupported;
+        }
+        const f = self.api.cmd_clone_entity orelse return error.Unsupported;
+        try checkResult(f(self.cmds, src_entity, dst_entity));
+    }
+
+    pub fn insertResource(
+        self: CommandsView,
+        resource: c.BamComponent,
+        data: []const u8,
+    ) BamError!void {
+        if (!coversHostApiSlot(self.api, offsets.CMD_INSERT_RESOURCE, @sizeOf(c.BamCmdInsertResourceFn))) {
+            return error.Unsupported;
+        }
+        const f = self.api.cmd_insert_resource orelse return error.Unsupported;
+        try checkResult(f(self.cmds, resource, data.ptr, data.len));
+    }
+
+    pub fn removeResource(self: CommandsView, resource: c.BamComponent) BamError!void {
+        if (!coversHostApiSlot(self.api, offsets.CMD_REMOVE_RESOURCE, @sizeOf(c.BamCmdRemoveResourceFn))) {
+            return error.Unsupported;
+        }
+        const f = self.api.cmd_remove_resource orelse return error.Unsupported;
+        try checkResult(f(self.cmds, resource));
+    }
+};
+
+/// RAII-style command-buffer transaction guard for Zig `defer tx.deinit()`.
+///
+/// Calls `cmds.checkpoint()` on `init` and automatically rolls back on `deinit()`
+/// unless `commit()` or `rollbackNow()` was called first.
+pub const ScopedTransaction = struct {
+    cmds: CommandsView,
+    token: usize,
+    active: bool,
+
+    pub fn init(cmds: CommandsView) BamError!ScopedTransaction {
+        const tok = try cmds.checkpoint();
+        return .{
+            .cmds = cmds,
+            .token = tok,
+            .active = true,
+        };
+    }
+
+    pub fn commit(self: *ScopedTransaction) void {
+        self.active = false;
+    }
+
+    pub fn rollbackNow(self: *ScopedTransaction) BamError!void {
+        if (!self.active) return;
+        self.active = false;
+        try self.cmds.rollback(self.token);
+    }
+
+    pub fn deinit(self: *ScopedTransaction) void {
+        if (self.active) {
+            self.active = false;
+            self.cmds.rollback(self.token) catch {};
+        }
+    }
 };
 
 pub const SystemContextView = struct {
@@ -2072,10 +2122,12 @@ pub const SystemContextView = struct {
 pub fn export_sdk(out_dir: &Path) -> Result<Vec<PathBuf>, std::io::Error> {
     fs::create_dir_all(out_dir)?;
     let c_hdr = crate::render_c99_header().map_err(std::io::Error::other)?;
+    let cpp_hdr = cpp17_header();
+    let zig_hdr = zig_sdk();
     let files: [(&str, &str); 3] = [
         ("bamabi.h", &c_hdr),
-        ("bamabi.hpp", CPP17_HEADER),
-        ("bamabi.zig", ZIG_SDK),
+        ("bamabi.hpp", &cpp_hdr),
+        ("bamabi.zig", &zig_hdr),
     ];
     let mut written = Vec::with_capacity(files.len());
     for (filename, content) in files {
@@ -2207,6 +2259,8 @@ mod tests {
         assert_eq!(slots.len(), BAM_HOST_API_SLOT_COUNT);
 
         assert!(CPP17_HEADER.contains("class ScopedTransaction"));
+        assert!(ZIG_SDK.contains("pub const ScopedTransaction = struct"));
+        assert!(ZIG_SDK.contains("pub const SLOT_COUNT: usize = 73;"));
         for slot in &slots {
             let cpp_dot = format!("api_.{slot}(");
             let cpp_arrow = format!("api_->{slot}(");

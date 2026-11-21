@@ -1,5 +1,5 @@
-error: `#[derive(AbiPod)]` does not support generic structs
- --> tests/ui/abi_pod_generic.rs:5:22
+error: `#[derive(AbiPod)]` does not support type or lifetime generic parameters (only `const` generic parameters are supported)
+ --> tests/ui/abi_pod_generic.rs:5:23
   |
 5 | pub struct GenericPod<T> {
-  |                      ^^^
+  |                       ^

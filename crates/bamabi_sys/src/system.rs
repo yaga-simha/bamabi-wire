@@ -52,25 +52,34 @@ pub type BamSystemFn =
 /// Must never unwind across the `extern "C"` boundary.
 pub type BamRunIfFn = unsafe extern "C" fn(user_data: *mut c_void) -> FfiBool;
 
-/// Bitmask of recognized [`BamQueryDesc::flags`] bits in ABI `0.2` (`0`).
-pub const BAM_QUERY_KNOWN_FLAGS: u32 = 0;
+/// Marks this query clause as belonging to a mutually exclusive `ParamSet` group identified by
+/// [`BamQueryDesc::param_set_group`] (`1 << 0`, C `BAM_QUERY_FLAG_PARAM_SET`).
+pub const BAM_QUERY_FLAG_PARAM_SET: u32 = 1 << 0;
+
+/// Bitmask of recognized [`BamQueryDesc::flags`] bits (`BAM_QUERY_FLAG_PARAM_SET`).
+pub const BAM_QUERY_KNOWN_FLAGS: u32 = BAM_QUERY_FLAG_PARAM_SET;
 
 /// Extensible query clause descriptor inside [`BamSystemDesc`] (`typedef struct BamQueryDesc BamQueryDesc;`).
 ///
 /// Layout:
-/// - 64-bit: `MIN_V0_2_SIZE = 24` bytes, `8`-byte alignment, zero implicit padding.
-/// - 32-bit: `MIN_V0_2_SIZE = 16` bytes, `4`-byte alignment, zero implicit padding.
+/// - 64-bit: `MIN_V0_2_SIZE = 24` bytes (`size_of = 32` bytes with `param_set_group`), `8`-byte alignment, zero implicit padding.
+/// - 32-bit: `MIN_V0_2_SIZE = 16` bytes (`size_of = 24` bytes with `param_set_group`), `4`-byte alignment, zero implicit padding.
 #[repr(C)]
 #[derive(Debug, Copy, Clone)]
 pub struct BamQueryDesc {
     /// Size of this struct in bytes (`offset 0`).
     pub struct_size: u32,
-    /// Query bitflags (`0` in ABI `0.2`, `offset 4`).
+    /// Query bitflags (`BAM_QUERY_FLAG_*`, `offset 4`).
     pub flags: u32,
     /// Pointer to `terms[0..term_count]` (null allowed iff `term_count == 0`, `offset 8`).
     pub terms: *const BamTermDesc,
     /// Number of terms in `terms` (`<= MAX_TERMS_PER_QUERY`, `offset 16` on 64-bit / `12` on 32-bit).
     pub term_count: usize,
+    /// Mutually exclusive `ParamSet` group ID (`0` = independent query; non-zero groups conflicting
+    /// queries within the same system into a `ParamSet`, `offset 24` on 64-bit / `16` on 32-bit).
+    pub param_set_group: u32,
+    /// Explicit zero-reserved alignment padding (`must be 0`, `offset 28` on 64-bit / `20` on 32-bit).
+    pub reserved0: u32,
 }
 
 impl BamQueryDesc {
@@ -78,7 +87,7 @@ impl BamQueryDesc {
     pub const MIN_V0_2_SIZE: usize =
         core::mem::offset_of!(Self, term_count) + core::mem::size_of::<usize>();
 
-    /// Constructs a `BamQueryDesc` over `terms[0..term_count]` with `flags = 0`.
+    /// Constructs a `BamQueryDesc` over `terms[0..term_count]` with `flags = 0` and `param_set_group = 0`.
     #[inline]
     pub const fn new(terms: *const BamTermDesc, term_count: usize) -> Self {
         Self {
@@ -86,6 +95,8 @@ impl BamQueryDesc {
             flags: 0,
             terms,
             term_count,
+            param_set_group: 0,
+            reserved0: 0,
         }
     }
 
@@ -95,6 +106,15 @@ impl BamQueryDesc {
         Self::new(core::ptr::null(), 0)
     }
 
+    /// Returns `true` if `self.struct_size` covers a field of `slot_size` bytes at `slot_offset`.
+    #[inline]
+    pub const fn covers_slot(&self, slot_offset: usize, slot_size: usize) -> bool {
+        match slot_offset.checked_add(slot_size) {
+            Some(end) => (self.struct_size as usize) >= end,
+            None => false,
+        }
+    }
+
     /// Sets query bitflags on this descriptor.
     #[inline]
     pub const fn with_flags(mut self, flags: u32) -> Self {
@@ -102,7 +122,21 @@ impl BamQueryDesc {
         self
     }
 
-    /// Validates `struct_size`, known `flags`, `term_count <= MAX_TERMS_PER_QUERY`, and pointer non-nullness.
+    /// Assigns this query clause to a mutually exclusive `ParamSet` group (`0` = independent query;
+    /// non-zero sets [`BAM_QUERY_FLAG_PARAM_SET`]).
+    #[inline]
+    pub const fn with_param_set_group(mut self, group: u32) -> Self {
+        self.param_set_group = group;
+        if group != 0 {
+            self.flags |= BAM_QUERY_FLAG_PARAM_SET;
+        } else {
+            self.flags &= !BAM_QUERY_FLAG_PARAM_SET;
+        }
+        self
+    }
+
+    /// Validates `struct_size`, known `flags`, `reserved0 == 0`, `term_count <= MAX_TERMS_PER_QUERY`,
+    /// and pointer non-nullness.
     #[inline]
     pub const fn validate(&self) -> FfiResult {
         if (self.struct_size as usize) < Self::MIN_V0_2_SIZE {
@@ -110,6 +144,9 @@ impl BamQueryDesc {
         }
         if (self.flags & !BAM_QUERY_KNOWN_FLAGS) != 0 {
             return FfiResult::UNSUPPORTED;
+        }
+        if self.reserved0 != 0 {
+            return FfiResult::INVALID_ARGUMENT;
         }
         if self.term_count > MAX_TERMS_PER_QUERY {
             return FfiResult::CAPACITY_EXCEEDED;
@@ -126,22 +163,26 @@ const _: () = {
     #[cfg(target_pointer_width = "64")]
     {
         assert!(BamQueryDesc::MIN_V0_2_SIZE == 24);
-        assert!(core::mem::size_of::<BamQueryDesc>() == 24);
+        assert!(core::mem::size_of::<BamQueryDesc>() == 32);
         assert!(core::mem::align_of::<BamQueryDesc>() == 8);
         assert!(core::mem::offset_of!(BamQueryDesc, struct_size) == 0);
         assert!(core::mem::offset_of!(BamQueryDesc, flags) == 4);
         assert!(core::mem::offset_of!(BamQueryDesc, terms) == 8);
         assert!(core::mem::offset_of!(BamQueryDesc, term_count) == 16);
+        assert!(core::mem::offset_of!(BamQueryDesc, param_set_group) == 24);
+        assert!(core::mem::offset_of!(BamQueryDesc, reserved0) == 28);
     }
     #[cfg(target_pointer_width = "32")]
     {
         assert!(BamQueryDesc::MIN_V0_2_SIZE == 16);
-        assert!(core::mem::size_of::<BamQueryDesc>() == 16);
+        assert!(core::mem::size_of::<BamQueryDesc>() == 24);
         assert!(core::mem::align_of::<BamQueryDesc>() == 4);
         assert!(core::mem::offset_of!(BamQueryDesc, struct_size) == 0);
         assert!(core::mem::offset_of!(BamQueryDesc, flags) == 4);
         assert!(core::mem::offset_of!(BamQueryDesc, terms) == 8);
         assert!(core::mem::offset_of!(BamQueryDesc, term_count) == 12);
+        assert!(core::mem::offset_of!(BamQueryDesc, param_set_group) == 16);
+        assert!(core::mem::offset_of!(BamQueryDesc, reserved0) == 20);
     }
 };
 
@@ -170,8 +211,8 @@ pub const BAM_SYSTEM_KNOWN_FLAGS: u32 =
 /// `.in_set()` membership, main-thread pinning, and optional `run_if` predicates.
 ///
 /// Layout:
-/// - 64-bit: `MIN_V0_2_SIZE = 104` bytes (`size_of = 168` bytes with `in_sets`, weak ordering, and `ambiguous_with`), `8`-byte alignment, zero implicit padding (`reserved0` explicit).
-/// - 32-bit: `MIN_V0_2_SIZE = 60` bytes (`size_of = 92` bytes with `in_sets`, weak ordering, and `ambiguous_with`), `4`-byte alignment, zero implicit padding.
+/// - 64-bit: `MIN_V0_2_SIZE = 104` bytes (`size_of = 192` bytes with `in_sets`, weak ordering, `ambiguous_with`, and ECS-aware `run_if_ctx`), `8`-byte alignment, zero implicit padding (`reserved0` explicit).
+/// - 32-bit: `MIN_V0_2_SIZE = 60` bytes (`size_of = 104` bytes with `in_sets`, weak ordering, `ambiguous_with`, and ECS-aware `run_if_ctx`), `4`-byte alignment, zero implicit padding.
 #[repr(C)]
 #[derive(Debug, Copy, Clone)]
 pub struct BamSystemDesc {
@@ -221,6 +262,14 @@ pub struct BamSystemDesc {
     pub ambiguous_with: *const *const c_char,
     /// Number of entries in `ambiguous_with` (`offset 160` / `88`).
     pub ambiguous_with_count: usize,
+    /// Optional ECS-aware run-condition callback receiving a [`BamSystemCtx`] backed by `run_if_query`
+    /// (`FfiResult::OK` = run; non-zero = skip, `offset 168` / `92`).
+    pub run_if_ctx: Option<BamSystemFn>,
+    /// Optional read-only [`BamQueryDesc`] declaring the ECS resources/components accessible to
+    /// `run_if_ctx` (`offset 176` / `96`).
+    pub run_if_query: *const BamQueryDesc,
+    /// Opaque guest-owned state passed to `run_if_ctx` (`offset 184` / `100`).
+    pub run_if_ctx_user_data: *mut c_void,
 }
 
 impl BamSystemDesc {
@@ -262,6 +311,9 @@ impl BamSystemDesc {
             before_weak_count: 0,
             ambiguous_with: core::ptr::null(),
             ambiguous_with_count: 0,
+            run_if_ctx: None,
+            run_if_query: core::ptr::null(),
+            run_if_ctx_user_data: core::ptr::null_mut(),
         }
     }
 
@@ -374,6 +426,21 @@ impl BamSystemDesc {
         self
     }
 
+    /// Attaches an optional ECS-aware `run_if_ctx` condition callback, its query descriptor, and
+    /// user-data pointer.
+    #[inline]
+    pub const fn with_run_if_ctx(
+        mut self,
+        run_if_ctx: BamSystemFn,
+        run_if_query: *const BamQueryDesc,
+        user_data: *mut c_void,
+    ) -> Self {
+        self.run_if_ctx = Some(run_if_ctx);
+        self.run_if_query = run_if_query;
+        self.run_if_ctx_user_data = user_data;
+        self
+    }
+
     /// Returns `true` if `BAM_SYSTEM_FLAG_MAIN_THREAD` is set.
     #[inline]
     pub const fn is_main_thread(&self) -> bool {
@@ -427,7 +494,7 @@ const _: () = {
     #[cfg(target_pointer_width = "64")]
     {
         assert!(BamSystemDesc::MIN_V0_2_SIZE == 104);
-        assert!(core::mem::size_of::<BamSystemDesc>() == 168);
+        assert!(core::mem::size_of::<BamSystemDesc>() == 192);
         assert!(core::mem::align_of::<BamSystemDesc>() == 8);
         assert!(core::mem::offset_of!(BamSystemDesc, struct_size) == 0);
         assert!(core::mem::offset_of!(BamSystemDesc, flags) == 4);
@@ -452,11 +519,14 @@ const _: () = {
         assert!(core::mem::offset_of!(BamSystemDesc, before_weak_count) == 144);
         assert!(core::mem::offset_of!(BamSystemDesc, ambiguous_with) == 152);
         assert!(core::mem::offset_of!(BamSystemDesc, ambiguous_with_count) == 160);
+        assert!(core::mem::offset_of!(BamSystemDesc, run_if_ctx) == 168);
+        assert!(core::mem::offset_of!(BamSystemDesc, run_if_query) == 176);
+        assert!(core::mem::offset_of!(BamSystemDesc, run_if_ctx_user_data) == 184);
     }
     #[cfg(target_pointer_width = "32")]
     {
         assert!(BamSystemDesc::MIN_V0_2_SIZE == 60);
-        assert!(core::mem::size_of::<BamSystemDesc>() == 92);
+        assert!(core::mem::size_of::<BamSystemDesc>() == 104);
         assert!(core::mem::align_of::<BamSystemDesc>() == 4);
         assert!(core::mem::offset_of!(BamSystemDesc, struct_size) == 0);
         assert!(core::mem::offset_of!(BamSystemDesc, flags) == 4);
@@ -481,6 +551,9 @@ const _: () = {
         assert!(core::mem::offset_of!(BamSystemDesc, before_weak_count) == 80);
         assert!(core::mem::offset_of!(BamSystemDesc, ambiguous_with) == 84);
         assert!(core::mem::offset_of!(BamSystemDesc, ambiguous_with_count) == 88);
+        assert!(core::mem::offset_of!(BamSystemDesc, run_if_ctx) == 92);
+        assert!(core::mem::offset_of!(BamSystemDesc, run_if_query) == 96);
+        assert!(core::mem::offset_of!(BamSystemDesc, run_if_ctx_user_data) == 100);
     }
 };
 

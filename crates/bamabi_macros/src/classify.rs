@@ -74,6 +74,11 @@ pub(crate) fn is_bool_type(ty: &Type) -> bool {
     match_unqualified_or_std_primitive(ty, "bool")
 }
 
+/// Returns `true` if `ty` syntactically spells Rust's primitive `char`.
+pub(crate) fn is_char_type(ty: &Type) -> bool {
+    match_unqualified_or_std_primitive(ty, "char")
+}
+
 /// Returns `true` if `ty` syntactically spells `usize` or `isize` (`RawInsertable` but not `AbiPod`).
 pub(crate) fn is_platform_size_int(ty: &Type) -> bool {
     match_unqualified_or_std_primitive(ty, "usize")
@@ -235,7 +240,8 @@ pub(crate) fn classify_type(ty: &Type, attr_override: FieldAttrOverride) -> syn:
                         "f32" | "f64" | "i8" | "i16" | "i32" | "i64" | "u8" | "u16" | "u32" | "u64"
                         | "FfiBool" | "FfiEntity" | "TargetEntity" | "BamComponent" | "BamSystem"
                         | "BamSystemSet" | "BamSymbol" | "FfiAssetLoadState" | "BamEventKind"
-                        | "BamFieldKind" | "ComponentUuid",
+                        | "BamFieldKind" | "FfiChildOf" | "FfiAssetHandle" | "BamChangeTicks"
+                        | "ComponentUuid",
                     ) => {
                         return Ok(FieldKind::Primitive {
                             ty: boxed_ty(),

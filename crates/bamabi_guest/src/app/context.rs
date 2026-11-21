@@ -75,6 +75,129 @@ impl<'a> RunConditionContext<'a> {
     }
 }
 
+/// Lightweight read-only ECS execution context passed to `.run_if_with(...)` and
+/// `.run_if_condition(...)` predicates backed by `BamSystemDesc::run_if_ctx` and `run_if_query`.
+///
+/// Exposes read-only access to the single `run_if_query` declared for the run condition
+/// (resources with change ticks, message streams, and read-only entity queries) alongside the
+/// world-scoped [`Host`].
+pub struct RunConditionSystemContext<'a> {
+    host: &'a Host,
+    query: Option<ChunkIter<'a>>,
+}
+
+impl<'a> RunConditionSystemContext<'a> {
+    /// Builds a [`RunConditionSystemContext`] from a trampoline [`ValidatedSystemInvocation`],
+    /// taking slot 0 (`run_if_query`) if present.
+    #[inline]
+    pub(crate) fn from_invocation(inv: &mut ValidatedSystemInvocation<'a>) -> Self {
+        let host = inv.host();
+        let query = inv.take_raw_query_slot(0).map(ChunkIter::from_validated);
+        Self { host, query }
+    }
+
+    /// Returns the active [`Host`] table for this mod instance.
+    #[inline]
+    pub const fn host(&self) -> &'a Host {
+        self.host
+    }
+
+    /// Returns the validated [`BamHostApi`] function table.
+    #[inline]
+    pub const fn host_api(&self) -> &'a BamHostApi {
+        self.host.api()
+    }
+
+    /// Borrows the read-only [`ChunkIter`] backing `run_if_query`, if any terms were declared.
+    #[inline]
+    pub fn query(&mut self) -> Option<&mut ChunkIter<'a>> {
+        self.query.as_mut()
+    }
+
+    /// Borrows singleton resource `R: GuestComponent` declared at `decl_index` in `run_if_query`,
+    /// validating `R`'s UUID and layout.
+    #[inline]
+    pub fn res<R: GuestComponent>(&self, decl_index: usize) -> Option<&R> {
+        self.query.as_ref()?.component_resource::<R>(decl_index)
+    }
+
+    /// Borrows singleton POD resource `R: AbiPod` declared at `decl_index` in `run_if_query`.
+    #[inline]
+    pub fn res_pod<R: AbiPod>(&self, decl_index: usize) -> Option<&R> {
+        self.query.as_ref()?.resource::<R>(decl_index)
+    }
+
+    /// Borrows singleton resource `R: GuestComponent` wrapped with its [`BamChangeTicks`].
+    #[inline]
+    pub fn res_with_ticks<R: GuestComponent>(
+        &self,
+        decl_index: usize,
+    ) -> Result<GuestRes<'_, R>, FfiResult> {
+        let Some(query) = self.query.as_ref() else {
+            return Err(FfiResult::NOT_FOUND);
+        };
+        query.component_resource_with_ticks::<R>(decl_index)
+    }
+
+    /// Returns `true` iff singleton resource `R: GuestComponent` at `decl_index` currently exists
+    /// in the host `World`.
+    #[inline]
+    pub fn has_resource<R: GuestComponent>(&self, decl_index: usize) -> bool {
+        self.res::<R>(decl_index).is_some()
+    }
+
+    /// Returns `true` iff singleton resource `R: GuestComponent` at `decl_index` exists and was
+    /// changed since this run condition's last evaluation.
+    #[inline]
+    pub fn is_resource_changed<R: GuestComponent>(&self, decl_index: usize) -> bool {
+        self.res_with_ticks::<R>(decl_index)
+            .is_ok_and(|res| res.is_changed())
+    }
+
+    /// Returns `true` iff singleton resource `R: GuestComponent` at `decl_index` exists and was
+    /// newly added since this run condition's last evaluation.
+    #[inline]
+    pub fn is_resource_added<R: GuestComponent>(&self, decl_index: usize) -> bool {
+        self.res_with_ticks::<R>(decl_index)
+            .is_ok_and(|res| res.is_added())
+    }
+
+    /// Drains unread messages (`M: GuestComponent`) from `decl_index` in `run_if_query`.
+    #[inline]
+    pub fn read_messages<M: GuestComponent>(
+        &mut self,
+        decl_index: usize,
+    ) -> Result<Vec<M>, FfiResult> {
+        let Some(query) = self.query.as_mut() else {
+            return Err(FfiResult::NOT_FOUND);
+        };
+        query.read_messages::<M>(decl_index)
+    }
+
+    /// Returns `true` iff at least one unread message `M: GuestComponent` is queued at
+    /// `decl_index` in `run_if_query`.
+    #[inline]
+    pub fn has_messages<M: GuestComponent>(&mut self, decl_index: usize) -> bool {
+        self.read_messages::<M>(decl_index)
+            .is_ok_and(|msgs| !msgs.is_empty())
+    }
+
+    /// Non-destructively counts matching entities in `run_if_query` via `iter_count` (slot 57).
+    #[inline]
+    pub fn query_count(&mut self) -> Result<usize, FfiResult> {
+        let Some(query) = self.query.as_mut() else {
+            return Ok(0);
+        };
+        query.count()
+    }
+
+    /// Non-destructively returns `true` iff zero entities match `run_if_query`.
+    #[inline]
+    pub fn query_is_empty(&mut self) -> Result<bool, FfiResult> {
+        Ok(self.query_count()? == 0)
+    }
+}
+
 /// Unified per-tick execution context passed to every guest system built with
 /// [`SystemBuilder::build`](crate::SystemBuilder::build).
 ///
@@ -822,6 +945,71 @@ impl<'a> SystemContext<'a> {
             query_index,
             term_index,
             entity,
+            None,
+        )
+    }
+
+    /// Simultaneously borrows `N` disjoint mutable references `[&mut T; N]` (`T: GuestComponent`)
+    /// for `entities` using declared writable access on `(query_index, term_index)`, mirroring
+    /// Bevy's `Query::get_many_mut`.
+    ///
+    /// Rejects null entities (`INVALID_ENTITY`), duplicate entities or overlapping host pointers
+    /// (`ACCESS_CONFLICT`), out-of-range query indices (`OUT_OF_RANGE`), missing entities
+    /// (`NOT_FOUND`), layout/UUID mismatches (`TYPE_MISMATCH`), and non-writable columns
+    /// (`PERMISSION_DENIED`).
+    #[inline]
+    pub fn get_many_mut<const N: usize, T: GuestComponent>(
+        &mut self,
+        query_index: usize,
+        term_index: usize,
+        entities: [FfiEntity; N],
+    ) -> Result<[&mut T; N], FfiResult> {
+        let filter = guest_uuid_filter::<T>(self.sys_ref.base_host().manifest_name());
+        let q = if query_index >= self.user_query_count {
+            return Err(FfiResult::OUT_OF_RANGE);
+        } else if query_index == 0 {
+            self.query0.as_mut().ok_or(FfiResult::OUT_OF_RANGE)?
+        } else {
+            self.extra_queries
+                .as_mut()
+                .and_then(|arr| arr.get_mut(query_index - 1))
+                .and_then(Option::as_mut)
+                .ok_or(FfiResult::OUT_OF_RANGE)?
+        };
+        self.sys_ref.entity_get_many_mut_checked::<N, T>(
+            &mut q.inner,
+            query_index,
+            term_index,
+            entities,
+            Some(filter),
+        )
+    }
+
+    /// Simultaneously borrows `N` disjoint mutable POD references `[&mut T; N]` (`T: AbiPod`)
+    /// for `entities` using declared writable access on `(query_index, term_index)`.
+    #[inline]
+    pub fn get_many_pod_mut<const N: usize, T: AbiPod>(
+        &mut self,
+        query_index: usize,
+        term_index: usize,
+        entities: [FfiEntity; N],
+    ) -> Result<[&mut T; N], FfiResult> {
+        let q = if query_index >= self.user_query_count {
+            return Err(FfiResult::OUT_OF_RANGE);
+        } else if query_index == 0 {
+            self.query0.as_mut().ok_or(FfiResult::OUT_OF_RANGE)?
+        } else {
+            self.extra_queries
+                .as_mut()
+                .and_then(|arr| arr.get_mut(query_index - 1))
+                .and_then(Option::as_mut)
+                .ok_or(FfiResult::OUT_OF_RANGE)?
+        };
+        self.sys_ref.entity_get_many_mut_checked::<N, T>(
+            &mut q.inner,
+            query_index,
+            term_index,
+            entities,
             None,
         )
     }

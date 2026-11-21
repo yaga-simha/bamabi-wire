@@ -6,10 +6,13 @@
 //! ## UI Fixture Scenario Catalog (`tests/ui/*.rs`)
 //!
 //! Note: individual `.rs` fixtures under `tests/ui/` are intentionally kept unmodified so
-//! `trybuild` `.stderr` line numbers and column spans remain exact. All 34 UI scenarios are
+//! `trybuild` `.stderr` line numbers and column spans remain exact. All 38 UI scenarios are
 //! documented below:
 //!
 //! ### Positive Controls (`pass_*.rs`)
+//! - `pass_abi_pod_const_generic.rs`: Verifies `#[derive(AbiPod)]` accepts `const` generic
+//!   structs (`FixedBuf<const N: usize>`, defaulted const params, `#[repr(transparent)]`, and
+//!   multi-const-generic `Grid<const ROWS: usize, const COLS: usize>`).
 //! - `pass_valid_abi_pod_and_mod_component.rs`: Verifies valid `#[repr(C)]` `AbiPod` structs
 //!   (explicit padding, primitives, nested `AbiPod`) and `#[derive(ModComponent)]` structs/enums
 //!   compile cleanly and satisfy `assert_abi_pod` / `assert_raw_insertable`.
@@ -19,10 +22,13 @@
 //!
 //! ### `#[derive(AbiPod)]` Compile-Fail Scenarios (`abi_pod_*.rs`)
 //! - `abi_pod_bool_field.rs`: Rejects Rust `bool` field (non-universal bit validity; use `FfiBool`).
+//! - `abi_pod_const_generic_conditional_padding.rs`: Rejects const-generic struct that is unpadded at `N = 0` but padded at `N = 1`.
+//! - `abi_pod_const_generic_padded.rs`: Rejects const-generic struct with implicit interior padding.
 //! - `abi_pod_direct_drop.rs`: Rejects struct implementing `Drop` (`!needs_drop` violation).
 //! - `abi_pod_enum.rs`: Rejects plain Rust enums (discriminant/tag layout not POD).
-//! - `abi_pod_generic.rs`: Rejects generic structs (monomorphization-dependent layout).
+//! - `abi_pod_generic.rs`: Rejects type-generic structs (only `const` generics are supported).
 //! - `abi_pod_implicit_padding.rs`: Rejects interior compiler padding (`size_of != sum(fields)`).
+//! - `abi_pod_lifetime_generic.rs`: Rejects lifetime-generic structs (only `const` generics are supported).
 //! - `abi_pod_nested_drop_field.rs`: Rejects struct containing a nested field with `Drop` glue.
 //! - `abi_pod_no_repr_c.rs`: Rejects default `#[repr(Rust)]` struct without `#[repr(C)]`/`transparent`.
 //! - `abi_pod_repr_c_packed.rs`: Rejects `#[repr(C, packed)]` (unaligned field references are UB).

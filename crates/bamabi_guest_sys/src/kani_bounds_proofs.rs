@@ -251,6 +251,10 @@ fn make_core_api(struct_size: u32, abi_version: u32) -> BamHostApi {
         cmd_remove_relation: None,
         migrate_component_column: None,
         iter_next_chunk_batch: None,
+        iter_column_ticks: None,
+        cmd_clone_entity: None,
+        cmd_insert_resource: None,
+        cmd_remove_resource: None,
     }
 }
 

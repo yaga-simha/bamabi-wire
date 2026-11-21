@@ -24,9 +24,10 @@ pub use bamabi_macros::{AbiPod, GuestComponent, ModComponent};
 
 pub use crate::{
     app::{
-        BevySchedules, GuestApp, GuestComponentOptions, GuestRes, GuestResMut, ObserverBuilder,
-        QueryBuilder, RelationDescBuilder, RunConditionContext, ScheduleSetBuilder, SystemBuilder,
-        SystemContext, TypedObserverBuilder, conditions,
+        BevySchedules, EcsRunCondition, GuestApp, GuestComponentOptions, GuestRes, GuestResMut,
+        ObserverBuilder, ParamSetBuilder, QueryBuilder, RelationDescBuilder, RunConditionContext,
+        RunConditionSystemContext, ScheduleSetBuilder, SystemBuilder, SystemContext,
+        TypedObserverBuilder, conditions,
     },
     bridges::{
         ACTIVATE_EVENT_UUID, APPLY_EAR_POSITIONS, APPLY_EMITTER_POS, APPLY_SPEED, APPLY_VOLUME,
@@ -100,9 +101,11 @@ pub use crate::{
     entity_commands::{GuestChildSpawner, GuestEntityCommands},
     export_mod, guest_log,
     iter::{
-        Added, Allow, Changed, Chunk, ChunkIter, ChunkSlice, ChunkSliceMut, Has, Or, Or2, Or3,
-        OrFilterTerm, OrFilterTuple, QuerySingleError, QueryTerm, QueryTuple, SparseRows,
-        SparseRowsMut, TypedChunkIter, With, Without,
+        Added, AddedMut, Allow, Changed, ChangedMut, Chunk, ChunkIter, ChunkSlice, ChunkSliceMut,
+        CopyableQueryTerm, CopyableQueryTuple, Has, Mut, MutSlice, Or, Or2, Or3, OrFilterTerm,
+        OrFilterTuple, PairwiseQueryTerm, PairwiseQueryTuple, QuerySingleError, QueryTerm,
+        QueryTuple, Ref, RefSlice, SparseRows, SparseRowsIter, SparseRowsMut, TypedChunkIter, With,
+        WithAdded, WithChanged, Without,
     },
     lifecycle::GuestPlugin,
 };

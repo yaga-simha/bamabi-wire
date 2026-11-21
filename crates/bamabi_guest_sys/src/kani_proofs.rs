@@ -460,8 +460,36 @@ unsafe extern "C" fn stub_iter_next_chunk_batch(
 ) -> FfiBool {
     FfiBool::FALSE
 }
+unsafe extern "C" fn stub_iter_column_ticks(
+    _: *const BamIter,
+    _: usize,
+    _: *mut *const u32,
+    _: *mut *const u32,
+    _: *mut u32,
+    _: *mut u32,
+) -> FfiResult {
+    FfiResult::OK
+}
+unsafe extern "C" fn stub_cmd_clone_entity(
+    _: *mut BamCommands,
+    _: FfiEntity,
+    _: FfiEntity,
+) -> FfiResult {
+    FfiResult::OK
+}
+unsafe extern "C" fn stub_cmd_insert_resource(
+    _: *mut BamCommands,
+    _: BamComponent,
+    _: *const u8,
+    _: usize,
+) -> FfiResult {
+    FfiResult::OK
+}
+unsafe extern "C" fn stub_cmd_remove_resource(_: *mut BamCommands, _: BamComponent) -> FfiResult {
+    FfiResult::OK
+}
 
-/// Builds a minimal `BamHostApi` populating only the 27 core ABI `0.2` slots and leaving all 41
+/// Builds a minimal `BamHostApi` populating only the 27 core ABI `0.2` slots and leaving all 46
 /// extended/ABI-`0.3.0` slots as `None`.
 fn make_core_api(struct_size: u32, abi_version: u32) -> BamHostApi {
     BamHostApi {
@@ -536,10 +564,14 @@ fn make_core_api(struct_size: u32, abi_version: u32) -> BamHostApi {
         cmd_remove_relation: None,
         migrate_component_column: None,
         iter_next_chunk_batch: None,
+        iter_column_ticks: None,
+        cmd_clone_entity: None,
+        cmd_insert_resource: None,
+        cmd_remove_resource: None,
     }
 }
 
-/// Builds a complete 68-slot `BamHostApi` populating all 27 core slots plus all 41 extended/ABI-`0.3.0`
+/// Builds a complete 73-slot `BamHostApi` populating all 27 core slots plus all 46 extended/ABI-`0.3.0`
 /// slots with zero-side-effect stubs.
 fn make_full_api(struct_size: u32, abi_version: u32) -> BamHostApi {
     let mut api = make_core_api(struct_size, abi_version);
@@ -585,6 +617,10 @@ fn make_full_api(struct_size: u32, abi_version: u32) -> BamHostApi {
     api.cmd_remove_relation = Some(stub_cmd_remove_rel);
     api.migrate_component_column = Some(stub_migrate_col);
     api.iter_next_chunk_batch = Some(stub_iter_next_chunk_batch);
+    api.iter_column_ticks = Some(stub_iter_column_ticks);
+    api.cmd_clone_entity = Some(stub_cmd_clone_entity);
+    api.cmd_insert_resource = Some(stub_cmd_insert_resource);
+    api.cmd_remove_resource = Some(stub_cmd_remove_resource);
     api
 }
 
@@ -643,6 +679,10 @@ fn assert_all_41_extended_slots_none(api: &BamHostApi) {
     assert!(host_slot!(api, cmd_remove_relation).is_none());
     assert!(host_slot!(api, migrate_component_column).is_none());
     assert!(host_slot!(api, iter_next_chunk_batch).is_none());
+    assert!(host_slot!(api, iter_column_ticks).is_none());
+    assert!(host_slot!(api, cmd_clone_entity).is_none());
+    assert!(host_slot!(api, cmd_insert_resource).is_none());
+    assert!(host_slot!(api, cmd_remove_resource).is_none());
 }
 
 /// PO-G1: `host_slot!` across all 41 extended/ABI-0.3 slots returns `Some` iff `populated` and
@@ -707,11 +747,17 @@ fn po_g1_host_slot_bounds_all_41_extended_slots() {
     check_slot!(cmd_remove_relation);
     check_slot!(migrate_component_column);
     check_slot!(iter_next_chunk_batch);
+    check_slot!(iter_column_ticks);
+    check_slot!(cmd_clone_entity);
+    check_slot!(cmd_insert_resource);
+    check_slot!(cmd_remove_resource);
 
     kani::cover!(host_slot!(&api, par_for_each_chunk).is_some());
     kani::cover!(host_slot!(&api, par_for_each_chunk).is_none());
     kani::cover!(host_slot!(&api, iter_next_chunk_batch).is_some());
     kani::cover!(host_slot!(&api, iter_next_chunk_batch).is_none());
+    kani::cover!(host_slot!(&api, cmd_remove_resource).is_some());
+    kani::cover!(host_slot!(&api, cmd_remove_resource).is_none());
 }
 
 /// PO-G1: `Host::from_raw` and `Host::from_load_ctx` reject null pointers, misaligned `api_ptr`,

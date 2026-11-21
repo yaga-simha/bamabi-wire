@@ -383,3 +383,33 @@ pub type BamCmdSpawnSceneFn = unsafe extern "C" fn(
     parent: FfiEntity,
     out_entity: *mut FfiEntity,
 ) -> FfiResult;
+
+/// Queues deferred cloning of all cloneable components from `src_entity` onto `dst_entity`.
+///
+/// # Safety
+/// `commands` must point to an active [`BamCommands`] belonging to the running system invocation.
+pub type BamCmdCloneEntityFn = unsafe extern "C" fn(
+    commands: *mut BamCommands,
+    src_entity: FfiEntity,
+    dst_entity: FfiEntity,
+) -> FfiResult;
+
+/// Queues deferred insertion or replacement of singleton `resource` (`data_len` bytes at `data_ptr`).
+///
+/// # Safety
+/// - `commands` must point to an active [`BamCommands`] belonging to the running system invocation.
+/// - If `data_len > 0`, `data_ptr` must point to at least `data_len` readable bytes matching the
+///   registered layout of `resource`.
+pub type BamCmdInsertResourceFn = unsafe extern "C" fn(
+    commands: *mut BamCommands,
+    resource: BamComponent,
+    data_ptr: *const u8,
+    data_len: usize,
+) -> FfiResult;
+
+/// Queues deferred removal of singleton `resource` from the `World`.
+///
+/// # Safety
+/// `commands` must point to an active [`BamCommands`] belonging to the running system invocation.
+pub type BamCmdRemoveResourceFn =
+    unsafe extern "C" fn(commands: *mut BamCommands, resource: BamComponent) -> FfiResult;

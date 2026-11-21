@@ -357,9 +357,10 @@ pub use bamabi_sys::{
 pub use bamabi_macros::{AbiPod, GuestComponent, ModComponent};
 
 pub use app::{
-    BevySchedules, GuestApp, GuestComponentOptions, GuestRes, GuestResMut, IntoSystemResult,
-    ObserverBuilder, QueryBuilder, RelationDescBuilder, RunConditionContext, ScheduleSetBuilder,
-    SystemBuilder, SystemContext, TypedObserverBuilder, conditions,
+    BevySchedules, EcsRunCondition, GuestApp, GuestComponentOptions, GuestRes, GuestResMut,
+    IntoSystemResult, ObserverBuilder, ParamSetBuilder, QueryBuilder, RelationDescBuilder,
+    RunConditionContext, RunConditionSystemContext, ScheduleSetBuilder, SystemBuilder,
+    SystemContext, TypedObserverBuilder, conditions,
 };
 pub use bridges::{
     ACTIVATE_EVENT_UUID, APPLY_EAR_POSITIONS, APPLY_EMITTER_POS, APPLY_SPEED, APPLY_VOLUME,
@@ -428,9 +429,11 @@ pub use commands::{GuestCommands, GuestTransaction};
 pub use component::{GuestComponent, GuestComponentHooks, guest_component_uuid};
 pub use entity_commands::{GuestChildSpawner, GuestEntityCommands};
 pub use iter::{
-    Added, Allow, Changed, Chunk, ChunkIter, ChunkSlice, ChunkSliceMut, Has, Or, Or2, Or3,
-    OrFilterTerm, OrFilterTuple, QuerySingleError, QueryTerm, QueryTuple, SparseRows,
-    SparseRowsIter, SparseRowsMut, TypedChunkIter, With, Without,
+    Added, AddedMut, Allow, Changed, ChangedMut, Chunk, ChunkIter, ChunkSlice, ChunkSliceMut,
+    CopyableQueryTerm, CopyableQueryTuple, Has, Mut, MutSlice, Or, Or2, Or3, OrFilterTerm,
+    OrFilterTuple, PairwiseQueryTerm, PairwiseQueryTuple, QuerySingleError, QueryTerm, QueryTuple,
+    Ref, RefSlice, SparseRows, SparseRowsIter, SparseRowsMut, TypedChunkIter, With, WithAdded,
+    WithChanged, Without,
 };
 pub use lifecycle::{GuestPlugin, build_guest_fn, build_guest_plugin};
 

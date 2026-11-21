@@ -153,6 +153,13 @@ impl<'a> ChunkIter<'a> {
         self.inner.column_info(term_index)
     }
 
+    /// Retrieves per-row `(added_ticks, changed_ticks, last_run, this_run)` for dense column
+    /// `col` in the active chunk via `BamHostApi::iter_column_ticks` (slot 69).
+    #[inline]
+    pub fn column_ticks(&self, col: usize) -> Result<(&[u32], &[u32], u32, u32), FfiResult> {
+        self.inner.column_ticks(col)
+    }
+
     /// Borrows the `[FfiEntity; current_len]` slice for the active chunk.
     #[inline]
     pub fn entities(&self) -> &[FfiEntity] {

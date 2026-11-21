@@ -99,14 +99,14 @@
 //! - [`BamManifest`]: Static identity struct returned by `bamabi_manifest()` (`MIN_V0_2_SIZE` =
 //!   `32` B / `24` B; full `48` B / `32` B with optional `save_state` / `restore_state` hot-reload
 //!   callbacks).
-//! - [`BamHostApi`]: Complete **69-slot** host function-pointer table passed to `bamabi_init`
+//! - [`BamHostApi`]: Complete **73-slot** host function-pointer table passed to `bamabi_init`
 //!   (`MIN_V0_2_SIZE` = `224` B / `116` B covering the 27 mandatory `0.2` slots; `MIN_V0_3_SIZE` =
-//!   `552` B / `280` B covering the first 68 slots; full `560` B / `284` B with slot 68
-//!   `iter_next_chunk_batch`). Probes `struct_size` / `abi_version` safely via
+//!   `552` B / `280` B covering the first 68 slots; full `592` B / `300` B with slots `68..=72`).
+//!   Probes `struct_size` / `abi_version` safely via
 //!   [`BamHostApi::raw_struct_size`], [`BamHostApi::raw_abi_version`], and [`BamHostApi::covers_slot`].
 //! - [`offsets`]: Exports target-native (`<FIELD>`), 64-bit (`OFF64_<FIELD>`, [`offsets::SIZE_64`] =
-//!   `560`), and 32-bit (`OFF32_<FIELD>`, [`offsets::SIZE_32`] = `284`) byte offsets for all 71
-//!   fields (`struct_size`, `abi_version`, and slots `0..69`, [`offsets::SLOT_COUNT`] = `69`).
+//!   `592`), and 32-bit (`OFF32_<FIELD>`, [`offsets::SIZE_32`] = `300`) byte offsets for all 75
+//!   fields (`struct_size`, `abi_version`, and slots `0..73`, [`offsets::SLOT_COUNT`] = `73`).
 //! - [`ExtensibleStruct`]: Contract for all 13 `struct_size`-prefixed `#[repr(C)]` structs whose
 //!   fields are zero-valid (`Option<unsafe extern "C" fn(...)>` niche optimization). Use
 //!   [`read_extensible_struct`] and [`read_descriptor`] to copy `min(struct_size, size_of::<T>())`
@@ -223,12 +223,13 @@ mod tests;
 mod kani_proofs;
 
 pub use access::{
-    AccessMode, BAM_TERM_KNOWN_FLAGS, BamTermDesc, MAX_QUERIES_PER_SYSTEM, MAX_TERMS_PER_QUERY,
-    ScheduleId,
+    AccessMode, BAM_TERM_FLAG_ADDED, BAM_TERM_FLAG_CHANGED, BAM_TERM_KNOWN_FLAGS, BamTermDesc,
+    MAX_QUERIES_PER_SYSTEM, MAX_TERMS_PER_QUERY, ScheduleId,
 };
 pub use commands::{
-    BAM_TRIGGER_FLAG_PROPAGATE, BAM_TRIGGER_KNOWN_FLAGS, BamCmdDespawnAllFn, BamCmdDespawnFn,
-    BamCmdInsertDefaultFn, BamCmdInsertFn, BamCmdObserveFn, BamCmdRemoveFn, BamCmdSpawnBatchFn,
+    BAM_TRIGGER_FLAG_PROPAGATE, BAM_TRIGGER_KNOWN_FLAGS, BamCmdCloneEntityFn, BamCmdDespawnAllFn,
+    BamCmdDespawnFn, BamCmdInsertDefaultFn, BamCmdInsertFn, BamCmdInsertResourceFn,
+    BamCmdObserveFn, BamCmdRemoveFn, BamCmdRemoveResourceFn, BamCmdSpawnBatchFn,
     BamCmdSpawnEmptyFn, BamCmdSpawnFn, BamCmdSpawnSceneFn, BamCmdTriggerExFn, BamCmdTriggerFn,
     BamCommands, BamTriggerDesc,
 };
@@ -267,10 +268,10 @@ pub use iter::{
     BAM_STORAGE_FLAG_SPARSE_SET, BAM_STORAGE_FLAG_SUMMARY_TICK, BamChangeTicks, BamChunkTaskFn,
     BamColumnInfo, BamIter, BamIterColumnInfoFn, BamIterColumnMutableFn,
     BamIterColumnMutableUntrackedFn, BamIterColumnReadonlyFn, BamIterColumnRowsMutableFn,
-    BamIterColumnRowsReadonlyFn, BamIterEntitiesFn, BamIterMarkChangedRangeFn,
-    BamIterNextChunkBatchFn, BamIterNextChunkFn, BamIterReadRemovedFn, BamIterResetFn,
-    BamMsgReadBatchFn, BamMsgSendFn, BamMsgWriteBatchFn, BamParForEachChunkFn, BamResMutPtrFn,
-    BamResPtrFn, BamResTicksFn,
+    BamIterColumnRowsReadonlyFn, BamIterColumnTicksFn, BamIterEntitiesFn,
+    BamIterMarkChangedRangeFn, BamIterNextChunkBatchFn, BamIterNextChunkFn, BamIterReadRemovedFn,
+    BamIterResetFn, BamMsgReadBatchFn, BamMsgSendFn, BamMsgWriteBatchFn, BamParForEachChunkFn,
+    BamResMutPtrFn, BamResPtrFn, BamResTicksFn,
 };
 pub use primitives::{
     BAM_CHILD_OF_NAME, BAM_CHILDREN_NAME, BAM_DISABLED_NAME, BamComponent, BamSymbol, BamSystem,
@@ -280,10 +281,10 @@ pub use primitives::{
     fnv1a_64_update_u64, siphash24_128,
 };
 pub use system::{
-    BAM_OBSERVER_FLAG_PROPAGATE, BAM_OBSERVER_KNOWN_FLAGS, BAM_QUERY_KNOWN_FLAGS,
-    BAM_SYSTEM_FLAG_AMBIGUOUS_WITH_ALL, BAM_SYSTEM_FLAG_MAIN_THREAD, BAM_SYSTEM_KNOWN_FLAGS,
-    BamEventKind, BamHostCtx, BamLoadCtx, BamObserverDesc, BamObserverFn, BamObserverMutFn,
-    BamQueryDesc, BamRunIfFn, BamSystemCtx, BamSystemDesc, BamSystemFn,
+    BAM_OBSERVER_FLAG_PROPAGATE, BAM_OBSERVER_KNOWN_FLAGS, BAM_QUERY_FLAG_PARAM_SET,
+    BAM_QUERY_KNOWN_FLAGS, BAM_SYSTEM_FLAG_AMBIGUOUS_WITH_ALL, BAM_SYSTEM_FLAG_MAIN_THREAD,
+    BAM_SYSTEM_KNOWN_FLAGS, BamEventKind, BamHostCtx, BamLoadCtx, BamObserverDesc, BamObserverFn,
+    BamObserverMutFn, BamQueryDesc, BamRunIfFn, BamSystemCtx, BamSystemDesc, BamSystemFn,
 };
 pub use traits::{
     AbiPod, ModComponent, RawInsertable, SymbolEntry, assert_abi_pod, assert_raw_insertable,

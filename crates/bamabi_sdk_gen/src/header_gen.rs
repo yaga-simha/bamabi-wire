@@ -15,17 +15,18 @@ use bamabi_sys::{
     BAM_COMPONENT_FLAG_SPARSE_SET, BAM_COMPONENT_FLAG_SUMMARY_TICK, BAM_COMPONENT_KNOWN_FLAGS,
     BAM_DISABLED_NAME, BAM_HOST_API_SLOT_COUNT, BAM_LOG_DEBUG, BAM_LOG_ERROR, BAM_LOG_INFO,
     BAM_LOG_TRACE, BAM_LOG_WARN, BAM_MANIFEST_KNOWN_FLAGS, BAM_MAX_CHANGE_AGE,
-    BAM_OBSERVER_FLAG_PROPAGATE, BAM_OBSERVER_KNOWN_FLAGS, BAM_QUERY_KNOWN_FLAGS,
-    BAM_RELATION_FLAG_ACYCLIC, BAM_RELATION_FLAG_CASCADE_DELETE, BAM_RELATION_FLAG_CASCADE_DESPAWN,
-    BAM_RELATION_FLAG_CLEANUP_REMOVE, BAM_RELATION_FLAG_EXCLUSIVE, BAM_RELATION_FLAG_SYMMETRIC,
-    BAM_RELATION_KNOWN_FLAGS, BAM_REQUIRED_FLAG_CUSTOM_BYTES, BAM_REQUIRED_FLAG_INIT_FN,
-    BAM_REQUIRED_FLAG_RESOLVE_BY_UUID, BAM_REQUIRED_KNOWN_FLAGS, BAM_SCHEDULE_SET_FLAG_AFTER_WEAK,
-    BAM_SCHEDULE_SET_FLAG_BEFORE_WEAK, BAM_SCHEDULE_SET_FLAG_PARALLEL,
-    BAM_SCHEDULE_SET_FLAG_SEQUENCE, BAM_SCHEDULE_SET_FLAG_SEQUENCE_WEAK,
-    BAM_SCHEDULE_SET_KNOWN_FLAGS, BAM_STORAGE_FLAG_ENTITY_EVENT, BAM_STORAGE_FLAG_EVENT,
-    BAM_STORAGE_FLAG_IMMUTABLE, BAM_STORAGE_FLAG_MESSAGE, BAM_STORAGE_FLAG_RESOURCE,
-    BAM_STORAGE_FLAG_SPARSE_SET, BAM_STORAGE_FLAG_SUMMARY_TICK, BAM_SYSTEM_FLAG_AMBIGUOUS_WITH_ALL,
-    BAM_SYSTEM_FLAG_MAIN_THREAD, BAM_SYSTEM_KNOWN_FLAGS, BAM_TERM_KNOWN_FLAGS,
+    BAM_OBSERVER_FLAG_PROPAGATE, BAM_OBSERVER_KNOWN_FLAGS, BAM_QUERY_FLAG_PARAM_SET,
+    BAM_QUERY_KNOWN_FLAGS, BAM_RELATION_FLAG_ACYCLIC, BAM_RELATION_FLAG_CASCADE_DELETE,
+    BAM_RELATION_FLAG_CASCADE_DESPAWN, BAM_RELATION_FLAG_CLEANUP_REMOVE,
+    BAM_RELATION_FLAG_EXCLUSIVE, BAM_RELATION_FLAG_SYMMETRIC, BAM_RELATION_KNOWN_FLAGS,
+    BAM_REQUIRED_FLAG_CUSTOM_BYTES, BAM_REQUIRED_FLAG_INIT_FN, BAM_REQUIRED_FLAG_RESOLVE_BY_UUID,
+    BAM_REQUIRED_KNOWN_FLAGS, BAM_SCHEDULE_SET_FLAG_AFTER_WEAK, BAM_SCHEDULE_SET_FLAG_BEFORE_WEAK,
+    BAM_SCHEDULE_SET_FLAG_PARALLEL, BAM_SCHEDULE_SET_FLAG_SEQUENCE,
+    BAM_SCHEDULE_SET_FLAG_SEQUENCE_WEAK, BAM_SCHEDULE_SET_KNOWN_FLAGS,
+    BAM_STORAGE_FLAG_ENTITY_EVENT, BAM_STORAGE_FLAG_EVENT, BAM_STORAGE_FLAG_IMMUTABLE,
+    BAM_STORAGE_FLAG_MESSAGE, BAM_STORAGE_FLAG_RESOURCE, BAM_STORAGE_FLAG_SPARSE_SET,
+    BAM_STORAGE_FLAG_SUMMARY_TICK, BAM_SYSTEM_FLAG_AMBIGUOUS_WITH_ALL, BAM_SYSTEM_FLAG_MAIN_THREAD,
+    BAM_SYSTEM_KNOWN_FLAGS, BAM_TERM_FLAG_ADDED, BAM_TERM_FLAG_CHANGED, BAM_TERM_KNOWN_FLAGS,
     BAM_TRIGGER_FLAG_PROPAGATE, BAM_TRIGGER_KNOWN_FLAGS, BamChangeTicks, BamColumnInfo,
     BamComponent, BamEventKind, BamFieldDesc, BamFieldKind, BamHostApi, BamLayoutInfo, BamManifest,
     BamObserverDesc, BamQueryDesc, BamRelationDesc, BamRequiredComponent, BamScheduleSetDesc,
@@ -283,9 +284,9 @@ fn wire_struct_specs() -> Vec<StructLayoutSpec> {
         StructLayoutSpec {
             c_name: "BamQueryDesc",
             assert_stem: "bam_query_desc",
-            size_64: 24,
+            size_64: 32,
             align_64: 8,
-            size_32: 16,
+            size_32: 24,
             align_32: Align32::Fixed(4),
             rust_host_size: size_of::<BamQueryDesc>(),
             rust_host_align: align_of::<BamQueryDesc>(),
@@ -314,14 +315,26 @@ fn wire_struct_specs() -> Vec<StructLayoutSpec> {
                     offset_32: 12,
                     rust_host_offset: offset_of!(BamQueryDesc, term_count),
                 },
+                FieldLayoutSpec {
+                    c_name: "param_set_group",
+                    offset_64: 24,
+                    offset_32: 16,
+                    rust_host_offset: offset_of!(BamQueryDesc, param_set_group),
+                },
+                FieldLayoutSpec {
+                    c_name: "reserved0",
+                    offset_64: 28,
+                    offset_32: 20,
+                    rust_host_offset: offset_of!(BamQueryDesc, reserved0),
+                },
             ],
         },
         StructLayoutSpec {
             c_name: "BamSystemDesc",
             assert_stem: "bam_system_desc",
-            size_64: 168,
+            size_64: 192,
             align_64: 8,
-            size_32: 92,
+            size_32: 104,
             align_32: Align32::Fixed(4),
             rust_host_size: size_of::<BamSystemDesc>(),
             rust_host_align: align_of::<BamSystemDesc>(),
@@ -463,6 +476,24 @@ fn wire_struct_specs() -> Vec<StructLayoutSpec> {
                     offset_64: 160,
                     offset_32: 88,
                     rust_host_offset: offset_of!(BamSystemDesc, ambiguous_with_count),
+                },
+                FieldLayoutSpec {
+                    c_name: "run_if_ctx",
+                    offset_64: 168,
+                    offset_32: 92,
+                    rust_host_offset: offset_of!(BamSystemDesc, run_if_ctx),
+                },
+                FieldLayoutSpec {
+                    c_name: "run_if_query",
+                    offset_64: 176,
+                    offset_32: 96,
+                    rust_host_offset: offset_of!(BamSystemDesc, run_if_query),
+                },
+                FieldLayoutSpec {
+                    c_name: "run_if_ctx_user_data",
+                    offset_64: 184,
+                    offset_32: 100,
+                    rust_host_offset: offset_of!(BamSystemDesc, run_if_ctx_user_data),
                 },
             ],
         },
@@ -1706,6 +1737,30 @@ fn wire_struct_specs() -> Vec<StructLayoutSpec> {
                     offset_32: host_api_offsets::OFF32_ITER_NEXT_CHUNK_BATCH,
                     rust_host_offset: host_api_offsets::ITER_NEXT_CHUNK_BATCH,
                 },
+                FieldLayoutSpec {
+                    c_name: "iter_column_ticks",
+                    offset_64: host_api_offsets::OFF64_ITER_COLUMN_TICKS,
+                    offset_32: host_api_offsets::OFF32_ITER_COLUMN_TICKS,
+                    rust_host_offset: host_api_offsets::ITER_COLUMN_TICKS,
+                },
+                FieldLayoutSpec {
+                    c_name: "cmd_clone_entity",
+                    offset_64: host_api_offsets::OFF64_CMD_CLONE_ENTITY,
+                    offset_32: host_api_offsets::OFF32_CMD_CLONE_ENTITY,
+                    rust_host_offset: host_api_offsets::CMD_CLONE_ENTITY,
+                },
+                FieldLayoutSpec {
+                    c_name: "cmd_insert_resource",
+                    offset_64: host_api_offsets::OFF64_CMD_INSERT_RESOURCE,
+                    offset_32: host_api_offsets::OFF32_CMD_INSERT_RESOURCE,
+                    rust_host_offset: host_api_offsets::CMD_INSERT_RESOURCE,
+                },
+                FieldLayoutSpec {
+                    c_name: "cmd_remove_resource",
+                    offset_64: host_api_offsets::OFF64_CMD_REMOVE_RESOURCE,
+                    offset_32: host_api_offsets::OFF32_CMD_REMOVE_RESOURCE,
+                    rust_host_offset: host_api_offsets::CMD_REMOVE_RESOURCE,
+                },
             ],
         },
     ]
@@ -2040,7 +2095,10 @@ pub fn render_c99_header() -> Result<String, String> {
          #define BAM_SCHEDULE_LAST         ((BamScheduleId){}u)\n\
          #define BAM_SCHEDULE_CUSTOM_BASE  ((BamScheduleId){}u)\n\n\
          #define BAM_MANIFEST_KNOWN_FLAGS            0x{BAM_MANIFEST_KNOWN_FLAGS:08X}u\n\
+         #define BAM_TERM_FLAG_CHANGED               0x{BAM_TERM_FLAG_CHANGED:04X}u\n\
+         #define BAM_TERM_FLAG_ADDED                 0x{BAM_TERM_FLAG_ADDED:04X}u\n\
          #define BAM_TERM_KNOWN_FLAGS                0x{BAM_TERM_KNOWN_FLAGS:04X}u\n\
+         #define BAM_QUERY_FLAG_PARAM_SET            0x{BAM_QUERY_FLAG_PARAM_SET:08X}u\n\
          #define BAM_QUERY_KNOWN_FLAGS               0x{BAM_QUERY_KNOWN_FLAGS:08X}u\n\
          #define BAM_SYSTEM_FLAG_MAIN_THREAD         0x{BAM_SYSTEM_FLAG_MAIN_THREAD:08X}u\n\
          #define BAM_SYSTEM_FLAG_AMBIGUOUS_WITH_ALL  0x{BAM_SYSTEM_FLAG_AMBIGUOUS_WITH_ALL:08X}u\n\
@@ -2242,6 +2300,13 @@ pub fn render_c99_header() -> Result<String, String> {
              uint32_t           flags;\n\
              const BamTermDesc* terms;\n\
              size_t             term_count;\n\
+         {cpp14_guard}\n\
+             uint32_t           param_set_group = 0;\n\
+             uint32_t           reserved0       = 0;\n\
+         #else\n\
+             uint32_t           param_set_group;\n\
+             uint32_t           reserved0;\n\
+         #endif\n\
          }} BamQueryDesc;\n\n\
          typedef struct BamSystemDesc {{\n\
              uint32_t            struct_size;\n\
@@ -2268,6 +2333,9 @@ pub fn render_c99_header() -> Result<String, String> {
              size_t              before_weak_count    = 0;\n\
              const char* const*  ambiguous_with       = nullptr;\n\
              size_t              ambiguous_with_count = 0;\n\
+             BamSystemFn         run_if_ctx           = nullptr;\n\
+             const BamQueryDesc* run_if_query         = nullptr;\n\
+             void*               run_if_ctx_user_data = nullptr;\n\
          #else\n\
              const char* const*  in_sets;\n\
              size_t              in_set_count;\n\
@@ -2277,6 +2345,9 @@ pub fn render_c99_header() -> Result<String, String> {
              size_t              before_weak_count;\n\
              const char* const*  ambiguous_with;\n\
              size_t              ambiguous_with_count;\n\
+             BamSystemFn         run_if_ctx;\n\
+             const BamQueryDesc* run_if_query;\n\
+             void*               run_if_ctx_user_data;\n\
          #endif\n\
          }} BamSystemDesc;\n\n\
          typedef struct BamObserverDesc {{\n\
@@ -2524,7 +2595,11 @@ pub fn render_c99_header() -> Result<String, String> {
          typedef BamResult (*BamCmdInsertRelationFn)(BamCommands* commands, BamEntity entity, BamComponent relation, BamEntity target, const void* data, size_t data_size);\n\
          typedef BamResult (*BamCmdRemoveRelationFn)(BamCommands* commands, BamEntity entity, BamComponent relation, BamEntity target);\n\
          typedef BamResult (*BamMigrateComponentColumnFn)(BamLoadCtx* load_ctx, BamComponent component, uint64_t old_fingerprint, const BamComponentDesc* new_desc, BamRowMigrateFn migrate_fn, void* user_data);\n\
-         typedef BamBool   (*BamIterNextChunkBatchFn)(BamIter* iter, size_t* out_len, const BamEntity** out_entities, uint8_t** out_col_ptrs, size_t col_count, uint32_t mark_changed_mask);\n\n\
+         typedef BamBool   (*BamIterNextChunkBatchFn)(BamIter* iter, size_t* out_len, const BamEntity** out_entities, uint8_t** out_col_ptrs, size_t col_count, uint32_t mark_changed_mask);\n\
+         typedef BamResult (*BamIterColumnTicksFn)(const BamIter* iter, size_t term_index, const uint32_t** out_added, const uint32_t** out_changed, uint32_t* out_last_run, uint32_t* out_this_run);\n\
+         typedef BamResult (*BamCmdCloneEntityFn)(BamCommands* commands, BamEntity src_entity, BamEntity dst_entity);\n\
+         typedef BamResult (*BamCmdInsertResourceFn)(BamCommands* commands, BamComponent resource, const uint8_t* data_ptr, size_t data_len);\n\
+         typedef BamResult (*BamCmdRemoveResourceFn)(BamCommands* commands, BamComponent resource);\n\n\
          struct BamHostApi {\n\
              uint32_t struct_size;\n\
              uint32_t abi_version;\n\n\
@@ -2605,6 +2680,10 @@ pub fn render_c99_header() -> Result<String, String> {
              BamCmdRemoveRelationFn      cmd_remove_relation;\n\
              BamMigrateComponentColumnFn migrate_component_column;\n\
              BamIterNextChunkBatchFn     iter_next_chunk_batch;\n\
+             BamIterColumnTicksFn        iter_column_ticks;\n\
+             BamCmdCloneEntityFn         cmd_clone_entity;\n\
+             BamCmdInsertResourceFn      cmd_insert_resource;\n\
+             BamCmdRemoveResourceFn      cmd_remove_resource;\n\
          };\n\n\
          #define BAM_MANIFEST_MIN_V0_2_SIZE            (offsetof(BamManifest, reserved0) + sizeof(uint32_t))\n\
          #define BAM_QUERY_DESC_MIN_V0_2_SIZE          (offsetof(BamQueryDesc, term_count) + sizeof(size_t))\n\
@@ -2621,7 +2700,7 @@ pub fn render_c99_header() -> Result<String, String> {
          #define BAM_VTABLE_HEADER_MIN_V0_2_SIZE       (offsetof(BamVTableHeader, align) + sizeof(size_t))\n\
          #define BAM_HOST_API_MIN_V0_2_SIZE            (offsetof(BamHostApi, cmd_remove) + sizeof(BamCmdRemoveFn))\n\
          #define BAM_HOST_API_MIN_V0_3_SIZE            (offsetof(BamHostApi, migrate_component_column) + sizeof(BamMigrateComponentColumnFn))\n\n\
-         /* Byte offset constants for every BamHostApi function-pointer slot (0..68): */\n",
+         /* Byte offset constants for every BamHostApi function-pointer slot (0..72): */\n",
     );
 
     for field in host_api_spec.fields {
@@ -3248,14 +3327,13 @@ pub fn write_or_check_header(root: &Path, check_only: bool) -> Result<(), String
     Ok(())
 }
 
-/// Returns the canonical ordered C field names for all 68 `BamHostApi` function-pointer slots.
+/// Returns the canonical ordered C field names for all `BamHostApi` function-pointer slots.
 ///
-/// Intended purpose: gives SDK parity tests a single authoritative slot list derived from
-/// [`wire_struct_specs`] so C99, C++17, and Zig offset macros are verified exhaustively.
+/// Intended purpose: gives SDK synthesizers and parity tests a single authoritative slot list
+/// derived from [`wire_struct_specs`] so C99, C++17, and Zig offset macros cannot drift.
 ///
 /// What it does: locates the `BamHostApi` entry in [`wire_struct_specs`] and collects every
 /// field name after the `struct_size` and `abi_version` header fields.
-#[cfg(test)]
 pub(crate) fn host_api_slot_names() -> Vec<&'static str> {
     let specs = wire_struct_specs();
     let host_api = specs
@@ -3286,7 +3364,13 @@ mod tests {
         let second = render_c99_header().expect("second render must succeed");
         assert_eq!(first, second);
         assert!(first.contains("#define BAM_ABI_VERSION 0x00030000u"));
-        assert!(first.contains("#define BAM_HOST_API_SLOT_COUNT    69u"));
+        assert!(first.contains("#define BAM_MAX_QUERIES_PER_SYSTEM 16u"));
+        assert!(first.contains("#define BAM_HOST_API_SLOT_COUNT    73u"));
+        assert!(first.contains("#define BAM_TERM_FLAG_CHANGED               0x0001u"));
+        assert!(first.contains("#define BAM_TERM_FLAG_ADDED                 0x0002u"));
+        assert!(first.contains("#define BAM_TERM_KNOWN_FLAGS                0x0003u"));
+        assert!(first.contains("#define BAM_QUERY_FLAG_PARAM_SET            0x00000001u"));
+        assert!(first.contains("#define BAM_QUERY_KNOWN_FLAGS               0x00000001u"));
         assert!(
             first.contains("#define BAM_DISABLED_NAME \"bevy_ecs::entity_disabling::Disabled\"")
         );
@@ -3320,13 +3404,37 @@ mod tests {
         ));
         assert!(first.contains("#define BAM_HOST_API_OFFSET_MIGRATE_COMPONENT_COLUMN offsetof(BamHostApi, migrate_component_column)"));
         assert!(first.contains("#define BAM_HOST_API_OFFSET_ITER_NEXT_CHUNK_BATCH offsetof(BamHostApi, iter_next_chunk_batch)"));
+        assert!(first.contains(
+            "#define BAM_HOST_API_OFFSET_ITER_COLUMN_TICKS offsetof(BamHostApi, iter_column_ticks)"
+        ));
+        assert!(first.contains(
+            "#define BAM_HOST_API_OFFSET_CMD_CLONE_ENTITY offsetof(BamHostApi, cmd_clone_entity)"
+        ));
+        assert!(first.contains("#define BAM_HOST_API_OFFSET_CMD_INSERT_RESOURCE offsetof(BamHostApi, cmd_insert_resource)"));
+        assert!(first.contains("#define BAM_HOST_API_OFFSET_CMD_REMOVE_RESOURCE offsetof(BamHostApi, cmd_remove_resource)"));
         assert!(first.contains("typedef struct BamHostApi   BamHostApi;"));
         assert!(
-            first.contains("BAM_STATIC_ASSERT(sizeof(BamHostApi) == 560u, bam_host_api_size_64);")
+            first.contains("BAM_STATIC_ASSERT(sizeof(BamHostApi) == 592u, bam_host_api_size_64);")
         );
         assert!(
-            first.contains("BAM_STATIC_ASSERT(sizeof(BamHostApi) == 284u, bam_host_api_size_32);")
+            first.contains("BAM_STATIC_ASSERT(sizeof(BamHostApi) == 300u, bam_host_api_size_32);")
         );
+        assert!(
+            first.contains(
+                "BAM_STATIC_ASSERT(sizeof(BamQueryDesc) == 32u, bam_query_desc_size_64);"
+            )
+        );
+        assert!(
+            first.contains(
+                "BAM_STATIC_ASSERT(sizeof(BamQueryDesc) == 24u, bam_query_desc_size_32);"
+            )
+        );
+        assert!(first.contains(
+            "BAM_STATIC_ASSERT(sizeof(BamSystemDesc) == 192u, bam_system_desc_size_64);"
+        ));
+        assert!(first.contains(
+            "BAM_STATIC_ASSERT(sizeof(BamSystemDesc) == 104u, bam_system_desc_size_32);"
+        ));
         assert!(first.contains(
             "BAM_STATIC_ASSERT(sizeof(BamComponentDesc) == 176u, bam_component_desc_size_64);"
         ));

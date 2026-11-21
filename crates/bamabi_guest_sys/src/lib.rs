@@ -277,10 +277,11 @@ pub use iter::{
 pub use panic::{catch_guest_bool, catch_guest_result, catch_guest_unit};
 pub use trampoline::{
     LazyCommands, PreparedRunIf, ReentrantCell, SystemRegistrationConfig,
-    ValidatedSystemInvocation, ValidatedSystemRef, allocate_run_if_trampoline,
-    allocate_system_trampoline, configure_schedule_set, configure_schedule_set_raw,
-    iter_dynamic_slice, iter_dynamic_slice_mut, iter_entities_and_dynamic_slice_mut,
-    mount_system_in_schedule, register_lifecycle_observer_closure, register_observer_closure,
+    ValidatedSystemInvocation, ValidatedSystemRef, allocate_run_if_ctx_query,
+    allocate_run_if_ctx_trampoline, allocate_run_if_trampoline, allocate_system_trampoline,
+    configure_schedule_set, configure_schedule_set_raw, iter_dynamic_slice, iter_dynamic_slice_mut,
+    iter_entities_and_dynamic_slice_mut, mount_system_in_schedule,
+    register_lifecycle_observer_closure, register_observer_closure,
     register_observer_closure_with_options, register_observer_mut_closure, register_system_closure,
     register_system_handle_closure, verify_same_mod_dynamic_component,
 };

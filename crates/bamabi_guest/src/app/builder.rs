@@ -4,7 +4,8 @@ use core::ffi::{CStr, c_void};
 
 use bamabi_guest_sys::{
     GuestInstance, Host, PreparedRunIf, SystemRegistrationConfig, TypedComponent, ValidatedLoadCtx,
-    ValidatedSystemInvocation, resolve_component, resolve_mod_component,
+    ValidatedSystemInvocation, allocate_run_if_ctx_query, allocate_run_if_ctx_trampoline,
+    resolve_component, resolve_mod_component,
 };
 use bamabi_sys::{
     AbiPod, AccessMode, BAM_COMPONENT_FLAG_IMMUTABLE, BAM_COMPONENT_FLAG_SPARSE_SET,
@@ -16,7 +17,8 @@ use bamabi_sys::{
 
 use crate::{
     app::{
-        context::{RunConditionContext, SystemContext},
+        conditions::EcsRunCondition,
+        context::{RunConditionContext, RunConditionSystemContext, SystemContext},
         observers::{RunIfPredicate, with_guest_commands},
     },
     commands::GuestCommands,
@@ -25,6 +27,10 @@ use crate::{
     },
     iter::typed_query::QueryTuple,
 };
+
+/// Boxed ECS-aware run-condition predicate paired with its base term offset in `run_if_query`.
+type RunIfCtxPredicate =
+    Box<dyn FnMut(&mut RunConditionSystemContext<'_>, usize) -> bool + Send + 'static>;
 
 mod private {
     /// Private sealing trait preventing downstream crates from implementing [`super::IntoSystemResult`].
@@ -580,6 +586,8 @@ impl<'a> GuestApp<'a> {
             app: self,
             name,
             queries: Vec::new(),
+            query_param_set_groups: Vec::new(),
+            next_param_set_group: 1,
             system_resources: Vec::new(),
             schedule: ScheduleId::UPDATE,
             flags: 0,
@@ -590,6 +598,8 @@ impl<'a> GuestApp<'a> {
             before_weak: Vec::new(),
             ambiguous_with: Vec::new(),
             run_if_preds: Vec::new(),
+            run_if_ctx_terms: Vec::new(),
+            run_if_ctx_preds: Vec::new(),
             first_error: None,
         }
     }
@@ -814,12 +824,45 @@ impl<'b> QueryBuilder<'b> {
     }
 }
 
+/// Scoped builder returned inside [`SystemBuilder::param_set`] for grouping mutually exclusive
+/// queries under a shared non-zero `param_set_group` ID (mirroring Bevy's `ParamSet<(Q0, Q1, ...)>`).
+pub struct ParamSetBuilder<'p, 'b, 'a> {
+    builder: &'p mut SystemBuilder<'b, 'a>,
+    group_id: u32,
+}
+
+impl<'b, 'a> ParamSetBuilder<'_, 'b, 'a> {
+    /// Returns the shared non-zero `param_set_group` ID assigned to every query added in this scope.
+    #[inline]
+    pub const fn group_id(&self) -> u32 {
+        self.group_id
+    }
+
+    /// Appends a [`QueryBuilder`]-configured query clause belonging to this `ParamSet` group.
+    pub fn query<F>(&mut self, configure: F) -> &mut Self
+    where
+        F: for<'q> FnOnce(QueryBuilder<'q>) -> QueryBuilder<'q>,
+    {
+        self.builder.push_query_with_group(configure, self.group_id);
+        self
+    }
+
+    /// Appends a typed [`QueryTuple`] query clause belonging to this `ParamSet` group.
+    pub fn query_typed<Q: QueryTuple>(&mut self) -> &mut Self {
+        self.builder.push_query_typed_with_group::<Q>(self.group_id);
+        self
+    }
+}
+
 /// Unified fluent builder compiling queries, resources, schedule selection, ordering sets,
-/// main-thread pinning, and optional `run_if` predicates into a single [`BamSystemDesc`](bamabi_sys::BamSystemDesc).
+/// main-thread pinning, and optional `run_if` / `run_if_with` predicates into a single
+/// [`BamSystemDesc`](bamabi_sys::BamSystemDesc).
 pub struct SystemBuilder<'b, 'a> {
     app: &'b mut GuestApp<'a>,
     name: &'b CStr,
     queries: Vec<Vec<BamTermDesc>>,
+    query_param_set_groups: Vec<u32>,
+    next_param_set_group: u32,
     system_resources: Vec<BamTermDesc>,
     schedule: ScheduleId,
     flags: u32,
@@ -830,6 +873,8 @@ pub struct SystemBuilder<'b, 'a> {
     before_weak: Vec<&'b CStr>,
     ambiguous_with: Vec<&'b CStr>,
     run_if_preds: Vec<RunIfPredicate>,
+    run_if_ctx_terms: Vec<BamTermDesc>,
+    run_if_ctx_preds: Vec<(usize, RunIfCtxPredicate)>,
     first_error: Option<FfiResult>,
 }
 
@@ -842,14 +887,14 @@ impl<'b, 'a> SystemBuilder<'b, 'a> {
         }
     }
 
-    /// Appends a query clause (`0..=MAX_QUERIES_PER_SYSTEM`) configured via [`QueryBuilder`].
-    pub fn query<F>(mut self, configure: F) -> Self
+    /// Internal helper appending a `QueryBuilder` query with `param_set_group` (`0` = standalone).
+    fn push_query_with_group<F>(&mut self, configure: F, param_set_group: u32)
     where
         F: for<'q> FnOnce(QueryBuilder<'q>) -> QueryBuilder<'q>,
     {
         if self.queries.len() >= MAX_QUERIES_PER_SYSTEM {
             self.record_error(FfiResult::CAPACITY_EXCEEDED);
-            return self;
+            return;
         }
         let host = *self.app.host();
         let qb = QueryBuilder {
@@ -863,23 +908,65 @@ impl<'b, 'a> SystemBuilder<'b, 'a> {
             self.record_error(err);
         } else {
             self.queries.push(finished.terms);
+            self.query_param_set_groups.push(param_set_group);
         }
+    }
+
+    /// Internal helper appending a typed `QueryTuple` query with `param_set_group` (`0` = standalone).
+    fn push_query_typed_with_group<Q: QueryTuple>(&mut self, param_set_group: u32) {
+        if self.queries.len() >= MAX_QUERIES_PER_SYSTEM {
+            self.record_error(FfiResult::CAPACITY_EXCEEDED);
+            return;
+        }
+        let host = *self.app.host();
+        match Q::collect_descs(&host, host.manifest_name()) {
+            Ok(terms) => {
+                self.queries.push(terms);
+                self.query_param_set_groups.push(param_set_group);
+            }
+            Err(err) => self.record_error(err),
+        }
+    }
+
+    /// Appends a query clause (`0..=MAX_QUERIES_PER_SYSTEM`) configured via [`QueryBuilder`].
+    pub fn query<F>(mut self, configure: F) -> Self
+    where
+        F: for<'q> FnOnce(QueryBuilder<'q>) -> QueryBuilder<'q>,
+    {
+        self.push_query_with_group(configure, 0);
         self
     }
 
     /// Appends a typed query clause derived from [`QueryTuple`] `Q`, matching
     /// [`SystemContext::single_query`] / [`SystemContext::query_typed`] without magic column indices.
     pub fn query_typed<Q: QueryTuple>(mut self) -> Self {
-        if self.queries.len() >= MAX_QUERIES_PER_SYSTEM {
+        self.push_query_typed_with_group::<Q>(0);
+        self
+    }
+
+    /// Groups mutually exclusive queries declared inside `f` under a shared non-zero
+    /// `param_set_group` ID (mirroring Bevy's `ParamSet`), allowing conflicting component accesses
+    /// across queries within the same group.
+    pub fn param_set(mut self, f: impl FnOnce(&mut ParamSetBuilder<'_, 'b, 'a>)) -> Self {
+        let group_id = self.next_param_set_group;
+        let Some(next) = self.next_param_set_group.checked_add(1) else {
             self.record_error(FfiResult::CAPACITY_EXCEEDED);
             return self;
-        }
-        let host = *self.app.host();
-        match Q::collect_descs(&host, host.manifest_name()) {
-            Ok(terms) => self.queries.push(terms),
-            Err(err) => self.record_error(err),
-        }
+        };
+        self.next_param_set_group = next;
+        let mut ps = ParamSetBuilder {
+            builder: &mut self,
+            group_id,
+        };
+        f(&mut ps);
         self
+    }
+
+    /// Returns the `param_set_group` ID assigned to each declared query (`0` for standalone
+    /// queries, non-zero for queries declared inside [`Self::param_set`]).
+    #[inline]
+    pub fn param_set_groups(&self) -> &[u32] {
+        &self.query_param_set_groups
     }
 
     /// Validates `component` and the `MAX_TERMS_PER_QUERY` cap before appending a system-level
@@ -1126,6 +1213,84 @@ impl<'b, 'a> SystemBuilder<'b, 'a> {
         self.run_if(move |_ctx| condition())
     }
 
+    /// Appends an ECS-aware run condition backed by `BamSystemDesc::run_if_ctx` and `run_if_query`.
+    ///
+    /// `configure_query` declares read-only resources, message readers, or component terms
+    /// accessible inside `condition` via [`RunConditionSystemContext`]. Any mutable term
+    /// (`WRITE`, `OPTIONAL_WRITE`, `RESOURCE_WRITE`, `MESSAGE_WRITE`) is rejected with
+    /// [`FfiResult::PERMISSION_DENIED`].
+    ///
+    /// Multiple `.run_if_with(...)` / `.run_if_condition(...)` calls merge their read-only terms
+    /// into a single `run_if_query` (up to [`MAX_TERMS_PER_QUERY`]) and evaluate with
+    /// short-circuit logical AND semantics.
+    pub fn run_if_with<Q, F>(mut self, configure_query: Q, mut condition: F) -> Self
+    where
+        Q: for<'q> FnOnce(QueryBuilder<'q>) -> QueryBuilder<'q>,
+        F: FnMut(&mut RunConditionSystemContext<'_>) -> bool + Send + 'static,
+    {
+        if self.first_error.is_some() {
+            return self;
+        }
+        let host = *self.app.host();
+        let qb = QueryBuilder {
+            host: &host,
+            manifest_name: host.manifest_name(),
+            terms: Vec::new(),
+            first_error: None,
+        };
+        let finished = configure_query(qb);
+        if let Some(err) = finished.first_error {
+            self.record_error(err);
+            return self;
+        }
+        self.push_run_if_ctx_terms_and_pred(finished.terms, move |ctx, _offset| condition(ctx));
+        self
+    }
+
+    /// Appends a pre-built [`EcsRunCondition`] (such as
+    /// [`conditions::resource_exists`](crate::conditions::resource_exists),
+    /// [`conditions::resource_changed`](crate::conditions::resource_changed),
+    /// [`conditions::on_message`](crate::conditions::on_message), or
+    /// [`conditions::in_state`](crate::conditions::in_state)).
+    ///
+    /// Multiple `.run_if_condition(...)` calls compose with short-circuit logical AND semantics
+    /// and automatically assign each condition's base term offset in `run_if_query`.
+    pub fn run_if_condition(mut self, condition: EcsRunCondition) -> Self {
+        if self.first_error.is_some() {
+            return self;
+        }
+        let host = *self.app.host();
+        match (condition.build_terms)(&host, host.manifest_name()) {
+            Ok(terms) => {
+                let mut eval = condition.eval;
+                self.push_run_if_ctx_terms_and_pred(terms, move |ctx, offset| eval(ctx, offset));
+            }
+            Err(err) => self.record_error(err),
+        }
+        self
+    }
+
+    /// Validates read-only terms and capacity, appends them to `run_if_ctx_terms`, and records
+    /// `pred` with its starting term offset.
+    fn push_run_if_ctx_terms_and_pred<F>(&mut self, terms: Vec<BamTermDesc>, pred: F)
+    where
+        F: FnMut(&mut RunConditionSystemContext<'_>, usize) -> bool + Send + 'static,
+    {
+        for term in &terms {
+            if term.mode.is_mutable() {
+                self.record_error(FfiResult::PERMISSION_DENIED);
+                return;
+            }
+        }
+        let offset = self.run_if_ctx_terms.len();
+        if offset.saturating_add(terms.len()) > MAX_TERMS_PER_QUERY {
+            self.record_error(FfiResult::CAPACITY_EXCEEDED);
+            return;
+        }
+        self.run_if_ctx_terms.extend(terms);
+        self.run_if_ctx_preds.push((offset, Box::new(pred)));
+    }
+
     /// Compiles accumulated `.run_if(...)` predicates into a single instance-owned
     /// [`PreparedRunIf`] trampoline with short-circuit logical AND evaluation.
     fn prepare_run_if(
@@ -1165,10 +1330,33 @@ impl<'b, 'a> SystemBuilder<'b, 'a> {
         if let Some(err) = self.first_error {
             return on_err(err);
         }
+        let (run_if_ctx, run_if_query, run_if_ctx_user_data) = if self.run_if_ctx_preds.is_empty() {
+            (None, core::ptr::null(), core::ptr::null_mut())
+        } else {
+            let query_ptr =
+                match allocate_run_if_ctx_query(self.app.instance, &self.run_if_ctx_terms) {
+                    Ok(ptr) => ptr,
+                    Err(err) => return on_err(err),
+                };
+            let query_count = usize::from(!self.run_if_ctx_terms.is_empty());
+            let mut preds = self.run_if_ctx_preds;
+            let (cb, ud) = allocate_run_if_ctx_trampoline(
+                self.app.instance,
+                query_count,
+                move |inv: &mut ValidatedSystemInvocation<'_>| {
+                    let mut ctx = RunConditionSystemContext::from_invocation(inv);
+                    preds
+                        .iter_mut()
+                        .all(|(offset, pred)| pred(&mut ctx, *offset))
+                },
+            );
+            (Some(cb), query_ptr, ud)
+        };
         let query_slices: Vec<&[BamTermDesc]> = self.queries.iter().map(Vec::as_slice).collect();
         let config = SystemRegistrationConfig {
             name: self.name,
             user_queries: &query_slices,
+            user_query_param_set_groups: &self.query_param_set_groups,
             system_resources: &self.system_resources,
             schedule: self.schedule,
             flags: self.flags,
@@ -1178,6 +1366,9 @@ impl<'b, 'a> SystemBuilder<'b, 'a> {
             after_weak: &self.after_weak,
             before_weak: &self.before_weak,
             ambiguous_with: &self.ambiguous_with,
+            run_if_ctx,
+            run_if_query,
+            run_if_ctx_user_data,
         };
         let run_if = Self::prepare_run_if(self.app.instance, self.run_if_preds);
         submit(&mut self.app.load_ctx, self.app.instance, &config, run_if)

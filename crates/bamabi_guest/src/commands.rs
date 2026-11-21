@@ -317,6 +317,60 @@ impl<'a> GuestCommands<'a> {
         self.inner.remove_relation(entity, relation, target)
     }
 
+    /// Clones all cloneable components from `src_entity` onto `dst_entity` via
+    /// `BamHostApi::cmd_clone_entity` (slot 70).
+    #[inline]
+    pub fn clone_entity(&mut self, src_entity: FfiEntity, dst_entity: FfiEntity) -> FfiResult {
+        self.inner.clone_entity(src_entity, dst_entity)
+    }
+
+    /// Queues a deferred singleton resource insert for pre-resolved `resource` (`R: AbiPod`) via
+    /// `BamHostApi::cmd_insert_resource` (slot 71).
+    #[inline]
+    pub fn insert_resource<R: AbiPod>(&mut self, resource: BamComponent, value: &R) -> FfiResult {
+        self.inner.insert_resource(resource, value)
+    }
+
+    /// Queues a deferred singleton resource insert using a pre-validated [`TypedComponent<R>`]
+    /// handle via `BamHostApi::cmd_insert_resource` (slot 71).
+    #[inline]
+    pub fn insert_resource_typed<R: AbiPod>(
+        &mut self,
+        resource: TypedComponent<R>,
+        value: &R,
+    ) -> FfiResult {
+        self.inner.insert_resource_typed(resource, value)
+    }
+
+    /// Resolves `R: GuestComponent` and queues a deferred singleton resource insert via
+    /// `BamHostApi::cmd_insert_resource` (slot 71).
+    #[inline]
+    pub fn insert_guest_resource<R: GuestComponent>(&mut self, value: &R) -> FfiResult {
+        let host = self.host();
+        match resolve_guest_component::<R>(host, host.manifest_name()) {
+            Ok(comp) => self.inner.insert_resource(comp, value),
+            Err(err) => err,
+        }
+    }
+
+    /// Queues a deferred singleton resource removal for pre-resolved `resource` via
+    /// `BamHostApi::cmd_remove_resource` (slot 72).
+    #[inline]
+    pub fn remove_resource(&mut self, resource: BamComponent) -> FfiResult {
+        self.inner.remove_resource(resource)
+    }
+
+    /// Resolves `R: GuestComponent` and queues a deferred singleton resource removal via
+    /// `BamHostApi::cmd_remove_resource` (slot 72).
+    #[inline]
+    pub fn remove_guest_resource<R: GuestComponent>(&mut self) -> FfiResult {
+        let host = self.host();
+        match resolve_guest_component::<R>(host, host.manifest_name()) {
+            Ok(comp) => self.inner.remove_resource(comp),
+            Err(err) => err,
+        }
+    }
+
     /// Captures a raw command-buffer checkpoint token via `BamHostApi::cmd_checkpoint`.
     #[inline]
     pub fn checkpoint(&mut self) -> Result<usize, FfiResult> {

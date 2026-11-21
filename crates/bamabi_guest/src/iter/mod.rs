@@ -11,6 +11,8 @@ pub use chunk::Chunk;
 pub use chunk_iter::ChunkIter;
 pub use slice::{ChunkSlice, ChunkSliceMut};
 pub use typed_query::{
-    Added, Allow, Changed, Has, Or, Or2, Or3, OrFilterTerm, OrFilterTuple, QuerySingleError,
-    QueryTerm, QueryTuple, TypedChunkIter, With, Without,
+    Added, AddedMut, Allow, Changed, ChangedMut, CopyableQueryTerm, CopyableQueryTuple, Has, Mut,
+    MutSlice, Or, Or2, Or3, OrFilterTerm, OrFilterTuple, PairwiseQueryTerm, PairwiseQueryTuple,
+    QuerySingleError, QueryTerm, QueryTuple, Ref, RefSlice, TypedChunkIter, With, WithAdded,
+    WithChanged, Without,
 };

@@ -97,7 +97,7 @@ impl<T> ReentrantCell<T> {
 }
 
 const _: () = {
-    assert!(MAX_QUERIES_PER_SYSTEM <= 8);
+    assert!(MAX_QUERIES_PER_SYSTEM <= 16);
     assert!(!core::mem::needs_drop::<ValidatedIter<'static>>());
 };
 
@@ -327,8 +327,8 @@ pub struct ValidatedSystemInvocation<'a> {
     resource_query_index: Option<usize>,
     sys_ref: Option<ValidatedSystemRef<'a>>,
     queries: [MaybeUninit<ValidatedIter<'a>>; MAX_QUERIES_PER_SYSTEM],
-    query_init_mask: u8,
-    query_taken_mask: u8,
+    query_init_mask: u16,
+    query_taken_mask: u16,
     empty_iter: ValidatedIter<'a>,
     commands: Option<ValidatedCommands<'a>>,
     commands_taken: bool,
@@ -492,7 +492,7 @@ impl<'a> ValidatedSystemInvocation<'a> {
         if index >= MAX_QUERIES_PER_SYSTEM {
             return None;
         }
-        let bit = 1u8 << index;
+        let bit = 1u16 << index;
         if (self.query_init_mask & bit) != 0 {
             // SAFETY: `query_init_mask & bit != 0` proves `self.queries[index]` is initialized.
             Some(unsafe { self.queries[index].assume_init_ref() })
@@ -507,7 +507,7 @@ impl<'a> ValidatedSystemInvocation<'a> {
         if index >= MAX_QUERIES_PER_SYSTEM {
             return None;
         }
-        let bit = 1u8 << index;
+        let bit = 1u16 << index;
         if (self.query_init_mask & bit) != 0 {
             // SAFETY: `query_init_mask & bit != 0` proves `self.queries[index]` is initialized.
             Some(unsafe { self.queries[index].assume_init_mut() })
@@ -523,7 +523,7 @@ impl<'a> ValidatedSystemInvocation<'a> {
         if index >= self.total_query_count {
             return None;
         }
-        let bit = 1u8 << index;
+        let bit = 1u16 << index;
         if (self.query_taken_mask & bit) != 0 {
             return None;
         }
@@ -585,7 +585,7 @@ impl<'a> ValidatedSystemInvocation<'a> {
         if index >= self.total_query_count {
             return;
         }
-        let bit = 1u8 << index;
+        let bit = 1u16 << index;
         if ((self.query_taken_mask | self.query_init_mask) & bit) != 0 {
             return;
         }
@@ -617,7 +617,7 @@ impl<'a> ValidatedSystemInvocation<'a> {
             return &mut self.empty_iter;
         }
         self.ensure_query_slot(0);
-        if (self.query_init_mask & 1u8) != 0 {
+        if (self.query_init_mask & 1u16) != 0 {
             // SAFETY: `query_init_mask & 1 != 0` proves `self.queries[0]` is initialized.
             unsafe { self.queries[0].assume_init_mut() }
         } else {
@@ -648,7 +648,7 @@ impl<'a> ValidatedSystemInvocation<'a> {
         self.ensure_query_slot(idx_a);
         self.ensure_query_slot(idx_b);
         let mask = self.query_init_mask;
-        if (mask & (1u8 << idx_a)) == 0 || (mask & (1u8 << idx_b)) == 0 {
+        if (mask & (1u16 << idx_a)) == 0 || (mask & (1u16 << idx_b)) == 0 {
             return None;
         }
         if idx_a < idx_b {
@@ -694,7 +694,7 @@ impl<'a> ValidatedSystemInvocation<'a> {
         } else {
             self.commands.as_mut().unwrap_or(&mut self.empty_commands)
         };
-        let iter = if self.user_query_count == 0 || (self.query_init_mask & 1u8) == 0 {
+        let iter = if self.user_query_count == 0 || (self.query_init_mask & 1u16) == 0 {
             &mut self.empty_iter
         } else {
             // SAFETY: `query_init_mask & 1 != 0` proves `self.queries[0]` is initialized.
@@ -720,7 +720,7 @@ impl<'a> ValidatedSystemInvocation<'a> {
         self.ensure_query_slot(idx_b);
         self.ensure_commands_slot();
         let mask = self.query_init_mask;
-        if (mask & (1u8 << idx_a)) == 0 || (mask & (1u8 << idx_b)) == 0 {
+        if (mask & (1u16 << idx_a)) == 0 || (mask & (1u16 << idx_b)) == 0 {
             return None;
         }
         let cmds = self.commands.as_mut()?;
@@ -962,6 +962,105 @@ impl<'a> ValidatedSystemRef<'a> {
         // SAFETY: Host verified query membership, writable `FilteredAccessSet` declaration, and
         // marked change ticks; `&'b mut self` + `&'b mut iter` guarantee exclusive access for `'b`.
         unsafe { Self::cast_entity_mut::<T>(ptr) }
+    }
+
+    /// Looks up `N` simultaneous disjoint exclusive `&'b mut T` component references for
+    /// `entities` using declared writable access on `(query_index, term_index)`, with zero heap
+    /// allocation.
+    ///
+    /// Rejects null entities with [`FfiResult::INVALID_ENTITY`], duplicate entities or hostile
+    /// overlapping host pointers with [`FfiResult::ACCESS_CONFLICT`], missing entities with
+    /// [`FfiResult::NOT_FOUND`], misaligned pointers or layout/UUID mismatches with
+    /// [`FfiResult::TYPE_MISMATCH`], non-writable/immutable columns with
+    /// [`FfiResult::PERMISSION_DENIED`], and missing `sys_entity_get_mut` slot with
+    /// [`FfiResult::UNSUPPORTED`].
+    // `&mut ValidatedIter` is an intentional borrow-guard preventing aliasing chunk borrows while
+    // `sys_entity_get_mut` holds mutable pointers into `iter`'s query storage.
+    #[allow(clippy::needless_pass_by_ref_mut)]
+    pub fn entity_get_many_mut_checked<'b, const N: usize, T: AbiPod>(
+        &'b mut self,
+        iter: &'b mut ValidatedIter<'a>,
+        query_index: usize,
+        term_index: usize,
+        entities: [FfiEntity; N],
+        expected_uuid: Option<UuidFilter>,
+    ) -> Result<[&'b mut T; N], FfiResult> {
+        if self.sys_ctx.is_null() {
+            return Err(FfiResult::NULL_POINTER);
+        }
+        let get_mut_fn =
+            host_slot!(self.host.api(), sys_entity_get_mut).ok_or(FfiResult::UNSUPPORTED)?;
+        for i in 0..N {
+            if entities[i].is_null() {
+                return Err(FfiResult::INVALID_ENTITY);
+            }
+            for j in (i + 1)..N {
+                if entities[i] == entities[j] {
+                    return Err(FfiResult::ACCESS_CONFLICT);
+                }
+            }
+        }
+        let info = iter.column_info(term_index)?;
+        if !info.mode.is_mutable()
+            || !info.mode.has_entity_column_data()
+            || info.is_immutable()
+            || info.is_resource()
+            || info.is_message()
+        {
+            return Err(FfiResult::PERMISSION_DENIED);
+        }
+        let elem_size = core::mem::size_of::<T>();
+        if info.size != elem_size
+            || info.align != core::mem::align_of::<T>()
+            || !expected_uuid.is_none_or(|f| f.matches(info.uuid))
+        {
+            return Err(FfiResult::TYPE_MISMATCH);
+        }
+
+        // Fetch and validate all raw pointers before creating any `&mut T` references so hostile
+        // overlapping pointers never trigger aliasing UB under Stacked/Tree Borrows.
+        let mut raw_ptrs: [*mut u8; N] = [core::ptr::null_mut(); N];
+        for i in 0..N {
+            // SAFETY: `self.sys_ctx` is an active `BamSystemCtx` for `'a`, and `&mut self` +
+            // `&mut iter` prevent any aliasing borrow on this system context.
+            let ptr = unsafe { get_mut_fn(self.sys_ctx, query_index, entities[i], term_index) };
+            if ptr.is_null() {
+                return Err(FfiResult::NOT_FOUND);
+            }
+            if elem_size > 0 {
+                if !(ptr as usize).is_multiple_of(core::mem::align_of::<T>()) {
+                    return Err(FfiResult::TYPE_MISMATCH);
+                }
+                let start = ptr.addr();
+                let end = start
+                    .checked_add(elem_size)
+                    .ok_or(FfiResult::OUT_OF_RANGE)?;
+                for prev_ptr in &raw_ptrs[..i] {
+                    let prev_start = prev_ptr.addr();
+                    let prev_end = prev_start + elem_size;
+                    if start < prev_end && prev_start < end {
+                        return Err(FfiResult::ACCESS_CONFLICT);
+                    }
+                }
+            }
+            raw_ptrs[i] = ptr;
+        }
+
+        let mut out: [MaybeUninit<&'b mut T>; N] = [const { MaybeUninit::uninit() }; N];
+        for i in 0..N {
+            let reference: &'b mut T = if elem_size == 0 {
+                // SAFETY: Zero-sized `T: AbiPod` may be mutably referenced via `NonNull::dangling()`.
+                unsafe { core::ptr::NonNull::<T>::dangling().as_mut() }
+            } else {
+                // SAFETY: All `raw_ptrs[0..N]` are verified non-null, aligned for `T`, pairwise
+                // byte-range disjoint, and exclusively accessible for `'b` under `&'b mut self` +
+                // `&'b mut iter`.
+                unsafe { &mut *raw_ptrs[i].cast::<T>() }
+            };
+            out[i].write(reference);
+        }
+        // SAFETY: The loop above initialized all `N` elements of `out`.
+        Ok(out.map(|slot| unsafe { slot.assume_init() }))
     }
 
     /// Looks up a shared singleton resource `&R` by its pre-resolved `BamComponent` handle,
@@ -1368,12 +1467,87 @@ where
     (run_if_closure_trampoline::<R>, raw.cast::<c_void>())
 }
 
+/// Allocates a panic-safe, re-entrancy-guarded ECS-aware `run_if_ctx` `(BamSystemFn, *mut c_void)`
+/// closure pair inside `instance`.
+///
+/// The wrapped predicate `func` receives a [`ValidatedSystemInvocation`] with `query_count`
+/// query slots and returns `true` to run the system (`FfiResult::OK`) or `false` to skip it
+/// (`FfiResult::NOT_FOUND`, non-zero per [`BamSystemDesc::run_if_ctx`]). Re-entrant invocation
+/// returns `FfiResult::ACCESS_CONFLICT` (skip) and panics are caught as `FfiResult::PANIC_CAUGHT`
+/// (skip).
+pub fn allocate_run_if_ctx_trampoline<F>(
+    instance: &mut GuestInstance,
+    query_count: usize,
+    mut func: F,
+) -> (BamSystemFn, *mut c_void)
+where
+    F: FnMut(&mut ValidatedSystemInvocation<'_>) -> bool + Send + 'static,
+{
+    allocate_system_trampoline(
+        instance,
+        query_count,
+        query_count,
+        None,
+        move |inv: &mut ValidatedSystemInvocation<'_>| {
+            if func(inv) {
+                FfiResult::OK
+            } else {
+                FfiResult::NOT_FOUND
+            }
+        },
+    )
+}
+
+/// Heap-pinned storage pairing an [`OwnedRawTermSlice`] with its [`BamQueryDesc`] for
+/// [`BamSystemDesc::run_if_query`].
+struct OwnedRunIfQuery {
+    _terms: OwnedRawTermSlice,
+    desc: BamQueryDesc,
+}
+
+// SAFETY: `desc.terms` points exclusively into `_terms` (owned via `Box::into_raw` and never
+// mutated or retagged on move) and lives until `OwnedRunIfQuery` drops on `bamabi_shutdown`.
+unsafe impl Send for OwnedRunIfQuery {}
+
+/// Validates `terms` and pins a heap-owned [`BamQueryDesc`] inside `instance`, returning a stable
+/// `*const BamQueryDesc` suitable for [`SystemRegistrationConfig::run_if_query`].
+pub fn allocate_run_if_ctx_query(
+    instance: &mut GuestInstance,
+    terms: &[BamTermDesc],
+) -> Result<*const BamQueryDesc, FfiResult> {
+    if terms.len() > MAX_TERMS_PER_QUERY {
+        return Err(FfiResult::CAPACITY_EXCEEDED);
+    }
+    for term in terms {
+        let status = term.validate();
+        if !status.is_ok() {
+            return Err(status);
+        }
+    }
+    let raw_terms = OwnedRawTermSlice::from_slice(terms);
+    let desc = if raw_terms.len == 0 {
+        BamQueryDesc::empty()
+    } else {
+        BamQueryDesc::new(raw_terms.as_ptr(), raw_terms.len)
+    };
+    let raw = instance.track_allocation(Box::new(OwnedRunIfQuery {
+        _terms: raw_terms,
+        desc,
+    }));
+    // SAFETY: `raw` is pinned inside `instance` until `bamabi_shutdown` (or rollback) and never
+    // mutated after allocation.
+    Ok(unsafe { core::ptr::addr_of!((*raw).desc) })
+}
+
 /// Descriptor assembly configuration passed from safe `SystemBuilder` to [`register_system_closure`].
 pub struct SystemRegistrationConfig<'a> {
     /// NUL-terminated UTF-8 system name.
     pub name: &'a CStr,
     /// User-declared entity/resource query clauses (`<= MAX_QUERIES_PER_SYSTEM`).
     pub user_queries: &'a [&'a [BamTermDesc]],
+    /// Optional per-query `ParamSet` group IDs (`0` = independent query; non-zero = mutually
+    /// exclusive `ParamSet` group) parallel to `user_queries`.
+    pub user_query_param_set_groups: &'a [u32],
     /// Optional system-level singleton resource terms (`resource_read` / `resource_write` on `SystemBuilder`).
     pub system_resources: &'a [BamTermDesc],
     /// Target Bevy schedule.
@@ -1392,6 +1566,37 @@ pub struct SystemRegistrationConfig<'a> {
     pub before_weak: &'a [&'a CStr],
     /// Named system sets whose access ambiguities with this system are explicitly suppressed.
     pub ambiguous_with: &'a [&'a CStr],
+    /// Optional ECS-aware run-condition callback receiving a [`BamSystemCtx`] backed by
+    /// `run_if_query` (`FfiResult::OK` = run; non-zero = skip).
+    pub run_if_ctx: Option<BamSystemFn>,
+    /// Optional read-only [`BamQueryDesc`] declaring the ECS resources/components accessible to
+    /// `run_if_ctx`.
+    pub run_if_query: *const BamQueryDesc,
+    /// Opaque guest-owned state passed to `run_if_ctx`.
+    pub run_if_ctx_user_data: *mut c_void,
+}
+
+impl Default for SystemRegistrationConfig<'_> {
+    #[inline]
+    fn default() -> Self {
+        Self {
+            name: c"",
+            user_queries: &[],
+            user_query_param_set_groups: &[],
+            system_resources: &[],
+            schedule: ScheduleId::UPDATE,
+            flags: 0,
+            after: &[],
+            before: &[],
+            in_sets: &[],
+            after_weak: &[],
+            before_weak: &[],
+            ambiguous_with: &[],
+            run_if_ctx: None,
+            run_if_query: core::ptr::null(),
+            run_if_ctx_user_data: core::ptr::null_mut(),
+        }
+    }
 }
 
 /// Raw-pointer owner for a heap-allocated NUL-terminated C string that avoids `Box` retagging
@@ -1564,16 +1769,22 @@ where
 
     let mut term_vecs: Vec<OwnedRawTermSlice> = Vec::with_capacity(total_query_count);
     let mut query_descs: Vec<BamQueryDesc> = Vec::with_capacity(total_query_count);
-    for terms in config.user_queries {
-        if terms.is_empty() {
-            query_descs.push(BamQueryDesc::empty());
+    for (q_idx, terms) in config.user_queries.iter().enumerate() {
+        let group = config
+            .user_query_param_set_groups
+            .get(q_idx)
+            .copied()
+            .unwrap_or(0);
+        let desc = if terms.is_empty() {
+            BamQueryDesc::empty()
         } else {
             let raw_terms = OwnedRawTermSlice::from_slice(terms);
             let ptr = raw_terms.as_ptr();
             let len = raw_terms.len;
             term_vecs.push(raw_terms);
-            query_descs.push(BamQueryDesc::new(ptr, len));
-        }
+            BamQueryDesc::new(ptr, len)
+        };
+        query_descs.push(desc.with_param_set_group(group));
     }
 
     let resource_query_index = if has_sys_resources {
@@ -1674,6 +1885,14 @@ where
 
     if let Some((run_if_fn, run_if_data)) = run_if {
         desc = desc.with_run_if(run_if_fn, run_if_data);
+    }
+
+    if let Some(run_if_ctx_fn) = config.run_if_ctx {
+        desc = desc.with_run_if_ctx(
+            run_if_ctx_fn,
+            config.run_if_query,
+            config.run_if_ctx_user_data,
+        );
     }
 
     let validation = desc.validate();

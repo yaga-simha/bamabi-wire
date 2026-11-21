@@ -943,6 +943,7 @@ fn s7_owned_runtime_allocs_and_system_descriptor_pointers_sound_under_miri() {
                     after_weak: &[c"set_after_w"],
                     before_weak: &[c"set_before_w"],
                     ambiguous_with: &[c"set_ambig"],
+                    ..Default::default()
                 };
                 load.register_system(inst, &cfg, None, |_| FfiResult::OK)
             },

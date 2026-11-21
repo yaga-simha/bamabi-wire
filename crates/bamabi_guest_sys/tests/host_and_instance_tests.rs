@@ -1047,3 +1047,646 @@ fn validated_iter_advance_batch_uses_slot_68_and_falls_back_on_v03_prefix() {
     assert_eq!(state.legacy_rw_calls, 1);
     assert_eq!(state.legacy_ro_calls, 3);
 }
+
+#[test]
+fn validated_iter_and_dispenser_column_ticks_validate_bounds_alignment_and_overlap() {
+    struct MockTickState {
+        len: usize,
+        col: core::cell::UnsafeCell<[u32; 3]>,
+        added: [u32; 3],
+        changed: [u32; 3],
+        last_run: u32,
+        this_run: u32,
+        mode: u8, // 0=ok, 1=null_added, 2=misaligned_changed, 3=overlap_col
+    }
+
+    unsafe extern "C" fn mock_next(iter: *mut bamabi_sys::BamIter, out_len: *mut usize) -> FfiBool {
+        // SAFETY: `iter` points to `MockTickState`.
+        let st = unsafe { &*iter.cast::<MockTickState>() };
+        // SAFETY: `out_len` is writable stack storage.
+        unsafe { *out_len = st.len };
+        FfiBool::TRUE
+    }
+
+    unsafe extern "C" fn mock_col_info(
+        _iter: *const bamabi_sys::BamIter,
+        term_index: usize,
+        out: *mut bamabi_sys::BamColumnInfo,
+    ) -> FfiResult {
+        if term_index != 0 {
+            return FfiResult::OUT_OF_RANGE;
+        }
+        // SAFETY: `out` is writable stack storage.
+        unsafe {
+            *out = bamabi_sys::BamColumnInfo {
+                component: BamComponent::from_raw(1),
+                mode: AccessMode::WRITE,
+                uuid: ComponentUuid::from_bytes([1; 16]),
+                size: core::mem::size_of::<u32>(),
+                align: core::mem::align_of::<u32>(),
+                storage_flags: 0,
+                reserved0: 0,
+            };
+        }
+        FfiResult::OK
+    }
+
+    unsafe extern "C" fn mock_col_mut(iter: *mut bamabi_sys::BamIter, _term: usize) -> *mut u8 {
+        // SAFETY: `iter` points to `MockTickState`.
+        let st = unsafe { &*iter.cast::<MockTickState>() };
+        st.col.get().cast::<u8>()
+    }
+
+    unsafe extern "C" fn mock_ticks(
+        iter: *const bamabi_sys::BamIter,
+        term_index: usize,
+        out_added: *mut *const u32,
+        out_changed: *mut *const u32,
+        out_last_run: *mut u32,
+        out_this_run: *mut u32,
+    ) -> FfiResult {
+        if term_index != 0 {
+            return FfiResult::OUT_OF_RANGE;
+        }
+        // SAFETY: `iter` points to `MockTickState`.
+        let st = unsafe { &*iter.cast::<MockTickState>() };
+        // SAFETY: All four out-pointers point to writable stack slots.
+        unsafe {
+            *out_last_run = st.last_run;
+            *out_this_run = st.this_run;
+            match st.mode {
+                0 => {
+                    *out_added = st.added.as_ptr();
+                    *out_changed = st.changed.as_ptr();
+                }
+                1 => {
+                    *out_added = core::ptr::null();
+                    *out_changed = st.changed.as_ptr();
+                }
+                2 => {
+                    *out_added = st.added.as_ptr();
+                    #[allow(clippy::cast_ptr_alignment)]
+                    {
+                        *out_changed = st.changed.as_ptr().cast::<u8>().add(1).cast::<u32>();
+                    }
+                }
+                _ => {
+                    *out_added = st.col.get().cast::<u32>().cast_const();
+                    *out_changed = st.changed.as_ptr();
+                }
+            }
+        }
+        FfiResult::OK
+    }
+
+    let mut api = make_mock_api();
+    api.iter_next_chunk = Some(mock_next);
+    api.iter_column_info = Some(mock_col_info);
+    api.iter_column_mutable = Some(mock_col_mut);
+    api.iter_column_ticks = Some(mock_ticks);
+
+    let mut dummy_ctx = 1u8;
+    // SAFETY: Stack pointers stay valid across test.
+    let host = unsafe { Host::from_raw(&raw const api, (&raw mut dummy_ctx).cast()) }.unwrap();
+
+    let mut state = MockTickState {
+        len: 3,
+        col: core::cell::UnsafeCell::new([10, 20, 30]),
+        added: [1, 2, 3],
+        changed: [4, 5, 6],
+        last_run: 2,
+        this_run: 6,
+        mode: 0,
+    };
+
+    // 1. Valid non-empty chunk via ValidatedIter and ChunkColumnDispenser.
+    {
+        // SAFETY: `state` outlives `iter`.
+        let mut iter = unsafe {
+            ValidatedIter::from_raw((&raw mut state).cast::<bamabi_sys::BamIter>(), &host)
+        };
+        assert_eq!(iter.next_chunk(), Some(3));
+        assert_eq!(
+            iter.column_ticks(0),
+            Ok((&[1, 2, 3][..], &[4, 5, 6][..], 2, 6))
+        );
+        assert_eq!(iter.column_ticks(1), Err(FfiResult::OUT_OF_RANGE));
+
+        let mut dispenser = ChunkColumnDispenser::new(&mut iter);
+        let term_idx = dispenser.next_term_index();
+        assert_eq!(term_idx, 0);
+        let col = dispenser.next_write::<u32>(None).unwrap();
+        let (added, changed, last_run, this_run) = dispenser.column_ticks(term_idx).unwrap();
+        assert_eq!(col, &[10, 20, 30]);
+        assert_eq!(added, &[1, 2, 3]);
+        assert_eq!(changed, &[4, 5, 6]);
+        assert_eq!((last_run, this_run), (2, 6));
+    }
+
+    // 2. Empty chunk still reports (last_run, this_run) with empty slices.
+    state.len = 0;
+    {
+        // SAFETY: `state` outlives `iter`.
+        let mut iter = unsafe {
+            ValidatedIter::from_raw((&raw mut state).cast::<bamabi_sys::BamIter>(), &host)
+        };
+        assert_eq!(iter.next_chunk(), Some(0));
+        assert_eq!(iter.column_ticks(0), Ok((&[][..], &[][..], 2, 6)));
+    }
+
+    // 3. Hostile null & misaligned pointers fail closed.
+    state.len = 3;
+    state.mode = 1;
+    {
+        // SAFETY: `state` outlives `iter`.
+        let mut iter = unsafe {
+            ValidatedIter::from_raw((&raw mut state).cast::<bamabi_sys::BamIter>(), &host)
+        };
+        assert_eq!(iter.next_chunk(), Some(3));
+        assert_eq!(iter.column_ticks(0), Err(FfiResult::NULL_POINTER));
+    }
+    state.mode = 2;
+    {
+        // SAFETY: `state` outlives `iter`.
+        let mut iter = unsafe {
+            ValidatedIter::from_raw((&raw mut state).cast::<bamabi_sys::BamIter>(), &host)
+        };
+        assert_eq!(iter.next_chunk(), Some(3));
+        assert_eq!(iter.column_ticks(0), Err(FfiResult::TYPE_MISMATCH));
+    }
+
+    // 4. Hostile tick pointer overlapping active mutable column borrow rejected in dispenser.
+    state.mode = 3;
+    {
+        // SAFETY: `state` outlives `iter`.
+        let mut iter = unsafe {
+            ValidatedIter::from_raw((&raw mut state).cast::<bamabi_sys::BamIter>(), &host)
+        };
+        assert_eq!(iter.next_chunk(), Some(3));
+        let mut dispenser = ChunkColumnDispenser::new(&mut iter);
+        let _col = dispenser.next_write::<u32>(None).unwrap();
+        assert_eq!(dispenser.column_ticks(0), Err(FfiResult::ACCESS_CONFLICT));
+    }
+
+    // 5. Older MIN_V0_3_SIZE host (slot 69 uncovered) returns UNSUPPORTED.
+    let mut v03_api = api;
+    v03_api.struct_size = bamabi_sys::BamHostApi::MIN_V0_3_SIZE as u32;
+    // SAFETY: Stack pointers stay valid across test.
+    let v03_host =
+        unsafe { Host::from_raw(&raw const v03_api, (&raw mut dummy_ctx).cast()) }.unwrap();
+    // SAFETY: `state` outlives `iter`.
+    let iter = unsafe {
+        ValidatedIter::from_raw((&raw mut state).cast::<bamabi_sys::BamIter>(), &v03_host)
+    };
+    assert_eq!(iter.column_ticks(0), Err(FfiResult::UNSUPPORTED));
+}
+
+#[test]
+fn entity_get_many_mut_checked_enforces_distinctness_overlap_and_zero_len() {
+    struct MockManyState {
+        values: core::cell::UnsafeCell<[u32; 4]>,
+        hostile_overlap: bool,
+        hostile_misalign: bool,
+    }
+
+    unsafe extern "C" fn mock_col_info(
+        _iter: *const bamabi_sys::BamIter,
+        term_index: usize,
+        out: *mut bamabi_sys::BamColumnInfo,
+    ) -> FfiResult {
+        if term_index != 0 {
+            return FfiResult::OUT_OF_RANGE;
+        }
+        // SAFETY: `out` is writable stack storage.
+        unsafe {
+            *out = bamabi_sys::BamColumnInfo {
+                component: BamComponent::from_raw(1),
+                mode: AccessMode::WRITE,
+                uuid: ComponentUuid::from_bytes([7; 16]),
+                size: core::mem::size_of::<u32>(),
+                align: core::mem::align_of::<u32>(),
+                storage_flags: 0,
+                reserved0: 0,
+            };
+        }
+        FfiResult::OK
+    }
+
+    unsafe extern "C" fn mock_entity_get_mut(
+        sys_ctx: *mut bamabi_sys::BamSystemCtx,
+        _query_index: usize,
+        entity: FfiEntity,
+        _term_index: usize,
+    ) -> *mut u8 {
+        // SAFETY: `sys_ctx` points to `MockManyState`.
+        let st = unsafe { &*sys_ctx.cast::<MockManyState>() };
+        let base = st.values.get().cast::<u32>();
+        if st.hostile_misalign {
+            // SAFETY: Offset by 1 byte inside `values` for alignment rejection test.
+            return unsafe { base.cast::<u8>().add(1) };
+        }
+        if st.hostile_overlap {
+            // Return the same pointer for distinct entity IDs.
+            return base.cast::<u8>();
+        }
+        let idx = entity.to_bits() as usize;
+        if (1..=4).contains(&idx) {
+            // SAFETY: `idx - 1 < 4`.
+            unsafe { base.add(idx - 1).cast::<u8>() }
+        } else {
+            core::ptr::null_mut()
+        }
+    }
+
+    let mut api = make_mock_api();
+    api.iter_column_info = Some(mock_col_info);
+    api.sys_entity_get_mut = Some(mock_entity_get_mut);
+
+    let mut dummy_ctx = 1u8;
+    // SAFETY: Stack pointers stay valid across test.
+    let host = unsafe { Host::from_raw(&raw const api, (&raw mut dummy_ctx).cast()) }.unwrap();
+
+    let mut state = MockManyState {
+        values: core::cell::UnsafeCell::new([10, 20, 30, 40]),
+        hostile_overlap: false,
+        hostile_misalign: false,
+    };
+
+    let e1 = FfiEntity::from_bits(1);
+    let e2 = FfiEntity::from_bits(2);
+    let e3 = FfiEntity::from_bits(3);
+    let e_missing = FfiEntity::from_bits(99);
+
+    let mut dummy_iter_tok = 1u8;
+    // SAFETY: `state` and `dummy_iter_tok` stay pinned across invocation.
+    let mut inv = unsafe {
+        ValidatedSystemInvocation::from_raw(
+            (&raw mut state).cast::<bamabi_sys::BamSystemCtx>(),
+            &host,
+            1,
+            1,
+            None,
+        )
+    };
+    let mut sys_ref = inv.take_system_ref().unwrap();
+    // SAFETY: `dummy_iter_tok` is non-null and `mock_col_info` does not dereference it.
+    let mut iter = unsafe {
+        ValidatedIter::from_raw(
+            (&raw mut dummy_iter_tok).cast::<bamabi_sys::BamIter>(),
+            &host,
+        )
+    };
+
+    // 1. N = 0 succeeds cleanly with empty array.
+    let empty: [&mut u32; 0] = sys_ref
+        .entity_get_many_mut_checked(&mut iter, 0, 0, [], None)
+        .unwrap();
+    assert!(empty.is_empty());
+
+    // 2. Distinct entities succeed and allow simultaneous mutation.
+    {
+        let [a, b, c] = sys_ref
+            .entity_get_many_mut_checked::<3, u32>(&mut iter, 0, 0, [e1, e2, e3], None)
+            .unwrap();
+        *a += 1;
+        *b += 2;
+        *c += 3;
+    }
+
+    // 3. Duplicate entities -> ACCESS_CONFLICT.
+    assert_eq!(
+        sys_ref.entity_get_many_mut_checked::<2, u32>(&mut iter, 0, 0, [e1, e1], None),
+        Err(FfiResult::ACCESS_CONFLICT)
+    );
+
+    // 4. Null entity -> INVALID_ENTITY.
+    assert_eq!(
+        sys_ref.entity_get_many_mut_checked::<2, u32>(&mut iter, 0, 0, [e1, FfiEntity::NULL], None),
+        Err(FfiResult::INVALID_ENTITY)
+    );
+
+    // 5. Missing entity -> NOT_FOUND.
+    assert_eq!(
+        sys_ref.entity_get_many_mut_checked::<2, u32>(&mut iter, 0, 0, [e1, e_missing], None),
+        Err(FfiResult::NOT_FOUND)
+    );
+
+    // 6. Hostile overlapping pointers for distinct entity IDs -> ACCESS_CONFLICT.
+    let _ = (sys_ref, inv);
+    assert_eq!(*state.values.get_mut(), [11, 22, 33, 40]);
+
+    state.hostile_overlap = true;
+    // SAFETY: `state` stays pinned across invocation.
+    let mut inv2 = unsafe {
+        ValidatedSystemInvocation::from_raw(
+            (&raw mut state).cast::<bamabi_sys::BamSystemCtx>(),
+            &host,
+            1,
+            1,
+            None,
+        )
+    };
+    let mut sys_ref2 = inv2.take_system_ref().unwrap();
+    assert_eq!(
+        sys_ref2.entity_get_many_mut_checked::<2, u32>(&mut iter, 0, 0, [e1, e2], None),
+        Err(FfiResult::ACCESS_CONFLICT)
+    );
+
+    // 7. Hostile misaligned pointer -> TYPE_MISMATCH.
+    let _ = (sys_ref2, inv2);
+    state.hostile_overlap = false;
+    state.hostile_misalign = true;
+    // SAFETY: `state` stays pinned across invocation.
+    let mut inv3 = unsafe {
+        ValidatedSystemInvocation::from_raw(
+            (&raw mut state).cast::<bamabi_sys::BamSystemCtx>(),
+            &host,
+            1,
+            1,
+            None,
+        )
+    };
+    let mut sys_ref3 = inv3.take_system_ref().unwrap();
+    assert_eq!(
+        sys_ref3.entity_get_many_mut_checked::<1, u32>(&mut iter, 0, 0, [e1], None),
+        Err(FfiResult::TYPE_MISMATCH)
+    );
+}
+
+#[test]
+fn validated_commands_clone_entity_and_resource_commands_validate_slots_and_layout() {
+    struct MockCmdState {
+        layout_calls: core::cell::Cell<usize>,
+        clone_calls: usize,
+        last_clone: (FfiEntity, FfiEntity),
+        insert_res_calls: usize,
+        last_insert_val: u64,
+        remove_res_calls: usize,
+        last_removed: BamComponent,
+    }
+
+    unsafe extern "C" fn mock_layout_info(
+        ctx: *const bamabi_sys::BamHostCtx,
+        comp: BamComponent,
+        out: *mut bamabi_sys::BamLayoutInfo,
+    ) -> FfiResult {
+        // SAFETY: `ctx` points to `MockCmdState`.
+        let st = unsafe { &*ctx.cast::<MockCmdState>() };
+        st.layout_calls.set(st.layout_calls.get() + 1);
+        if comp == BamComponent::from_raw(10) {
+            // SAFETY: `out` is writable stack storage.
+            unsafe {
+                *out = bamabi_sys::BamLayoutInfo {
+                    size: core::mem::size_of::<u64>(),
+                    align: core::mem::align_of::<u64>(),
+                    uuid: ComponentUuid::from_bytes([0xAA; 16]),
+                    ..bamabi_sys::BamLayoutInfo::empty()
+                };
+            }
+            FfiResult::OK
+        } else {
+            FfiResult::NOT_FOUND
+        }
+    }
+
+    unsafe extern "C" fn mock_clone_entity(
+        cmds: *mut bamabi_sys::BamCommands,
+        src: FfiEntity,
+        dst: FfiEntity,
+    ) -> FfiResult {
+        // SAFETY: `cmds` points to `MockCmdState`.
+        let st = unsafe { &mut *cmds.cast::<MockCmdState>() };
+        st.clone_calls += 1;
+        st.last_clone = (src, dst);
+        FfiResult::OK
+    }
+
+    unsafe extern "C" fn mock_insert_resource(
+        cmds: *mut bamabi_sys::BamCommands,
+        _res: BamComponent,
+        data_ptr: *const u8,
+        data_len: usize,
+    ) -> FfiResult {
+        // SAFETY: `cmds` points to `MockCmdState`.
+        let st = unsafe { &mut *cmds.cast::<MockCmdState>() };
+        st.insert_res_calls += 1;
+        if data_len == core::mem::size_of::<u64>() {
+            // SAFETY: Caller passes valid `u64` bytes.
+            st.last_insert_val = unsafe { core::ptr::read_unaligned(data_ptr.cast::<u64>()) };
+        }
+        FfiResult::OK
+    }
+
+    unsafe extern "C" fn mock_remove_resource(
+        cmds: *mut bamabi_sys::BamCommands,
+        res: BamComponent,
+    ) -> FfiResult {
+        // SAFETY: `cmds` points to `MockCmdState`.
+        let st = unsafe { &mut *cmds.cast::<MockCmdState>() };
+        st.remove_res_calls += 1;
+        st.last_removed = res;
+        FfiResult::OK
+    }
+
+    let mut api = make_mock_api();
+    api.component_layout_info = Some(mock_layout_info);
+    api.cmd_clone_entity = Some(mock_clone_entity);
+    api.cmd_insert_resource = Some(mock_insert_resource);
+    api.cmd_remove_resource = Some(mock_remove_resource);
+
+    let mut state = MockCmdState {
+        layout_calls: core::cell::Cell::new(0),
+        clone_calls: 0,
+        last_clone: (FfiEntity::NULL, FfiEntity::NULL),
+        insert_res_calls: 0,
+        last_insert_val: 0,
+        remove_res_calls: 0,
+        last_removed: BamComponent::INVALID,
+    };
+
+    let res_comp = BamComponent::from_raw(10);
+    let e1 = FfiEntity::from_bits(1);
+    let e2 = FfiEntity::from_bits(2);
+
+    {
+        let state_ptr = &raw mut state;
+        // SAFETY: `api` and `state` stay pinned for `host` and `cmds`.
+        let host =
+            unsafe { Host::from_raw(&raw const api, state_ptr.cast_const().cast()) }.unwrap();
+        let typed = bamabi_guest_sys::TypedComponent::<u64>::validate(&host, res_comp).unwrap();
+        // SAFETY: `state` acts as `BamCommands`.
+        let mut cmds = unsafe { ValidatedCommands::from_raw(state_ptr.cast(), &host) };
+
+        // clone_entity validation & happy path
+        assert_eq!(
+            cmds.clone_entity(FfiEntity::NULL, e2),
+            FfiResult::INVALID_ENTITY
+        );
+        assert_eq!(
+            cmds.clone_entity(e1, FfiEntity::NULL),
+            FfiResult::INVALID_ENTITY
+        );
+        assert_eq!(cmds.clone_entity(e1, e2), FfiResult::OK);
+
+        // insert_resource validates layout (u32 fails TYPE_MISMATCH, u64 succeeds)
+        assert_eq!(
+            cmds.insert_resource::<u32>(res_comp, &42u32),
+            FfiResult::TYPE_MISMATCH
+        );
+        assert_eq!(
+            cmds.insert_resource::<u64>(BamComponent::INVALID, &99u64),
+            FfiResult::INVALID_COMPONENT
+        );
+        assert_eq!(
+            cmds.insert_resource::<u64>(res_comp, &0x1234_5678u64),
+            FfiResult::OK
+        );
+
+        // insert_resource_typed skips component_layout_info
+        assert_eq!(
+            cmds.insert_resource_typed(typed, &0xDEAD_BEEFu64),
+            FfiResult::OK
+        );
+
+        // remove_resource
+        assert_eq!(
+            cmds.remove_resource(BamComponent::INVALID),
+            FfiResult::INVALID_COMPONENT
+        );
+        assert_eq!(cmds.remove_resource(res_comp), FfiResult::OK);
+    }
+
+    // 1 call in TypedComponent::validate + 1 for u32 mismatch + 1 for u64 insert_resource = 3
+    // (insert_resource_typed skipped component_layout_info!).
+    assert_eq!(state.layout_calls.get(), 3);
+    assert_eq!(state.clone_calls, 1);
+    assert_eq!(state.last_clone, (e1, e2));
+    assert_eq!(state.insert_res_calls, 2);
+    assert_eq!(state.last_insert_val, 0xDEAD_BEEFu64);
+    assert_eq!(state.remove_res_calls, 1);
+    assert_eq!(state.last_removed, res_comp);
+
+    // Older MIN_V0_3_SIZE host (slots 70..72 uncovered) returns UNSUPPORTED.
+    let mut v03_api = api;
+    v03_api.struct_size = bamabi_sys::BamHostApi::MIN_V0_3_SIZE as u32;
+    let state_ptr = &raw mut state;
+    // SAFETY: Stack pointers stay valid across test.
+    let v03_host =
+        unsafe { Host::from_raw(&raw const v03_api, state_ptr.cast_const().cast()) }.unwrap();
+    // SAFETY: `state` acts as `BamCommands`.
+    let mut v03_cmds = unsafe { ValidatedCommands::from_raw(state_ptr.cast(), &v03_host) };
+    assert_eq!(v03_cmds.clone_entity(e1, e2), FfiResult::UNSUPPORTED);
+    assert_eq!(
+        v03_cmds.insert_resource(res_comp, &1u64),
+        FfiResult::UNSUPPORTED
+    );
+    assert_eq!(v03_cmds.remove_resource(res_comp), FfiResult::UNSUPPORTED);
+}
+
+#[test]
+fn run_if_ctx_trampoline_and_registration_config_forward_to_system_desc() {
+    use core::sync::atomic::{AtomicBool, Ordering};
+
+    struct MockRegState {
+        saw_run_if_ctx: bool,
+        saw_query_terms: usize,
+        captured_fn: Option<bamabi_sys::BamSystemFn>,
+        captured_user_data: *mut c_void,
+    }
+
+    unsafe extern "C" fn mock_register_system(
+        load_ctx: *mut bamabi_sys::BamLoadCtx,
+        desc: *const bamabi_sys::BamSystemDesc,
+    ) -> FfiResult {
+        // SAFETY: `load_ctx` points to `MockRegState`.
+        let st = unsafe { &mut *load_ctx.cast::<MockRegState>() };
+        // SAFETY: `desc` points to a valid `BamSystemDesc`.
+        let desc_ref = unsafe { &*desc };
+        st.saw_run_if_ctx = desc_ref.run_if_ctx.is_some();
+        st.captured_fn = desc_ref.run_if_ctx;
+        st.captured_user_data = desc_ref.run_if_ctx_user_data;
+        if !desc_ref.run_if_query.is_null() {
+            // SAFETY: `run_if_query` points to a valid `BamQueryDesc`.
+            st.saw_query_terms = unsafe { (*desc_ref.run_if_query).term_count };
+        }
+        FfiResult::OK
+    }
+
+    let mut api = make_mock_api();
+    api.register_system = Some(mock_register_system);
+
+    let mut reg_state = MockRegState {
+        saw_run_if_ctx: false,
+        saw_query_terms: 0,
+        captured_fn: None,
+        captured_user_data: core::ptr::null_mut(),
+    };
+
+    let manifest = bamabi_sys::BamManifest::new(c"run_if_ctx_mod".as_ptr(), c"0.1.0".as_ptr());
+    let mut raw_inst: *mut bamabi_sys::BamInstance = core::ptr::null_mut();
+    let allow_run = std::sync::Arc::new(AtomicBool::new(true));
+    let allow_run_clone = std::sync::Arc::clone(&allow_run);
+
+    // SAFETY: Stack pointers stay live across `init_guest_instance` and `shutdown_guest_instance`.
+    let status = unsafe {
+        bamabi_guest_sys::init_guest_instance(
+            &raw const api,
+            (&raw mut reg_state).cast::<bamabi_sys::BamLoadCtx>(),
+            &raw mut raw_inst,
+            &manifest,
+            move |inst, load| {
+                let run_if_terms = [bamabi_sys::BamTermDesc::new(
+                    BamComponent::from_raw(5),
+                    AccessMode::RESOURCE_READ,
+                )];
+                let query_ptr =
+                    match bamabi_guest_sys::allocate_run_if_ctx_query(inst, &run_if_terms) {
+                        Ok(ptr) => ptr,
+                        Err(err) => return err,
+                    };
+                let (run_if_fn, run_if_ud) =
+                    bamabi_guest_sys::allocate_run_if_ctx_trampoline(inst, 1, move |inv| {
+                        assert_eq!(inv.query_count(), 1);
+                        allow_run_clone.load(Ordering::Relaxed)
+                    });
+                let cfg = bamabi_guest_sys::SystemRegistrationConfig {
+                    name: c"gated_sys",
+                    run_if_ctx: Some(run_if_fn),
+                    run_if_query: query_ptr,
+                    run_if_ctx_user_data: run_if_ud,
+                    ..Default::default()
+                };
+                load.register_system(inst, &cfg, None, |_| FfiResult::OK)
+            },
+        )
+    };
+    assert_eq!(status, FfiResult::OK);
+    assert!(reg_state.saw_run_if_ctx);
+    assert_eq!(reg_state.saw_query_terms, 1);
+
+    let run_if_fn = reg_state.captured_fn.unwrap();
+    let mut dummy_sys_ctx = 1u8;
+    // Predicate returns true -> FfiResult::OK (run).
+    // SAFETY: `raw_inst` is still alive and `dummy_sys_ctx` is non-null.
+    let rc_true = unsafe {
+        run_if_fn(
+            (&raw mut dummy_sys_ctx).cast::<bamabi_sys::BamSystemCtx>(),
+            reg_state.captured_user_data,
+        )
+    };
+    assert_eq!(rc_true, FfiResult::OK);
+
+    // Predicate returns false -> non-zero (skip).
+    allow_run.store(false, Ordering::Relaxed);
+    // SAFETY: `raw_inst` is still alive and `dummy_sys_ctx` is non-null.
+    let rc_false = unsafe {
+        run_if_fn(
+            (&raw mut dummy_sys_ctx).cast::<bamabi_sys::BamSystemCtx>(),
+            reg_state.captured_user_data,
+        )
+    };
+    assert!(!rc_false.is_ok());
+
+    // SAFETY: `raw_inst` was returned by `init_guest_instance`.
+    unsafe { bamabi_guest_sys::shutdown_guest_instance(raw_inst) };
+}

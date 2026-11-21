@@ -162,20 +162,16 @@
 //!
 //! | Field Type | Generated VTable Slots | `RawInsertable`? | `AbiPod`? | Compile-Time Guard |
 //! |---|---|---|---|---|
-//! | `u8..u64`, `i8..i64`, `f32`, `f64`, `FfiBool`, `FfiEntity`, `TargetEntity`, `BamComponent`, `BamSystem`, `BamSystemSet`, `BamSymbol`, `FfiAssetLoadState`, `BamEventKind`, `BamFieldKind`, `ComponentUuid` | `get_<f>`, `set_<f>` | Yes | Yes | `assert_abi_pod::<T>()` + `Default` |
+//! | `u8..u64`, `i8..i64`, `f32`, `f64`, `FfiBool`, `FfiEntity`, `TargetEntity`, `BamComponent`, `BamSystem`, `BamSystemSet`, `BamSymbol`, `FfiAssetLoadState`, `BamEventKind`, `BamFieldKind`, `FfiChildOf`, `FfiAssetHandle`, `BamChangeTicks`, `ComponentUuid` | `get_<f>`, `set_<f>` | Yes | Yes | `assert_abi_pod::<T>()` + `Default` |
 //! | `usize`, `isize` | `get_<f>`, `set_<f>` | Yes | **No** | `assert_raw_insertable::<T>()` + `Copy + Default` |
 //! | `u128`, `i128` | `ptr_<f>`, `ptr_mut_<f>` | Yes | **No** | `assert_raw_insertable::<T>()` |
 //! | `bool` | `get_<f>` (`-> FfiBool`), `set_<f>` (`FfiBool -> FfiResult`) | **No** | **No** | `__BamPrimBool` |
 //! | `FfiOption<T>` (`T: AbiPod`) | `get_<f>`, `set_<f>`, `clear_<f>` | Yes | Yes | `__BamFfiOption<T>` + `assert_abi_pod::<T>()` |
 //! | `String` | `get_<f>` (`-> StrView`), `set_<f>` (`StrView -> FfiResult`) | **No** | **No** | `__BamStdString` |
 //! | `Vec<T>` (`T: AbiPod`) | `get`, `set`, `len`, `clear`, `push`, `pop`, `remove`, `swap_remove`, `truncate`, `reserve`, `as_mut_slice` (11 slots) | **No** | **No** | `__BamStdVec<T>` + `assert_abi_pod::<T>()` |
-//! | Nested structs & `[T; N]` arrays (incl. `FfiChildOf`, `FfiAssetHandle`, `BamChangeTicks`) | `ptr_<f>` (`-> *const c_void`), `ptr_mut_<f>` (`-> *mut c_void`) | Yes (unless `opaque`) | If `#[repr(C)]` + candidate | `assert_raw_insertable::<T>()` (or `ModComponent` if `opaque`) + `assert_abi_pod::<T>()` when POD |
+//! | Nested structs & `[T; N]` arrays | `ptr_<f>` (`-> *const c_void`), `ptr_mut_<f>` (`-> *mut c_void`) | Yes (unless `opaque`) | If `#[repr(C)]` + candidate | `assert_raw_insertable::<T>()` (or `ModComponent` if `opaque`) + `assert_abi_pod::<T>()` when POD |
 //! | C-ABI enums (`#[repr(u8..i64)]` / `#[repr(C)]` fieldless, `#[repr(C, u8..i64)]` data-carrying) | `tag`, `set_<variant>`, `try_get_<variant>_<field>` | **No** | **No** | Discriminant range & `size_of` / discriminant checks |
 //! | `Box`, `Rc`, `Arc`, `Option`, `Result`, `HashMap`, `BTreeMap`, `HashSet`, `BTreeSet`, `Cow`, `VecDeque`, `&T`, `*const T`, `[T]` | *Compile error unless `#[mod_field(skip)]`* | **No** | **No** | Rejected in `classify_type` |
-//!
-//! > **Note on `FfiChildOf`, `FfiAssetHandle`, `BamChangeTicks`:** `c_decl.rs` maps these to their
-//! > C99/Zig typedefs (`BamChildOf`, `BamAssetHandle`, `BamChangeTicks`); in `classify.rs` they
-//! > default to `Nested` (`ptr`/`ptr_mut`) unless annotated with `#[mod_field(primitive)]`.
 //!
 //! ### `#[mod_component(...)]` Container Attributes
 //!
@@ -322,8 +318,9 @@ use syn::{DeriveInput, parse_macro_input};
 /// # Expansion & Compile-Time Checks
 ///
 /// Enforces at compile time that:
-/// 1. The target is a non-generic struct annotated with `#[repr(C)]` or `#[repr(transparent)]`
-///    (and not `packed`).
+/// 1. The target is a struct annotated with `#[repr(C)]` or `#[repr(transparent)]` (and not
+///    `packed`), with no type or lifetime generic parameters (`const` generic parameters such as
+///    `const N: usize` are supported).
 /// 2. Every field implements `AbiPod` via `assert_abi_pod::<FieldTy>()` (`u128`, `i128`, `usize`,
 ///    `isize`, `bool`, `char`, `String`, `Vec<T>`, enums, and `#[repr(Rust)]` structs are rejected).
 /// 3. The struct implements `Copy + 'static`, has no drop glue (`!core::mem::needs_drop::<Self>()`),

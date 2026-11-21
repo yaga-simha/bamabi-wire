@@ -1406,6 +1406,67 @@ impl<'a> ValidatedIter<'a> {
         unsafe { core::slice::from_raw_parts(ptr, self.current_len) }
     }
 
+    /// Retrieves per-row `added` and `changed` tick slices (`[u32; current_len]`) alongside the
+    /// enclosing system's `(last_run, this_run)` tick window for dense column `term_index` in the
+    /// active chunk via `BamHostApi::iter_column_ticks` (slot 69).
+    ///
+    /// Returns [`FfiResult::UNSUPPORTED`] when the host does not cover or populate slot 69,
+    /// [`FfiResult::NULL_POINTER`] when `self` is null or the host returns null pointers for a
+    /// non-empty chunk, [`FfiResult::TYPE_MISMATCH`] when returned pointers are misaligned for
+    /// `u32`, or [`FfiResult::OUT_OF_RANGE`] if `current_len * size_of::<u32>() > isize::MAX`.
+    #[inline]
+    pub fn column_ticks(&self, term_index: usize) -> Result<(&[u32], &[u32], u32, u32), FfiResult> {
+        if self.raw.is_null() {
+            return Err(FfiResult::NULL_POINTER);
+        }
+        let ticks_fn =
+            host_slot!(self.host.api(), iter_column_ticks).ok_or(FfiResult::UNSUPPORTED)?;
+        let mut added_ptr: *const u32 = core::ptr::null();
+        let mut changed_ptr: *const u32 = core::ptr::null();
+        let mut last_run: u32 = 0;
+        let mut this_run: u32 = 0;
+        // SAFETY: `self.raw` is a valid active `BamIter` for `'a` and all four out-pointers point
+        // to aligned writable stack storage.
+        let status = unsafe {
+            ticks_fn(
+                self.raw.cast_const(),
+                term_index,
+                &mut added_ptr,
+                &mut changed_ptr,
+                &mut last_run,
+                &mut this_run,
+            )
+        };
+        if !status.is_ok() {
+            return Err(status);
+        }
+        if self.current_len == 0 {
+            return Ok((&[], &[], last_run, this_run));
+        }
+        if added_ptr.is_null() || changed_ptr.is_null() {
+            return Err(FfiResult::NULL_POINTER);
+        }
+        if !(added_ptr as usize).is_multiple_of(core::mem::align_of::<u32>())
+            || !(changed_ptr as usize).is_multiple_of(core::mem::align_of::<u32>())
+        {
+            return Err(FfiResult::TYPE_MISMATCH);
+        }
+        let byte_len = self
+            .current_len
+            .checked_mul(core::mem::size_of::<u32>())
+            .ok_or(FfiResult::OUT_OF_RANGE)?;
+        if byte_len > isize::MAX as usize {
+            return Err(FfiResult::OUT_OF_RANGE);
+        }
+        // SAFETY: Host reported `OK`, both pointers are non-null and aligned for `u32`,
+        // `byte_len <= isize::MAX`, and the tick arrays remain valid for shared reads until the
+        // next chunk advance or reset on `self`.
+        let added = unsafe { core::slice::from_raw_parts(added_ptr, self.current_len) };
+        // SAFETY: Same invariants as `added` above.
+        let changed = unsafe { core::slice::from_raw_parts(changed_ptr, self.current_len) };
+        Ok((added, changed, last_run, this_run))
+    }
+
     /// Raw read-only byte pointer for dense column `term_index` in the active chunk (or null).
     #[inline]
     pub fn column_readonly_ptr(&self, term_index: usize) -> *const u8 {
@@ -3426,6 +3487,93 @@ impl<'chunk, 'ctx> ChunkColumnDispenser<'chunk, 'ctx> {
     #[inline]
     pub const fn is_empty(&self) -> bool {
         self.len() == 0
+    }
+
+    /// Returns the next term index that will be consumed by the next `next_*` dispenser method.
+    #[inline]
+    pub const fn next_term_index(&self) -> usize {
+        self.next_term_index
+    }
+
+    /// Retrieves per-row `added` and `changed` tick slices (`&'chunk [u32]`) alongside the
+    /// enclosing system's `(last_run, this_run)` tick window for dense column `term_index` in the
+    /// active chunk via `BamHostApi::iter_column_ticks` (slot 69).
+    ///
+    /// Rejects hostile tick pointers that overlap any previously dispensed mutable column borrow
+    /// with [`FfiResult::ACCESS_CONFLICT`].
+    #[inline]
+    pub fn column_ticks(
+        &self,
+        term_index: usize,
+    ) -> Result<(&'chunk [u32], &'chunk [u32], u32, u32), FfiResult> {
+        if self.iter.raw.is_null() {
+            return Err(FfiResult::NULL_POINTER);
+        }
+        let ticks_fn =
+            host_slot!(self.iter.host.api(), iter_column_ticks).ok_or(FfiResult::UNSUPPORTED)?;
+        let mut added_ptr: *const u32 = core::ptr::null();
+        let mut changed_ptr: *const u32 = core::ptr::null();
+        let mut last_run: u32 = 0;
+        let mut this_run: u32 = 0;
+        // SAFETY: `self.iter.raw` is a valid active `BamIter` for `'chunk` and all four
+        // out-pointers point to aligned writable stack storage.
+        let status = unsafe {
+            ticks_fn(
+                self.iter.raw.cast_const(),
+                term_index,
+                &mut added_ptr,
+                &mut changed_ptr,
+                &mut last_run,
+                &mut this_run,
+            )
+        };
+        if !status.is_ok() {
+            return Err(status);
+        }
+        let len = self.iter.current_len();
+        if len == 0 {
+            return Ok((&[], &[], last_run, this_run));
+        }
+        if added_ptr.is_null() || changed_ptr.is_null() {
+            return Err(FfiResult::NULL_POINTER);
+        }
+        if !(added_ptr as usize).is_multiple_of(core::mem::align_of::<u32>())
+            || !(changed_ptr as usize).is_multiple_of(core::mem::align_of::<u32>())
+        {
+            return Err(FfiResult::TYPE_MISMATCH);
+        }
+        let byte_len = len
+            .checked_mul(core::mem::size_of::<u32>())
+            .ok_or(FfiResult::OUT_OF_RANGE)?;
+        if byte_len > isize::MAX as usize {
+            return Err(FfiResult::OUT_OF_RANGE);
+        }
+        let added_start = added_ptr.addr();
+        let added_end = added_start
+            .checked_add(byte_len)
+            .ok_or(FfiResult::OUT_OF_RANGE)?;
+        let changed_start = changed_ptr.addr();
+        let changed_end = changed_start
+            .checked_add(byte_len)
+            .ok_or(FfiResult::OUT_OF_RANGE)?;
+        for idx in 0..self.borrowed_count {
+            // SAFETY: Entries `0..self.borrowed_count` are initialized by `check_and_record_borrow`.
+            let prev = unsafe { self.borrowed[idx].assume_init_ref() };
+            if prev.is_mut
+                && prev.end > prev.start
+                && ((added_start < prev.end && prev.start < added_end)
+                    || (changed_start < prev.end && prev.start < changed_end))
+            {
+                return Err(FfiResult::ACCESS_CONFLICT);
+            }
+        }
+        // SAFETY: Host reported `OK`, both tick pointers are non-null, aligned for `u32`,
+        // `byte_len <= isize::MAX`, disjoint from active mutable column borrows, and valid for
+        // shared reads throughout `'chunk`.
+        let added = unsafe { core::slice::from_raw_parts(added_ptr, len) };
+        // SAFETY: Same invariants as `added` above.
+        let changed = unsafe { core::slice::from_raw_parts(changed_ptr, len) };
+        Ok((added, changed, last_run, this_run))
     }
 
     #[cfg(kani)]
