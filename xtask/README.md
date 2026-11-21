@@ -27,6 +27,14 @@ Optional toolchains for extended subcommands (`audit`, `miri`, `kani`, `nightly`
 
 See [`../DEVELOPMENT.md`](../DEVELOPMENT.md) for full toolchain setup instructions.
 
+## Building
+
+```bash
+cargo build -p xtask
+```
+
+`cargo xtask ...` automatically compiles and runs the `xtask` binary on demand via the `.cargo/config.toml` alias.
+
 ## Usage
 
 ```bash
@@ -53,6 +61,21 @@ cargo xtask miri                      # Tree Borrows + Stacked Borrows (or --s39
 cargo xtask kani                      # Kani proofs for bamabi_sys & bamabi_guest_sys
 cargo xtask nightly                   # Big-endian s390x Miri + -Zrandomize-layout extended proptests
 ```
+
+## Testing
+
+```bash
+cargo fmt -p xtask -- --check
+cargo clippy -p xtask --all-targets -- -D warnings
+RUSTDOCFLAGS="-D warnings" cargo doc -p xtask --no-deps
+cargo test -p xtask
+```
+
+`cargo test -p xtask` runs all 6 unit tests covering CLI argument parsing, flag conflict rejection, and `include/generated/testbed_components.h` byte-for-byte parity with `ModComponent::C_DECL` (see [`TESTS.md`](TESTS.md)).
+
+## Benchmarking
+
+As part of Layer 0 (`bamabi-wire`), neither `xtask` nor any `bamabi-wire` crate contains Criterion `[[bench]]` targets; runtime ECS and FFI benchmarks live downstream in `bamabi-showcase` (`docs/BENCHMARKS.md`). To profile `xtask` or workspace build timings locally, use `cargo check --timings`, or scale proptest case counts via `cargo xtask test --proptest --cases <N>` (see [`../TESTING.md`](../TESTING.md)).
 
 ## Documentation
 
