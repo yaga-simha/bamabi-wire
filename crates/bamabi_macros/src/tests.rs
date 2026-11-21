@@ -1,3 +1,9 @@
+//! Unit tests for `bamabi_macros` AST validation, token generation, and crate-path resolution.
+//!
+//! Covers `#[derive(AbiPod)]`, `#[derive(ModComponent)]`, and `#[derive(GuestComponent)]`
+//! expansion outputs and error diagnostics directly on `syn::DeriveInput` without spawning
+//! `rustc` subprocesses.
+
 use crate::abi_pod::expand_abi_pod;
 use crate::attrs::{resolve_guest_crate_with, resolve_sys_crate_with};
 use crate::codegen::{expand_mod_component, expand_mod_component_with_crate};

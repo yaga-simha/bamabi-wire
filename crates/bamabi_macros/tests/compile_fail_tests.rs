@@ -38,10 +38,10 @@
 //! - `mod_component_bool_not_raw_insertable.rs`: Verifies `ModComponent` containing `bool` does NOT impl `RawInsertable`.
 //! - `mod_component_enum_not_abi_pod.rs`: Verifies `ModComponent` enum does NOT impl `AbiPod`.
 //! - `mod_component_ffi_option_bool_rejected.rs`: Rejects `FfiOption<bool>` (inner type must be `AbiPod`).
-//! - `mod_component_guest_non_pod.rs`: Rejects non-POD field in a `ModComponent` marked for direct POD access.
-//! - `mod_component_implicit_padding.rs`: Rejects implicit padding in a POD `ModComponent`.
-//! - `mod_component_invalid_uuid_rejected.rs`: Rejects malformed `#[bam(uuid = "...")]` hex literal.
-//! - `mod_component_no_pod_suppresses_abi_pod.rs`: Verifies `#[bam(no_pod)]` suppresses `AbiPod` impl.
+//! - `mod_component_guest_non_pod.rs`: Rejects `#[mod_component(guest)]` on a struct with non-POD `String` (`GuestComponent: AbiPod`).
+//! - `mod_component_implicit_padding.rs`: Rejects implicit padding in a `#[repr(C)]` POD `ModComponent`.
+//! - `mod_component_invalid_uuid_rejected.rs`: Rejects malformed `#[mod_component(uuid = "...")]` hex literal.
+//! - `mod_component_no_pod_suppresses_abi_pod.rs`: Verifies `#[mod_component(no_pod)]` suppresses `AbiPod` impl.
 //! - `mod_component_non_opaque_nested_string_rejected.rs`: Rejects non-opaque nested `String` without `ModComponent` VTable.
 //! - `mod_component_spoofed_string_rejected.rs`: Rejects user-defined `struct String` attempting to spoof `std::string::String`.
 //! - `mod_component_spoofed_vec_rejected.rs`: Rejects user-defined `struct Vec<T>` attempting to spoof `std::vec::Vec<T>`.

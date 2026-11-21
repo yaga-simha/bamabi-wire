@@ -86,6 +86,7 @@ impl<const N: usize> Write for StackFmtBuf<N> {
 
 // --- Dummy callbacks for populating `BamHostApi` and descriptors ---
 
+/// No-op `get_proc_address` test stub returning null.
 unsafe extern "C" fn stub_get_proc_address(
     _ctx: *const BamHostCtx,
     _name: *const c_char,
@@ -93,6 +94,7 @@ unsafe extern "C" fn stub_get_proc_address(
     core::ptr::null()
 }
 
+/// No-op `last_error` test stub returning `0` bytes.
 unsafe extern "C" fn stub_last_error(
     _ctx: *const BamHostCtx,
     _buf: *mut c_char,
@@ -101,10 +103,12 @@ unsafe extern "C" fn stub_last_error(
     0
 }
 
+/// No-op `load_host_ctx` test stub returning null.
 unsafe extern "C" fn stub_load_host_ctx(_load_ctx: *const BamLoadCtx) -> *const BamHostCtx {
     core::ptr::null()
 }
 
+/// No-op `register_component` test stub writing handle `1`.
 unsafe extern "C" fn stub_register_component(
     _load_ctx: *mut BamLoadCtx,
     _desc: *const ComponentDesc,
@@ -120,6 +124,7 @@ unsafe extern "C" fn stub_register_component(
     FfiResult::OK
 }
 
+/// No-op `resolve_component` test stub writing handle `1`.
 unsafe extern "C" fn stub_resolve_component(
     _ctx: *const BamHostCtx,
     _name: *const c_char,
@@ -136,6 +141,7 @@ unsafe extern "C" fn stub_resolve_component(
     FfiResult::OK
 }
 
+/// No-op `register_system` test stub returning `FfiResult::OK`.
 unsafe extern "C" fn stub_register_system(
     _load_ctx: *mut BamLoadCtx,
     _desc: *const BamSystemDesc,
@@ -143,10 +149,12 @@ unsafe extern "C" fn stub_register_system(
     FfiResult::OK
 }
 
+/// No-op `sys_host_ctx` test stub returning null.
 unsafe extern "C" fn stub_sys_host_ctx(_sys_ctx: *const BamSystemCtx) -> *const BamHostCtx {
     core::ptr::null()
 }
 
+/// No-op `sys_query` test stub returning `FfiResult::OK`.
 unsafe extern "C" fn stub_sys_query(
     _sys_ctx: *mut BamSystemCtx,
     _query_index: usize,
@@ -155,6 +163,7 @@ unsafe extern "C" fn stub_sys_query(
     FfiResult::OK
 }
 
+/// No-op `sys_commands` test stub returning `FfiResult::OK`.
 unsafe extern "C" fn stub_sys_commands(
     _sys_ctx: *mut BamSystemCtx,
     _out_commands: *mut *mut BamCommands,
@@ -162,18 +171,22 @@ unsafe extern "C" fn stub_sys_commands(
     FfiResult::OK
 }
 
+/// No-op `iter_next_chunk` test stub returning `FfiBool::FALSE`.
 unsafe extern "C" fn stub_iter_next_chunk(_iter: *mut BamIter, _out_len: *mut usize) -> FfiBool {
     FfiBool::FALSE
 }
 
+/// No-op `iter_reset` test stub returning `FfiResult::OK`.
 unsafe extern "C" fn stub_iter_reset(_iter: *mut BamIter) -> FfiResult {
     FfiResult::OK
 }
 
+/// No-op `iter_entities` test stub returning null.
 unsafe extern "C" fn stub_iter_entities(_iter: *const BamIter) -> *const FfiEntity {
     core::ptr::null()
 }
 
+/// No-op `iter_column_readonly` test stub returning null.
 unsafe extern "C" fn stub_iter_column_readonly(
     _iter: *const BamIter,
     _term_index: usize,
@@ -181,10 +194,12 @@ unsafe extern "C" fn stub_iter_column_readonly(
     core::ptr::null()
 }
 
+/// No-op `iter_column_mutable` test stub returning null.
 unsafe extern "C" fn stub_iter_column_mutable(_iter: *mut BamIter, _term_index: usize) -> *mut u8 {
     core::ptr::null_mut()
 }
 
+/// No-op `iter_column_mutable_untracked` test stub returning null.
 unsafe extern "C" fn stub_iter_column_mutable_untracked(
     _iter: *mut BamIter,
     _term_index: usize,
@@ -192,6 +207,7 @@ unsafe extern "C" fn stub_iter_column_mutable_untracked(
     core::ptr::null_mut()
 }
 
+/// No-op `iter_mark_changed_range` test stub returning `FfiResult::OK`.
 unsafe extern "C" fn stub_iter_mark_changed_range(
     _iter: *mut BamIter,
     _term_index: usize,
@@ -201,6 +217,7 @@ unsafe extern "C" fn stub_iter_mark_changed_range(
     FfiResult::OK
 }
 
+/// No-op `iter_column_rows_readonly` test stub returning null.
 unsafe extern "C" fn stub_iter_column_rows_readonly(
     _iter: *mut BamIter,
     _term_index: usize,
@@ -208,6 +225,7 @@ unsafe extern "C" fn stub_iter_column_rows_readonly(
     core::ptr::null()
 }
 
+/// No-op `iter_column_rows_mutable` test stub returning null.
 unsafe extern "C" fn stub_iter_column_rows_mutable(
     _iter: *mut BamIter,
     _term_index: usize,
@@ -215,6 +233,7 @@ unsafe extern "C" fn stub_iter_column_rows_mutable(
     core::ptr::null()
 }
 
+/// No-op `iter_column_info` test stub returning `FfiResult::OK`.
 unsafe extern "C" fn stub_iter_column_info(
     _iter: *const BamIter,
     _term_index: usize,
@@ -223,14 +242,17 @@ unsafe extern "C" fn stub_iter_column_info(
     FfiResult::OK
 }
 
+/// No-op `res_ptr` test stub returning null.
 unsafe extern "C" fn stub_res_ptr(_iter: *const BamIter, _term_index: usize) -> *const u8 {
     core::ptr::null()
 }
 
+/// No-op `res_mut_ptr` test stub returning null.
 unsafe extern "C" fn stub_res_mut_ptr(_iter: *mut BamIter, _term_index: usize) -> *mut u8 {
     core::ptr::null_mut()
 }
 
+/// No-op `cmd_spawn_empty` test stub returning `FfiResult::OK`.
 unsafe extern "C" fn stub_cmd_spawn_empty(
     _commands: *mut BamCommands,
     _out_entity: *mut FfiEntity,
@@ -238,6 +260,7 @@ unsafe extern "C" fn stub_cmd_spawn_empty(
     FfiResult::OK
 }
 
+/// No-op `cmd_spawn` test stub returning `FfiResult::OK`.
 unsafe extern "C" fn stub_cmd_spawn(
     _commands: *mut BamCommands,
     _components: *const BamComponent,
@@ -248,6 +271,7 @@ unsafe extern "C" fn stub_cmd_spawn(
     FfiResult::OK
 }
 
+/// No-op `cmd_despawn` test stub returning `FfiResult::OK`.
 unsafe extern "C" fn stub_cmd_despawn(
     _commands: *mut BamCommands,
     _entity: FfiEntity,
@@ -255,6 +279,7 @@ unsafe extern "C" fn stub_cmd_despawn(
     FfiResult::OK
 }
 
+/// No-op `cmd_insert` test stub returning `FfiResult::OK`.
 unsafe extern "C" fn stub_cmd_insert(
     _commands: *mut BamCommands,
     _entity: FfiEntity,
@@ -265,6 +290,7 @@ unsafe extern "C" fn stub_cmd_insert(
     FfiResult::OK
 }
 
+/// No-op `cmd_insert_default` test stub returning `FfiResult::OK`.
 unsafe extern "C" fn stub_cmd_insert_default(
     _commands: *mut BamCommands,
     _entity: FfiEntity,
@@ -273,6 +299,7 @@ unsafe extern "C" fn stub_cmd_insert_default(
     FfiResult::OK
 }
 
+/// No-op `cmd_remove` test stub returning `FfiResult::OK`.
 unsafe extern "C" fn stub_cmd_remove(
     _commands: *mut BamCommands,
     _entity: FfiEntity,
@@ -281,6 +308,7 @@ unsafe extern "C" fn stub_cmd_remove(
     FfiResult::OK
 }
 
+/// No-op `BamSystemFn` test callback returning `FfiResult::OK`.
 unsafe extern "C" fn stub_system_cb(
     _sys_ctx: *mut BamSystemCtx,
     _user_data: *mut c_void,
@@ -288,10 +316,12 @@ unsafe extern "C" fn stub_system_cb(
     FfiResult::OK
 }
 
+/// No-op `BamRunIfFn` test predicate returning `FfiBool::TRUE`.
 unsafe extern "C" fn stub_run_if(_user_data: *mut c_void) -> FfiBool {
     FfiBool::TRUE
 }
 
+/// No-op `ComponentDropFn` test destructor.
 unsafe extern "C" fn stub_drop(_ptr: *mut c_void) {}
 
 /// Builds a `BamHostApi` with all 27 mandatory core ABI `0.2` slots populated with no-op stubs

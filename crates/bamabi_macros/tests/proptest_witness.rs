@@ -42,6 +42,7 @@ unsafe extern "C" fn collect_sink(
     FfiResult::OK
 }
 
+/// Resolves `"bam.v0.<Name>.export_fields"` from `T::symbols()` and casts it to `ExportFieldsFn`.
 fn resolve_export_fn<T: ModComponent>() -> ExportFieldsFn {
     let sym = format!("bam.v0.{}.export_fields", T::CANONICAL_NAME);
     let ptr = T::resolve_symbol(&sym).expect("export_fields witness symbol");
@@ -49,6 +50,7 @@ fn resolve_export_fn<T: ModComponent>() -> ExportFieldsFn {
     unsafe { core::mem::transmute::<*const c_void, ExportFieldsFn>(ptr) }
 }
 
+/// Resolves `"bam.v0.<Name>.import_field"` from `T::symbols()` and casts it to `ImportFieldFn`.
 fn resolve_import_fn<T: ModComponent>() -> ImportFieldFn {
     let sym = format!("bam.v0.{}.import_field", T::CANONICAL_NAME);
     let ptr = T::resolve_symbol(&sym).expect("import_field witness symbol");
@@ -56,6 +58,7 @@ fn resolve_import_fn<T: ModComponent>() -> ImportFieldFn {
     unsafe { core::mem::transmute::<*const c_void, ImportFieldFn>(ptr) }
 }
 
+/// Exports all fields of `val` into an owned `(field_name, type_tag, payload_bytes)` vector.
 fn export_all<T: ModComponent>(val: &T) -> Vec<(String, String, Vec<u8>)> {
     let export_fn = resolve_export_fn::<T>();
     let mut captured: Vec<(String, String, Vec<u8>)> = Vec::new();
@@ -71,6 +74,7 @@ fn export_all<T: ModComponent>(val: &T) -> Vec<(String, String, Vec<u8>)> {
     captured
 }
 
+/// Imports every `(field_name, type_tag, payload_bytes)` entry into `dst`, asserting `FfiResult::OK`.
 fn import_all<T: ModComponent>(dst: &mut T, fields: &[(String, String, Vec<u8>)]) {
     let import_fn = resolve_import_fn::<T>();
     for (name, tag, bytes) in fields {
@@ -217,6 +221,9 @@ fn proptest_config() -> ProptestConfig {
 proptest! {
     #![proptest_config(proptest_config())]
 
+    /// Test scenario: verifies `export_fields` -> `import_field` preserves arbitrary `bool`,
+    /// `String`, `Vec<u8>`, `Vec<u32>`, `FfiOption<u32>`, nested `FfiOption<FfiOption<u8>>`, and
+    /// nested `ModComponent` (`leaf.code`, `leaf.nested_opt`) values over dirty destinations.
     #[test]
     fn mod_component_struct_witness_roundtrip(
         src in witness_record_strategy(),
@@ -231,6 +238,8 @@ proptest! {
         prop_assert_eq!(dst, src);
     }
 
+    /// Test scenario: verifies tagged enum witness round-trips (`__variant` switching plus
+    /// named-variant, tuple-variant, and nested `ModComponent` payload restoration).
     #[test]
     fn mod_component_enum_witness_roundtrip(
         src in witness_enum_strategy(),
@@ -244,6 +253,9 @@ proptest! {
         prop_assert_eq!(dst, src);
     }
 
+    /// Test scenario: verifies cross-schema migration (`SchemaV1` -> `SchemaV2`) handles
+    /// reordered fields, dropped fields (`FfiResult::NOT_FOUND`), added fields left intact, and
+    /// lossless numeric widening (`i16 -> i64`, `f32 -> f64`).
     #[test]
     fn mod_component_schema_migration_roundtrip(
         small_signed in any::<i16>(),

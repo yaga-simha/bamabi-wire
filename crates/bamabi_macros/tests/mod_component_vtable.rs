@@ -1,3 +1,11 @@
+//! Integration & Miri soundness suite for `#[derive(ModComponent)]` and `#[derive(AbiPod)]`.
+//!
+//! Exercises runtime VTable header validation, null/alignment receiver guards, `FfiBool`,
+//! `StrView`, 11-slot `HostVec`, `FfiOption<T>`, nested interior pointers, self-aliasing
+//! `String`/`Vec` mutations, byte-stride array iteration, fieldless & tagged enums,
+//! `SCHEMA_FINGERPRINT`, `BAM_FIELDS`, `REQUIRED_COMPONENTS` custom init callbacks,
+//! `C_DECL`/`ZIG_DECL`, and `field_info`/`export_fields`/`import_field` witness migrations.
+
 #![allow(
     clippy::undocumented_unsafe_blocks,
     clippy::ptr_as_ptr,
