@@ -6,8 +6,50 @@
 //! Safe (`#![forbid(unsafe_code)]`), **zero-Bevy-dependency** Rust SDK for authoring native
 //! `.cdylib` mods targeting `bamabi` (`ABI 0.3.0`, `v0.3.0`, Layer 0 of `bamabi-wire`).
 //!
-//! Follow the eight incremental steps below to go from mental model to a tested, hot-reloadable
-//! native mod.
+//! Follow the workspace map and eight incremental steps below to go from the full 6-crate
+//! architecture to a tested, hot-reloadable native mod.
+//!
+//! ---
+//!
+//! ## Workspace Map & How Everything Ties Together (`cargo docs --open`)
+//!
+//! `bamabi_guest` is the default landing crate when running `cargo doc --open` (or
+//! `cargo docs --open`) at the `bamabi-wire` workspace root. Inside `bamabi-wire` (Layer 0, zero
+//! `bevy_*` dependencies), **6 crates** form a strictly acyclic DAG that separates raw C-ABI
+//! contracts from `#![forbid(unsafe_code)]` Rust code:
+//!
+//! ```text
+//!   bamabi_sys (#![no_std], 0 deps: ABI 0.3.0 C-ABI types, 68-slot BamHostApi, ComponentUuid, offsets)
+//!     ├──► bamabi_macros (#![forbid(unsafe_code)]: #[derive(AbiPod, GuestComponent, ModComponent)], VTables)
+//!     ├──► bamabi_sdk_gen (#![forbid(unsafe_code)]: C99 bamabi.h, C++17 bamabi.hpp, Zig bamabi.zig, C_DECL)
+//!     ├──► bamabi_guest_sys (guest unsafe boundary: Host, GuestInstance, ReentrantCell, wire_types)
+//!     │       └──► bamabi_guest (#![forbid(unsafe_code)]: safe .cdylib SDK — you are here)
+//!     └──► xtask (#![forbid(unsafe_code)]: fmt, clippy, rustdoc, test, header parity, C99 ASan/UBSan, Miri, Kani)
+//! ```
+//!
+//! ### Workspace & Crate Guides
+//!
+//! - **Workspace-Wide Documentation ([`docs::workspace`]):**
+//!   - [`docs::workspace`] — End-to-end explanation of how all 6 crates connect across types,
+//!     `ComponentUuid`, `BamHostApi` offsets, VTables, panic containment, headers, and CI.
+//!   - [`docs::workspace::overview`] — Workspace overview, quickstart, and federated repo layout (`README.md`).
+//!   - [`docs::workspace::architecture`] — Layer 0 crate DAG, ABI `0.3.0` lifecycle, memory/panic
+//!     boundaries, and polyglot pipeline (`ARCHITECTURE.md`).
+//!   - [`docs::workspace::development`] — Toolchains, `.cdylib` mod builds, `cargo xtask`, and
+//!     `bamabi-dev-overlay` (`DEVELOPMENT.md`).
+//!   - [`docs::workspace::testing`] — Multi-tier verification pyramid, `trybuild`, `proptest`, Miri,
+//!     and Kani `PO-W1..PO-W8` / `PO-G1..PO-G9` (`TESTING.md`).
+//! - **This Crate (`bamabi_guest`):**
+//!   - [`docs::architecture`] — `bamabi_guest` wrapper architecture, sealed `QueryTuple`,
+//!     `GuestTransaction` RAII rollback, and bridge guide (`crates/bamabi_guest/ARCHITECTURE.md`).
+//!   - [`docs::tests`] — Unit, integration, Bevy `0.20` parity, stress, Miri, and doctest catalog
+//!     (`crates/bamabi_guest/TESTS.md`).
+//! - **Sibling Crates:**
+//!   [`bamabi_sys`](../bamabi_sys/index.html) ·
+//!   [`bamabi_macros`](../bamabi_macros/index.html) ·
+//!   [`bamabi_sdk_gen`](../bamabi_sdk_gen/index.html) ·
+//!   [`bamabi_guest_sys`](../bamabi_guest_sys/index.html) ·
+//!   [`xtask`](../xtask/index.html)
 //!
 //! ---
 //!
@@ -248,9 +290,10 @@
 //! | [`bridges`] | Unconditional Bevy `0.20` subsystem wrappers (`std_types`, `ui`, `state`, `asset`, `picking`, `camera_light`, `audio`, `bsn`, `reflect`, `render`, `window`, `gizmos`) |
 //! | [`raw`] | Re-exports [`bamabi_sys`] and `bamabi_guest_sys` raw escape hatches & `*RawExt` pointer traits |
 //!
-//! For deep architectural explanations, see `crates/bamabi_guest/ARCHITECTURE.md`. For a complete
-//! catalog of unit, integration, parity, stress, Miri, and compile-fail tests, see
-//! `crates/bamabi_guest/TESTS.md`.
+//! For deep architectural explanations, see [`docs::architecture`]
+//! (`crates/bamabi_guest/ARCHITECTURE.md`). For a complete catalog of unit, integration, parity,
+//! stress, Miri, and compile-fail tests, see [`docs::tests`] (`crates/bamabi_guest/TESTS.md`). For
+//! workspace-wide guides across all 6 crates, see [`docs::workspace`].
 //!
 //! ---
 //!
@@ -304,6 +347,118 @@ pub mod bridges;
 pub mod commands;
 pub mod commands_lifecycle;
 pub mod component;
+#[cfg(doc)]
+/// Workspace-wide and `bamabi_guest` architecture, development, and test guides.
+pub mod docs {
+    /// How the entire `bamabi-wire` workspace ties together across all 6 crates, plus embedded
+    /// workspace-root guides (`README.md`, `ARCHITECTURE.md`, `DEVELOPMENT.md`, `TESTING.md`).
+    pub mod workspace {
+        //! # How the `bamabi-wire` Workspace Ties Together
+        //!
+        //! `bamabi-wire` is **Layer 0** of the federated `bamabi` (`ABI 0.3.0`, `v0.3.0`) native
+        //! modding framework for Bevy ECS (`v0.20.1`). Every crate in this repository is strictly
+        //! **zero-Bevy** so hosts, CLI tools (`bamabi-tools`), query compilers (`bevy_bql`), and
+        //! Rust / C99 / C++17 / Zig `.cdylib` mods share one identical C-ABI binary contract.
+        //!
+        //! ## The 6-Crate Dependency Chain
+        //!
+        //! ```text
+        //! bamabi_sys ──► bamabi_macros ──► bamabi_sdk_gen ──► bamabi_guest_sys ──► bamabi_guest
+        //!     │                                                                         │
+        //!     └──────────────────────────► xtask ◄──────────────────────────────────────┘
+        //! ```
+        //!
+        //! 1. **[`bamabi_sys`](../../../bamabi_sys/index.html)** (`#![no_std]`, zero dependencies):
+        //!    Single source of truth for `ABI 0.3.0` (`0x0003_0000`). Defines `#[repr(C)]` and
+        //!    `#[repr(transparent)]` wire primitives (`FfiResult`, `FfiBool`, `FfiEntity`,
+        //!    `StrView`, `FfiSlice`, `FfiOption`), deterministic const SipHash-2-4-128
+        //!    `ComponentUuid`, prefix-extensible descriptors (`ExtensibleStruct`, `BamManifest`,
+        //!    `VTableHeader`, `BamQueryDesc`, `BamSystemDesc`, `BamObserverDesc`, `BamRelationDesc`,
+        //!    `BamScheduleSetDesc`), the frozen **68-slot** `BamHostApi` table plus byte-offset
+        //!    constants (`offsets::OFF64_*` / `OFF32_*`), and core contract traits (`AbiPod`,
+        //!    `ModComponent`, `RawInsertable`).
+        //! 2. **[`bamabi_macros`](../../../bamabi_macros/index.html)** (`#![forbid(unsafe_code)]`):
+        //!    Proc-macro compiler plugin reading `bamabi_sys` layout rules to generate
+        //!    `#[derive(AbiPod)]` (compile-time zero-padding and field checks),
+        //!    `#[derive(GuestComponent)]`, and `#[derive(ModComponent)]` (and `#[mod_component]`),
+        //!    emitting `ComponentUuid`, `SCHEMA_FINGERPRINT`, `BAM_FIELDS`, `REQUIRED_COMPONENTS`,
+        //!    hygienic `"bam.v0.*"` VTables, witness `export_fields`/`import_field` adapters, and
+        //!    polyglot `C_DECL` / `ZIG_DECL` constants.
+        //! 3. **[`bamabi_sdk_gen`](../../../bamabi_sdk_gen/index.html)** (`#![forbid(unsafe_code)]`):
+        //!    Consumes `bamabi_sys` constants and `offsets` to render the checked-in ISO C99
+        //!    header (`include/bamabi.h`), the full polyglot SDK bundle (`bamabi.h`, C++17
+        //!    `bamabi.hpp` with 68/68 slot views and RAII `ScopedTransaction`, and Zig `bamabi.zig`
+        //!    with `addTranslateC` views and lossless `BamError`), and `ModComponent::C_DECL`
+        //!    component headers (`include/generated/testbed_components.h`).
+        //! 4. **[`bamabi_guest_sys`](../../../bamabi_guest_sys/index.html)** (guest `unsafe`
+        //!    boundary): Wraps `*const BamHostApi` (`Host` + `host_slot!` bounds checking),
+        //!    per-World `GuestInstance` ownership with move-safe raw provenance and LIFO teardown,
+        //!    `catch_unwind` `extern "C"` panic barriers (`panic`), lock-free `ReentrantCell`,
+        //!    validated slices/iterators (`ChunkColumnDispenser`, `SparseRows`), checked
+        //!    `ValidatedCommands`, schema migrations, and unconditional Bevy `0.20` POD
+        //!    `wire_types`.
+        //! 5. **`bamabi_guest`** (`#![forbid(unsafe_code)]`, this crate): Builds the safe,
+        //!    idiomatic Rust `.cdylib` mod SDK atop `bamabi_guest_sys` (and optionally
+        //!    `bamabi_macros` via `feature = "derive"`): `export_mod!`, `GuestPlugin`, `GuestApp`,
+        //!    `SystemBuilder`, `1..=16`-term sealed `QueryTuple` + `Or<(T0..T7)>`, `GuestCommands`
+        //!    + RAII `GuestTransaction`, `GuestEntityCommands`, `BevySchedules`, `conditions`,
+        //!    `TypedObserverBuilder`, and unconditional Bevy `0.20` `bridges`.
+        //! 6. **[`xtask`](../../../xtask/index.html)** (`#![forbid(unsafe_code)]`): Orchestrates
+        //!    the entire verification and codegen pipeline—formatting, `#![forbid(unsafe_code)]`
+        //!    and zero-Bevy audits, `clippy`, `RUSTDOCFLAGS="-D warnings"` doc builds, `--no-deps`
+        //!    and feature-matrix test runs, `bamabi.h` and component-header parity checks, strict
+        //!    C99 + ASan/UBSan tests, cross-target `i686`/`wasm32` checks, `typos`/`cargo-deny`,
+        //!    dual-model Miri, and Kani formal proofs.
+        //!
+        //! ## End-to-End Flow at a Glance
+        //!
+        //! - **Compile Time:** A mod defines a `#[repr(C)]` component with `#[derive(AbiPod,
+        //!   GuestComponent)]` (from `bamabi_macros`), hashing its canonical name, layout, and
+        //!   field schema into a `ComponentUuid` and `SCHEMA_FINGERPRINT` matching `bamabi_sys`
+        //!   and C99/C++17/Zig headers emitted by `bamabi_sdk_gen`.
+        //! - **Load & Init (`bamabi_init`):** `export_mod!` delegates into `bamabi_guest_sys`,
+        //!   which verifies `BamManifest` + `BamHostApi` (`MIN_V0_2_SIZE` + `covers_slot`), allocates
+        //!   an isolated `GuestInstance` on the guest heap, and runs `GuestPlugin::build` on
+        //!   `GuestApp` to register components, relations, schedule sets, systems, and observers.
+        //! - **Per-Tick Execution & Teardown:** Host calls enter `bamabi_guest_sys` trampolines
+        //!   (`catch_guest_*` + `ReentrantCell`), construct a safe `SystemContext` with
+        //!   dispenser-verified `Chunk` slices and `GuestTransaction`-capable `GuestCommands`, and
+        //!   release every guest allocation in LIFO order during `bamabi_shutdown`.
+        //!
+        //! ## Embedded Workspace Guides
+        //!
+        //! - [`crate::docs::workspace::overview`] — Root `README.md` (layer map, crates, quickstart, `bamabi-dev-overlay`).
+        //! - [`crate::docs::workspace::architecture`] — Root `ARCHITECTURE.md` (DAG, ABI `0.3.0` lifecycle, invariants).
+        //! - [`crate::docs::workspace::development`] — Root `DEVELOPMENT.md` (toolchains, `.cdylib` builds, `cargo xtask`).
+        //! - [`crate::docs::workspace::testing`] — Root `TESTING.md` (8-tier verification pyramid, Miri, Kani, stress notes).
+        //! - [`crate::docs::architecture`] — `crates/bamabi_guest/ARCHITECTURE.md`.
+        //! - [`crate::docs::tests`] — `crates/bamabi_guest/TESTS.md`.
+
+        pub mod overview {
+            #![doc = include_str!("../../../README.md")]
+        }
+
+        pub mod architecture {
+            #![doc = include_str!("../../../ARCHITECTURE.md")]
+        }
+
+        pub mod development {
+            #![doc = include_str!("../../../DEVELOPMENT.md")]
+        }
+
+        pub mod testing {
+            #![doc = include_str!("../../../TESTING.md")]
+        }
+    }
+
+    pub mod architecture {
+        #![doc = include_str!("../ARCHITECTURE.md")]
+    }
+
+    pub mod tests {
+        #![doc = include_str!("../TESTS.md")]
+    }
+}
 pub mod entity_commands;
 pub mod iter;
 pub mod lifecycle;

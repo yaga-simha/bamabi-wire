@@ -4,6 +4,27 @@
 //! calling this `-sys` crate directly. Read this documentation incrementally from Step 1 to Step 6
 //! to understand how every guest-side `unsafe` boundary is isolated and verified.
 //!
+//! ## Workspace & Crate Documentation
+//!
+//! - **This Crate (`bamabi_guest_sys`):**
+//!   - [`docs::architecture`] — Guest-side `unsafe` boundary architecture, 68-slot `host_slot!`
+//!     negotiation, move-safe `GuestInstance` provenance, `ChunkColumnDispenser`, and Bevy `0.20`
+//!     `wire_types`.
+//!   - [`docs::tests`] — Integration tests, soundness regressions (`S1`–`S10`), `proptest` fuzzing,
+//!     and Kani formal proofs (`PO-G1`, `PO-G3`..`PO-G9`).
+//! - **Workspace-Wide Guides ("How Everything Ties Together"):**
+//!   - [`bamabi_guest::docs::workspace`](../bamabi_guest/docs/workspace/index.html) — Workspace
+//!     landing guide across all 6 crates (`bamabi_sys` -> `bamabi_macros` -> `bamabi_sdk_gen` ->
+//!     `bamabi_guest_sys` -> `bamabi_guest` -> `xtask`).
+//!   - [`bamabi_sys::docs::workspace`](../bamabi_sys/docs/workspace/index.html) — Wire-contract
+//!     workspace documentation hub.
+//! - **Sibling Crates:**
+//!   [`bamabi_sys`](../bamabi_sys/index.html) ·
+//!   [`bamabi_macros`](../bamabi_macros/index.html) ·
+//!   [`bamabi_sdk_gen`](../bamabi_sdk_gen/index.html) ·
+//!   [`bamabi_guest`](../bamabi_guest/index.html) ·
+//!   [`xtask`](../xtask/index.html)
+//!
 //! ---
 //!
 //! ## Step 1: Safety Boundary Role — Isolating All Guest `unsafe`
@@ -133,8 +154,9 @@
 //! | 7 | [`commands`] | [`ValidatedCommands`], [`SpawnEntry`], [`SpawnBatchColumn`], checkpoints, relations, triggers |
 //! | 8 | [`wire_types`] | Unconditional Bevy `0.20` `AbiPod` mirrors (`std_types`, `lifecycle`, `picking`, `camera_light`, `audio`, `ui`, `render`) |
 //!
-//! For deep implementation internals and the full test/proof catalog, see `ARCHITECTURE.md` and
-//! `TESTS.md` in the `crates/bamabi_guest_sys/` crate directory.
+//! For deep implementation internals and the full test/proof catalog, see [`docs::architecture`]
+//! (`crates/bamabi_guest_sys/ARCHITECTURE.md`) and [`docs::tests`]
+//! (`crates/bamabi_guest_sys/TESTS.md`).
 //!
 //! ---
 //!
@@ -207,6 +229,17 @@ macro_rules! host_slot {
 
 pub mod commands;
 pub mod component;
+#[cfg(doc)]
+/// Architecture and verification guides for `bamabi_guest_sys`.
+pub mod docs {
+    pub mod architecture {
+        #![doc = include_str!("../ARCHITECTURE.md")]
+    }
+
+    pub mod tests {
+        #![doc = include_str!("../TESTS.md")]
+    }
+}
 pub mod host;
 pub mod instance;
 pub mod iter;
