@@ -6,7 +6,7 @@
 
 | File | Responsibility |
 |---|---|
-| [`src/main.rs`](src/main.rs) | CLI argument parsing (`parse_args`), usage text (`print_help`), command dispatch (`dispatch`), subprocess wrappers (`run_cmd`, `cargo_cmd`, `clean_toolchain_cargo_cmd`, `check_tool_available`), and all 11 `cmd_*` runners |
+| [`src/main.rs`](src/main.rs) | CLI argument parsing (`parse_args`), usage text (`print_help`), command dispatch (`dispatch`), subprocess wrappers (`run_cmd`, `cargo_cmd`, `clean_toolchain_cargo_cmd`, `check_tool_available`), all 11 `cmd_*` runners, and `#[cfg(doc)] pub mod docs` (`ARCHITECTURE.md` / `TESTS.md` in `rustdoc`) |
 | [`src/component_headers.rs`](src/component_headers.rs) | Canonical `#[derive(ModComponent)]` testbed structs, `generate_testbed_components_header()`, `write_or_check_component_headers()`, and `first_line_diff()` |
 | [`Cargo.toml`](Cargo.toml) | Declares workspace-local dependencies only (`bamabi_macros`, `bamabi_sdk_gen`, `bamabi_sys`) and inherits `[workspace.lints]` |
 

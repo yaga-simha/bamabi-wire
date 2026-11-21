@@ -129,9 +129,96 @@ Every opaque handle issued by the host is strictly scoped and must never be cach
 2. **`bamabi_sdk_gen::sdk`** embeds and exports the polyglot bundle (`export_sdk`): `bamabi.h` (C99), `bamabi.hpp` (C++17 68/68 slot view wrappers + RAII `ScopedTransaction`), and `bamabi.zig` (Zig `b.addTranslateC` `"bam_c"` 68/68 slot views + lossless 18-code `BamError`).
 3. **`bamabi_macros` + `bamabi_sdk_gen::component_header` + `xtask/src/component_headers.rs`**: `#[derive(ModComponent)]` emits compile-time `ModComponent::C_DECL` and `ZIG_DECL` constants; `cargo xtask gen-component-headers` collects `section_for::<T>()` into [`include/generated/testbed_components.h`](include/generated/testbed_components.h).
 
-## 6. Crate Onboarding Index
+## 6. How Everything Ties Together: End-to-End Walkthrough
 
-Each workspace crate includes a `README.md`, an `ARCHITECTURE.md` deep dive, and a `TESTS.md` verification catalog:
+To see how all 6 workspace crates interlock without a single `bevy_*` dependency, trace one concrete feature end-to-end: defining a `#[derive(ModComponent, GuestComponent)]` component (`Health`), running a system that queries and updates it via deferred commands (`GuestCommands`), exporting polyglot C99/C++17/Zig headers, and passing `cargo xtask ci`:
+
+```text
+  1. bamabi_sys        ──► Wire types, offsets (68 slots), ComponentUuid, AbiPod & ModComponent traits
+         │
+         ▼
+  2. bamabi_macros     ──► #[derive(ModComponent, GuestComponent)]: zero-pad checks, VTableHeader + C_DECL/ZIG_DECL
+         │
+         ├──► 3. bamabi_sdk_gen  ──► include/bamabi.h, bamabi.hpp, bamabi.zig, include/generated/testbed_components.h
+         │
+         ├──► 4. bamabi_guest_sys ──► Host (68-slot covers_slot), GuestInstance, ReentrantCell, catch_guest_result
+         │          │
+         │          ▼
+         └──► 5. bamabi_guest    ──► #![forbid(unsafe_code)] GuestPlugin, GuestApp, QueryTuple, GuestCommands
+                    │
+                    ▼
+             6. xtask            ──► header --check, gen-component-headers --check, lint, test, c-test (ASan/UBSan)
+```
+
+### Step 1 (`bamabi_sys`): Wire Primitives, 68-Slot `offsets`, and Identity Hashing
+
+Everything begins in [`bamabi_sys`](crates/bamabi_sys/README.md) (`#![no_std]`, zero dependencies):
+
+- **Deterministic wire primitives:** Components, queries, and commands cross `extern "C"` using `#[repr(C)]` / `#[repr(transparent)]` types with no Rust-ABI assumptions: `FfiEntity`, `BamComponent` (1-based `u32` handle), `FfiResult` (18-code `u32` status), `FfiBool` (`u8`), `FfiOption<T>`, and `FfiSlice<T>` / `StrView`.
+- **Single-source-of-truth offsets (`bamabi_sys::offsets`):** `BamHostApi` declares `struct_size`, `abi_version`, and all **68** host function-pointer slots (`MIN_V0_2_SIZE = 224` B / `116` B; `MIN_V0_3_SIZE = 552` B / `280` B). `bamabi_sys::offsets` computes `OFF64_*`, `OFF32_*`, `SIZE_64 = 552`, `SIZE_32 = 280`, and `SLOT_COUNT = 68` via `core::mem::offset_of!`.
+- **Const UUID & Schema Fingerprint:** `ComponentUuid::from_parts(name, size, align, field_schema_hash)` hashes component identity in `const` using keyed SipHash-2-4-128 (`SIPHASH_KEY_0`, `SIPHASH_KEY_1`), while `ModComponent::SCHEMA_FINGERPRINT` carries a 64-bit FNV-1a structural hash (`FNV1A_64_OFFSET_BASIS`, `FNV1A_64_PRIME`).
+- **Safety contracts:** `RawInsertable`, `AbiPod`, and `ModComponent` define the trait contract enforced at compile time (`assert_abi_pod::<T>()`).
+
+### Step 2 (`bamabi_macros`): Compile-Time Layout Proofs, VTables & Polyglot Decls
+
+When a developer writes a cross-language POD component (or a rich `String`/`Vec` host component):
+
+```rust
+#[repr(C)]
+#[derive(Copy, Clone, ModComponent, GuestComponent)]
+#[mod_component(name = "combat::Health", summary_tick)]
+#[guest_component(name = "combat::Health", summary_tick)]
+pub struct Health {
+    pub current: i32,
+    pub max: i32,
+}
+```
+
+[`bamabi_macros`](crates/bamabi_macros/README.md) (`#![forbid(unsafe_code)]`) expands both derives inside hygienic `const _: ()` blocks:
+
+- **Zero-padding & type firewall:** `#[derive(ModComponent)]` and `#[derive(AbiPod)]` verify `#[repr(C)]` (rejecting `#[repr(packed)]`, `bool` in POD structs, `usize`, `u128`, and `Drop` types) and emit compile-time assertions that `size_of::<Health>() == sum(field sizes)` and every field satisfies `assert_abi_pod`.
+- **Traits, `BAM_FIELDS` & `REQUIRED_COMPONENTS`:** Generates `impl ModComponent for Health` with `CANONICAL_NAME = "combat::Health"`, `UUID`, `SCHEMA_FINGERPRINT`, `BAM_FIELDS: &'static [BamFieldDesc]`, `REQUIRED_COMPONENTS: &'static [BamRequiredComponent]`, `IS_ABI_POD = true`, `C_DECL`, and `ZIG_DECL`.
+- **Hygienic VTable & `"bam.v0.*"` symbols:** Emits a static `HealthVTable` prefixed by `VTableHeader` (`struct_size`, `abi_version`, `uuid`) plus `unsafe extern "C" fn` field/row accessors (for non-POD types like `String`/`Vec<T>`, generated setters check pointer overlap for self-aliasing safety and validate `String` UTF-8) and `SymbolEntry` exports under `"bam.v0.*"`.
+- **Guest metadata (`#[derive(GuestComponent)]`):** Emits `bamabi_guest::GuestComponent` with `NAME = c"combat::Health"`, `FIELD_SCHEMA_HASH`, `FLAGS = BAM_COMPONENT_FLAG_SUMMARY_TICK`, and the matching `UUID` (or use `#[mod_component(..., guest)]` to emit both in one attribute).
+
+### Step 3 (`bamabi_sdk_gen`): Zero-Drift C99, C++17 & Zig Synthesis
+
+[`bamabi_sdk_gen`](crates/bamabi_sdk_gen/README.md) (`#![forbid(unsafe_code)]`, depends only on `bamabi_sys`) turns Rust wire metadata into polyglot headers without duplicating constants:
+
+- **Core ABI header (`header_gen::render_c99_header`):** Reads `bamabi_sys::offsets` and a 20-struct layout specification table (`wire_struct_specs`), verifies `verify_host_rust_layouts()` and `BAM_HOST_API_SLOT_COUNT == 68` before emitting a single byte, and renders [`include/bamabi.h`](include/bamabi.h) with all 68 `BAM_HOST_API_OFFSET_*` macros, `bam_uuid_from_parts`, `bam_host_api_covers_slot`, `bam_host_api_copy_bounded`, and 64-bit/32-bit `BAM_STATIC_ASSERT` checks.
+- **Polyglot bundle (`sdk::export_sdk`):** Emits `bamabi.h` (C99), `bamabi.hpp` (C++17 68/68 slot view wrappers + RAII `ScopedTransaction`), and `bamabi.zig` (Zig `0.16` `b.addTranslateC` `"bam_c"` bindings + lossless 18-code `BamError`) so C/C++/Zig mods see the exact same `BamHostApi` table as Rust mods.
+- **Component declarations (`component_header`):** `section_for::<Health>()` reads `(Health::CANONICAL_NAME, Health::IS_ABI_POD, Health::C_DECL)` and `render_component_header` wraps it in `#ifndef` guards, `#include "../bamabi.h"`, and `extern "C"` blocks (used to generate [`include/generated/testbed_components.h`](include/generated/testbed_components.h)).
+
+### Step 4 (`bamabi_guest_sys`): Host Table Validation, Panic Boundary & Data Plane
+
+[`bamabi_guest_sys`](crates/bamabi_guest_sys/README.md) isolates every guest-side `unsafe` operation behind fail-closed runtime checks:
+
+- **Instance & table handshake (`bamabi_init`):** `init_guest_instance` allocates a heap-owned per-World `GuestInstance` (zero process-global mutable state). `Host::from_load_ctx` copies `min(struct_size, size_of::<BamHostApi>())` bytes via `read_descriptor::<BamHostApi>`, enforces `abi_version_is_compatible` and the 27 core `0.2` slots, and probes all 41 extended/v0.3 slots via `BamHostApi::covers_slot` (returning `FfiResult::UNSUPPORTED` if absent).
+- **Registration & VTables:** `ValidatedLoadCtx::register_pod_component` populates `ComponentDesc` (with `schema_fingerprint`, `fields`, and `required_init_descs`) and invokes `BamHostApi::register_component` to obtain a 1-based `BamComponent` handle. Host-exported VTables can also be resolved and verified (`VTableHeader` size/version/UUID) via `Host::resolve_vtable`.
+- **Lock-free re-entrancy & panic containment:** `register_system_closure` wraps each `FnMut` system closure in `ReentrantCell<F>` (`UnsafeCell` + `AtomicBool` `Acquire`/`Release` + `ReleaseGuard`), rejecting re-entrant execution with `FfiResult::ACCESS_CONFLICT`. Its `extern "C"` trampoline (`BamSystemFn`) executes inside `panic::catch_guest_result` (`catch_unwind`), dropping any panic payload on the guest heap and returning `FfiResult::PANIC_CAUGHT` (`3`) instead of unwinding across `extern "C"`.
+- **Validated iteration & deferred commands:** Inside the system tick, `ValidatedIter` checks `BamColumnInfo` (`mode`, `size`, `align`, `uuid`, storage flags) and `ChunkColumnDispenser` prevents mutable aliasing across query terms; `ValidatedCommands::insert` validates `BamLayoutInfo` (and `SpawnEntry::new::<T>` checks `(size, align)` on batched spawns) before calling `BamHostApi::cmd_insert` on `*mut BamCommands`.
+
+### Step 5 (`bamabi_guest`): Safe `#![forbid(unsafe_code)]` Mod Authoring
+
+[`bamabi_guest`](crates/bamabi_guest/README.md) builds an idiomatic, `#![forbid(unsafe_code)]` Rust API on top of `bamabi_guest_sys` and `bamabi_sys`:
+
+- **Plugin & entry-point export:** Implementing `GuestPlugin` and invoking `export_mod!(plugin: CombatMod)` exports `bamabi_manifest`, `bamabi_init`, `bamabi_shutdown`, and `bamabi_resolve_symbol` backed by per-World `GuestInstance` ownership.
+- **Component, query & deferred command wiring:** Inside `GuestPlugin::build(&mut self, app: &mut GuestApp<'_>)`:
+  - `app.register_component::<Health>()` (or `register_component_with_options`) forwards `Health`'s `GuestComponent` metadata to `ValidatedLoadCtx`.
+  - `app.system(c"regen").schedule(ScheduleId::UPDATE).query_typed::<(FfiEntity, &mut Health)>().commands().build(|mut ctx| { ... })` builds `BamQueryDesc` and `BamSystemDesc`, exposes safe `ChunkSliceMut` columns via `ctx.single_query::<(FfiEntity, &mut Health)>()`, and enqueues deferred mutations via `ctx.commands()` (`GuestCommands::insert::<Health>(entity, &updated)` or `GuestEntityCommands`).
+
+### Step 6 (`xtask`): Codegen Sync & Multi-Tier CI Gate
+
+[`xtask`](xtask/README.md) (`#![forbid(unsafe_code)]`) ties the entire workspace together in one reproducible verification loop (`cargo xtask ci`):
+
+1. **`xtask/src/component_headers.rs`:** Collects `section_for::<T>()` for 19 canonical `#[derive(ModComponent)]` fixtures and keeps [`include/generated/testbed_components.h`](include/generated/testbed_components.h) synchronized (`cargo xtask gen-component-headers`).
+2. **Byte-parity checks:** `cargo xtask header --check` verifies [`include/bamabi.h`](include/bamabi.h) matches `bamabi_sdk_gen::render_c99_header()` byte-for-byte; `cargo xtask gen-component-headers --check` verifies `testbed_components.h`.
+3. **Static & isolation lints (`cargo xtask lint`):** Confirms `#![forbid(unsafe_code)]` in `bamabi_macros`, `bamabi_sdk_gen`, `bamabi_guest`, and `xtask`; confirms zero `bevy*` crates in `cargo tree --workspace`; runs `clippy -D warnings` and `RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps`.
+4. **Rust + C99 + sanitizer execution:** `cargo xtask test` runs `--no-default-features`, `--all-features`, and `--doc`; `cargo xtask c-test` validates both generated headers under strict `-std=c99 -Wall -Wextra -Werror -pedantic -fsyntax-only` and compiles/runs [`tests/standalone_c_test.c`](tests/standalone_c_test.c) under AddressSanitizer and UndefinedBehaviorSanitizer.
+
+## 7. Crate Onboarding Index
+
+Each workspace crate includes a `README.md`, an `ARCHITECTURE.md` deep dive, and a `TESTS.md` verification catalog, and is also browsable locally in `rustdoc` via `cargo docs --open` (alias for `cargo doc --workspace --no-deps --open`):
 
 | Crate | README | Architecture | Tests & Proofs |
 |---|---|---|---|

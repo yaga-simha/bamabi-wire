@@ -123,9 +123,22 @@ cargo check -p bamabi_sys --target wasm32-unknown-unknown
 
 ## 3. Running
 
+### Browsing Workspace & Crate Docs (`cargo docs --open`)
+
+[`.cargo/config.toml`](.cargo/config.toml) defines `docs = "doc --workspace --no-deps"`. Use `cargo docs --open` as the primary way to browse all workspace guides (`README.md`, `ARCHITECTURE.md`, `DEVELOPMENT.md`, `TESTING.md`), per-crate incremental API tutorials, and `ARCHITECTURE.md` / `TESTS.md` modules together in `rustdoc`:
+
+```bash
+# Primary local docs browser (workspace guides + all 6 crates)
+cargo docs --open
+
+# Equivalent unaliased command (add --all-features to include derive examples)
+cargo doc --workspace --no-deps --open
+cargo doc --workspace --no-deps --all-features --open
+```
+
 ### Workspace Task Runner (`cargo xtask`)
 
-[`.cargo/config.toml`](.cargo/config.toml) defines `xtask = "run --package xtask --"`. Run from the repository root:
+[`.cargo/config.toml`](.cargo/config.toml) defines `xtask = "run --package xtask --"` alongside `docs = "doc --workspace --no-deps"`. Run from the repository root:
 
 ```bash
 cargo xtask --help                    # Overview of all 11 subcommands
