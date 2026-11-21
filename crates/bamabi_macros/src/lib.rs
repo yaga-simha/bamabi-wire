@@ -7,6 +7,15 @@
 //! `v0.3.0`) providing [`AbiPod`], [`ModComponent`], and [`GuestComponent`].
 //!
 //! Read this page in order as a 6-step onboarding path, or jump to the section you need:
+//!
+//! ## Workspace & Crate Documentation
+//!
+//! - **Crate guides:** [Architecture Guide](#bamabi_macros-architecture--implementation-guide) (`crates/bamabi_macros/ARCHITECTURE.md`) · [Test & Verification Guide](#bamabi_macros-test--verification-guide) (`crates/bamabi_macros/TESTS.md`)
+//! - **Workspace guides:** [`bamabi_sys::docs::workspace`](../bamabi_sys/docs/workspace/index.html) · [`bamabi_guest::docs::workspace`](../bamabi_guest/docs/workspace/index.html)
+//! - **Sibling crates:** [`bamabi_sys`](../bamabi_sys/index.html) · [`bamabi_sdk_gen`](../bamabi_sdk_gen/index.html) · [`bamabi_guest_sys`](../bamabi_guest_sys/index.html) · [`bamabi_guest`](../bamabi_guest/index.html) · [`xtask`](../xtask/index.html)
+//!
+//! > Note: `bamabi_macros` is a `proc-macro` crate, which Rust forbids from exporting `pub mod` items; therefore its `ARCHITECTURE.md` and `TESTS.md` are embedded directly below on the crate root doc page.
+//!
 //! 1. [Step 1: Why `bamabi_macros` Exists & `#![forbid(unsafe_code)]` Hygiene](#step-1-why-bamabi_macros-exists--forbidunsafe_code-hygiene)
 //! 2. [Step 2: Choosing a Derive (`AbiPod` vs `ModComponent` vs `GuestComponent`)](#step-2-choosing-a-derive-abipod-vs-modcomponent-vs-guestcomponent)
 //! 3. [Step 3: Attribute & Type-Support Matrix](#step-3-attribute--type-support-matrix)
@@ -285,6 +294,10 @@
 //!
 //! Layer 0 contains no Criterion benchmarks; runtime VTable/ECS overhead benchmarks live in the
 //! downstream `bamabi-showcase` repository.
+#![cfg_attr(doc, doc = "\n\n---\n\n")]
+#![cfg_attr(doc, doc = include_str!("../ARCHITECTURE.md"))]
+#![cfg_attr(doc, doc = "\n\n---\n\n")]
+#![cfg_attr(doc, doc = include_str!("../TESTS.md"))]
 
 mod abi_pod;
 mod attrs;

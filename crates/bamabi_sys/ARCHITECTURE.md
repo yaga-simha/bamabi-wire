@@ -203,7 +203,7 @@ All **13** `ExtensibleStruct` implementors in `bamabi_sys`:
    - *Implemented for:* `u8`, `i8`, `u16`, `i16`, `u32`, `i32`, `u64`, `i64`, `f32`, `f64`, `FfiBool`, `BamComponent`, `BamSystem`, `BamSystemSet`, `BamSymbol`, `FfiEntity`, `FfiChildOf`, `FfiDisabled`, `BamChangeTicks`, `ComponentUuid`, `FfiAssetHandle`, `FfiAssetLoadState`, `BamEventKind`, `BamFieldKind`, `[T; N] where T: AbiPod`, and `FfiOption<T> where T: AbiPod`.
    - *Explicitly excluded:* `u128`/`i128` (no ISO C99 equivalent; 8- vs 16-byte alignment divergence), `usize`/`isize` (pointer-width dependent), `bool`/`char` (invalid bit patterns).
 3. **`pub trait ModComponent: Sized + 'static`** (safe trait)
-   - *Contract:* Deliberately has **no** `bevy_ecs`, `RawInsertable`, or `Default` supertraits so `#[repr(Rust)]` components containing `String`, `Vec<T>`, `bool`, skipped fields, or opaque data can still expose a [`VTableHeader`]-prefixed VTable, `CANONICAL_NAME`, `COMPONENT_CSTR`, `UUID`, `SCHEMA_FINGERPRINT`, `BAM_FIELDS`, `REQUIRED_COMPONENTS`, `C_DECL`, `ZIG_DECL`, and `symbols()`.
+   - *Contract:* Deliberately has **no** `bevy_ecs`, `RawInsertable`, or `Default` supertraits so `#[repr(Rust)]` components containing `String`, `Vec<T>`, `bool`, skipped fields, or opaque data can still expose a `VTableHeader`-prefixed VTable, `CANONICAL_NAME`, `COMPONENT_CSTR`, `UUID`, `SCHEMA_FINGERPRINT`, `BAM_FIELDS`, `REQUIRED_COMPONENTS`, `C_DECL`, `ZIG_DECL`, and `symbols()`.
 
 ---
 
