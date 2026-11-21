@@ -357,6 +357,7 @@ fn bevy_020_wire_types_math_and_edge_cases_work_unconditionally() {
 // Mock ABI 0.3.0 Host Harness for End-to-End Guest SDK Verification
 // ============================================================================
 
+/// Plain `#[repr(C)]` 2D position test struct used across parity harness fixtures.
 #[derive(Clone, Copy, Debug, PartialEq)]
 #[repr(C)]
 struct TestPos {
@@ -367,6 +368,7 @@ struct TestPos {
 // Here we use built-in FfiChildOf, FfiDisabled, FfiPointerClick, FfiCamera, FfiGizmoLine, etc.,
 // which are ALL unconditional GuestComponents without needing `feature = "derive"`!
 
+/// Registered component or resource metadata tracked by [`MockHost`].
 #[derive(Clone)]
 struct MockComp {
     handle: BamComponent,
@@ -382,6 +384,7 @@ struct MockComp {
     required_custom_bytes: Vec<Vec<u8>>,
 }
 
+/// Registered guest system descriptor and trampolines tracked by [`MockHost`].
 struct MockSystem {
     name: String,
     queries: Vec<Vec<BamTermDesc>>,
@@ -391,6 +394,7 @@ struct MockSystem {
     run_if_user_data: *mut c_void,
 }
 
+/// Registered observer descriptor and callbacks tracked by [`MockHost`].
 struct MockObserver {
     name: String,
     event: BamComponent,
@@ -401,6 +405,7 @@ struct MockObserver {
     user_data: *mut c_void,
 }
 
+/// Recorded deferred ECS command emitted into [`MockSysCtxState`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum MockCmd {
     SpawnEmpty(FfiEntity),
@@ -411,11 +416,13 @@ enum MockCmd {
     Trigger(BamComponent, FfiEntity, Vec<u8>, u32),
 }
 
+/// Mock message entry storing either encoded POD/witness bytes or a host pointer.
 enum MockMsgItem {
     Bytes(Vec<u8>),
     Ptr(*const c_void),
 }
 
+/// Per-query simulated chunk iterator state passed as `*mut BamIter` in [`MockHost`].
 struct MockIterState {
     host: *mut MockHost,
     terms: Vec<BamTermDesc>,
@@ -434,6 +441,7 @@ struct MockIterState {
     active_chunk: Option<core::ops::Range<usize>>,
 }
 
+/// Copies `bytes` into an 8-byte-aligned `Vec<u64>` backing buffer for mock column/resource storage.
 fn aligned_buf_from_bytes(bytes: &[u8]) -> Vec<u64> {
     let mut words = vec![0u64; bytes.len().div_ceil(8).max(1)];
     if !bytes.is_empty() {
@@ -448,6 +456,7 @@ fn aligned_buf_from_bytes(bytes: &[u8]) -> Vec<u64> {
     words
 }
 
+/// Per-system execution context frame passed as `*mut BamSystemCtx` during [`MockHost`] runs.
 struct MockSysCtxState {
     host: *mut MockHost,
     iters: Vec<Box<MockIterState>>,
@@ -459,6 +468,7 @@ struct MockSysCtxState {
     children: HashMap<(BamComponent, FfiEntity), Vec<FfiEntity>>,
 }
 
+/// Full-featured ABI `0.3.0` mock host harness used by the Bevy `0.20` parity test suite.
 struct MockHost {
     next_handle: u32,
     comps: Vec<MockComp>,

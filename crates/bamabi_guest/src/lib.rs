@@ -3,98 +3,299 @@
 
 //! # `bamabi_guest`: Safe Idiomatic Rust Guest SDK (`ABI 0.3.0`)
 //!
-//! Zero-Bevy-dependency safe Rust SDK for authoring native `.cdylib` mods targeting
-//! `bamabi` (`ABI 0.3.0`).
+//! Safe (`#![forbid(unsafe_code)]`), **zero-Bevy-dependency** Rust SDK for authoring native
+//! `.cdylib` mods targeting `bamabi` (`ABI 0.3.0`, `v0.3.0`, Layer 0 of `bamabi-wire`).
 //!
-//! Every unsafe FFI operation, pointer check, [`VTableHeader`] layout verification, and `extern "C"`
-//! panic trampoline is isolated inside `bamabi_guest_sys`; this crate enforces
-//! `#![forbid(unsafe_code)]` unconditionally.
+//! Follow the eight incremental steps below to go from mental model to a tested, hot-reloadable
+//! native mod.
 //!
-//! ## Core Capabilities
-//! - **Per-World Instance Isolation:** [`export_mod!`] exports
-//!   `bamabi_manifest`, `bamabi_init`, and `bamabi_shutdown` backed by a
-//!   heap-allocated per-World [`GuestInstance`](raw::GuestInstance) with **zero** process-global
-//!   mutable state—loading the same `.cdylib` into multiple Bevy `World`s simultaneously is
-//!   completely isolated.
-//! - **Unified `app.system(...)` Builder & Typed Queries:** [`GuestApp::system`] compiles up to
-//!   [`MAX_QUERIES_PER_SYSTEM`] typed tuple queries (`query_typed::<(&mut A, &B, With<C>, Without<D>, Allow<E>, Has<F>, Or<(With<G>, Added<H>)>)>()`
-//!   up to 16 query terms, plus [`Or2`] / [`Or3`] aliases),
-//!   `RemovedComponents<T>` cursors ([`QueryBuilder::removed`], [`SystemContext::read_removed`]), declaration-indexed singleton
-//!   resources ([`GuestRes`] / [`GuestResMut`] with [`BamChangeTicks`]), [`ScheduleId`] selection,
-//!   `.after(...)` / `.before(...)` / `.after_weak(...)` / `.in_set(...)` / `.ambiguous_with(...)`
-//!   ordering (including `"host::<name>"` sets), decoupled [`SystemBuilder::register_handle`] +
-//!   [`ScheduleSetBuilder`] + [`GuestApp::mount_system`], `.main_thread()` pinning, and lock-free
-//!   `.run_if(...)` predicates into a single [`BamSystemDesc`](raw::BamSystemDesc).
-//! - **Verified Zero-Copy Views & Parallelism:** [`Chunk`] validates [`BamColumnInfo`]
-//!   (`size`, `align`, `mode`, storage flags, and `ComponentUuid` via [`Chunk::component`]),
-//!   provides indirect sparse-set row views ([`Chunk::rows`] / [`Chunk::rows_mut`]), supports
-//!   untracked mutable slices paired with [`Chunk::mark_changed_range`], non-destructive
-//!   [`ChunkIter::count`] / [`ChunkIter::up_cascade`] ancestor lookups, and offers work-stealing
-//!   [`ChunkIter::par_for_each`] / [`ChunkIter::par_for_each_chunk_readonly`] (and
-//!   [`SystemContext::par_chunks`] / [`SystemContext::par_chunks_readonly`]) iteration.
-//! - **Deferred Commands, Transactions, Relationships, Messages & Observers:** [`GuestCommands`]
-//!   enqueues zero-steady-state-allocation spawns (`spawn_empty`, `spawn`, `spawn_persistent`,
-//!   `spawn_batch`, [`FfiChildOf`]), `despawn`, `despawn_all`, `insert`, `insert_if_new`,
-//!   `insert_default`, `remove`, `trigger`, `trigger_ex`, typed relationships
-//!   ([`RelationDescBuilder`], [`GuestApp::register_relation`], [`GuestCommands::insert_relation`],
-//!   [`GuestCommands::remove_relation`]), and RAII command transactions
-//!   ([`GuestCommands::transaction`], [`GuestTransaction`]), alongside batch `Messages<M>`
-//!   read/write (POD and witness-backed non-POD) and dynamic global, `EntityEvent`, lifecycle,
-//!   `Ready`, mutable, and upward-propagating observers ([`GuestApp::observe`],
-//!   [`ObserverBuilder`]).
-//! - **Subsystem Bridges (`bridges`):** Unconditional (`default = []`) zero-Bevy wrappers matching
-//!   `bamabi_bridges` and `bamabi_reflect` (`std_types` + mouse/gamepad, `picking`, `camera_light`,
-//!   `audio`, `ui` / Feathers / editable text / text bridges, isolated `mod://<ns>/...` &
-//!   `mod://overlay/...` `asset` handles, `state` including `ModStateSlab`, `reflect` / BRP /
-//!   `"BAMT"` `SystemTelemetryDigest64`, and `bsn` scenes), plus host-opt-in conventions for
-//!   `render`, `window`, and `gizmos`.
+//! ---
 //!
-//! ## Quickstart
+//! ## Step 1: Mental Model — Safe `#![forbid(unsafe_code)]` `.cdylib` SDK & Per-World Isolation
+//!
+//! - **Zero `unsafe` in Guest Code:** This crate enforces `#![forbid(unsafe_code)]` at the crate
+//!   root. Every raw FFI pointer check, [`BamHostApi`](raw::BamHostApi) slot bounds check,
+//!   [`VTableHeader`] verification, and `extern "C"` panic trampoline is isolated inside
+//!   `bamabi_guest_sys` over the [`bamabi_sys`] `ABI 0.3.0` (`0x0003_0000`) wire contract.
+//! - **Zero Bevy Dependencies:** `bamabi_guest` depends only on `bamabi_sys`, `bamabi_guest_sys`,
+//!   and optionally `bamabi_macros` (`feature = "derive"`, `default = []`). Guest mods compile
+//!   independently of Bevy and across mismatched Rust compiler toolchains.
+//! - **Per-World Isolation:** [`export_mod!`] exports `bamabi_manifest`, `bamabi_init`,
+//!   `bamabi_shutdown`, and `bamabi_resolve_symbol` backed by a heap-allocated per-World
+//!   [`GuestInstance`](raw::GuestInstance) with **zero** process-global mutable state. Loading the
+//!   same `.cdylib` into multiple Bevy `World`s simultaneously keeps every instance isolated.
+//! - **Panic & Unwind Policy (`panic = "unwind"` vs. `panic = "abort"`):** Every function pointer
+//!   across `bamabi` uses `extern "C"` (`nounwind`), never `extern "C-unwind"`. Unwinding across
+//!   `extern "C"` is Undefined Behavior, and the host never frees guest-allocated panic payloads:
+//!   - **`panic = "unwind"` *(Cargo default — recommended)*:** Guest trampolines (`bamabi_init`,
+//!     `bamabi_shutdown`, system callbacks, `run_if` predicates, observers, migration callbacks,
+//!     and component destructors) catch panics inside the guest, drop the payload on the guest
+//!     heap, release their lock-free re-entrancy guard, and return [`FfiResult::PANIC_CAUGHT`]
+//!     (or [`FfiBool::FALSE`] for `run_if`). The host discards uncommitted commands from that tick
+//!     and applies its `ModErrorPolicy` without crashing the game.
+//!   - **`panic = "abort"`:** `std::panic::catch_unwind` compiles away and any guest panic aborts
+//!     the OS process immediately. Use only for trusted first-party mods needing smaller binaries.
+//!
+//! ---
+//!
+//! ## Step 2: Hello World Mod — `GuestPlugin`, `GuestApp`, `export_mod!`, `prelude`
+//!
+//! Implement [`GuestPlugin`] on a `Default + Send + 'static` struct, register systems and
+//! components inside [`GuestPlugin::build`] on [`GuestApp`], and export the C entry points with
+//! [`export_mod!`]. Importing [`prelude`] (`use bamabi_guest::prelude::*;`) brings in the core
+//! traits, builders, bridges, and macros.
 //!
 //! ```no_run
 //! use bamabi_guest::prelude::*;
 //! use core::ffi::CStr;
 //!
 //! #[derive(Default)]
-//! struct HierarchyMod;
+//! pub struct HelloMod;
 //!
-//! impl GuestPlugin for HierarchyMod {
-//!     const NAME: &'static CStr = c"hierarchy_mod";
+//! impl GuestPlugin for HelloMod {
+//!     const NAME: &'static CStr = c"hello_mod";
 //!     const VERSION: &'static CStr = c"0.3.0";
 //!
 //!     fn build(&mut self, app: &mut GuestApp<'_>) -> FfiResult {
-//!         app.system(c"inspect_parents")
-//!             .query(|q| q.read::<FfiChildOf>())
+//!         app.system(c"hello_tick")
 //!             .schedule(ScheduleId::UPDATE)
 //!             .build(|ctx| {
-//!                 while let Some(chunk) = ctx.iter().next_chunk_view() {
-//!                     let _parents = chunk.component::<FfiChildOf>(0);
-//!                 }
+//!                 let _ = guest_log!(ctx, info, "hello from hello_mod");
 //!             })
 //!     }
 //! }
 //!
-//! export_mod!(plugin: HierarchyMod);
+//! export_mod!(plugin: HelloMod);
 //! ```
 //!
-//! ## Panic & Unwind Policy: `panic = "unwind"` vs. `panic = "abort"`
+//! [`export_mod!`] also supports explicit CStr manifests (`export_mod!(name: c"...", version: c"...", build_fn)`),
+//! Cargo package metadata (`export_mod!(build_fn)`), and raw C-ABI hooks (`export_mod!(manifest: ..., init: ..., shutdown: ...)`).
+//! Implement [`GuestPlugin::save_state`] and [`GuestPlugin::restore_state`] (or
+//! [`GuestApp::on_save_state`] / [`GuestApp::on_restore_state`]) for hot-reload state transfer.
 //!
-//! Every function pointer across `bamabi` uses `extern "C"` (`nounwind`), never
-//! `extern "C-unwind"`. Unwinding across an `extern "C"` boundary is Undefined Behavior, and the
-//! host never catches guest unwinds because freeing a guest-allocated `Box<dyn Any + Send>` panic
-//! payload on the host allocator would corrupt the heap.
+//! ---
 //!
-//! - **`panic = "unwind"` *(Cargo default — recommended)*:** Every guest trampoline (`bamabi_init`,
-//!   `bamabi_shutdown`, system callbacks, `run_if` predicates, and component destructors)
-//!   catches panics **inside the guest runtime**, drops the panic payload on the **guest** heap,
-//!   releases its lock-free re-entrancy guard, and returns [`FfiResult::PANIC_CAUGHT`] (or
-//!   [`FfiBool::FALSE`] for `run_if`). The host discards uncommitted commands from that tick and
-//!   applies `ModErrorPolicy` (e.g. quarantining the faulting system) while keeping the host
-//!   application running.
-//! - **`panic = "abort"`:** `std::panic::catch_unwind` compiles to a zero-overhead direct call, and
-//!   any panic inside the guest immediately terminates the OS process via `abort()` without
-//!   crossing `extern "C"`. Use `panic = "abort"` only for trusted first-party mods when smaller
-//!   binary size and fail-fast termination are desired.
+//! ## Step 3: Defining Components & Systems
+//!
+//! Cross-language Plain Old Data components implement [`AbiPod`] and [`GuestComponent`] (either
+//! via `#[derive(AbiPod, GuestComponent)]` when `feature = "derive"` is enabled, via
+//! `#[mod_component(..., guest)]`, or manually on `#[repr(C)]` types). Unqualified names such as
+//! `c"Health"` are automatically prefixed with `"<manifest.name>::Health"` when registered via
+//! [`GuestApp::register_component`] or [`GuestApp::register_component_with_options`]
+//! ([`GuestComponentOptions`] adds `sparse_set`, `immutable`, `summary_tick`, `clone`, lifecycle
+//! hooks, and `require::<R>()`). Non-POD Rust components implement [`ModComponent`] and register
+//! via [`GuestApp::register_dynamic_component`].
+//!
+//! Systems are built with [`GuestApp::system`]:
+//! - **Typed Queries (`1..=16` terms):** [`SystemBuilder::query_typed`] accepts any [`QueryTuple`]
+//!   over `&T`, `&mut T`, `Option<&T>`, `Option<&mut T>`, [`With<T>`], [`Without<T>`],
+//!   [`Changed<T>`], [`Added<T>`], [`Allow<T>`], [`Has<T>`], [`Or<(T0, T1, ...)>`] (2..=8
+//!   branches, plus [`Or2`] / [`Or3`] aliases), and [`FfiEntity`]. Up to [`MAX_QUERIES_PER_SYSTEM`]
+//!   (8) queries per system are supported (`ctx.single_query`, `ctx.query_typed`,
+//!   `ctx.queries_2_typed`, `ctx.queries_3_typed`).
+//! - **Dynamic Queries & `RemovedComponents`:** [`SystemBuilder::query`] + [`QueryBuilder`]
+//!   support handle-based, dynamic, and entity-disabling terms (`allow_disabled`, `with_disabled`,
+//!   `without_disabled`, `has_disabled`), plus removal streams via [`QueryBuilder::removed`] /
+//!   [`SystemBuilder::removed`] and [`SystemContext::read_removed`].
+//! - **Resources, Messages & Local State:** [`SystemBuilder::resource_read`] /
+//!   [`SystemBuilder::resource_write`] pair with [`SystemContext::res_with_ticks`] /
+//!   [`SystemContext::res_mut_with_ticks`] returning [`GuestRes`] / [`GuestResMut`] (with
+//!   [`BamChangeTicks::is_added`] / [`BamChangeTicks::is_changed`]); buffered streams use
+//!   `message_read` / `message_write` (`read_messages`, `send_message`, plus non-POD witness
+//!   streams); per-system `Local<L>` state uses [`SystemBuilder::build_with_local`].
+//!
+//! ```text
+//! #[repr(C)]
+//! #[derive(Clone, Copy, Debug, Default, PartialEq, AbiPod, GuestComponent)]
+//! #[guest_component(name = "my_mod::Health", summary_tick)]
+//! pub struct Health {
+//!     pub current: f32,
+//!     pub max: f32,
+//! }
+//! ```
+//!
+//! ```no_run
+//! use bamabi_guest::prelude::*;
+//!
+//! fn register_systems(app: &mut GuestApp<'_>) -> FfiResult {
+//!     app.system(c"inspect_hierarchy")
+//!         .query_typed::<(
+//!             FfiEntity,
+//!             &FfiChildOf,
+//!             Or<(With<FfiChildOf>, Without<FfiDisabled>)>,
+//!         )>()
+//!         .removed::<FfiChildOf>()
+//!         .build_with_local(0u64, |ctx, tick_count| {
+//!             *tick_count += 1;
+//!             let _removed = ctx.read_removed::<FfiChildOf>(0);
+//!             let _total = ctx.single_query::<(
+//!                 FfiEntity,
+//!                 &FfiChildOf,
+//!                 Or<(With<FfiChildOf>, Without<FfiDisabled>)>,
+//!             )>()
+//!             .count();
+//!         })
+//! }
+//! ```
+//!
+//! ---
+//!
+//! ## Step 4: Iterating & Mutating Data
+//!
+//! Choose the abstraction level that matches your system:
+//!
+//! - **Typed Ergonomic Iteration ([`TypedChunkIter`]):** Borrow via
+//!   [`SystemContext::single_query`] (or `query_typed` / `queries_2_typed` / `queries_3_typed`) and
+//!   iterate with [`TypedChunkIter::for_each`], [`TypedChunkIter::single_chunk`] (returning
+//!   [`QuerySingleError`]), [`TypedChunkIter::is_empty`], [`TypedChunkIter::count`] (non-destructive),
+//!   or [`TypedChunkIter::up_cascade`] (ancestor lookup).
+//! - **Low-Level Chunk & Sparse Views ([`ChunkIter`], [`Chunk`]):** Iterate chunks via
+//!   [`ChunkIter::next_chunk_view`]; borrow dense columns via [`Chunk::component`] /
+//!   [`Chunk::component_mut`] or split disjoint borrows via [`Chunk::component_read_write`] /
+//!   [`Chunk::component_write_2`] / [`Chunk::entities_and_component_mut`]. For `SparseSet`
+//!   components, use [`Chunk::component_rows`] / [`Chunk::component_rows_mut`] ([`SparseRows`] /
+//!   [`SparseRowsMut`]).
+//! - **Fine-Grained Change Marking:** Borrow [`Chunk::component_mut_untracked`] and explicitly mark
+//!   modified rows with [`Chunk::mark_changed`] or [`Chunk::mark_changed_range`] so downstream
+//!   `Changed<T>` queries do not wake on untouched rows.
+//! - **Parallel Chunk Processing:** Dispatch chunks across the host `ComputeTaskPool` via
+//!   [`TypedChunkIter::par_for_each`] / [`SystemContext::par_chunks`], or enforce read-only access at
+//!   compile time and across FFI via [`TypedChunkIter::par_for_each_chunk_readonly`] (checked with
+//!   [`QueryTuple::IS_READ_ONLY`]) and [`SystemContext::par_chunks_readonly`].
+//! - **Random Entity Access:** Use [`SystemContext::get`], [`SystemContext::get_mut`],
+//!   [`SystemContext::get_many`], or [`SystemContext::get_dynamic`] /
+//!   [`SystemContext::get_dynamic_mut`].
+//!
+//! ---
+//!
+//! ## Step 5: Commands, Transactions, Hierarchy, Observers & Schedules
+//!
+//! - **Deferred Commands ([`GuestCommands`]):** Queue `spawn_empty`, `spawn`, `spawn_persistent`,
+//!   `spawn_batch` (SoA columns), `despawn`, `despawn_all`, `insert`, `insert_if_new`,
+//!   `insert_default`, `remove`, and `trigger` / `trigger_ex`.
+//! - **RAII Transactions ([`GuestTransaction`]):** Wrap multi-step command sequences in
+//!   [`GuestCommands::transaction`] or [`GuestCommands::begin_transaction`]. Any early `?` error or
+//!   drop without [`GuestTransaction::commit`] rolls back all commands queued since the checkpoint.
+//! - **Fluent Entity & Hierarchy Builders ([`GuestEntityCommands`], [`GuestChildSpawner`]):** Use
+//!   `commands.entity(e)` or `commands.spawn_entity()` to chain `.insert_component(...)`,
+//!   `.with_children(...)`, `.disable()` / `.enable()`, `.observe(...)`, and `.trigger(...)`.
+//!   Read hierarchy children via [`SystemContext::children`] and cycle-safe
+//!   [`SystemContext::iter_descendants`] (paired with [`QueryBuilder::read_children`]).
+//! - **Typed Relationships:** Register ABI `0.3.0` relationships via [`RelationDescBuilder`] +
+//!   [`GuestApp::register_relation`] (or dynamic hook pairs via
+//!   [`GuestApp::register_relationship_pair`]) and mutate edges with
+//!   [`GuestCommands::insert_relation`] / [`GuestCommands::remove_relation`].
+//! - **Observers:** Register global, entity-scoped, lifecycle (`Add`/`Insert`/`Discard`/`Remove`/
+//!   `Despawn`), `Ready`, mutable/stoppable, and upward-propagating observers via
+//!   [`GuestApp::observe`], [`GuestApp::observe_event`] ([`TypedObserverBuilder`]),
+//!   [`GuestApp::observe_ready_with`] ([`ObserverBuilder`]), or runtime [`GuestCommands`] observers.
+//! - **Schedules, Ordering & Run Conditions:** Target built-in [`ScheduleId`]s or all 16 Bevy
+//!   `0.20` schedules via [`BevySchedules`]; define sets via [`ScheduleSetBuilder`] +
+//!   [`GuestApp::configure_schedule_set`], decouple system handles via
+//!   [`SystemBuilder::register_handle`] + [`GuestApp::mount_system`], order with `.in_set()` /
+//!   `.before()` / `.after()` / `.after_weak()` / `.ambiguous_with*()` / `.main_thread()`, and gate
+//!   execution with chainable AND-composed `.run_if(...)` / `.run_if_fn(...)` using
+//!   [`conditions`] (`run_once`, `not`, `and`, `or`, `xor`, `every_n_ticks`, `component_registered`,
+//!   `component_registered_named`, `symbol_exists`).
+//!
+//! ---
+//!
+//! ## Step 6: Bevy `0.20` Subsystem Bridges (`bridges`)
+//!
+//! All [`bridges`] submodules are available unconditionally (even with `--no-default-features`) and
+//! resolve via [`GuestBridgesHostExt`] (`.std_bridges()`, `.ui_handles()`, `.state_bridge()`,
+//! etc.), [`GuestAssetHostExt`] (`.assets()`), and domain extension traits:
+//!
+//! - **Built-in `bamabi_bridges` / `bamabi_reflect` ABI parity:**
+//!   - [`bridges::std_types`]: `FfiTransform`, `FfiGlobalTransform`, `FfiVisibility`, `Name`,
+//!     `Disabled` (`GuestDisabledBridge`), `FfiColor`, `Time<Virtual|Fixed|Real>`,
+//!     `ButtonInput<KeyCode|MouseButton>` (194 `FfiKeyCode` indices), mouse motion/scroll, and
+//!     gamepad state/rumble.
+//!   - [`bridges::picking`]: Flattened `FfiPointerPress`/`Release`/`Move`/`Click`/`Over`/`Out`/
+//!     `Drag` observers and `FfiEntityCursor`.
+//!   - [`bridges::camera_light`]: `FfiCamera2d`, `FfiCamera3d`, `FfiPointLight`, `FfiSpotLight`,
+//!     `FfiDirectionalLight`, `FfiPanOrbitCamera`, `FfiSolariLighting`.
+//!   - [`bridges::audio`]: `FfiAudioPlaybackSettings`, `FfiAudioPlayerSpec`,
+//!     `FfiSpatialAudioSinkControl`, `AudioSource`, atomic `spawn_audio`.
+//!   - [`bridges::ui`]: `FfiVal` (incl. `Em`/`Rem`), `FfiUiNode`, `FfiUiTextStyle`, Feathers
+//!     widgets, `Activate` / `FfiValueChange` observers, `GuestUiHandles`, string/wire bridges.
+//!   - [`bridges::asset`]: Isolated `mod://<ns>/...` and `mod://overlay/...` paths (`mod_asset_path`,
+//!     `mod_overlay_path`), [`GuestAssetServer`], [`GuestAssetHandle`], [`TypedAssetHandle`].
+//!   - [`bridges::state`]: Primary slot-0 [`GuestStateBridge`], unbounded `ModStateSlab`
+//!     ([`ModStateEntry`], [`ModStateTransitionRequest`], [`ModDespawnOnExit`], [`ModDespawnOnEnter`]),
+//!     and deterministic `OnEnter` / `OnExit` / `OnTransition` schedules.
+//!   - [`bridges::reflect`]: `bamabi/*` / `bam/*` / `world.*` BRP constants and 64-byte `"BAMT"`
+//!     [`SystemTelemetryDigest64`].
+//!   - [`bridges::bsn`]: [`GuestScene`] (`cmd_spawn_scene`) and `Ready` integration.
+//! - **Host-opt-in conventions:** [`bridges::render`] (`Sprite`, `StandardMaterial`, `FfiMesh2d`,
+//!   `FfiMesh3d`, WESL material specs), [`bridges::window`] (`Window`, `WindowResized`,
+//!   `WindowCloseRequested`, `FfiAppExit`), and [`bridges::gizmos`] (`FfiGizmo*`).
+//!
+//! ---
+//!
+//! ## Step 7: Module Map & Companion Documentation
+//!
+//! | Module | Purpose |
+//! |---|---|
+//! | [`prelude`] | Single-import wildcard (`use bamabi_guest::prelude::*;`) |
+//! | [`lifecycle`] | [`GuestPlugin`], [`build_guest_plugin`], [`build_guest_fn`] |
+//! | [`macros`] | [`export_mod!`] (4 forms) and [`guest_log!`] |
+//! | [`component`] | [`GuestComponent`], [`GuestComponentHooks`], [`guest_component_uuid`], manifest prefixing |
+//! | [`app`] | [`GuestApp`], [`SystemBuilder`], [`QueryBuilder`], [`SystemContext`], [`BevySchedules`], [`conditions`], [`observers`](app::observers), [`hierarchy`](app::hierarchy), [`v03`](app::v03) |
+//! | [`iter`] | [`QueryTuple`], [`TypedChunkIter`], [`ChunkIter`], [`Chunk`], [`ChunkSlice`], [`ChunkSliceMut`], [`SparseRows`], [`RemovedComponents`](iter::filters) |
+//! | [`commands`] / [`commands_lifecycle`] | [`GuestCommands`], [`GuestTransaction`], persistent spawns, non-POD [`ModComponent`] commands |
+//! | [`entity_commands`] | [`GuestEntityCommands`], [`GuestChildSpawner`], `.disable()` / `.enable()` |
+//! | [`bridges`] | Unconditional Bevy `0.20` subsystem wrappers (`std_types`, `ui`, `state`, `asset`, `picking`, `camera_light`, `audio`, `bsn`, `reflect`, `render`, `window`, `gizmos`) |
+//! | [`raw`] | Re-exports [`bamabi_sys`] and `bamabi_guest_sys` raw escape hatches & `*RawExt` pointer traits |
+//!
+//! For deep architectural explanations, see `crates/bamabi_guest/ARCHITECTURE.md`. For a complete
+//! catalog of unit, integration, parity, stress, Miri, and compile-fail tests, see
+//! `crates/bamabi_guest/TESTS.md`.
+//!
+//! ---
+//!
+//! ## Step 8: Setup, Build, Run `.cdylib`, Test & Benchmark
+//!
+//! ### Cargo Setup (`Cargo.toml`)
+//!
+//! ```toml
+//! [lib]
+//! crate-type = ["cdylib"]
+//!
+//! [dependencies]
+//! bamabi_guest = { git = "https://github.com/yaga-simha/bamabi-wire.git", branch = "main", features = ["derive"] }
+//! ```
+//!
+//! ### Build & Run `.cdylib`
+//!
+//! ```bash
+//! cargo build --release -p <your_mod_crate>   # produces target/release/lib<name>.{so,dylib,dll}
+//! ```
+//!
+//! Load the compiled `.cdylib` in a `bamabi` host (or via `cargo-bam` in `bamabi-tools` /
+//! runnable examples in Layer 4 `bamabi-showcase`).
+//!
+//! ### Test & Verify `bamabi_guest`
+//!
+//! ```bash
+//! cargo fmt -p bamabi_guest -- --check
+//! cargo clippy -p bamabi_guest --all-targets -- -D warnings
+//! cargo clippy -p bamabi_guest --all-targets --all-features -- -D warnings
+//! cargo test -p bamabi_guest --no-default-features
+//! cargo test -p bamabi_guest --all-features
+//! cargo test --doc -p bamabi_guest --no-default-features
+//! cargo test --doc -p bamabi_guest --all-features
+//! RUSTDOCFLAGS="-D warnings" cargo doc -p bamabi_guest --no-deps --all-features
+//! MIRIFLAGS="-Zmiri-tree-borrows -Zmiri-strict-provenance" cargo +nightly miri test -p bamabi_guest
+//! ```
+//!
+//! ### Stress Testing & Benchmarks
+//!
+//! `bamabi-wire` is Layer 0 and contains no Criterion `[[bench]]` targets; runtime ECS/FFI
+//! benchmarks live in Layer 4 (`bamabi-showcase`, `docs/BENCHMARKS.md`). Within `bamabi_guest`,
+//! command-queue fast/heap paths and padded-payload soundness are stress-tested in
+//! `crates/bamabi_guest/tests/command_queue_stress.rs`, and per-system host telemetry frames are
+//! modeled via [`SystemTelemetryDigest64`] (`"BAMT"`).
 
 pub use bamabi_sys;
 
