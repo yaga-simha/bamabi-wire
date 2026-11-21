@@ -1,0 +1,18 @@
+[package]
+name = "bamabi_bench_guest_rust"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+publish = false
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+bamabi_guest = { path = "../../../crates/bamabi_guest", features = ["derive"] }
+bamabi_sys = { workspace = true }
+
+[lints]
+workspace = true

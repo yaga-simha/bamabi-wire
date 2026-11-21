@@ -1,12 +1,12 @@
 # `xtask` Architecture & Implementation Guide
 
-`xtask` is a `#![forbid(unsafe_code)]`, zero-external-dependency Cargo binary crate (`publish = false`, edition `2024`, MSRV `1.95`) that automates formatting, header generation, isolation lints, testing, static audits, Miri, Kani, and nightly verification for [`bamabi-wire`](../README.md).
+`xtask` is a `#![forbid(unsafe_code)]`, zero-external-dependency Cargo binary crate (`publish = false`, edition `2024`, MSRV `1.95`) that automates formatting, header generation, isolation lints, testing, static audits, Miri, Kani, nightly verification, and Layer-0 polyglot benchmarking for [`bamabi-wire`](../README.md).
 
 ## Module Layout
 
 | File | Responsibility |
 |---|---|
-| [`src/main.rs`](src/main.rs) | CLI argument parsing (`parse_args`), usage text (`print_help`), command dispatch (`dispatch`), subprocess wrappers (`run_cmd`, `cargo_cmd`, `clean_toolchain_cargo_cmd`, `check_tool_available`), all 11 `cmd_*` runners, and `#[cfg(doc)] pub mod docs` (`ARCHITECTURE.md` / `TESTS.md` in `rustdoc`) |
+| [`src/main.rs`](src/main.rs) | CLI argument parsing (`parse_args`), usage text (`print_help`), command dispatch (`dispatch`), subprocess wrappers (`run_cmd`, `cargo_cmd`, `clean_toolchain_cargo_cmd`, `check_tool_available`), all 12 `cmd_*` runners, and `#[cfg(doc)] pub mod docs` (`ARCHITECTURE.md` / `TESTS.md` in `rustdoc`) |
 | [`src/component_headers.rs`](src/component_headers.rs) | Canonical `#[derive(ModComponent)]` testbed structs, `generate_testbed_components_header()`, `write_or_check_component_headers()`, and `first_line_diff()` |
 | [`Cargo.toml`](Cargo.toml) | Declares workspace-local dependencies only (`bamabi_macros`, `bamabi_sdk_gen`, `bamabi_sys`) and inherits `[workspace.lints]` |
 
@@ -32,11 +32,12 @@ std::env::args().skip(1)
 
 - Empty arguments, `-h`, `--help`, or `help` route to `ParsedArgs::Help(None)`.
 - `help <subcommand>` and `<subcommand> -h` / `--help` resolve the subcommand via `parse_subcommand_kind` and route to `ParsedArgs::Help(Some(kind))`.
-- Each subcommand parses its own flags into a dedicated struct (`FmtArgs`, `TestArgs`, `CTestArgs`, `CheckArgs`, `AuditArgs`, `MiriArgs`, `KaniArgs`, `NightlyArgs`, `CiArgs`) or calls `reject_extra_args` (`lint`).
+- Each subcommand parses its own flags into a dedicated struct (`FmtArgs`, `TestArgs`, `CTestArgs`, `CheckArgs`, `AuditArgs`, `MiriArgs`, `KaniArgs`, `NightlyArgs`, `BenchArgs`, `CiArgs`) or calls `reject_extra_args` (`lint`).
 - Flag validation happens strictly before execution:
   - `parse_positive_usize` rejects `0` and non-integers for `--cases`.
   - `next_flag_value` rejects missing or empty option arguments; `--flag=` prefixes reject empty values.
   - `parse_c_test_args` rejects combining `--no-asan` and `--asan-only`.
+  - `parse_csv_enum` validates and deduplicates `--langs` (`rust`, `c99`, `cpp17`, `zig`) and `--guest-profiles` (`release`, `debug`).
   - `MiriArgs::resolved()` expands default invocation to `(tree_borrows=true, stacked_borrows=true, s390x=false)`.
   - `NightlyArgs::resolved()` expands default invocation to `(s390x=true, randomize_layout=true)` with default `cases = 2048`.
 
@@ -61,7 +62,8 @@ std::env::args().skip(1)
 | `miri` | `cmd_miri` | Verifies `cargo +nightly miri --version`. Runs `run_miri_suite` (`-p bamabi_sys -p bamabi_guest_sys -p bamabi_guest --all-features`, plus `-p bamabi_macros --test mod_component_vtable`) under Tree Borrows (`-Zmiri-tree-borrows -Zmiri-strict-provenance`) and/or Stacked Borrows (`-Zmiri-strict-provenance`). With `--s390x`, runs `s390x-unknown-linux-gnu` Tree Borrows + strict provenance on `bamabi_sys`, `bamabi_guest_sys`, and `bamabi_guest` (`--all-features`). |
 | `kani` | `cmd_kani` | Verifies `cargo kani --version`, then runs `cargo kani` on `bamabi_sys` and `bamabi_guest_sys` (or `-p` packages) with optional `--harness <pat>`, `-Z unstable-options --harness-timeout 15m --output-format terse -j`. |
 | `nightly` | `cmd_nightly` | Runs `cmd_miri` with `--s390x` and/or `RUSTFLAGS="-Zrandomize-layout" PROPTEST_CASES=<cases> cargo +nightly test` across `bamabi_sys`, `bamabi_guest_sys`, `bamabi_guest` (`--all-features`), `bamabi_macros` (`--lib --test mod_component_vtable`), and `bamabi_sdk_gen`. |
-| `ci` | `cmd_ci` | Runs `fmt` -> `header --check` -> `gen-component-headers --check` -> `lint` -> `test` -> `c-test`, plus optional `--audit`, `--miri`, `--kani` (or all three via `--full`). |
+| `bench` | `cmd_bench` | With `--check-docs`: validates `BENCHMARKS.md` markers and subject/workload coverage via `validate_benchmarks_doc`. Otherwise exports `bamabi.h`/`bamabi.hpp`/`bamabi.zig` via `bamabi_sdk_gen::export_sdk` into `target/bench_sdk/`, builds `bamabi_bench` in `--release`, compiles selected guest languages (`rust`, `c99`, `cpp17`, `zig`; skipping absent optional toolchains unless `--strict-langs` or explicitly listed in `--langs`) across selected profiles (`release`, `debug`) into `target/bench_guests/`, runs `bamabi_bench` passing `--guest <lang>:<profile>=<path>` alongside `--workloads`, `--entities`, `--chunks`, `--quick`, `--json`, and `--markdown target/bench-summary.md`, and updates `BENCHMARKS.md` automatically on full 8-guest runs (or `--write-docs`; disabled via `--no-write-docs`). |
+| `ci` | `cmd_ci` | Runs `fmt` -> `header --check` -> `gen-component-headers --check` -> `bench --check-docs` -> `lint` -> `test` -> `c-test` -> `bench --quick --no-write-docs` (unless `--no-bench`), plus optional `--audit`, `--miri`, `--kani` (or all three via `--full`). |
 
 ## Component Header Extraction (`xtask/src/component_headers.rs`)
 

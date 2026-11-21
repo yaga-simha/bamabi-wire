@@ -23,6 +23,8 @@
 //!     (`DEVELOPMENT.md`)
 //!   - [`testing`] — 8-tier verification pyramid, Miri, Kani `PO-W1..PO-W8` / `PO-G1..PO-G9`, and
 //!     Layer 0 stress/telemetry notes (`TESTING.md`)
+//!   - [`benchmarks`] — Layer 0 testing & polyglot host-guest benchmarking strategy and recorded
+//!     results (`BENCHMARKS.md`)
 //!   - [`wire_spec`] — Canonical byte-level wire specification (`spec.md`)
 //!   - [`crates`] — Curated index of all 6 functional crates with direct links to every crate root,
 //!     architecture guide, and test catalog
@@ -191,11 +193,13 @@
 //! cargo test -p bamabi_docs --doc
 //! ```
 //!
-//! - **Benchmarking note:** As Layer 0, `bamabi-wire` contains **no Criterion `[[bench]]` targets**.
-//!   Runtime ECS, FFI dispatch, and hot-reload benchmarks live downstream in Layer 4
-//!   (`bamabi-showcase`, `docs/BENCHMARKS.md`). For Layer 0 command-queue stress tests,
-//!   `"BAMT"` `SystemTelemetryDigest64` wire framing tests, `PROPTEST_CASES` scaling, and
-//!   `cargo check --workspace --all-features --timings`, see [`testing`].
+//! - **Benchmarking note:** Layer 0 includes a zero-dependency polyglot host-guest benchmark
+//!   harness (`benches/bamabi_bench` in `--release` mode + Rust/C99/C++17/Zig guests in `release`
+//!   and `debug` profiles, orchestrated via `cargo xtask bench`). See [`benchmarks`] for the
+//!   testing/benchmarking strategy and latest recorded results, and [`testing`] for command-queue
+//!   stress tests, `"BAMT"` `SystemTelemetryDigest64` wire framing tests, `PROPTEST_CASES` scaling,
+//!   and `cargo check --workspace --all-features --timings`. End-to-end Bevy-integrated ECS and
+//!   hot-reload Criterion benchmarks live downstream in Layer 4 (`bamabi-showcase`, `docs/BENCHMARKS.md`).
 
 #[cfg(doc)]
 pub mod overview {
@@ -215,6 +219,11 @@ pub mod development {
 #[cfg(doc)]
 pub mod testing {
     #![doc = include_str!("../../../TESTING.md")]
+}
+
+#[cfg(doc)]
+pub mod benchmarks {
+    #![doc = include_str!("../../../BENCHMARKS.md")]
 }
 
 #[cfg(doc)]
@@ -244,5 +253,6 @@ pub mod crates {
     //! - [`architecture`](../architecture/index.html) — Workspace `ARCHITECTURE.md`
     //! - [`development`](../development/index.html) — Workspace `DEVELOPMENT.md`
     //! - [`testing`](../testing/index.html) — Workspace `TESTING.md`
+    //! - [`benchmarks`](../benchmarks/index.html) — Workspace `BENCHMARKS.md`
     //! - [`wire_spec`](../wire_spec/index.html) — Canonical `spec.md`
 }

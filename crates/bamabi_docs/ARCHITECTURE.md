@@ -13,7 +13,7 @@ Adding `crates/bamabi_docs` (`name = "bamabi_docs"`, which sorts before `bamabi_
 
 ## 2. Module Layout (`src/lib.rs`)
 
-`crates/bamabi_docs/src/lib.rs` exports zero runtime symbols and six `#[cfg(doc)]` documentation modules:
+`crates/bamabi_docs/src/lib.rs` exports zero runtime symbols and seven `#[cfg(doc)]` documentation modules:
 
 | Module | Source | Generated Page |
 |---|---|---|
@@ -22,6 +22,7 @@ Adding `crates/bamabi_docs` (`name = "bamabi_docs"`, which sorts before `bamabi_
 | `architecture` | [`../../ARCHITECTURE.md`](../../ARCHITECTURE.md) | `target/doc/bamabi_docs/architecture/index.html` |
 | `development` | [`../../DEVELOPMENT.md`](../../DEVELOPMENT.md) | `target/doc/bamabi_docs/development/index.html` |
 | `testing` | [`../../TESTING.md`](../../TESTING.md) | `target/doc/bamabi_docs/testing/index.html` |
+| `benchmarks` | [`../../BENCHMARKS.md`](../../BENCHMARKS.md) | `target/doc/bamabi_docs/benchmarks/index.html` |
 | `wire_spec` | [`../../spec.md`](../../spec.md) | `target/doc/bamabi_docs/wire_spec/index.html` |
 | `crates` | Curated crate index in [`src/lib.rs`](src/lib.rs) | `target/doc/bamabi_docs/crates/index.html` |
 
@@ -30,7 +31,7 @@ Adding `crates/bamabi_docs` (`name = "bamabi_docs"`, which sorts before `bamabi_
 Each submodule is gated with `#[cfg(doc)]` so:
 
 1. `rustdoc` (`cargo doc` / `cargo docs`) renders all root markdown documents and `spec.md` into browsable HTML pages and checks all intra-doc links, bare URLs, and HTML tags under `RUSTDOCFLAGS="-D warnings"`.
-2. `cargo test --doc -p bamabi_docs` and `cargo build -p bamabi_docs` do not attempt to compile unlabelled markdown code blocks inside `README.md`, `ARCHITECTURE.md`, `DEVELOPMENT.md`, `TESTING.md`, or `spec.md` as Rust doctests.
+2. `cargo test --doc -p bamabi_docs` and `cargo build -p bamabi_docs` do not attempt to compile unlabelled markdown code blocks inside `README.md`, `ARCHITECTURE.md`, `DEVELOPMENT.md`, `TESTING.md`, `BENCHMARKS.md`, or `spec.md` as Rust doctests.
 
 ## 3. Isolation & Policy Invariants
 

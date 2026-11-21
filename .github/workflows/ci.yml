@@ -29,13 +29,14 @@ jobs:
       - name: Cache Cargo artifacts
         uses: Swatinem/rust-cache@v2
 
-      - name: Formatting, headers, isolation, clippy & rustdoc
+      - name: Formatting, headers, benchmark docs, isolation, clippy & rustdoc
         shell: bash
         run: |
           set -euo pipefail
           cargo xtask fmt
           cargo xtask header --check
           cargo xtask gen-component-headers --check
+          cargo xtask bench --check-docs
           cargo xtask lint
 
       - name: Run Layer 0 test suites
@@ -213,3 +214,71 @@ jobs:
             --harness-timeout 15m
             --output-format terse
             -j
+
+  benchmarks:
+    name: Polyglot Benchmarks (Rust, C99, C++17, Zig)
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    env:
+      CARGO_PROFILE_DEV_DEBUG: "line-tables-only"
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+
+      - name: Install stable Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Cargo artifacts
+        uses: Swatinem/rust-cache@v2
+
+      - name: Install Zig 0.16.0
+        uses: mlugg/setup-zig@v2
+        with:
+          version: 0.16.0
+
+      - name: Verify C99 and C++17 compilers
+        shell: bash
+        run: |
+          set -euo pipefail
+          cc --version
+          c++ --version
+          zig version
+
+      - name: Run polyglot benchmark suite and update BENCHMARKS.md report
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p target
+          if [ "${{ github.event_name }}" = "push" ] && { [ "${{ github.ref }}" = "refs/heads/main" ] || [ "${{ github.ref }}" = "refs/heads/master" ]; }; then
+            cargo xtask bench --strict-langs --write-docs --json target/bench-results.json
+          else
+            cargo xtask bench --quick --strict-langs --write-docs --json target/bench-results.json
+          fi
+          cat target/bench-summary.md >> "$GITHUB_STEP_SUMMARY"
+          RUSTDOCFLAGS="-D warnings" cargo doc -p bamabi_docs --no-deps
+
+      - name: Upload benchmark JSON, Markdown report & updated BENCHMARKS.md artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: bench-results
+          path: |
+            target/bench-results.json
+            target/bench-summary.md
+            BENCHMARKS.md
+          if-no-files-found: warn
+
+      - name: Commit updated BENCHMARKS.md report on main/master
+        if: github.event_name == 'push' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master')
+        shell: bash
+        run: |
+          set -euo pipefail
+          if ! git diff --quiet -- BENCHMARKS.md; then
+            git config user.name "github-actions[bot]"
+            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+            git add BENCHMARKS.md
+            git commit -m "chore(bench): update BENCHMARKS.md report [skip ci]"
+            git pull --rebase origin "${GITHUB_REF_NAME}"
+            git push origin "HEAD:${GITHUB_REF_NAME}"
+          fi

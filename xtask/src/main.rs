@@ -34,9 +34,9 @@
 //! Invoke via the `.cargo/config.toml` alias from the repository root:
 //!
 //! ```text
-//! cargo xtask ci          # fmt, header --check, gen-component-headers --check, lint, test, c-test
+//! cargo xtask ci          # fmt, header --check, gen-component-headers --check, lint, test, c-test, bench --quick
 //! cargo xtask ci --full   # adds audit, dual-model Miri, and Kani formal proofs
-//! cargo xtask --help      # lists all 11 subcommands
+//! cargo xtask --help      # lists all 12 subcommands
 //! ```
 //!
 //! To add a new subcommand:
@@ -50,7 +50,7 @@
 //!
 //! # Workspace & Crate Documentation
 //!
-//! - [`docs::architecture`]: Deep dive into `xtask` CLI parsing, toolchain isolation, and all 11
+//! - [`docs::architecture`]: Deep dive into `xtask` CLI parsing, toolchain isolation, and all 12
 //!   subcommand runners (`ARCHITECTURE.md`).
 //! - [`docs::tests`]: Unit test inventory covering CLI parsing and checked-in component-header
 //!   parity (`TESTS.md`).
@@ -59,11 +59,12 @@
 //!   [`architecture`](../bamabi_docs/architecture/index.html),
 //!   [`development`](../bamabi_docs/development/index.html),
 //!   [`testing`](../bamabi_docs/testing/index.html),
+//!   [`benchmarks`](../bamabi_docs/benchmarks/index.html),
 //!   [`wire_spec`](../bamabi_docs/wire_spec/index.html),
 //!   [`crates`](../bamabi_docs/crates/index.html)):
 //!   Root `README.md`, `ARCHITECTURE.md` (with the 6-crate end-to-end walkthrough),
-//!   `DEVELOPMENT.md`, `TESTING.md`, and `spec.md` rendered directly inside `cargo docs --open`
-//!   (landing on `target/doc/bamabi_docs/index.html`).
+//!   `DEVELOPMENT.md`, `TESTING.md`, `BENCHMARKS.md`, and `spec.md` rendered directly inside
+//!   `cargo docs --open` (landing on `target/doc/bamabi_docs/index.html`).
 
 #[cfg(doc)]
 #[allow(unreachable_pub)]
@@ -110,6 +111,7 @@ enum SubcommandKind {
     Miri,
     Kani,
     Nightly,
+    Bench,
     Ci,
 }
 
@@ -126,6 +128,7 @@ enum CommandSpec {
     Miri(MiriArgs),
     Kani(KaniArgs),
     Nightly(NightlyArgs),
+    Bench(BenchArgs),
     Ci(CiArgs),
 }
 
@@ -233,12 +236,99 @@ impl NightlyArgs {
     }
 }
 
+/// Supported polyglot guest languages for `cargo xtask bench`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BenchLang {
+    Rust,
+    C99,
+    Cpp17,
+    Zig,
+}
+
+impl BenchLang {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Rust => "rust",
+            Self::C99 => "c99",
+            Self::Cpp17 => "cpp17",
+            Self::Zig => "zig",
+        }
+    }
+}
+
+/// Guest compilation profile for `cargo xtask bench`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GuestProfile {
+    Release,
+    Debug,
+}
+
+impl GuestProfile {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Release => "release",
+            Self::Debug => "debug",
+        }
+    }
+}
+
+/// Options for `cargo xtask bench`.
+#[derive(Debug, Default, PartialEq, Eq)]
+struct BenchArgs {
+    langs: Option<Vec<BenchLang>>,
+    guest_profiles: Option<Vec<GuestProfile>>,
+    workloads: Option<String>,
+    entities: Option<String>,
+    chunks: Option<String>,
+    quick: bool,
+    strict_langs: bool,
+    json: Option<PathBuf>,
+    write_docs: bool,
+    no_write_docs: bool,
+    check_docs: bool,
+}
+
+impl BenchArgs {
+    /// Returns `true` when no language, guest-profile, or workload subset filter was applied.
+    fn is_full_matrix_request(&self) -> bool {
+        self.langs.is_none() && self.guest_profiles.is_none() && self.workloads.is_none()
+    }
+    /// Returns the selected languages, defaulting to all 4 (`rust`, `c99`, `cpp17`, `zig`).
+    fn resolved_langs(&self) -> Vec<BenchLang> {
+        match &self.langs {
+            Some(langs) if !langs.is_empty() => langs.clone(),
+            _ => vec![
+                BenchLang::Rust,
+                BenchLang::C99,
+                BenchLang::Cpp17,
+                BenchLang::Zig,
+            ],
+        }
+    }
+
+    /// Returns `true` when `--langs` explicitly requested `lang`.
+    fn explicit_lang_requested(&self, lang: BenchLang) -> bool {
+        self.langs
+            .as_ref()
+            .is_some_and(|langs| langs.contains(&lang))
+    }
+
+    /// Returns the selected guest build profiles, defaulting to `[Release, Debug]`.
+    fn resolved_profiles(&self) -> Vec<GuestProfile> {
+        match &self.guest_profiles {
+            Some(profiles) if !profiles.is_empty() => profiles.clone(),
+            _ => vec![GuestProfile::Release, GuestProfile::Debug],
+        }
+    }
+}
+
 /// Options for `cargo xtask ci`.
 #[derive(Debug, Default, PartialEq, Eq)]
 struct CiArgs {
     audit: bool,
     miri: bool,
     kani: bool,
+    no_bench: bool,
 }
 
 fn main() -> ExitCode {
@@ -307,6 +397,7 @@ fn parse_args(args: &[String]) -> Result<ParsedArgs, String> {
         SubcommandKind::Miri => CommandSpec::Miri(parse_miri_args(rest)?),
         SubcommandKind::Kani => CommandSpec::Kani(parse_kani_args(rest)?),
         SubcommandKind::Nightly => CommandSpec::Nightly(parse_nightly_args(rest)?),
+        SubcommandKind::Bench => CommandSpec::Bench(parse_bench_args(rest)?),
         SubcommandKind::Ci => CommandSpec::Ci(parse_ci_args(rest)?),
     };
     Ok(ParsedArgs::Run(spec))
@@ -328,6 +419,7 @@ fn parse_subcommand_kind(name: &str) -> Option<SubcommandKind> {
         "miri" => Some(SubcommandKind::Miri),
         "kani" => Some(SubcommandKind::Kani),
         "nightly" => Some(SubcommandKind::Nightly),
+        "bench" => Some(SubcommandKind::Bench),
         "ci" => Some(SubcommandKind::Ci),
         _ => None,
     }
@@ -558,6 +650,114 @@ fn parse_nightly_args(args: &[String]) -> Result<NightlyArgs, String> {
     Ok(parsed)
 }
 
+fn parse_bench_lang(item: &str) -> Option<BenchLang> {
+    match item {
+        "rust" => Some(BenchLang::Rust),
+        "c99" => Some(BenchLang::C99),
+        "cpp17" => Some(BenchLang::Cpp17),
+        "zig" => Some(BenchLang::Zig),
+        _ => None,
+    }
+}
+
+fn parse_guest_profile(item: &str) -> Option<GuestProfile> {
+    match item {
+        "release" => Some(GuestProfile::Release),
+        "debug" => Some(GuestProfile::Debug),
+        _ => None,
+    }
+}
+
+fn parse_csv_enum<T: Copy + PartialEq>(
+    flag: &str,
+    value: &str,
+    parse_item: fn(&str) -> Option<T>,
+    valid: &str,
+) -> Result<Vec<T>, String> {
+    let mut out = Vec::new();
+    for raw in value.split(',') {
+        let trimmed = raw.trim();
+        if trimmed.is_empty() {
+            return Err(format!("empty item in `{flag}` list `{value}`"));
+        }
+        let parsed = parse_item(trimmed).ok_or_else(|| {
+            format!("unknown `{flag}` value `{trimmed}`; expected subset of {valid}")
+        })?;
+        if !out.contains(&parsed) {
+            out.push(parsed);
+        }
+    }
+    if out.is_empty() {
+        return Err(format!("empty value for `{flag}`"));
+    }
+    Ok(out)
+}
+
+fn parse_bench_args(args: &[String]) -> Result<BenchArgs, String> {
+    let mut parsed = BenchArgs::default();
+    let mut i = 0;
+    while i < args.len() {
+        let arg = args[i].as_str();
+        let (flag, inline_val) = match arg.split_once('=') {
+            Some((f, v)) => (f, Some(v)),
+            None => (arg, None),
+        };
+        let take_val = |idx: &mut usize| -> Result<String, String> {
+            let val = if let Some(v) = inline_val {
+                v.to_owned()
+            } else {
+                next_flag_value(args, idx, flag)?.to_owned()
+            };
+            if val.trim().is_empty() {
+                return Err(format!("empty value for `{flag}`"));
+            }
+            Ok(val)
+        };
+        match flag {
+            "--langs" => {
+                let v = take_val(&mut i)?;
+                parsed.langs = Some(parse_csv_enum(
+                    "--langs",
+                    &v,
+                    parse_bench_lang,
+                    "rust, c99, cpp17, zig",
+                )?);
+            }
+            "--guest-profiles" => {
+                let v = take_val(&mut i)?;
+                parsed.guest_profiles = Some(parse_csv_enum(
+                    "--guest-profiles",
+                    &v,
+                    parse_guest_profile,
+                    "release, debug",
+                )?);
+            }
+            "--workloads" => parsed.workloads = Some(take_val(&mut i)?),
+            "--entities" => parsed.entities = Some(take_val(&mut i)?),
+            "--chunks" => parsed.chunks = Some(take_val(&mut i)?),
+            "--json" => parsed.json = Some(PathBuf::from(take_val(&mut i)?)),
+            "--quick" if inline_val.is_none() => parsed.quick = true,
+            "--strict-langs" if inline_val.is_none() => parsed.strict_langs = true,
+            "--write-docs" if inline_val.is_none() => parsed.write_docs = true,
+            "--no-write-docs" if inline_val.is_none() => parsed.no_write_docs = true,
+            "--check-docs" if inline_val.is_none() => parsed.check_docs = true,
+            _ => {
+                return Err(format!(
+                    "unknown `bench` flag `{arg}`; run `cargo xtask bench --help`"
+                ));
+            }
+        }
+        i += 1;
+    }
+    if parsed.write_docs && parsed.check_docs {
+        return Err("cannot combine `--write-docs` and `--check-docs`".to_owned());
+    }
+    if parsed.write_docs && parsed.no_write_docs {
+        return Err("cannot combine `--write-docs` and `--no-write-docs`".to_owned());
+    }
+    Ok(parsed)
+}
+
 fn parse_ci_args(args: &[String]) -> Result<CiArgs, String> {
     let mut parsed = CiArgs::default();
     for arg in args {
@@ -570,6 +770,7 @@ fn parse_ci_args(args: &[String]) -> Result<CiArgs, String> {
             "--audit" => parsed.audit = true,
             "--miri" => parsed.miri = true,
             "--kani" => parsed.kani = true,
+            "--no-bench" => parsed.no_bench = true,
             other => {
                 return Err(format!(
                     "unknown `ci` flag `{other}`; run `cargo xtask ci --help`"
@@ -600,7 +801,8 @@ SUBCOMMANDS:
     miri                   Run Miri (Tree Borrows, Stacked Borrows, and/or s390x)
     kani                   Run Kani formal verification proofs
     nightly                Run s390x Miri and -Zrandomize-layout extended suites
-    ci                     Run the local CI gate (fmt, headers, lint, test, c-test)
+    bench                  Build and run the polyglot host-guest benchmark suite (Rust, C99, C++17, Zig)
+    ci                     Run the local CI gate (fmt, headers, lint, test, c-test, bench --quick)
 
 Run `cargo xtask <SUBCOMMAND> --help` for subcommand options."
         ),
@@ -705,18 +907,37 @@ OPTIONS:
 
 Defaults to running both --s390x and --randomize-layout."
         ),
+        Some(SubcommandKind::Bench) => println!(
+            "\
+USAGE:
+    cargo xtask bench [OPTIONS]
+
+OPTIONS:
+    --langs <csv>             Comma-separated subset of: rust, c99, cpp17, zig (default: all)
+    --guest-profiles <csv>    Comma-separated subset of: release, debug (default: release,debug)
+    --workloads <csv>         Filter workloads (noop,dense_query_update,command_burst,host_api_roundtrip)
+    --entities <csv>          Entity counts for dense_query_update (default: 1000,100000)
+    --chunks <csv>            Chunk sizes for dense_query_update (default: 256,4096; quick: 256)
+    --quick                   Use fast warmup/sample counts (also run by `cargo xtask ci`)
+    --strict-langs            Fail instead of skipping if an optional toolchain (e.g. zig) is missing
+    --json <path>             Write JSON benchmark results to <path>
+    --write-docs              Force refreshing BENCHMARKS.md (automatic on full 8-guest runs)
+    --no-write-docs           Do not update BENCHMARKS.md after running benchmarks
+    --check-docs              Verify BENCHMARKS.md contains valid markers and complete results"
+        ),
         Some(SubcommandKind::Ci) => println!(
             "\
 USAGE:
-    cargo xtask ci [--full] [--audit] [--miri] [--kani]
+    cargo xtask ci [--full] [--audit] [--miri] [--kani] [--no-bench]
 
 OPTIONS:
-    --audit    Also run `cargo xtask audit`
-    --miri     Also run `cargo xtask miri`
-    --kani     Also run `cargo xtask kani`
-    --full     Enable --audit, --miri, and --kani
+    --audit       Also run `cargo xtask audit`
+    --miri        Also run `cargo xtask miri`
+    --kani        Also run `cargo xtask kani`
+    --no-bench    Skip `cargo xtask bench --quick`
+    --full        Enable --audit, --miri, and --kani
 
-Default runs fmt, header --check, gen-component-headers --check, lint, test, and c-test."
+Default runs fmt, header --check, gen-component-headers --check, lint, test, c-test, and bench --quick."
         ),
     }
 }
@@ -743,6 +964,7 @@ fn dispatch(cmd: CommandSpec) -> Result<(), String> {
         CommandSpec::Miri(args) => cmd_miri(&root, &args),
         CommandSpec::Kani(args) => cmd_kani(&root, &args),
         CommandSpec::Nightly(args) => cmd_nightly(&root, &args),
+        CommandSpec::Bench(args) => cmd_bench(&root, &args),
         CommandSpec::Ci(args) => cmd_ci(&root, &args),
     }
 }
@@ -978,6 +1200,24 @@ fn cmd_test(root: &Path, args: &TestArgs) -> Result<(), String> {
 
 fn c_compiler() -> String {
     env::var("CC").unwrap_or_else(|_| "cc".to_owned())
+}
+
+fn cpp_compiler() -> String {
+    env::var("CXX").unwrap_or_else(|_| "c++".to_owned())
+}
+
+fn cargo_target_dir(root: &Path) -> PathBuf {
+    match env::var_os("CARGO_TARGET_DIR") {
+        Some(val) if !val.is_empty() => {
+            let path = PathBuf::from(val);
+            if path.is_absolute() {
+                path
+            } else {
+                root.join(path)
+            }
+        }
+        _ => root.join("target"),
+    }
 }
 
 fn sanitizer_clang() -> String {
@@ -1405,13 +1645,546 @@ fn cmd_nightly(root: &Path, args: &NightlyArgs) -> Result<(), String> {
     Ok(())
 }
 
+fn guest_lib_filename(lang: BenchLang, profile: GuestProfile) -> String {
+    format!(
+        "libbench_{}_{}{}",
+        lang.as_str(),
+        profile.as_str(),
+        env::consts::DLL_SUFFIX
+    )
+}
+
+fn shared_compile_flags() -> &'static [&'static str] {
+    if cfg!(target_os = "macos") {
+        &["-fPIC", "-dynamiclib"]
+    } else if cfg!(target_os = "windows") {
+        &["-shared"]
+    } else {
+        &["-fPIC", "-shared"]
+    }
+}
+
+fn ensure_optional_bench_tool(
+    program: &str,
+    version_args: &[&str],
+    install_hint: &str,
+    lang: BenchLang,
+    args: &BenchArgs,
+) -> Result<bool, String> {
+    match check_tool_available(program, version_args, install_hint) {
+        Ok(()) => Ok(true),
+        Err(err) => {
+            if args.strict_langs || args.explicit_lang_requested(lang) {
+                Err(err)
+            } else {
+                println!("==> Skipping `{}` benchmark guests ({err})", lang.as_str());
+                Ok(false)
+            }
+        }
+    }
+}
+
+fn build_rust_guest(
+    root: &Path,
+    target_dir: &Path,
+    guests_dir: &Path,
+    profile: GuestProfile,
+) -> Result<PathBuf, String> {
+    let mut cmd = cargo_cmd(root);
+    cmd.args(["build", "-p", "bamabi_bench_guest_rust"]);
+    let label = match profile {
+        GuestProfile::Release => {
+            cmd.arg("--release");
+            "cargo build --release -p bamabi_bench_guest_rust"
+        }
+        GuestProfile::Debug => "cargo build -p bamabi_bench_guest_rust",
+    };
+    run_cmd(&mut cmd, label)?;
+
+    let built_name = format!(
+        "{}bamabi_bench_guest_rust{}",
+        env::consts::DLL_PREFIX,
+        env::consts::DLL_SUFFIX
+    );
+    let built_path = target_dir.join(profile.as_str()).join(&built_name);
+    if !built_path.is_file() {
+        return Err(format!(
+            "expected compiled Rust guest library at {}",
+            built_path.display()
+        ));
+    }
+    let out_path = guests_dir.join(guest_lib_filename(BenchLang::Rust, profile));
+    fs::copy(&built_path, &out_path).map_err(|e| {
+        format!(
+            "failed to copy {} to {}: {e}",
+            built_path.display(),
+            out_path.display()
+        )
+    })?;
+    Ok(out_path)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn build_c_or_cpp_guest(
+    root: &Path,
+    compiler: &str,
+    lang: BenchLang,
+    std_flag: &str,
+    pedantic_flag: &str,
+    src_rel: &str,
+    sdk_dir: &Path,
+    guests_dir: &Path,
+    profile: GuestProfile,
+) -> Result<PathBuf, String> {
+    let src_path = root.join(src_rel);
+    let out_path = guests_dir.join(guest_lib_filename(lang, profile));
+    let opt_flags: &[&str] = match profile {
+        GuestProfile::Release => &["-O3"],
+        GuestProfile::Debug => &["-O0", "-g"],
+    };
+
+    let mut cmd = Command::new(compiler);
+    cmd.current_dir(root)
+        .args([std_flag, "-Wall", "-Wextra", "-Werror", pedantic_flag])
+        .args(opt_flags)
+        .args(shared_compile_flags())
+        .arg("-I")
+        .arg(sdk_dir)
+        .arg(&src_path)
+        .arg("-o")
+        .arg(&out_path);
+
+    let label = format!(
+        "{compiler} ({lang}:{profile}) {src_rel} -> {}",
+        out_path.display(),
+        lang = lang.as_str(),
+        profile = profile.as_str()
+    );
+    run_cmd(&mut cmd, &label)?;
+    Ok(out_path)
+}
+
+fn build_zig_guest(
+    root: &Path,
+    sdk_dir: &Path,
+    guests_dir: &Path,
+    profile: GuestProfile,
+) -> Result<PathBuf, String> {
+    let zig_dir = root.join("benches").join("guests").join("zig_guest");
+    let opt_arg = match profile {
+        GuestProfile::Release => "-Doptimize=ReleaseFast",
+        GuestProfile::Debug => "-Doptimize=Debug",
+    };
+    let sdk_arg = format!("-Dsdk-dir={}", sdk_dir.display());
+    let cache_root = guests_dir.join(format!("zig_cache_{}", profile.as_str()));
+    let local_cache = cache_root.join("local");
+    let global_cache = cache_root.join("global");
+    let out_prefix = guests_dir.join(format!("zig_out_{}", profile.as_str()));
+    for dir in [&local_cache, &global_cache, &out_prefix] {
+        fs::create_dir_all(dir).map_err(|e| format!("failed to create {}: {e}", dir.display()))?;
+    }
+
+    let mut cmd = Command::new("zig");
+    cmd.current_dir(&zig_dir)
+        .env("ZIG_GLOBAL_CACHE_DIR", &global_cache)
+        .args(["build", opt_arg, &sdk_arg, "--prefix"])
+        .arg(&out_prefix)
+        .arg("--cache-dir")
+        .arg(&local_cache)
+        .arg("--global-cache-dir")
+        .arg(&global_cache);
+    run_cmd(
+        &mut cmd,
+        &format!("zig build ({}, {opt_arg})", profile.as_str()),
+    )?;
+
+    let built_name = format!(
+        "{}bench_zig{}",
+        env::consts::DLL_PREFIX,
+        env::consts::DLL_SUFFIX
+    );
+    let lib_candidate = out_prefix.join("lib").join(&built_name);
+    let bin_candidate = out_prefix.join("bin").join(&built_name);
+    let built_path = if lib_candidate.is_file() {
+        lib_candidate
+    } else if bin_candidate.is_file() {
+        bin_candidate
+    } else {
+        return Err(format!(
+            "expected compiled Zig guest library at {} or {}",
+            lib_candidate.display(),
+            bin_candidate.display()
+        ));
+    };
+
+    let out_path = guests_dir.join(guest_lib_filename(BenchLang::Zig, profile));
+    fs::copy(&built_path, &out_path).map_err(|e| {
+        format!(
+            "failed to copy {} to {}: {e}",
+            built_path.display(),
+            out_path.display()
+        )
+    })?;
+    Ok(out_path)
+}
+
+const BENCH_RESULTS_START: &str = "<!-- BENCHMARKS_RESULTS_START -->";
+const BENCH_RESULTS_END: &str = "<!-- BENCHMARKS_RESULTS_END -->";
+
+fn extract_bench_results_section(content: &str) -> Result<&str, String> {
+    let start_pos = content
+        .find(BENCH_RESULTS_START)
+        .ok_or_else(|| format!("BENCHMARKS.md is missing `{BENCH_RESULTS_START}` marker"))?;
+    let body_start = start_pos + BENCH_RESULTS_START.len();
+    let end_rel = content[body_start..]
+        .find(BENCH_RESULTS_END)
+        .ok_or_else(|| format!("BENCHMARKS.md is missing `{BENCH_RESULTS_END}` marker"))?;
+    Ok(&content[body_start..body_start + end_rel])
+}
+
+fn update_benchmarks_doc_section(existing: &str, generated_block: &str) -> Result<String, String> {
+    let normalized = existing.replace("\r\n", "\n");
+    let start_pos = normalized
+        .find(BENCH_RESULTS_START)
+        .ok_or_else(|| format!("BENCHMARKS.md is missing `{BENCH_RESULTS_START}` marker"))?;
+    let body_start = start_pos + BENCH_RESULTS_START.len();
+    let end_rel = normalized[body_start..]
+        .find(BENCH_RESULTS_END)
+        .ok_or_else(|| format!("BENCHMARKS.md is missing `{BENCH_RESULTS_END}` marker"))?;
+    let end_pos = body_start + end_rel;
+
+    let mut out = String::with_capacity(normalized.len() + generated_block.len());
+    out.push_str(&normalized[..body_start]);
+    out.push('\n');
+    out.push_str(generated_block.trim());
+    out.push('\n');
+    out.push_str(&normalized[end_pos..]);
+    Ok(out)
+}
+
+fn validate_benchmarks_doc(content: &str) -> Result<(), String> {
+    let normalized = content.replace("\r\n", "\n");
+    let section = extract_bench_results_section(&normalized)?;
+    if !section.contains("| Subject") || !section.contains("| ---") {
+        return Err(
+            "BENCHMARKS.md results section does not contain a formatted Markdown results table"
+                .to_owned(),
+        );
+    }
+    let required_subjects = [
+        "native",
+        "rust:release",
+        "rust:debug",
+        "c99:release",
+        "c99:debug",
+        "cpp17:release",
+        "cpp17:debug",
+        "zig:release",
+        "zig:debug",
+    ];
+    for subject in required_subjects {
+        let row_prefix = format!("| {subject}");
+        if !section.contains(&row_prefix) {
+            return Err(format!(
+                "BENCHMARKS.md results section is missing subject `{subject}`"
+            ));
+        }
+    }
+    let required_workloads = [
+        "noop",
+        "dense_query_update",
+        "command_burst",
+        "host_api_roundtrip",
+    ];
+    for workload in required_workloads {
+        if !section.contains(workload) {
+            return Err(format!(
+                "BENCHMARKS.md results section is missing workload `{workload}`"
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn check_benchmarks_doc(root: &Path) -> Result<(), String> {
+    let path = root.join("BENCHMARKS.md");
+    let content =
+        fs::read_to_string(&path).map_err(|e| format!("failed to read {}: {e}", path.display()))?;
+    validate_benchmarks_doc(&content)?;
+    println!(
+        "==> Verified {} contains valid polyglot benchmark results",
+        path.display()
+    );
+    Ok(())
+}
+
+fn probe_tool_first_line(program: &str, args: &[&str]) -> String {
+    let Ok(output) = Command::new(program)
+        .args(args)
+        .env_remove("RUSTUP_TOOLCHAIN")
+        .env_remove("RUSTC")
+        .output()
+    else {
+        return "unavailable".to_owned();
+    };
+    if !output.status.success() {
+        return "unavailable".to_owned();
+    }
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let text = if stdout.trim().is_empty() {
+        stderr.as_ref()
+    } else {
+        stdout.as_ref()
+    };
+    text.lines()
+        .map(str::trim)
+        .find(|line| !line.is_empty())
+        .unwrap_or("unknown")
+        .replace('`', "'")
+}
+
+fn probe_git_short_sha(root: &Path) -> String {
+    let Ok(output) = Command::new("git")
+        .current_dir(root)
+        .args(["rev-parse", "--short", "HEAD"])
+        .output()
+    else {
+        return "unknown".to_owned();
+    };
+    if !output.status.success() {
+        return "unknown".to_owned();
+    }
+    let sha = String::from_utf8_lossy(&output.stdout).trim().to_owned();
+    if sha.is_empty() {
+        "unknown".to_owned()
+    } else {
+        sha
+    }
+}
+
+fn format_bench_env_metadata(root: &Path) -> String {
+    let commit = probe_git_short_sha(root);
+    let cc = c_compiler();
+    let cxx = cpp_compiler();
+    let rustc_ver = probe_tool_first_line("rustc", &["--version"]);
+    let cc_ver = probe_tool_first_line(&cc, &["--version"]);
+    let cxx_ver = probe_tool_first_line(&cxx, &["--version"]);
+    let zig_ver = probe_tool_first_line("zig", &["version"]);
+    format!(
+        "- **Commit:** `{commit}`\n\
+         - **Host target:** `{os}/{arch}` (`bamabi_bench` built with `--release`)\n\
+         - **Rust:** `{rustc_ver}`\n\
+         - **C99 (`{cc}`):** `{cc_ver}`\n\
+         - **C++17 (`{cxx}`):** `{cxx_ver}`\n\
+         - **Zig:** `{zig_ver}`\n",
+        os = env::consts::OS,
+        arch = env::consts::ARCH,
+    )
+}
+
+fn cmd_bench(root: &Path, args: &BenchArgs) -> Result<(), String> {
+    if args.check_docs {
+        return check_benchmarks_doc(root);
+    }
+
+    let target_dir = cargo_target_dir(root);
+    let sdk_dir = target_dir.join("bench_sdk");
+    let guests_dir = target_dir.join("bench_guests");
+    fs::create_dir_all(&guests_dir)
+        .map_err(|e| format!("failed to create {}: {e}", guests_dir.display()))?;
+
+    println!(
+        "==> Exporting polyglot SDK headers to {}",
+        sdk_dir.display()
+    );
+    bamabi_sdk_gen::export_sdk(&sdk_dir)
+        .map_err(|e| format!("failed to export SDK to {}: {e}", sdk_dir.display()))?;
+
+    run_cmd(
+        cargo_cmd(root).args(["build", "--release", "-p", "bamabi_bench"]),
+        "cargo build --release -p bamabi_bench",
+    )?;
+    let host_bin = target_dir
+        .join("release")
+        .join(format!("bamabi_bench{}", env::consts::EXE_SUFFIX));
+    if !host_bin.is_file() {
+        return Err(format!(
+            "expected benchmark host binary at {}, but it was not found",
+            host_bin.display()
+        ));
+    }
+
+    let langs = args.resolved_langs();
+    let profiles = args.resolved_profiles();
+    let mut built_guests: Vec<(BenchLang, GuestProfile, PathBuf)> = Vec::new();
+
+    for &lang in &langs {
+        match lang {
+            BenchLang::Rust => {
+                for &profile in &profiles {
+                    let path = build_rust_guest(root, &target_dir, &guests_dir, profile)?;
+                    built_guests.push((lang, profile, path));
+                }
+            }
+            BenchLang::C99 => {
+                let cc = c_compiler();
+                for &profile in &profiles {
+                    let path = build_c_or_cpp_guest(
+                        root,
+                        &cc,
+                        BenchLang::C99,
+                        "-std=c99",
+                        "-pedantic",
+                        "benches/guests/c99_guest/bench_guest.c",
+                        &sdk_dir,
+                        &guests_dir,
+                        profile,
+                    )?;
+                    built_guests.push((lang, profile, path));
+                }
+            }
+            BenchLang::Cpp17 => {
+                let cxx = cpp_compiler();
+                if ensure_optional_bench_tool(
+                    &cxx,
+                    &["--version"],
+                    "install a C++17 compiler (e.g. g++/clang++) or set $CXX",
+                    BenchLang::Cpp17,
+                    args,
+                )? {
+                    for &profile in &profiles {
+                        let path = build_c_or_cpp_guest(
+                            root,
+                            &cxx,
+                            BenchLang::Cpp17,
+                            "-std=c++17",
+                            "-Wpedantic",
+                            "benches/guests/cpp17_guest/bench_guest.cpp",
+                            &sdk_dir,
+                            &guests_dir,
+                            profile,
+                        )?;
+                        built_guests.push((lang, profile, path));
+                    }
+                }
+            }
+            BenchLang::Zig => {
+                if ensure_optional_bench_tool(
+                    "zig",
+                    &["version"],
+                    "install Zig 0.16.0 (https://ziglang.org/download/)",
+                    BenchLang::Zig,
+                    args,
+                )? {
+                    for &profile in &profiles {
+                        let path = build_zig_guest(root, &sdk_dir, &guests_dir, profile)?;
+                        built_guests.push((lang, profile, path));
+                    }
+                }
+            }
+        }
+    }
+
+    let mut bench_cmd = Command::new(&host_bin);
+    bench_cmd.current_dir(root);
+    for (lang, profile, path) in &built_guests {
+        bench_cmd.arg("--guest").arg(format!(
+            "{}:{}={}",
+            lang.as_str(),
+            profile.as_str(),
+            path.display()
+        ));
+    }
+    if let Some(workloads) = &args.workloads {
+        bench_cmd.args(["--workloads", workloads]);
+    }
+    if let Some(entities) = &args.entities {
+        bench_cmd.args(["--entities", entities]);
+    }
+    if let Some(chunks) = &args.chunks {
+        bench_cmd.args(["--chunks", chunks]);
+    }
+    if args.quick {
+        bench_cmd.arg("--quick");
+    }
+    if let Some(json_path) = &args.json {
+        let resolved_json = if json_path.is_absolute() {
+            json_path.clone()
+        } else {
+            root.join(json_path)
+        };
+        if let Some(parent) = resolved_json.parent()
+            && !parent.as_os_str().is_empty()
+        {
+            fs::create_dir_all(parent)
+                .map_err(|e| format!("failed to create {}: {e}", parent.display()))?;
+        }
+        bench_cmd.arg("--json").arg(&resolved_json);
+    }
+
+    let markdown_path = target_dir.join("bench-summary.md");
+    bench_cmd.arg("--markdown").arg(&markdown_path);
+
+    run_cmd(&mut bench_cmd, "bamabi_bench")?;
+
+    let built_all_default_langs = built_guests.len() == 8;
+    let should_write_docs = if args.write_docs {
+        true
+    } else if args.no_write_docs {
+        false
+    } else {
+        args.is_full_matrix_request() && built_all_default_langs
+    };
+
+    if should_write_docs {
+        let generated_md = fs::read_to_string(&markdown_path).map_err(|e| {
+            format!(
+                "failed to read generated Markdown report {}: {e}",
+                markdown_path.display()
+            )
+        })?;
+        let doc_path = root.join("BENCHMARKS.md");
+        let existing_doc = fs::read_to_string(&doc_path)
+            .map_err(|e| format!("failed to read {}: {e}", doc_path.display()))?;
+        let block = format!(
+            "{}\n{}",
+            format_bench_env_metadata(root),
+            generated_md.trim()
+        );
+        let updated_doc = update_benchmarks_doc_section(&existing_doc, &block)?;
+        validate_benchmarks_doc(&updated_doc)?;
+        fs::write(&doc_path, updated_doc.as_bytes())
+            .map_err(|e| format!("failed to write {}: {e}", doc_path.display()))?;
+        println!("==> Updated {}", doc_path.display());
+    } else if !args.no_write_docs {
+        println!(
+            "==> Skipped updating BENCHMARKS.md (filtered run or partial language coverage: {}/8 guests)",
+            built_guests.len()
+        );
+    }
+
+    Ok(())
+}
+
 fn cmd_ci(root: &Path, args: &CiArgs) -> Result<(), String> {
     cmd_fmt(root, &FmtArgs { fix: false })?;
     cmd_header(root, &CheckArgs { check: true })?;
     component_headers::write_or_check_component_headers(root, true)?;
+    check_benchmarks_doc(root)?;
     cmd_lint(root)?;
     cmd_test(root, &TestArgs::default())?;
     cmd_c_test(root, &CTestArgs::default())?;
+    if !args.no_bench {
+        cmd_bench(
+            root,
+            &BenchArgs {
+                quick: true,
+                no_write_docs: true,
+                ..Default::default()
+            },
+        )?;
+    }
 
     if args.audit {
         cmd_audit(root, &AuditArgs::default())?;
@@ -1617,8 +2390,177 @@ mod tests {
                 audit: true,
                 miri: true,
                 kani: true,
+                no_bench: false,
             }))
         );
+        assert_eq!(
+            parse_args(&s(&["ci", "--no-bench"])).unwrap(),
+            ParsedArgs::Run(CommandSpec::Ci(CiArgs {
+                audit: false,
+                miri: false,
+                kani: false,
+                no_bench: true,
+            }))
+        );
+        assert_eq!(
+            parse_args(&s(&["ci", "--full", "--no-bench"])).unwrap(),
+            ParsedArgs::Run(CommandSpec::Ci(CiArgs {
+                audit: true,
+                miri: true,
+                kani: true,
+                no_bench: true,
+            }))
+        );
+    }
+
+    /// Proves that `bench` parses default options, `--flag val` and `--flag=val` forms,
+    /// CSV deduplication, help routing, and invalid `bench` flag rejections.
+    #[test]
+    fn parses_bench_flags_and_rejects_invalid_inputs() {
+        assert_eq!(
+            parse_args(&s(&["help", "bench"])).unwrap(),
+            ParsedArgs::Help(Some(SubcommandKind::Bench))
+        );
+        assert_eq!(
+            parse_args(&s(&["bench", "-h"])).unwrap(),
+            ParsedArgs::Help(Some(SubcommandKind::Bench))
+        );
+
+        let default_bench = BenchArgs::default();
+        assert_eq!(
+            parse_args(&s(&["bench"])).unwrap(),
+            ParsedArgs::Run(CommandSpec::Bench(BenchArgs::default()))
+        );
+        assert!(default_bench.is_full_matrix_request());
+        assert_eq!(
+            default_bench.resolved_langs(),
+            vec![
+                BenchLang::Rust,
+                BenchLang::C99,
+                BenchLang::Cpp17,
+                BenchLang::Zig
+            ]
+        );
+        assert_eq!(
+            default_bench.resolved_profiles(),
+            vec![GuestProfile::Release, GuestProfile::Debug]
+        );
+
+        let parsed = parse_args(&s(&[
+            "bench",
+            "--langs",
+            "rust,zig,rust",
+            "--guest-profiles=release",
+            "--workloads=noop,dense_query_update",
+            "--entities",
+            "1000",
+            "--chunks=256",
+            "--quick",
+            "--strict-langs",
+            "--json",
+            "target/bench.json",
+            "--write-docs",
+        ]))
+        .unwrap();
+        assert_eq!(
+            parsed,
+            ParsedArgs::Run(CommandSpec::Bench(BenchArgs {
+                langs: Some(vec![BenchLang::Rust, BenchLang::Zig]),
+                guest_profiles: Some(vec![GuestProfile::Release]),
+                workloads: Some("noop,dense_query_update".to_owned()),
+                entities: Some("1000".to_owned()),
+                chunks: Some("256".to_owned()),
+                quick: true,
+                strict_langs: true,
+                json: Some(PathBuf::from("target/bench.json")),
+                write_docs: true,
+                no_write_docs: false,
+                check_docs: false,
+            }))
+        );
+        assert_eq!(
+            parse_args(&s(&["bench", "--check-docs"])).unwrap(),
+            ParsedArgs::Run(CommandSpec::Bench(BenchArgs {
+                check_docs: true,
+                ..Default::default()
+            }))
+        );
+        assert_eq!(
+            parse_args(&s(&["bench", "--no-write-docs"])).unwrap(),
+            ParsedArgs::Run(CommandSpec::Bench(BenchArgs {
+                no_write_docs: true,
+                ..Default::default()
+            }))
+        );
+        if let ParsedArgs::Run(CommandSpec::Bench(ref bench_args)) = parsed {
+            assert!(bench_args.explicit_lang_requested(BenchLang::Zig));
+            assert!(!bench_args.explicit_lang_requested(BenchLang::C99));
+            assert!(!bench_args.is_full_matrix_request());
+        } else {
+            panic!("expected CommandSpec::Bench");
+        }
+
+        assert!(parse_args(&s(&["bench", "--langs=rust,go"])).is_err());
+        assert!(parse_args(&s(&["bench", "--langs="])).is_err());
+        assert!(parse_args(&s(&["bench", "--langs", "rust,"])).is_err());
+        assert!(parse_args(&s(&["bench", "--guest-profiles=fast"])).is_err());
+        assert!(parse_args(&s(&["bench", "--workloads"])).is_err());
+        assert!(parse_args(&s(&["bench", "--entities="])).is_err());
+        assert!(parse_args(&s(&["bench", "--chunks="])).is_err());
+        assert!(parse_args(&s(&["bench", "--json", ""])).is_err());
+        assert!(parse_args(&s(&["bench", "--quick=true"])).is_err());
+        assert!(parse_args(&s(&["bench", "--write-docs", "--check-docs"])).is_err());
+        assert!(parse_args(&s(&["bench", "--write-docs", "--no-write-docs"])).is_err());
+        assert!(parse_args(&s(&["bench", "--write-docs=true"])).is_err());
+        assert!(parse_args(&s(&["bench", "--no-write-docs=true"])).is_err());
+        assert!(parse_args(&s(&["bench", "--check-docs=true"])).is_err());
+        assert!(parse_args(&s(&["bench", "--unknown"])).is_err());
+    }
+
+    /// Proves that `BENCHMARKS.md` marker splicing, structural validation, and the checked-in
+    /// `BENCHMARKS.md` document stay consistent.
+    #[test]
+    fn validates_and_updates_benchmarks_doc_markers() {
+        let template = "\
+# Benchmarks
+Intro
+<!-- BENCHMARKS_RESULTS_START -->
+old content
+<!-- BENCHMARKS_RESULTS_END -->
+Footer
+";
+        let valid_block = "\
+### bamabi-wire ABI 0.3.0 Polyglot Benchmark (quick, warmup=5, samples=20)
+
+| Subject | Workload | Entities | Chunk | Min (ns) | Median (ns) | P95 (ns) | Mean (ns) | ns/entity | M ent/s | vs Native |
+| ------- | -------- | -------: | ----: | -------: | ----------: | -------: | --------: | --------: | ------: | --------: |
+| native | noop | - | - | 1.0 | 1.0 | 1.0 | 1.0 | - | - | 1.00x |
+| native | dense_query_update | 1000 | 256 | 1.0 | 1.0 | 1.0 | 1.0 | 0.1 | 1000.0 | 1.00x |
+| native | command_burst | - | - | 1.0 | 1.0 | 1.0 | 1.0 | - | - | 1.00x |
+| native | host_api_roundtrip | - | - | 1.0 | 1.0 | 1.0 | 1.0 | - | - | 1.00x |
+| rust:release | noop | - | - | 1.0 | 1.0 | 1.0 | 1.0 | - | - | 1.00x |
+| rust:debug | noop | - | - | 1.0 | 1.0 | 1.0 | 1.0 | - | - | 1.00x |
+| c99:release | noop | - | - | 1.0 | 1.0 | 1.0 | 1.0 | - | - | 1.00x |
+| c99:debug | noop | - | - | 1.0 | 1.0 | 1.0 | 1.0 | - | - | 1.00x |
+| cpp17:release | noop | - | - | 1.0 | 1.0 | 1.0 | 1.0 | - | - | 1.00x |
+| cpp17:debug | noop | - | - | 1.0 | 1.0 | 1.0 | 1.0 | - | - | 1.00x |
+| zig:release | noop | - | - | 1.0 | 1.0 | 1.0 | 1.0 | - | - | 1.00x |
+| zig:debug | noop | - | - | 1.0 | 1.0 | 1.0 | 1.0 | - | - | 1.00x |";
+        let updated = update_benchmarks_doc_section(template, valid_block).unwrap();
+        assert!(updated.contains("Intro"));
+        assert!(updated.contains("Footer"));
+        assert!(!updated.contains("old content"));
+        validate_benchmarks_doc(&updated).unwrap();
+
+        assert!(update_benchmarks_doc_section("no markers", valid_block).is_err());
+        assert!(validate_benchmarks_doc("no markers").is_err());
+        let missing_zig = updated.replace("| zig:debug", "| omitted:debug");
+        assert!(validate_benchmarks_doc(&missing_zig).is_err());
+
+        let checked_in = workspace_root().unwrap().join("BENCHMARKS.md");
+        let content = fs::read_to_string(&checked_in)
+            .expect("checked-in BENCHMARKS.md must exist at workspace root");
+        validate_benchmarks_doc(&content).expect("checked-in BENCHMARKS.md must pass validation");
     }
 
     /// Proves that unknown subcommands, unexpected extra arguments, conflicting `--no-asan` /

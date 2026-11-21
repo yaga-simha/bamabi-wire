@@ -12,6 +12,7 @@ Its crate-root documentation explains the 5-repo federated `bamabi` stack, the 6
 - `bamabi_docs::architecture` — [`../../ARCHITECTURE.md`](../../ARCHITECTURE.md)
 - `bamabi_docs::development` — [`../../DEVELOPMENT.md`](../../DEVELOPMENT.md)
 - `bamabi_docs::testing` — [`../../TESTING.md`](../../TESTING.md)
+- `bamabi_docs::benchmarks` — [`../../BENCHMARKS.md`](../../BENCHMARKS.md)
 - `bamabi_docs::wire_spec` — [`../../spec.md`](../../spec.md)
 - `bamabi_docs::crates` — curated index of all 6 functional crates and their `ARCHITECTURE.md` / `TESTS.md` pages
 
@@ -19,7 +20,7 @@ Its crate-root documentation explains the 5-repo federated `bamabi` stack, the 6
 
 - **Crate Architecture:** [`ARCHITECTURE.md`](ARCHITECTURE.md) — alphabetical landing-page design, `#[cfg(doc)]` module layout, isolation invariants, and maintenance recipe.
 - **Test & Verification Guide:** [`TESTS.md`](TESTS.md) — `RUSTDOCFLAGS="-D warnings"` doc build, `cargo test --doc -p bamabi_docs`, `clippy`, `fmt`, `typos`, and `xtask` lint checks.
-- **Workspace Guides:** [`../../README.md`](../../README.md) · [`../../ARCHITECTURE.md`](../../ARCHITECTURE.md) · [`../../DEVELOPMENT.md`](../../DEVELOPMENT.md) · [`../../TESTING.md`](../../TESTING.md) · [`../../spec.md`](../../spec.md)
+- **Workspace Guides:** [`../../README.md`](../../README.md) · [`../../ARCHITECTURE.md`](../../ARCHITECTURE.md) · [`../../DEVELOPMENT.md`](../../DEVELOPMENT.md) · [`../../TESTING.md`](../../TESTING.md) · [`../../BENCHMARKS.md`](../../BENCHMARKS.md) · [`../../spec.md`](../../spec.md)
 
 ## Setup & Building
 
@@ -49,7 +50,7 @@ cargo test --doc -p bamabi_docs
 
 ## Benchmarking
 
-`bamabi_docs` is a pure documentation crate inside Layer 0 (`bamabi-wire`) and contains **no Criterion `[[bench]]` targets** (runtime ECS and FFI benchmarks live downstream in Layer 4, `bamabi-showcase`, `docs/BENCHMARKS.md`). To measure documentation build timings across the workspace, run `cargo doc --workspace --no-deps --timings`.
+`bamabi_docs` is a pure documentation crate inside Layer 0 (`bamabi-wire`) and embeds [`../../BENCHMARKS.md`](../../BENCHMARKS.md) as `bamabi_docs::benchmarks` (powered by the standalone `cargo xtask bench` suite; see [`../../BENCHMARKS.md`](../../BENCHMARKS.md)). Downstream Bevy-integrated runtime ECS and FFI benchmarks live in Layer 4 (`bamabi-showcase`, `docs/BENCHMARKS.md`). To measure documentation build timings across the workspace, run `cargo doc --workspace --no-deps --timings`.
 
 ## License
 

@@ -2,7 +2,7 @@
 
 Zero-external-dependency workspace task runner (`cargo xtask`) for [`bamabi-wire`](../README.md).
 
-Enforces `#![forbid(unsafe_code)]`, edition `2024`, and MSRV `1.95` ([`xtask/Cargo.toml`](Cargo.toml)), invoking only the workspace crates `bamabi_sys`, `bamabi_macros`, and `bamabi_sdk_gen` alongside standard CLI toolchains (`cargo`, `cc`/`clang`, `typos`, `cargo-deny`, `cargo-semver-checks`, `miri`, `kani`).
+Enforces `#![forbid(unsafe_code)]`, edition `2024`, and MSRV `1.95` ([`xtask/Cargo.toml`](Cargo.toml)), invoking only the workspace crates `bamabi_sys`, `bamabi_macros`, and `bamabi_sdk_gen` alongside standard CLI toolchains (`cargo`, `cc`/`clang`, `c++`, `zig`, `typos`, `cargo-deny`, `cargo-semver-checks`, `miri`, `kani`).
 
 ## Setup
 
@@ -17,10 +17,11 @@ xtask = "run --package xtask --"
 Prerequisites for the default `cargo xtask ci` gate:
 
 - Stable Rust toolchain with `rustfmt` and `clippy` (pinned in [`rust-toolchain.toml`](../rust-toolchain.toml))
-- An ISO C99 compiler (`cc` or `$CC`) and `clang` (or `$CLANG`) with AddressSanitizer and UndefinedBehaviorSanitizer runtimes (`c-test`)
+- An ISO C99 compiler (`cc` or `$CC`) and `clang` (or `$CLANG`) with AddressSanitizer and UndefinedBehaviorSanitizer runtimes (`c-test`, `bench`)
 
-Optional toolchains for extended subcommands (`audit`, `miri`, `kani`, `nightly`):
+Optional toolchains for extended subcommands (`bench`, `audit`, `miri`, `kani`, `nightly`):
 
+- Polyglot benchmark guests (`bench`): ISO C++17 compiler (`c++` or `$CXX`) and Zig `0.16.0` (skipped automatically if absent unless `--strict-langs` or explicitly selected via `--langs`)
 - Targets: `rustup target add i686-unknown-linux-gnu wasm32-unknown-unknown` (`audit`)
 - Tools: `typos-cli`, `cargo-deny`, `cargo-semver-checks` (`audit`)
 - Nightly + Miri + `rust-src`: `rustup toolchain install nightly --component miri rust-src` (`miri`, `nightly`)
@@ -43,8 +44,11 @@ cargo build -p xtask
 cargo xtask --help
 cargo xtask <SUBCOMMAND> --help
 
-# Default local CI gate: fmt, header --check, gen-component-headers --check, lint, test, c-test
+# Default local CI gate: fmt, header --check, gen-component-headers --check, lint, test, c-test, bench --quick
 cargo xtask ci
+
+# Skip benchmarks in local CI when iterating quickly
+cargo xtask ci --no-bench
 
 # Full gate (adds audit, dual-model Miri, and Kani formal proofs)
 cargo xtask ci --full
@@ -61,6 +65,10 @@ cargo xtask audit                     # i686/wasm32 checks, typos, cargo-deny, o
 cargo xtask miri                      # Tree Borrows + Stacked Borrows (or --s390x)
 cargo xtask kani                      # Kani proofs for bamabi_sys & bamabi_guest_sys
 cargo xtask nightly                   # Big-endian s390x Miri + -Zrandomize-layout extended proptests
+cargo xtask bench                     # Build & run Layer-0 polyglot benchmarks (auto-updates BENCHMARKS.md on full 8-guest runs)
+cargo xtask bench --quick --strict-langs --no-write-docs --json target/bench-results.json
+cargo xtask bench --write-docs        # Force refreshing the recorded benchmark report in BENCHMARKS.md
+cargo xtask bench --check-docs        # Validate BENCHMARKS.md markers and subject/workload table
 ```
 
 ## Testing
@@ -72,16 +80,16 @@ RUSTDOCFLAGS="-D warnings" cargo doc -p xtask --no-deps
 cargo test -p xtask
 ```
 
-`cargo test -p xtask` runs all 6 unit tests covering CLI argument parsing, flag conflict rejection, and `include/generated/testbed_components.h` byte-for-byte parity with `ModComponent::C_DECL` (see [`TESTS.md`](TESTS.md)).
+`cargo test -p xtask` runs all 8 unit tests covering CLI argument parsing, flag conflict rejection, `BENCHMARKS.md` marker validation/splicing, and `include/generated/testbed_components.h` byte-for-byte parity with `ModComponent::C_DECL` (see [`TESTS.md`](TESTS.md)).
 
 ## Benchmarking
 
-As part of Layer 0 (`bamabi-wire`), neither `xtask` nor any `bamabi-wire` crate contains Criterion `[[bench]]` targets; runtime ECS and FFI benchmarks live downstream in `bamabi-showcase` (`docs/BENCHMARKS.md`). To profile `xtask` or workspace build timings locally, use `cargo check --timings`, or scale proptest case counts via `cargo xtask test --proptest --cases <N>` (see [`../TESTING.md`](../TESTING.md)).
+As part of Layer 0 (`bamabi-wire`), there are no Criterion `[[bench]]` targets; instead, `cargo xtask bench` orchestrates the zero-dependency polyglot host-guest benchmark suite ([`benches/bamabi_bench`](../benches/bamabi_bench/Cargo.toml)) across Rust, C99, C++17, and Zig shared-library guests (`release` and `debug` guest profiles) against a `--release` host and in-process `native` baseline (see [`../BENCHMARKS.md`](../BENCHMARKS.md) and [`../TESTING.md`](../TESTING.md)). Downstream Bevy-integrated benchmarks live in `bamabi-showcase` (`docs/BENCHMARKS.md`).
 
 ## Documentation
 
 Browse all workspace and `xtask` docs locally in `rustdoc` via `cargo docs --open` (which lands on `target/doc/bamabi_docs/index.html` and builds `xtask::docs::architecture` and `xtask::docs::tests` alongside every workspace crate):
 
 - [`ARCHITECTURE.md`](ARCHITECTURE.md) — internal pipeline (`parse_args` -> `dispatch` -> `cmd_*` runners), `component_headers.rs` `ModComponent::C_DECL` extraction, toolchain isolation, and how to add a new check or subcommand.
-- [`TESTS.md`](TESTS.md) — catalog of `xtask` unit tests (CLI parsing, flag conflict checks, help routing, and checked-in header parity) and what each proves.
-- Workspace docs: [`../ARCHITECTURE.md`](../ARCHITECTURE.md), [`../DEVELOPMENT.md`](../DEVELOPMENT.md), [`../TESTING.md`](../TESTING.md).
+- [`TESTS.md`](TESTS.md) — catalog of `xtask` unit tests (CLI parsing, flag conflict checks, help routing, `BENCHMARKS.md` marker parity, and checked-in header parity) and what each proves.
+- Workspace docs: [`../ARCHITECTURE.md`](../ARCHITECTURE.md), [`../DEVELOPMENT.md`](../DEVELOPMENT.md), [`../TESTING.md`](../TESTING.md), [`../BENCHMARKS.md`](../BENCHMARKS.md).

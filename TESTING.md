@@ -5,8 +5,11 @@
 ## 1. Quick Commands
 
 ```bash
-# Standard CI gate (fmt, header parity checks, lint, Rust tests, C99 + ASan/UBSan)
+# Standard CI gate (fmt, header parity checks, lint, Rust tests, C99 + ASan/UBSan, quick polyglot benchmarks)
 cargo xtask ci
+
+# Skip quick benchmarks for fast local runs
+cargo xtask ci --no-bench
 
 # Full gate (adds audit, dual-model Miri, and Kani formal verification)
 cargo xtask ci --full
@@ -35,7 +38,8 @@ Running `cargo xtask test` with no filter flags executes:
 
 Targeted filters:
 - `cargo xtask test --no-default-features` / `--all-features` / `--doc`
-- `cargo test -p xtask` — runs the 6 `xtask` CLI parser and generated-component-header parity unit tests (see [`xtask/TESTS.md`](xtask/TESTS.md)).
+- `cargo test -p xtask` — runs the 7 `xtask` CLI parser and generated-component-header parity unit tests (see [`xtask/TESTS.md`](xtask/TESTS.md)).
+- `cargo test -p bamabi_bench` — runs the 7 Layer-0 benchmark host unit tests covering `HostWorld`, dense SoA chunk iteration, command checkpoint/rollback, stats computation, and `native` baseline verification.
 
 ### Tier 3: `trybuild` UI Compile-Fail & Positive Controls (`bamabi_macros`)
 
@@ -95,9 +99,36 @@ cargo xtask kani -p bamabi_sys --harness po_w1      # Filtered local run
 
 ## 3. Benchmarking, Stress & Telemetry Notes
 
-`bamabi-wire` is the **Layer 0** wire contract and guest SDK repository and contains **no Criterion `[[bench]]` targets** (neither [`Cargo.toml`](Cargo.toml) nor any member crate defines `[[bench]]`). End-to-end runtime ECS, FFI dispatch, and hot-reload benchmarks live downstream in **Layer 4** (`bamabi-showcase`, `docs/BENCHMARKS.md`).
+`bamabi-wire` is the **Layer 0** wire contract and guest SDK repository and contains **no Criterion `[[bench]]` targets** (neither [`Cargo.toml`](Cargo.toml) nor any member crate defines `[[bench]]` or pulls external benchmarking dependencies). Instead, `bamabi-wire` ships a self-contained **Layer-0 polyglot host-guest benchmark suite** documented in detail — including testing/benchmarking strategy, workload semantics, and recorded results — in [`BENCHMARKS.md`](BENCHMARKS.md), orchestrated by `cargo xtask bench` (and run in the `benchmarks` job of [`.github/workflows/ci.yml`](.github/workflows/ci.yml)):
 
-Tooling in `bamabi-wire` that measures stress behavior, telemetry framing, and build performance:
+- **Zero-dependency benchmark host ([`benches/bamabi_bench`](benches/bamabi_bench/Cargo.toml)):** Always compiled in `--release` mode; implements the 68-slot `ABI 0.3.0` `BamHostApi` vtable over dense SoA chunk storage and a command queue, dynamically loads guest shared libraries via `dlopen`/`LoadLibraryW`, runs an in-process `native` Rust baseline, asserts strict functional correctness (manifest ABI check, dense `Position` checksum match against `native`, exact `64` spawns / `64` inserts / `1` checkpoint / `1` rollback per tick, and exact `64` `intern_symbol` round-trips), and outputs aligned Markdown + optional JSON (`min`, `median`, `p95`, `mean`, `ns/entity`, `M ent/s`, and ratio vs `native`).
+- **Four polyglot guest mods (built in both `release` and `debug` profiles into `target/bench_guests/`):**
+  - **Rust** ([`benches/guests/rust_guest`](benches/guests/rust_guest/Cargo.toml), `#![forbid(unsafe_code)]` via `bamabi_guest`)
+  - **C99** ([`benches/guests/c99_guest/bench_guest.c`](benches/guests/c99_guest/bench_guest.c), `-std=c99 -Wall -Wextra -Werror -pedantic` against exported `bamabi.h`)
+  - **C++17** ([`benches/guests/cpp17_guest/bench_guest.cpp`](benches/guests/cpp17_guest/bench_guest.cpp), `-std=c++17 -Wall -Wextra -Werror -Wpedantic` against exported `bamabi.hpp`)
+  - **Zig `0.16.0`** ([`benches/guests/zig_guest/bench_guest.zig`](benches/guests/zig_guest/bench_guest.zig) & [`build.zig`](benches/guests/zig_guest/build.zig), `b.addTranslateC` against exported `bamabi.h` + `bamabi.zig`; skipped automatically if `zig` is not installed unless `--strict-langs` or `--langs zig` is passed)
+- **Workloads & invocation:**
+
+  ```bash
+  # Full matrix across all installed languages (auto-updates BENCHMARKS.md when all 8 guests run)
+  cargo xtask bench
+
+  # Run without updating BENCHMARKS.md on disk
+  cargo xtask bench --no-write-docs
+
+  # CI-style fast check requiring all 4 toolchains and emitting JSON + Markdown
+  cargo xtask bench --quick --strict-langs --no-write-docs --json target/bench-results.json
+
+  # Verify BENCHMARKS.md markers and recorded results structure
+  cargo xtask bench --check-docs
+
+  # Filtered run (subset of languages, guest profiles, workloads, entities, chunks)
+  cargo xtask bench --langs rust,c99 --guest-profiles release --workloads noop,dense_query_update --entities 1000 --chunks 256
+  ```
+
+See [`BENCHMARKS.md`](BENCHMARKS.md) for the full Layer-0 testing/benchmarking strategy, result interpretation, and latest recorded benchmark report. Downstream Bevy-integrated ECS, FFI dispatch, and hot-reload benchmarks live in **Layer 4** (`bamabi-showcase`, `docs/BENCHMARKS.md`).
+
+Additional tooling in `bamabi-wire` that measures stress behavior, telemetry framing, and build performance:
 
 - **Command-queue & batch-spawn stress tests:** [`crates/bamabi_guest/tests/command_queue_stress.rs`](crates/bamabi_guest/tests/command_queue_stress.rs) exercises handle-based `GuestCommands`, uninitialized alignment padding under Miri, ZST components, the `<= 16`-component stack fast path vs. the `> 16`-component heap fallback (20 components) in batched `spawn`, and invalid-handle error rejections:
   ```bash

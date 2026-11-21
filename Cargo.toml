@@ -8,6 +8,8 @@ members = [
     "crates/bamabi_guest_sys",
     "crates/bamabi_guest",
     "xtask",
+    "benches/bamabi_bench",
+    "benches/guests/rust_guest",
 ]
 
 [workspace.package]

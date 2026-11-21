@@ -17,7 +17,8 @@ cargo doc --workspace --no-deps --open
 
 - **[`ARCHITECTURE.md`](ARCHITECTURE.md)** — Layer 0 crate DAG, zero-Bevy / zero-shared-Rust-ABI invariants, `ABI 0.3.0` (`0x0003_0000`) host-guest lifecycle, allocator & panic boundaries, polyglot SDK pipeline, end-to-end 6-crate walkthrough, and per-crate onboarding index.
 - **[`DEVELOPMENT.md`](DEVELOPMENT.md)** — Setting up Rust (`1.87`/`1.95`), C99/ASan/UBSan, optional Miri/Kani/`audit` tools, browsing `cargo docs --open`, building workspace & guest `.cdylib` mods, generating C99/C++17/Zig headers, and `bamabi-dev-overlay`.
-- **[`TESTING.md`](TESTING.md)** — Multi-tier verification pyramid (unit/integration, doctests, `trybuild`, `proptest`, header parity, C99 ASan/UBSan, Miri, Kani `PO-W1..PO-W8` & `PO-G1..PO-G9`, `audit`, nightly `-Zrandomize-layout`) and Layer 0 benchmarking/stress notes.
+- **[`TESTING.md`](TESTING.md)** — Multi-tier verification pyramid (unit/integration, doctests, `trybuild`, `proptest`, header parity, C99 ASan/UBSan, Miri, Kani `PO-W1..PO-W8` & `PO-G1..PO-G9`, `audit`, nightly `-Zrandomize-layout`) and Layer 0 stress/telemetry notes.
+- **[`BENCHMARKS.md`](BENCHMARKS.md)** — Layer 0 testing & polyglot host-guest benchmarking strategy (`native` + Rust, C99, C++17, Zig in `release` & `debug`) and recorded benchmark results (`cargo xtask bench --write-docs` / `--check-docs`).
 - **[`spec.md`](spec.md)** — Canonical byte-level wire specification, struct layouts, offsets, and error codes.
 
 ## Workspace Crates
@@ -30,7 +31,7 @@ cargo doc --workspace --no-deps --open
 | [`bamabi_sdk_gen`](crates/bamabi_sdk_gen/README.md) | `#![forbid(unsafe_code)]` | `bamabi_sys` | `1.95` / `2024` | [Arch](crates/bamabi_sdk_gen/ARCHITECTURE.md) · [Tests](crates/bamabi_sdk_gen/TESTS.md) | Generates `include/bamabi.h` (C99), `bamabi.hpp` (C++17 68/68 views + `ScopedTransaction`), `bamabi.zig` (Zig `addTranslateC` 68/68 views + lossless 18-code `BamError`), and C99 component headers with `BAM_EXPORT`, `BAM_RESTRICT`, and `BAM_HOST_API_OFFSET_*` |
 | [`bamabi_guest_sys`](crates/bamabi_guest_sys/README.md) | Guest `unsafe` FFI boundary | `bamabi_sys` | `1.87` / `2024` | [Arch](crates/bamabi_guest_sys/ARCHITECTURE.md) · [Tests](crates/bamabi_guest_sys/TESTS.md) | `GuestInstance`, `extern "C"` panic guards (`ReentrantCell`), checked 68/68 `BamHostApi` wrappers, unconditional `wire_types` Bevy `0.20` POD projections, validated iterators, commands, and migration trampolines |
 | [`bamabi_guest`](crates/bamabi_guest/README.md) | `#![forbid(unsafe_code)]` | `bamabi_sys`, `bamabi_guest_sys`, opt. `bamabi_macros` (`derive`) | `1.87` / `2024` | [Arch](crates/bamabi_guest/ARCHITECTURE.md) · [Tests](crates/bamabi_guest/TESTS.md) | Safe Rust `.cdylib` guest SDK (`GuestPlugin`, `GuestApp`, `BevySchedules`, `conditions::*`, `GuestEntityCommands`/`GuestChildSpawner`, `FfiDisabled`, 1..=16-term `QueryTuple`, `Or<(T0..T7)>`, `GuestTransaction`, `TypedObserverBuilder`, unconditional Bevy `0.20` subsystem bridges, `export_mod!`) |
-| [`xtask`](xtask/README.md) | `#![forbid(unsafe_code)]` | `bamabi_sys`, `bamabi_macros`, `bamabi_sdk_gen` | `1.95` / `2024` | [Arch](xtask/ARCHITECTURE.md) · [Tests](xtask/TESTS.md) | Workspace CI, header generation/parity, C99 + ASan/UBSan checks, cross-target/deny/typos audits, Miri, Kani, and nightly `-Zrandomize-layout` runner |
+| [`xtask`](xtask/README.md) | `#![forbid(unsafe_code)]` | `bamabi_sys`, `bamabi_macros`, `bamabi_sdk_gen` | `1.95` / `2024` | [Arch](xtask/ARCHITECTURE.md) · [Tests](xtask/TESTS.md) | Workspace CI, header generation/parity, C99 + ASan/UBSan checks, polyglot benchmarks, cross-target/deny/typos audits, Miri, Kani, and nightly `-Zrandomize-layout` runner |
 
 ## Wire Specification, Headers & Tests
 
@@ -64,13 +65,16 @@ cargo build --workspace --all-features
 # Browse workspace + crate + architecture + test docs locally in rustdoc
 cargo docs --open
 
-# Default local CI gate: fmt, header parity checks, lint (forbid-unsafe, zero-Bevy, clippy, rustdoc), tests, C99 + ASan/UBSan
+# Default local CI gate: fmt, header parity checks, lint (forbid-unsafe, zero-Bevy, clippy, rustdoc), tests, C99 + ASan/UBSan, quick polyglot benchmarks
 cargo xtask ci
+
+# Skip quick benchmarks when iterating locally
+cargo xtask ci --no-bench
 
 # Full gate including cross-target/typos/deny audit, dual-model Miri, and Kani formal verification
 cargo xtask ci --full
 
-# Individual verification & codegen subcommands
+# Individual verification, codegen & benchmark subcommands
 cargo xtask fmt                       # Check formatting (--fix to format)
 cargo xtask lint                      # #![forbid(unsafe_code)], zero-Bevy tree check, clippy & rustdoc
 cargo xtask test                      # --no-default-features, --all-features, doctests (--cases N, --proptest, --header-parity)
@@ -81,12 +85,13 @@ cargo xtask audit                     # i686/wasm32 checks, typos, cargo-deny (-
 cargo xtask miri                      # Tree Borrows + Stacked Borrows (--tree-borrows, --stacked-borrows, --s390x)
 cargo xtask kani                      # Kani formal verification for bamabi_sys (PO-W1..PO-W8) & bamabi_guest_sys (PO-G1..PO-G9)
 cargo xtask nightly                   # Big-endian s390x Miri + -Zrandomize-layout proptest (--s390x, --randomize-layout, --cases N)
+cargo xtask bench                     # Polyglot ABI 0.3.0 benchmarks (auto-updates BENCHMARKS.md on full 8-guest runs; --quick, --strict-langs, --no-write-docs, --check-docs, --json <path>)
 
 # Inspect all subcommands and optional flags
 cargo xtask --help
 ```
 
-- **Benchmarking note:** As Layer 0, `bamabi-wire` contains no Criterion `[[bench]]` targets (runtime ECS/FFI benchmarks live downstream in `bamabi-showcase`, `docs/BENCHMARKS.md`). For Layer 0 command-queue stress tests, `"BAMT"` `SystemTelemetryDigest64` wire tests, and `cargo check --timings`, see [`TESTING.md#3-benchmarking-stress--telemetry-notes`](TESTING.md#3-benchmarking-stress--telemetry-notes).
+- **Benchmarking & Strategy:** `bamabi-wire` contains no Criterion `[[bench]]` targets; instead, [`benches/bamabi_bench`](benches/bamabi_bench/Cargo.toml) + [`benches/guests`](benches/guests/rust_guest/Cargo.toml) provide a zero-dependency Layer-0 polyglot host-guest benchmark suite (`cargo xtask bench`) comparing compiled Rust, C99, C++17, and Zig guest `.dylib`/`.so`/`.dll` libraries (`release` & `debug`) against an in-process `native` baseline across `noop`, `dense_query_update`, `command_burst`, and `host_api_roundtrip` workloads. See [`BENCHMARKS.md`](BENCHMARKS.md) for the testing/benchmarking strategy and latest recorded results, [`TESTING.md#3-benchmarking-stress--telemetry-notes`](TESTING.md#3-benchmarking-stress--telemetry-notes) for stress/telemetry notes, and `bamabi-showcase` (`docs/BENCHMARKS.md`) for downstream Bevy-integrated benchmarks.
 
 ## Federated `bamabi` Repositories
 
