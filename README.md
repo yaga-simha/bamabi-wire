@@ -4,15 +4,23 @@ Layer 0 (**zero-Bevy**, zero cross-repo dependencies) wire contract, procedural 
 
 Refactored from the original [`bevy_mod_abi`](https://github.com/yaga-simha/bevy_mod_abi) monorepo into a strictly acyclic 5-repository DAG plus [`bamabi-dev-overlay`](https://github.com/yaga-simha/bamabi-dev-overlay), `bamabi-wire` is the root dependency layer: no crate in this repository depends on `bevy_*` or any sibling repository, allowing host runtimes, CLI tooling, compiler backends (`bevy_bql`), and Rust/C99/C++17/Zig guest `.cdylib` mods to share one identical C-ABI binary contract.
 
+## Documentation & Onboarding
+
+- **[`ARCHITECTURE.md`](ARCHITECTURE.md)** — Layer 0 crate DAG, zero-Bevy / zero-shared-Rust-ABI invariants, `ABI 0.3.0` (`0x0003_0000`) host-guest lifecycle, allocator & panic boundaries, polyglot SDK pipeline, and per-crate onboarding index.
+- **[`DEVELOPMENT.md`](DEVELOPMENT.md)** — Setting up Rust (`1.87`/`1.95`), C99/ASan/UBSan, optional Miri/Kani/`audit` tools, building workspace & guest `.cdylib` mods, generating C99/C++17/Zig headers, and `bamabi-dev-overlay`.
+- **[`TESTING.md`](TESTING.md)** — Multi-tier verification pyramid (unit/integration, doctests, `trybuild`, `proptest`, header parity, C99 ASan/UBSan, Miri, Kani `PO-W1..PO-W8` & `PO-G1..PO-G9`, `audit`, nightly `-Zrandomize-layout`) and Layer 0 benchmarking/stress notes.
+- **[`spec.md`](spec.md)** — Canonical byte-level wire specification, struct layouts, offsets, and error codes.
+
 ## Workspace Crates
 
-| Crate | Safety Policy | External Deps | MSRV / Edition | Responsibilities |
-|---|---|---|---|---|
-| [`bamabi_sys`](crates/bamabi_sys/README.md) | `#![no_std]` (`unsafe` FFI contract) | Zero | `1.87` / `2024` | `ABI 0.3.0` (`0x0003_0000`) wire types, 68-slot `BamHostApi` (552 B 64-bit / 280 B 32-bit), `offsets` (`OFF64_*`/`OFF32_*`), `ComponentUuid` (SipHash-2-4-128), `FfiResult`, descriptors, `ModComponent`, `AbiPod`, `RawInsertable` |
-| [`bamabi_macros`](crates/bamabi_macros/README.md) | `#![forbid(unsafe_code)]` | `syn`, `quote`, `proc-macro2`, `proc-macro-crate` | `1.87` / `2024` | `#[derive(ModComponent, AbiPod, GuestComponent)]`, zero-padding checks, hygienic VTables, `SCHEMA_FINGERPRINT`, `BAM_FIELDS`, `REQUIRED_COMPONENTS`, `C_DECL`/`ZIG_DECL` |
-| [`bamabi_sdk_gen`](crates/bamabi_sdk_gen/README.md) | `#![forbid(unsafe_code)]` | `bamabi_sys` | `1.95` / `2024` | Generates `include/bamabi.h` (C99), `bamabi.hpp` (C++17 68/68 views + `ScopedTransaction`), `bamabi.zig` (Zig 0.16 68/68 views + lossless 18-code `BamError`), and C99 component headers with `BAM_EXPORT`, `BAM_RESTRICT`, and `BAM_HOST_API_OFFSET_*` |
-| [`bamabi_guest_sys`](crates/bamabi_guest_sys/README.md) | Guest `unsafe` FFI boundary | `bamabi_sys` | `1.87` / `2024` | `GuestInstance`, `extern "C"` panic guards (`ReentrantCell`), checked 68/68 `BamHostApi` wrappers, unconditional `wire_types` Bevy `0.20` POD projections, validated iterators, commands, and migration trampolines |
-| [`bamabi_guest`](crates/bamabi_guest/README.md) | `#![forbid(unsafe_code)]` | `bamabi_sys`, `bamabi_guest_sys`, opt. `bamabi_macros` (`derive`) | `1.87` / `2024` | Safe Rust `.cdylib` guest SDK (`GuestPlugin`, `GuestApp`, `BevySchedules`, `conditions::*`, `GuestEntityCommands`/`GuestChildSpawner`, `FfiDisabled`, 1..=16-term `QueryTuple`, `Or<(T0..T7)>`, `GuestTransaction`, `TypedObserverBuilder`, unconditional Bevy `0.20` subsystem bridges, `export_mod!`) |
+| Crate | Safety Policy | External Deps | MSRV / Edition | Docs | Responsibilities |
+|---|---|---|---|---|---|
+| [`bamabi_sys`](crates/bamabi_sys/README.md) | `#![no_std]` (`unsafe` FFI contract) | Zero | `1.87` / `2024` | [Arch](crates/bamabi_sys/ARCHITECTURE.md) · [Tests](crates/bamabi_sys/TESTS.md) | `ABI 0.3.0` (`0x0003_0000`) wire types, 68-slot `BamHostApi` (552 B 64-bit / 280 B 32-bit), `offsets` (`OFF64_*`/`OFF32_*`), `ComponentUuid` (SipHash-2-4-128), `FfiResult`, descriptors, `ModComponent`, `AbiPod`, `RawInsertable` |
+| [`bamabi_macros`](crates/bamabi_macros/README.md) | `#![forbid(unsafe_code)]` | `syn`, `quote`, `proc-macro2`, `proc-macro-crate` | `1.87` / `2024` | [Arch](crates/bamabi_macros/ARCHITECTURE.md) · [Tests](crates/bamabi_macros/TESTS.md) | `#[derive(ModComponent, AbiPod, GuestComponent)]`, zero-padding checks, hygienic VTables, `SCHEMA_FINGERPRINT`, `BAM_FIELDS`, `REQUIRED_COMPONENTS`, `C_DECL`/`ZIG_DECL` |
+| [`bamabi_sdk_gen`](crates/bamabi_sdk_gen/README.md) | `#![forbid(unsafe_code)]` | `bamabi_sys` | `1.95` / `2024` | [Arch](crates/bamabi_sdk_gen/ARCHITECTURE.md) · [Tests](crates/bamabi_sdk_gen/TESTS.md) | Generates `include/bamabi.h` (C99), `bamabi.hpp` (C++17 68/68 views + `ScopedTransaction`), `bamabi.zig` (Zig `addTranslateC` 68/68 views + lossless 18-code `BamError`), and C99 component headers with `BAM_EXPORT`, `BAM_RESTRICT`, and `BAM_HOST_API_OFFSET_*` |
+| [`bamabi_guest_sys`](crates/bamabi_guest_sys/README.md) | Guest `unsafe` FFI boundary | `bamabi_sys` | `1.87` / `2024` | [Arch](crates/bamabi_guest_sys/ARCHITECTURE.md) · [Tests](crates/bamabi_guest_sys/TESTS.md) | `GuestInstance`, `extern "C"` panic guards (`ReentrantCell`), checked 68/68 `BamHostApi` wrappers, unconditional `wire_types` Bevy `0.20` POD projections, validated iterators, commands, and migration trampolines |
+| [`bamabi_guest`](crates/bamabi_guest/README.md) | `#![forbid(unsafe_code)]` | `bamabi_sys`, `bamabi_guest_sys`, opt. `bamabi_macros` (`derive`) | `1.87` / `2024` | [Arch](crates/bamabi_guest/ARCHITECTURE.md) · [Tests](crates/bamabi_guest/TESTS.md) | Safe Rust `.cdylib` guest SDK (`GuestPlugin`, `GuestApp`, `BevySchedules`, `conditions::*`, `GuestEntityCommands`/`GuestChildSpawner`, `FfiDisabled`, 1..=16-term `QueryTuple`, `Or<(T0..T7)>`, `GuestTransaction`, `TypedObserverBuilder`, unconditional Bevy `0.20` subsystem bridges, `export_mod!`) |
+| [`xtask`](xtask/README.md) | `#![forbid(unsafe_code)]` | `bamabi_sys`, `bamabi_macros`, `bamabi_sdk_gen` | `1.95` / `2024` | [Arch](xtask/ARCHITECTURE.md) · [Tests](xtask/TESTS.md) | Workspace CI, header generation/parity, C99 + ASan/UBSan checks, cross-target/deny/typos audits, Miri, Kani, and nightly `-Zrandomize-layout` runner |
 
 ## Wire Specification, Headers & Tests
 
@@ -35,11 +43,14 @@ bamabi_guest = { git = "https://github.com/yaga-simha/bamabi-wire.git", branch =
 
 For lower-level or generator consumers (`bamabi_sys`, `bamabi_macros`, `bamabi_sdk_gen`, `bamabi_guest_sys`), point directly to `git = "https://github.com/yaga-simha/bamabi-wire.git", branch = "main"`.
 
-## Local & CI Verification
+## Quickstart: Setup, Build, Run, Test & Benchmarks
 
-All checks run standalone inside `bamabi-wire` with zero sibling repositories required via the workspace task runner (`cargo xtask`):
+All checks run standalone inside `bamabi-wire` with zero sibling repositories required via `cargo xtask` (see [`DEVELOPMENT.md`](DEVELOPMENT.md) and [`TESTING.md`](TESTING.md) for prerequisites and details):
 
 ```bash
+# Build workspace (default / --no-default-features / --all-features)
+cargo build --workspace --all-features
+
 # Default local CI gate: fmt, header parity checks, lint (forbid-unsafe, zero-Bevy, clippy, rustdoc), tests, C99 + ASan/UBSan
 cargo xtask ci
 
@@ -62,7 +73,7 @@ cargo xtask nightly                   # Big-endian s390x Miri + -Zrandomize-layo
 cargo xtask --help
 ```
 
-Optional flags such as `cargo xtask kani -p bamabi_sys --harness <pat>` or `cargo xtask ci --audit --miri` let you scope heavier checks locally; run `cargo xtask <subcommand> --help` for full option details.
+- **Benchmarking note:** As Layer 0, `bamabi-wire` contains no Criterion `[[bench]]` targets (runtime ECS/FFI benchmarks live downstream in `bamabi-showcase`, `docs/BENCHMARKS.md`). For Layer 0 command-queue stress tests, `"BAMT"` `SystemTelemetryDigest64` wire tests, and `cargo check --timings`, see [`TESTING.md#3-benchmarking-stress--telemetry-notes`](TESTING.md#3-benchmarking-stress--telemetry-notes).
 
 ## Federated `bamabi` Repositories
 

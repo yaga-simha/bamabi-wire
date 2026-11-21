@@ -275,6 +275,8 @@ pub(crate) fn first_line_diff(expected: &str, actual: &str) -> String {
 mod tests {
     use super::*;
 
+    /// Proves that the checked-in `include/generated/testbed_components.h` matches the
+    /// deterministic output of `ModComponent::C_DECL` byte-for-byte (modulo CRLF normalization).
     #[test]
     fn generated_testbed_header_matches_checked_in_file() {
         let repo_root = Path::new(env!("CARGO_MANIFEST_DIR"))

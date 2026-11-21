@@ -2,9 +2,51 @@
 
 //! Workspace build, verification, header generation, and QA automation (`cargo xtask`).
 //!
-//! Zero-external-dependency task runner covering formatting, safety/isolation lints,
-//! Rust + C99 test suites, header byte-parity checks, static audits, Miri (Tree & Stacked
-//! Borrows + big-endian `s390x`), Kani formal verification, and nightly `-Zrandomize-layout` runs.
+//! Zero-external-dependency task runner (aside from workspace crates [`bamabi_macros`] and
+//! [`bamabi_sdk_gen`]) covering formatting, safety/isolation lints, Rust + C99 test suites,
+//! header byte-parity checks, static audits, Miri (Tree & Stacked Borrows + big-endian `s390x`),
+//! Kani formal verification, and nightly `-Zrandomize-layout` runs.
+//!
+//! # Architecture Overview
+//!
+//! Execution flows through three small stages inside this binary:
+//!
+//! 1. **CLI parsing (`parse_args`)**: Reads `std::env::args().skip(1)`, handles top-level and
+//!    per-subcommand `--help` / `-h` / `help <subcommand>`, and validates flags into a strongly
+//!    typed `CommandSpec` (or returns a descriptive usage error before spawning any subprocess).
+//! 2. **Dispatch (`dispatch`)**: Resolves the repository root from `CARGO_MANIFEST_DIR`
+//!    (`workspace_root`) and routes each `CommandSpec` variant to its dedicated `cmd_*` runner
+//!    (or into `component_headers::write_or_check_component_headers`).
+//! 3. **Verification & codegen runners (`cmd_*`)**: Invoke `cargo`, `cc`/`clang`, `typos`,
+//!    `cargo deny`, `cargo semver-checks`, `cargo +nightly miri`, and `cargo kani` with explicit
+//!    environment hygiene (`clean_toolchain_cargo_cmd` clears `RUSTUP_TOOLCHAIN` and `RUSTC`
+//!    overrides so `+nightly` and tool subcommands select the right toolchain).
+//!
+//! # Component Header Extraction (`component_headers`)
+//!
+//! The `component_headers` module defines canonical `#[derive(ModComponent)]` testbed structs
+//! (mirroring `testbed::*` and `c_interop::*` fixtures) and feeds `bamabi_sdk_gen::section_for::<T>()`
+//! (which reads `ModComponent::C_DECL`) into `bamabi_sdk_gen::render_component_header` to
+//! produce or byte-check `include/generated/testbed_components.h`.
+//!
+//! # Running & Extending Subcommands
+//!
+//! Invoke via the `.cargo/config.toml` alias from the repository root:
+//!
+//! ```text
+//! cargo xtask ci          # fmt, header --check, gen-component-headers --check, lint, test, c-test
+//! cargo xtask ci --full   # adds audit, dual-model Miri, and Kani formal proofs
+//! cargo xtask --help      # lists all 11 subcommands
+//! ```
+//!
+//! To add a new subcommand:
+//!
+//! 1. Add variants to `SubcommandKind` and `CommandSpec` (plus an `*Args` struct if needed).
+//! 2. Wire the string name in `parse_subcommand_kind`, its flag parser in `parse_args`, and its
+//!    usage text in `print_help`.
+//! 3. Implement `cmd_<name>(root: &Path, ...)` and route to it in `dispatch`.
+//! 4. Add parser unit tests in the `tests` module verifying both valid flag combinations and
+//!    rejected/conflicting flags.
 
 mod component_headers;
 
@@ -1358,6 +1400,8 @@ mod tests {
         items.iter().map(|item| (*item).to_owned()).collect()
     }
 
+    /// Proves that empty args, `-h`/`--help`, `help <topic>`, and `<subcommand> -h`/`--help`
+    /// resolve to `ParsedArgs::Help` with the exact target `SubcommandKind` (or `None`).
     #[test]
     fn parses_help_variants() {
         assert_eq!(parse_args(&s(&[])).unwrap(), ParsedArgs::Help(None));
@@ -1377,6 +1421,8 @@ mod tests {
         );
     }
 
+    /// Proves that `fmt`, `lint`, `header`, `gen-component-headers`, and `c-test` parse
+    /// their boolean mode switches (`--fix`, `--check`, `--no-asan`, `--asan-only`) accurately.
     #[test]
     fn parses_fmt_lint_header_and_c_test() {
         assert_eq!(
@@ -1415,6 +1461,8 @@ mod tests {
         );
     }
 
+    /// Proves that `cargo xtask test` supports both bare default execution and explicit suite
+    /// filters alongside `--cases N` and `--cases=N` `PROPTEST_CASES` overrides.
     #[test]
     fn parses_test_filters_and_cases() {
         assert_eq!(
@@ -1458,6 +1506,8 @@ mod tests {
         );
     }
 
+    /// Proves that `audit`, `miri`, `kani`, `nightly`, and `ci` flags parse correctly and that
+    /// `MiriArgs::resolved` / `NightlyArgs::resolved` expand default flags as documented.
     #[test]
     fn parses_audit_miri_kani_nightly_and_ci() {
         assert_eq!(
@@ -1537,6 +1587,9 @@ mod tests {
         );
     }
 
+    /// Proves that unknown subcommands, unexpected extra arguments, conflicting `--no-asan` /
+    /// `--asan-only` flags, zero `--cases`, missing flag values, and empty `--flag=` values fail
+    /// parsing cleanly before spawning subprocesses.
     #[test]
     fn rejects_invalid_subcommands_and_flags() {
         assert!(parse_args(&s(&["unknown"])).is_err());
