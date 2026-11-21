@@ -1,7 +1,13 @@
 //! Validated chunk iteration, `BamColumnInfo` layout/UUID verification, dense slices, indirect
 //! sparse-set row views, untracked mutation + `mark_changed_range`, and singleton resource access.
 
-use core::{ffi::c_void, marker::PhantomData, mem::MaybeUninit, ops::Index};
+use core::{
+    cell::{Cell, UnsafeCell},
+    ffi::c_void,
+    marker::PhantomData,
+    mem::MaybeUninit,
+    ops::Index,
+};
 use std::ffi::CString;
 
 use bamabi_sys::{
@@ -1024,12 +1030,26 @@ impl<'a, T: AbiPod> SparseRowsMut<'a, T> {
     }
 }
 
+/// Number of leading query term indices whose [`BamColumnInfo`] metadata is cached inline inside
+/// [`ValidatedIter`].
+///
+/// Covers 1–4 term queries (including dense physics/transform updates and singleton resource
+/// lookups) without inflating per-tick stack frames past 4 KB, eliminating redundant per-chunk and
+/// per-resource `BamHostApi::iter_column_info` FFI calls.
+const INLINE_COL_INFO_CAP: usize = 4;
+
+const _: () = {
+    assert!(INLINE_COL_INFO_CAP <= 8);
+};
+
 /// Validated query chunk and singleton resource accessor wrapping `*mut BamIter`.
 pub struct ValidatedIter<'a> {
     raw: *mut BamIter,
     host: &'a Host,
     lazy_host: Option<&'a LazyInvocationHost<'a>>,
     current_len: usize,
+    col_info_mask: Cell<u8>,
+    col_infos: UnsafeCell<[MaybeUninit<BamColumnInfo>; INLINE_COL_INFO_CAP]>,
 }
 
 impl<'a> ValidatedIter<'a> {
@@ -1047,6 +1067,8 @@ impl<'a> ValidatedIter<'a> {
             host,
             lazy_host: None,
             current_len: 0,
+            col_info_mask: Cell::new(0),
+            col_infos: UnsafeCell::new([const { MaybeUninit::uninit() }; INLINE_COL_INFO_CAP]),
         }
     }
 
@@ -1066,6 +1088,8 @@ impl<'a> ValidatedIter<'a> {
             host,
             lazy_host,
             current_len: 0,
+            col_info_mask: Cell::new(0),
+            col_infos: UnsafeCell::new([const { MaybeUninit::uninit() }; INLINE_COL_INFO_CAP]),
         }
     }
 
@@ -1077,6 +1101,8 @@ impl<'a> ValidatedIter<'a> {
             host,
             lazy_host: None,
             current_len: 0,
+            col_info_mask: Cell::new(0),
+            col_infos: UnsafeCell::new([const { MaybeUninit::uninit() }; INLINE_COL_INFO_CAP]),
         }
     }
 
@@ -1156,8 +1182,37 @@ impl<'a> ValidatedIter<'a> {
     }
 
     /// Queries layout, UUID, access mode, and storage flags for `term_index`.
+    ///
+    /// Caches successful results for `term_index < INLINE_COL_INFO_CAP` inside `self` because
+    /// [`BamColumnInfo`] metadata is invariant across all chunks and resource lookups of an active
+    /// `BamIter`.
     #[inline]
     pub fn column_info(&self, term_index: usize) -> Result<BamColumnInfo, FfiResult> {
+        if term_index < INLINE_COL_INFO_CAP {
+            let bit = 1u8 << term_index;
+            if (self.col_info_mask.get() & bit) != 0 {
+                // SAFETY: `col_info_mask & bit != 0` proves slot `term_index` was initialized by
+                // `column_info_uncached`, `term_index < INLINE_COL_INFO_CAP`, and `BamColumnInfo`
+                // is `Copy`. Reading via raw pointer through `UnsafeCell::get()` avoids forming
+                // aliasing references under Miri Stacked/Tree Borrows.
+                let info = unsafe {
+                    self.col_infos
+                        .get()
+                        .cast::<BamColumnInfo>()
+                        .add(term_index)
+                        .read()
+                };
+                return Ok(info);
+            }
+        }
+        self.column_info_uncached(term_index)
+    }
+
+    /// Cold FFI path invoking `BamHostApi::iter_column_info` and populating the inline cache for
+    /// `term_index < INLINE_COL_INFO_CAP` on [`FfiResult::OK`].
+    #[cold]
+    #[inline(never)]
+    fn column_info_uncached(&self, term_index: usize) -> Result<BamColumnInfo, FfiResult> {
         if self.raw.is_null() {
             return Err(FfiResult::NULL_POINTER);
         }
@@ -1169,7 +1224,22 @@ impl<'a> ValidatedIter<'a> {
         let status = unsafe { info_fn(self.raw.cast_const(), term_index, out.as_mut_ptr()) };
         if status.is_ok() {
             // SAFETY: Host reported `FfiResult::OK`, confirming `*out` was initialized.
-            Ok(unsafe { out.assume_init() })
+            let info = unsafe { out.assume_init() };
+            if term_index < INLINE_COL_INFO_CAP {
+                // SAFETY: `ValidatedIter` is `!Sync`, `term_index < INLINE_COL_INFO_CAP`, and
+                // writing directly via `ptr::write` through `UnsafeCell::get()` preserves
+                // `SharedReadWrite` provenance under Miri Stacked/Tree Borrows.
+                unsafe {
+                    self.col_infos
+                        .get()
+                        .cast::<BamColumnInfo>()
+                        .add(term_index)
+                        .write(info);
+                }
+                self.col_info_mask
+                    .set(self.col_info_mask.get() | (1u8 << term_index));
+            }
+            Ok(info)
         } else {
             Err(status)
         }
@@ -3075,7 +3145,7 @@ struct DispensedBorrow {
 pub struct ChunkColumnDispenser<'chunk, 'ctx> {
     iter: &'chunk mut ValidatedIter<'ctx>,
     next_term_index: usize,
-    borrowed: [DispensedBorrow; MAX_TERMS_PER_QUERY],
+    borrowed: [MaybeUninit<DispensedBorrow>; MAX_TERMS_PER_QUERY],
     borrowed_count: usize,
     entities_range: Option<(usize, usize)>,
 }
@@ -3087,12 +3157,7 @@ impl<'chunk, 'ctx> ChunkColumnDispenser<'chunk, 'ctx> {
         Self {
             iter,
             next_term_index: 0,
-            borrowed: [DispensedBorrow {
-                component: BamComponent::INVALID,
-                start: 0,
-                end: 0,
-                is_mut: false,
-            }; MAX_TERMS_PER_QUERY],
+            borrowed: [const { MaybeUninit::uninit() }; MAX_TERMS_PER_QUERY],
             borrowed_count: 0,
             entities_range: None,
         }
@@ -3153,7 +3218,9 @@ impl<'chunk, 'ctx> ChunkColumnDispenser<'chunk, 'ctx> {
         {
             return Err(FfiResult::ACCESS_CONFLICT);
         }
-        for prev in &self.borrowed[..self.borrowed_count] {
+        for idx in 0..self.borrowed_count {
+            // SAFETY: Entries `0..self.borrowed_count` are initialized by `check_and_record_borrow`.
+            let prev = unsafe { self.borrowed[idx].assume_init_ref() };
             if is_mut || prev.is_mut {
                 if prev.component == component {
                     return Err(FfiResult::ACCESS_CONFLICT);
@@ -3167,18 +3234,19 @@ impl<'chunk, 'ctx> ChunkColumnDispenser<'chunk, 'ctx> {
         if self.borrowed_count >= MAX_TERMS_PER_QUERY {
             return Err(FfiResult::CAPACITY_EXCEEDED);
         }
-        self.borrowed[self.borrowed_count] = DispensedBorrow {
+        self.borrowed[self.borrowed_count].write(DispensedBorrow {
             component,
             start,
             end,
             is_mut,
-        };
+        });
         self.borrowed_count += 1;
         Ok(())
     }
 
     /// Dispenses the contiguous `[FfiEntity; len]` slice for the active chunk without consuming a
     /// `BamTermDesc` index.
+    #[inline]
     pub fn entities(&mut self) -> Result<&'chunk [FfiEntity], FfiResult> {
         let len = self.iter.current_len();
         if len == 0 {
@@ -3208,7 +3276,9 @@ impl<'chunk, 'ctx> ChunkColumnDispenser<'chunk, 'ctx> {
         {
             return Err(FfiResult::ACCESS_CONFLICT);
         }
-        for prev in &self.borrowed[..self.borrowed_count] {
+        for idx in 0..self.borrowed_count {
+            // SAFETY: Entries `0..self.borrowed_count` are initialized by `check_and_record_borrow`.
+            let prev = unsafe { self.borrowed[idx].assume_init_ref() };
             if prev.is_mut && prev.end > prev.start && start < prev.end && prev.start < end {
                 return Err(FfiResult::ACCESS_CONFLICT);
             }
@@ -3289,6 +3359,7 @@ impl<'chunk, 'ctx> ChunkColumnDispenser<'chunk, 'ctx> {
     }
 
     /// Dispenses the next dense read-only `&'chunk [T]` column (`READ`, `CHANGED`, or `ADDED`).
+    #[inline]
     pub fn next_read<T: AbiPod>(
         &mut self,
         expected_mode: AccessMode,
@@ -3318,6 +3389,7 @@ impl<'chunk, 'ctx> ChunkColumnDispenser<'chunk, 'ctx> {
     }
 
     /// Dispenses the next dense mutable `&'chunk mut [T]` column (`WRITE`).
+    #[inline]
     pub fn next_write<T: AbiPod>(
         &mut self,
         expected_uuid: Option<UuidFilter>,
@@ -3353,6 +3425,7 @@ impl<'chunk, 'ctx> ChunkColumnDispenser<'chunk, 'ctx> {
     }
 
     /// Dispenses the next optional dense read-only `Option<&'chunk [T]>` column (`OPTIONAL_READ`).
+    #[inline]
     pub fn next_optional_read<T: AbiPod>(
         &mut self,
         expected_uuid: Option<UuidFilter>,
@@ -3382,6 +3455,7 @@ impl<'chunk, 'ctx> ChunkColumnDispenser<'chunk, 'ctx> {
     }
 
     /// Dispenses the next optional dense mutable `Option<&'chunk mut [T]>` column (`OPTIONAL_WRITE`).
+    #[inline]
     pub fn next_optional_write<T: AbiPod>(
         &mut self,
         expected_uuid: Option<UuidFilter>,
@@ -3411,6 +3485,7 @@ impl<'chunk, 'ctx> ChunkColumnDispenser<'chunk, 'ctx> {
     }
 
     /// Validates and advances past a pure filter term (`FILTER_ONLY` / `WITHOUT` / `ALLOW`).
+    #[inline]
     pub fn next_filter<T: AbiPod>(
         &mut self,
         expected_mode: AccessMode,
@@ -3435,6 +3510,7 @@ impl<'chunk, 'ctx> ChunkColumnDispenser<'chunk, 'ctx> {
 
     /// Validates and advances past an untyped/bridged filter term (`FILTER_ONLY` / `WITHOUT` / `ALLOW`)
     /// without comparing `T`'s guest layout against opaque host `size`/`align`.
+    #[inline]
     pub fn next_filter_untyped(
         &mut self,
         expected_mode: AccessMode,
@@ -3455,6 +3531,7 @@ impl<'chunk, 'ctx> ChunkColumnDispenser<'chunk, 'ctx> {
     }
 
     /// Dispenses the next `AccessMode::HAS` presence indicator for `T: AbiPod`.
+    #[inline]
     pub fn next_has<T: AbiPod>(
         &mut self,
         expected_uuid: Option<UuidFilter>,
@@ -3479,6 +3556,7 @@ impl<'chunk, 'ctx> ChunkColumnDispenser<'chunk, 'ctx> {
     }
 
     /// Dispenses the next `AccessMode::HAS` presence indicator for an opaque/bridged component.
+    #[inline]
     pub fn next_has_untyped(
         &mut self,
         expected_uuid: Option<UuidFilter>,

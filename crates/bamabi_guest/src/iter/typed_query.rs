@@ -866,12 +866,24 @@ impl<'iter, 'ctx, Q: QueryTuple> TypedChunkIter<'iter, 'ctx, Q> {
         F: FnMut(Q::Slices<'_>) -> R,
         R: IntoSystemResult,
     {
+        // Keep the per-chunk callback behind a `noalias`-preserving call boundary so LLVM
+        // retains `&mut [T]` / `&[U]` disjointness metadata for SIMD auto-vectorization even
+        // when `Q::fetch_slices` is fully inlined into this loop.
+        #[inline(never)]
+        fn invoke_chunk<S, F, R>(f: &mut F, slices: S) -> FfiResult
+        where
+            F: FnMut(S) -> R,
+            R: IntoSystemResult,
+        {
+            f(slices).into_ffi_result()
+        }
+
         while let Some(chunk_res) = self.try_next_chunk() {
             let slices = match chunk_res {
                 Ok(s) => s,
                 Err(err) => return err,
             };
-            let status = f(slices).into_ffi_result();
+            let status = invoke_chunk(&mut f, slices);
             if !status.is_ok() {
                 return status;
             }

@@ -718,3 +718,64 @@ fn system_closure_trampoline_defers_sys_host_ctx_and_sys_commands_until_accessed
     // SAFETY: `sys_ctx` and `fallback_ud` are valid for this synchronous call.
     assert_eq!(unsafe { fallback_fn(sys_ctx, fallback_ud) }, FfiResult::OK);
 }
+
+/// Verifies that [`ValidatedIter::column_info`] caches successful `BamColumnInfo` lookups for
+/// inline-cached terms (`0..4`) across repeated chunk/resource accesses while still forwarding
+/// higher term indices (`>= 4`) and never caching error results.
+#[test]
+fn validated_iter_caches_column_info_per_term_across_repeated_lookups() {
+    static INFO_CALLS: AtomicUsize = AtomicUsize::new(0);
+
+    /// Counting mock `iter_column_info` returning `OK` for `term_index < 6` and `OUT_OF_RANGE` otherwise.
+    unsafe extern "C" fn counting_column_info(
+        _iter: *const bamabi_sys::BamIter,
+        term_index: usize,
+        out_info: *mut bamabi_sys::BamColumnInfo,
+    ) -> FfiResult {
+        INFO_CALLS.fetch_add(1, Ordering::SeqCst);
+        if term_index >= 6 {
+            return FfiResult::OUT_OF_RANGE;
+        }
+        // SAFETY: `out_info` is writable stack storage supplied by `ValidatedIter::column_info`.
+        unsafe {
+            *out_info = bamabi_sys::BamColumnInfo {
+                component: BamComponent::from_raw((term_index + 1) as u32),
+                mode: AccessMode::READ,
+                uuid: ComponentUuid::ZERO,
+                size: 4,
+                align: 4,
+                storage_flags: 0,
+                reserved0: 0,
+            };
+        }
+        FfiResult::OK
+    }
+
+    INFO_CALLS.store(0, Ordering::SeqCst);
+    let mut api = make_mock_api();
+    api.iter_column_info = Some(counting_column_info);
+
+    let mut dummy_ctx = 1u8;
+    let mut dummy_iter = 2u8;
+    // SAFETY: Stack pointers stay valid for the duration of this test.
+    let host = unsafe { Host::from_raw(&raw const api, (&raw mut dummy_ctx).cast()) }.unwrap();
+    // SAFETY: `dummy_iter` acts as an opaque non-null `BamIter` for the mock callback.
+    let iter = unsafe { ValidatedIter::from_raw((&raw mut dummy_iter).cast(), &host) };
+
+    // Repeated lookups on inline-cached terms `0` and `1` invoke FFI only once each.
+    for _ in 0..8 {
+        assert_eq!(iter.column_info(0).unwrap().component.0, 1);
+        assert_eq!(iter.column_info(1).unwrap().component.0, 2);
+    }
+    assert_eq!(INFO_CALLS.load(Ordering::SeqCst), 2);
+
+    // Term index `5` (beyond the 4-slot inline cache) still queries FFI cleanly.
+    assert_eq!(iter.column_info(5).unwrap().component.0, 6);
+    assert_eq!(iter.column_info(5).unwrap().component.0, 6);
+    assert_eq!(INFO_CALLS.load(Ordering::SeqCst), 4);
+
+    // Error results (`OUT_OF_RANGE`) are never cached.
+    assert_eq!(iter.column_info(7), Err(FfiResult::OUT_OF_RANGE));
+    assert_eq!(iter.column_info(7), Err(FfiResult::OUT_OF_RANGE));
+    assert_eq!(INFO_CALLS.load(Ordering::SeqCst), 6);
+}

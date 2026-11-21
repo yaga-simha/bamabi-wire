@@ -286,30 +286,43 @@ pub(crate) fn resolve_guest_component<T: GuestComponent>(
     }
 }
 
-/// Computes the expected [`UuidFilter`] for runtime column and resource validation of
-/// `T: GuestComponent` inside a mod whose manifest name is `manifest_name`.
-///
-/// When `T::NAME` is already namespaced (`contains("::")`), `manifest_name` is empty, or `T`
-/// overrides `UUID` explicitly, matches `T::UUID` exactly. When `T::NAME` is unqualified, matches
-/// the auto-prefixed `"<manifest_name>::<T::NAME>"` UUID (without heap allocation for names up to
-/// 256 bytes) or `T::UUID` (matching [`resolve_guest_component`]'s fallback behavior).
-#[inline]
-pub(crate) fn guest_uuid_filter<T: GuestComponent>(manifest_name: &str) -> UuidFilter {
+/// Returns `true` if `name` is empty or already contains `"::"` (const-evaluable for hot-path
+/// `guest_uuid_filter` constant folding).
+const fn cstr_is_empty_or_namespaced(name: &CStr) -> bool {
+    let bytes = name.to_bytes();
+    if bytes.is_empty() {
+        return true;
+    }
+    let mut i = 0;
+    while i + 1 < bytes.len() {
+        if bytes[i] == b':' && bytes[i + 1] == b':' {
+            return true;
+        }
+        i += 1;
+    }
+    false
+}
+
+/// Const-evaluable equality comparison for two [`ComponentUuid`] values.
+const fn uuid_const_eq(a: ComponentUuid, b: ComponentUuid) -> bool {
+    let mut i = 0;
+    while i < 16 {
+        if a.bytes[i] != b.bytes[i] {
+            return false;
+        }
+        i += 1;
+    }
+    true
+}
+
+/// Cold path computing the manifest-prefixed fallback [`UuidFilter`] for unqualified
+/// `GuestComponent` names.
+#[cold]
+#[inline(never)]
+fn guest_uuid_filter_unqualified<T: GuestComponent>(manifest_name: &str) -> UuidFilter {
     let Ok(raw_name) = T::NAME.to_str() else {
         return UuidFilter::exact(T::UUID);
     };
-    if raw_name.is_empty() || raw_name.contains("::") || manifest_name.is_empty() {
-        return UuidFilter::exact(T::UUID);
-    }
-    let default_unqualified_uuid = ComponentUuid::from_parts(
-        raw_name,
-        core::mem::size_of::<T>(),
-        core::mem::align_of::<T>(),
-        T::FIELD_SCHEMA_HASH,
-    );
-    if T::UUID != default_unqualified_uuid {
-        return UuidFilter::exact(T::UUID);
-    }
     let total_len = manifest_name.len() + 2 + raw_name.len();
     let qualified_uuid = if total_len <= 256 {
         let mut stack_buf = [0u8; 256];
@@ -336,4 +349,38 @@ pub(crate) fn guest_uuid_filter<T: GuestComponent>(manifest_name: &str) -> UuidF
         )
     };
     UuidFilter::with_fallback(qualified_uuid, T::UUID)
+}
+
+/// Computes the expected [`UuidFilter`] for runtime column and resource validation of
+/// `T: GuestComponent` inside a mod whose manifest name is `manifest_name`.
+///
+/// When `T::NAME` is already namespaced (`contains("::")`), `manifest_name` is empty, or `T`
+/// overrides `UUID` explicitly, constant-folds at compile time to `UuidFilter::exact(T::UUID)`
+/// with zero runtime UTF-8 validation or string scanning. When `T::NAME` is unqualified, matches
+/// the auto-prefixed `"<manifest_name>::<T::NAME>"` UUID (without heap allocation for names up to
+/// 256 bytes) or `T::UUID` (matching [`resolve_guest_component`]'s fallback behavior).
+#[inline(always)]
+pub(crate) fn guest_uuid_filter<T: GuestComponent>(manifest_name: &str) -> UuidFilter {
+    let exact_only = const {
+        match T::NAME.to_str() {
+            Err(_) => true,
+            Ok(raw_name) => {
+                if cstr_is_empty_or_namespaced(T::NAME) {
+                    true
+                } else {
+                    let default_unqualified = ComponentUuid::from_parts(
+                        raw_name,
+                        core::mem::size_of::<T>(),
+                        core::mem::align_of::<T>(),
+                        T::FIELD_SCHEMA_HASH,
+                    );
+                    !uuid_const_eq(T::UUID, default_unqualified)
+                }
+            }
+        }
+    };
+    if exact_only || manifest_name.is_empty() {
+        return UuidFilter::exact(T::UUID);
+    }
+    guest_uuid_filter_unqualified::<T>(manifest_name)
 }
