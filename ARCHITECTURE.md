@@ -17,7 +17,7 @@ Across the 5-repository federated `bamabi` stack, `bamabi-wire` sits at the root
 | **4** | [`bamabi-showcase`](https://github.com/yaga-simha/bamabi-showcase) | Integration repo: examples (`01`–`10`), benchmarks (`docs/BENCHMARKS.md`), fuzzers, mdBook guide |
 | **Overlay** | [`bamabi-dev-overlay`](https://github.com/yaga-simha/bamabi-dev-overlay) | Multi-repo `abi-lock.toml` consistency checker (`sync_check.py`) and local sibling `[patch]` manager (`overlay.py`) |
 
-Inside `bamabi-wire`, the 5 library crates and `xtask` form a strictly acyclic DAG that separates `unsafe` FFI machinery (`bamabi_sys`, `bamabi_guest_sys`) from `#![forbid(unsafe_code)]` crates:
+Inside `bamabi-wire`, the 5 functional library crates and `xtask` form a strictly acyclic DAG that separates `unsafe` FFI machinery (`bamabi_sys`, `bamabi_guest_sys`) from `#![forbid(unsafe_code)]` crates (alongside the non-published `bamabi_docs` documentation hub crate):
 
 ```text
                 ┌──────────────────────────┐
@@ -48,6 +48,7 @@ Inside `bamabi-wire`, the 5 library crates and `xtask` form a strictly acyclic D
 
 | Crate | `#![no_std]` | `#![forbid(unsafe_code)]` | External Deps | Role |
 |---|---|---|---|---|
+| `bamabi_docs` | Yes | **Yes** | **Zero** | Non-published (`publish = false`) workspace `rustdoc` landing hub (`target/doc/bamabi_docs/index.html`) embedding `README.md`, `ARCHITECTURE.md`, `DEVELOPMENT.md`, `TESTING.md`, `spec.md`, and the curated crate index |
 | `bamabi_sys` | Yes | No (`unsafe` traits/slice views) | **Zero** | ABI `0.3.0` (`0x0003_0000`) `#[repr(C)]`/`#[repr(transparent)]` primitives, 68-slot `BamHostApi`, `offsets`, `ComponentUuid` (SipHash-2-4-128), `ExtensibleStruct`, descriptors, `ModComponent`/`AbiPod`/`RawInsertable` |
 | `bamabi_macros` | Proc-macro | **Yes** | `syn`, `quote`, `proc-macro2`, `proc-macro-crate` | `#[derive(ModComponent, AbiPod, GuestComponent)]`, compile-time zero-padding checks, hygienic VTables, `SCHEMA_FINGERPRINT`, `BAM_FIELDS`, `REQUIRED_COMPONENTS`, `C_DECL`/`ZIG_DECL` |
 | `bamabi_sdk_gen` | `std` | **Yes** | None (`bamabi_sys` only) | Renders `include/bamabi.h` (C99), `bamabi.hpp` (C++17), `bamabi.zig` (Zig), and C99 component headers from `bamabi_sys` metadata |
@@ -213,15 +214,16 @@ pub struct Health {
 
 1. **`xtask/src/component_headers.rs`:** Collects `section_for::<T>()` for 19 canonical `#[derive(ModComponent)]` fixtures and keeps [`include/generated/testbed_components.h`](include/generated/testbed_components.h) synchronized (`cargo xtask gen-component-headers`).
 2. **Byte-parity checks:** `cargo xtask header --check` verifies [`include/bamabi.h`](include/bamabi.h) matches `bamabi_sdk_gen::render_c99_header()` byte-for-byte; `cargo xtask gen-component-headers --check` verifies `testbed_components.h`.
-3. **Static & isolation lints (`cargo xtask lint`):** Confirms `#![forbid(unsafe_code)]` in `bamabi_macros`, `bamabi_sdk_gen`, `bamabi_guest`, and `xtask`; confirms zero `bevy*` crates in `cargo tree --workspace`; runs `clippy -D warnings` and `RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps`.
+3. **Static & isolation lints (`cargo xtask lint`):** Confirms `#![forbid(unsafe_code)]` in `bamabi_docs`, `bamabi_macros`, `bamabi_sdk_gen`, `bamabi_guest`, and `xtask`; confirms zero `bevy*` crates in `cargo tree --workspace`; runs `clippy -D warnings` and `RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps`.
 4. **Rust + C99 + sanitizer execution:** `cargo xtask test` runs `--no-default-features`, `--all-features`, and `--doc`; `cargo xtask c-test` validates both generated headers under strict `-std=c99 -Wall -Wextra -Werror -pedantic -fsyntax-only` and compiles/runs [`tests/standalone_c_test.c`](tests/standalone_c_test.c) under AddressSanitizer and UndefinedBehaviorSanitizer.
 
 ## 7. Crate Onboarding Index
 
-Each workspace crate includes a `README.md`, an `ARCHITECTURE.md` deep dive, and a `TESTS.md` verification catalog, and is also browsable locally in `rustdoc` via `cargo docs --open` (alias for `cargo doc --workspace --no-deps --open`):
+Each workspace crate includes a `README.md`, an `ARCHITECTURE.md` deep dive, and a `TESTS.md` verification catalog, and is browsable locally in `rustdoc` via `cargo docs --open` (alias for `cargo doc --workspace --no-deps --open`, landing on `target/doc/bamabi_docs/index.html`):
 
 | Crate | README | Architecture | Tests & Proofs |
 |---|---|---|---|
+| `bamabi_docs` | [`crates/bamabi_docs/README.md`](crates/bamabi_docs/README.md) | [`crates/bamabi_docs/ARCHITECTURE.md`](crates/bamabi_docs/ARCHITECTURE.md) | [`crates/bamabi_docs/TESTS.md`](crates/bamabi_docs/TESTS.md) |
 | `bamabi_sys` | [`crates/bamabi_sys/README.md`](crates/bamabi_sys/README.md) | [`crates/bamabi_sys/ARCHITECTURE.md`](crates/bamabi_sys/ARCHITECTURE.md) | [`crates/bamabi_sys/TESTS.md`](crates/bamabi_sys/TESTS.md) |
 | `bamabi_macros` | [`crates/bamabi_macros/README.md`](crates/bamabi_macros/README.md) | [`crates/bamabi_macros/ARCHITECTURE.md`](crates/bamabi_macros/ARCHITECTURE.md) | [`crates/bamabi_macros/TESTS.md`](crates/bamabi_macros/TESTS.md) |
 | `bamabi_sdk_gen` | [`crates/bamabi_sdk_gen/README.md`](crates/bamabi_sdk_gen/README.md) | [`crates/bamabi_sdk_gen/ARCHITECTURE.md`](crates/bamabi_sdk_gen/ARCHITECTURE.md) | [`crates/bamabi_sdk_gen/TESTS.md`](crates/bamabi_sdk_gen/TESTS.md) |

@@ -1,0 +1,17 @@
+[package]
+name = "bamabi_docs"
+version.workspace = true
+edition.workspace = true
+rust-version = "1.87"
+license.workspace = true
+authors.workspace = true
+publish = false
+repository.workspace = true
+readme = "README.md"
+description = "Workspace-level architecture, onboarding, testing, and wire contract documentation hub for bamabi-wire"
+
+[lints]
+workspace = true
+
+[dependencies]
+# Zero dependencies. Non-published documentation hub for the bamabi-wire workspace.

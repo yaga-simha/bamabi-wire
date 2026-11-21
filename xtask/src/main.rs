@@ -54,10 +54,16 @@
 //!   subcommand runners (`ARCHITECTURE.md`).
 //! - [`docs::tests`]: Unit test inventory covering CLI parsing and checked-in component-header
 //!   parity (`TESTS.md`).
-//! - [Workspace Guides (`bamabi_sys::docs::workspace`)](../bamabi_sys/docs/workspace/index.html) and
-//!   [Guest Workspace Docs (`bamabi_guest::docs::workspace`)](../bamabi_guest/docs/workspace/index.html):
+//! - [Workspace Documentation Hub (`bamabi_docs`)](../bamabi_docs/index.html)
+//!   ([`overview`](../bamabi_docs/overview/index.html),
+//!   [`architecture`](../bamabi_docs/architecture/index.html),
+//!   [`development`](../bamabi_docs/development/index.html),
+//!   [`testing`](../bamabi_docs/testing/index.html),
+//!   [`wire_spec`](../bamabi_docs/wire_spec/index.html),
+//!   [`crates`](../bamabi_docs/crates/index.html)):
 //!   Root `README.md`, `ARCHITECTURE.md` (with the 6-crate end-to-end walkthrough),
-//!   `DEVELOPMENT.md`, and `TESTING.md` rendered directly inside `cargo docs --open`.
+//!   `DEVELOPMENT.md`, `TESTING.md`, and `spec.md` rendered directly inside `cargo docs --open`
+//!   (landing on `target/doc/bamabi_docs/index.html`).
 
 #[cfg(doc)]
 #[allow(unreachable_pub)]
@@ -612,7 +618,7 @@ USAGE:
     cargo xtask lint
 
 CHECKS:
-    - #![forbid(unsafe_code)] on bamabi_guest, bamabi_macros, bamabi_sdk_gen, and xtask
+    - #![forbid(unsafe_code)] on bamabi_docs, bamabi_guest, bamabi_macros, bamabi_sdk_gen, and xtask
     - Zero non-bamabi Bevy dependencies in `cargo tree --workspace`
     - `cargo clippy --workspace --all-targets -- -D warnings` (default & --all-features)
     - `RUSTDOCFLAGS=\"-D warnings\" cargo doc --workspace --no-deps` (default & --all-features)"
@@ -850,6 +856,7 @@ fn cmd_lint(root: &Path) -> Result<(), String> {
 fn verify_forbid_unsafe(root: &Path) -> Result<(), String> {
     println!("==> Verifying #![forbid(unsafe_code)] on safe crates");
     let required = [
+        "crates/bamabi_docs/src/lib.rs",
         "crates/bamabi_guest/src/lib.rs",
         "crates/bamabi_macros/src/lib.rs",
         "crates/bamabi_sdk_gen/src/lib.rs",

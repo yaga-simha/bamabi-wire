@@ -80,7 +80,7 @@ As part of Layer 0 (`bamabi-wire`), neither `xtask` nor any `bamabi-wire` crate 
 
 ## Documentation
 
-Browse all workspace and `xtask` docs locally in `rustdoc` via `cargo docs --open` (which builds `xtask::docs::architecture` and `xtask::docs::tests` alongside every workspace crate):
+Browse all workspace and `xtask` docs locally in `rustdoc` via `cargo docs --open` (which lands on `target/doc/bamabi_docs/index.html` and builds `xtask::docs::architecture` and `xtask::docs::tests` alongside every workspace crate):
 
 - [`ARCHITECTURE.md`](ARCHITECTURE.md) — internal pipeline (`parse_args` -> `dispatch` -> `cmd_*` runners), `component_headers.rs` `ModComponent::C_DECL` extraction, toolchain isolation, and how to add a new check or subcommand.
 - [`TESTS.md`](TESTS.md) — catalog of `xtask` unit tests (CLI parsing, flag conflict checks, help routing, and checked-in header parity) and what each proves.

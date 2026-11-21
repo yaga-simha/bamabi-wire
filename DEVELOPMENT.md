@@ -125,10 +125,10 @@ cargo check -p bamabi_sys --target wasm32-unknown-unknown
 
 ### Browsing Workspace & Crate Docs (`cargo docs --open`)
 
-[`.cargo/config.toml`](.cargo/config.toml) defines `docs = "doc --workspace --no-deps"`. Use `cargo docs --open` as the primary way to browse all workspace guides (`README.md`, `ARCHITECTURE.md`, `DEVELOPMENT.md`, `TESTING.md`), per-crate incremental API tutorials, and `ARCHITECTURE.md` / `TESTS.md` modules together in `rustdoc`:
+[`.cargo/config.toml`](.cargo/config.toml) defines `docs = "doc --workspace --no-deps"`. Both `cargo docs --open` and `cargo doc --workspace --no-deps --open` land directly on `target/doc/bamabi_docs/index.html` ([`bamabi_docs`](crates/bamabi_docs/README.md)), which embeds all workspace guides (`overview`, `architecture`, `development`, `testing`, `wire_spec`) and links to every crate's incremental API tutorials and `ARCHITECTURE.md` / `TESTS.md` modules in `rustdoc`:
 
 ```bash
-# Primary local docs browser (workspace guides + all 6 crates)
+# Primary local docs browser (lands on target/doc/bamabi_docs/index.html)
 cargo docs --open
 
 # Equivalent unaliased command (add --all-features to include derive examples)
