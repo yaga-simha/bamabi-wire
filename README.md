@@ -6,10 +6,10 @@ Refactored from the original [`bevy_mod_abi`](https://github.com/yaga-simha/bevy
 
 ## Documentation & Onboarding
 
-The primary way to browse the full workspace overview, end-to-end architecture walkthrough, per-crate incremental API guides, and test catalogs locally is `rustdoc` via the `.cargo/config.toml` alias:
+The primary way to browse the full workspace overview, end-to-end architecture walkthrough, per-crate incremental API guides, wire spec, and test catalogs locally is `rustdoc` via the `.cargo/config.toml` alias, which lands directly on `target/doc/bamabi_docs/index.html` ([`bamabi_docs`](crates/bamabi_docs/README.md)):
 
 ```bash
-# Build and open all workspace, crate, architecture, and test docs locally
+# Build and open all workspace, crate, architecture, wire spec, and test docs locally (lands on bamabi_docs/index.html)
 cargo docs --open
 # Equivalent full command:
 cargo doc --workspace --no-deps --open
@@ -24,6 +24,7 @@ cargo doc --workspace --no-deps --open
 
 | Crate | Safety Policy | External Deps | MSRV / Edition | Docs | Responsibilities |
 |---|---|---|---|---|---|
+| [`bamabi_docs`](crates/bamabi_docs/README.md) | `#![no_std]`, `#![forbid(unsafe_code)]` (`publish = false`) | Zero | `1.87` / `2024` | [Arch](crates/bamabi_docs/ARCHITECTURE.md) · [Tests](crates/bamabi_docs/TESTS.md) | Workspace-general `rustdoc` landing hub (`target/doc/bamabi_docs/index.html`) tying together all 6 functional crates and embedding `README.md`, `ARCHITECTURE.md`, `DEVELOPMENT.md`, `TESTING.md`, and `spec.md` |
 | [`bamabi_sys`](crates/bamabi_sys/README.md) | `#![no_std]` (`unsafe` FFI contract) | Zero | `1.87` / `2024` | [Arch](crates/bamabi_sys/ARCHITECTURE.md) · [Tests](crates/bamabi_sys/TESTS.md) | `ABI 0.3.0` (`0x0003_0000`) wire types, 68-slot `BamHostApi` (552 B 64-bit / 280 B 32-bit), `offsets` (`OFF64_*`/`OFF32_*`), `ComponentUuid` (SipHash-2-4-128), `FfiResult`, descriptors, `ModComponent`, `AbiPod`, `RawInsertable` |
 | [`bamabi_macros`](crates/bamabi_macros/README.md) | `#![forbid(unsafe_code)]` | `syn`, `quote`, `proc-macro2`, `proc-macro-crate` | `1.87` / `2024` | [Arch](crates/bamabi_macros/ARCHITECTURE.md) · [Tests](crates/bamabi_macros/TESTS.md) | `#[derive(ModComponent, AbiPod, GuestComponent)]`, zero-padding checks, hygienic VTables, `SCHEMA_FINGERPRINT`, `BAM_FIELDS`, `REQUIRED_COMPONENTS`, `C_DECL`/`ZIG_DECL` |
 | [`bamabi_sdk_gen`](crates/bamabi_sdk_gen/README.md) | `#![forbid(unsafe_code)]` | `bamabi_sys` | `1.95` / `2024` | [Arch](crates/bamabi_sdk_gen/ARCHITECTURE.md) · [Tests](crates/bamabi_sdk_gen/TESTS.md) | Generates `include/bamabi.h` (C99), `bamabi.hpp` (C++17 68/68 views + `ScopedTransaction`), `bamabi.zig` (Zig `addTranslateC` 68/68 views + lossless 18-code `BamError`), and C99 component headers with `BAM_EXPORT`, `BAM_RESTRICT`, and `BAM_HOST_API_OFFSET_*` |

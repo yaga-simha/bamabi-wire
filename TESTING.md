@@ -21,7 +21,7 @@ cargo xtask test
 
 - `cargo xtask fmt`: runs `cargo fmt --all -- --check` (`--fix` to format).
 - `cargo xtask lint`:
-  1. Verifies `#![forbid(unsafe_code)]` is present in `crates/bamabi_guest/src/lib.rs`, `crates/bamabi_macros/src/lib.rs`, `crates/bamabi_sdk_gen/src/lib.rs`, and `xtask/src/main.rs`.
+  1. Verifies `#![forbid(unsafe_code)]` is present in `crates/bamabi_docs/src/lib.rs`, `crates/bamabi_guest/src/lib.rs`, `crates/bamabi_macros/src/lib.rs`, `crates/bamabi_sdk_gen/src/lib.rs`, and `xtask/src/main.rs`.
   2. Verifies zero non-`bamabi` Bevy crates in `cargo tree --workspace`.
   3. Runs `cargo clippy --workspace --all-targets -- -D warnings` (both default features and `--all-features`), enforcing workspace lints in [`Cargo.toml`](Cargo.toml) (`unsafe_op_in_unsafe_fn = "deny"`, `improper_ctypes_definitions = "deny"`, `undocumented_unsafe_blocks = "warn"`, `cast_ptr_alignment = "warn"`, etc.) and [`clippy.toml`](clippy.toml).
   4. Runs `RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps` (default features and `--all-features`).
@@ -116,6 +116,7 @@ Tooling in `bamabi-wire` that measures stress behavior, telemetry framing, and b
 
 ## 4. Per-Crate Test Catalogs
 
+- [`crates/bamabi_docs/TESTS.md`](crates/bamabi_docs/TESTS.md) — strict `rustdoc` landing-hub build, doctest/clippy/fmt checks, and `#![forbid(unsafe_code)]` verification.
 - [`crates/bamabi_sys/TESTS.md`](crates/bamabi_sys/TESTS.md) — layout assertions, ABI constants, `proptest_wire`, and `PO-W1..PO-W8` Kani proofs.
 - [`crates/bamabi_macros/TESTS.md`](crates/bamabi_macros/TESTS.md) — macro unit tests, `mod_component_vtable`, 34 `trybuild` UI scenarios, and `proptest_witness`.
 - [`crates/bamabi_sdk_gen/TESTS.md`](crates/bamabi_sdk_gen/TESTS.md) — `header_parity`, `sdk_compile_tests` (C++17 & Zig), and unit tests.
