@@ -300,6 +300,10 @@ enum HeldWrite<'a> {
 proptest! {
     #![proptest_config(proptest_config())]
 
+    /// Fuzzes `ChunkColumnDispenser` with random sequences of `Read`, `Write`, `OptionalRead`,
+    /// `OptionalWrite`, and `Entities` operations against an independent interval-and-component
+    /// oracle, proving that overlapping mutable borrows or capacity overflows (`> MAX_TERMS_PER_QUERY`)
+    /// are rejected with `ACCESS_CONFLICT` / `CAPACITY_EXCEEDED` and live slices never alias mutably.
     #[test]
     fn chunk_column_dispenser_random_sequences_never_alias_mutably(
         chunk_len in 0usize..=8,
@@ -829,6 +833,10 @@ unsafe extern "C" fn msg_read_batch(
 proptest! {
     #![proptest_config(proptest_config())]
 
+    /// Fuzzes `ValidatedIter::read_messages_batch_checked` across adversarial `read_count` values
+    /// (including `usize::MAX`), `max_count == 0`, ZST messages, and corrupt `BamColumnInfo`
+    /// metadata (`mode`, `storage_flags`, `size`, `align`, `uuid`), proving uninitialized `scratch`
+    /// elements are never exposed and metadata mismatches fail closed with `TYPE_MISMATCH`.
     #[test]
     fn read_messages_batch_checked_clamps_hostile_read_count_and_guards_metadata(
         max_count in 0usize..=64,
@@ -992,6 +1000,10 @@ fn outer_array_plan_strategy() -> impl Strategy<Value = OuterArrayPlan> {
 proptest! {
     #![proptest_config(proptest_config())]
 
+    /// Fuzzes `SparseRows::from_raw_parts` and `SparseRowsMut::from_raw_parts` with hostile outer
+    /// arrays (null, misaligned, `len * ptr_size > isize::MAX`), hostile inner row pointers (null,
+    /// misaligned, duplicate/aliased), `allow_null_rows` toggles, and ZST markers, proving invalid
+    /// layouts fail closed and valid `for_each_mut` / `get` / `iter` calls remain sound.
     #[test]
     fn sparse_rows_and_mut_hostile_pointer_array_fuzzing(
         outer_plan in outer_array_plan_strategy(),

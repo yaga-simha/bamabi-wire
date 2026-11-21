@@ -177,6 +177,7 @@ unsafe extern "C" fn stub_cmd_remove(
     FfiResult::OK
 }
 
+/// Builds a minimal `BamHostApi` populating only the 27 core ABI `0.2` slots for `PO-G9` harnesses.
 fn make_core_api(struct_size: u32, abi_version: u32) -> BamHostApi {
     BamHostApi {
         struct_size,
@@ -252,6 +253,8 @@ fn make_core_api(struct_size: u32, abi_version: u32) -> BamHostApi {
     }
 }
 
+/// Validates `api` against `ABI_VERSION` and constructs a `Host` preserving typed function
+/// pointers for CBMC via `Host::from_api_for_kani`.
 fn make_valid_host(api: BamHostApi, host_ctx: *const BamHostCtx) -> Host {
     assert_eq!(api.validate_for_guest(ABI_VERSION), FfiResult::OK);
     Host::from_api_for_kani(api, host_ctx)
