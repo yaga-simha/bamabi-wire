@@ -451,6 +451,8 @@ unsafe extern "C" fn stub_migrate_col(
     FfiResult::OK
 }
 
+/// Builds a minimal `BamHostApi` populating only the 27 core ABI `0.2` slots and leaving all 41
+/// extended/ABI-`0.3.0` slots as `None`.
 fn make_core_api(struct_size: u32, abi_version: u32) -> BamHostApi {
     BamHostApi {
         struct_size,
@@ -526,6 +528,8 @@ fn make_core_api(struct_size: u32, abi_version: u32) -> BamHostApi {
     }
 }
 
+/// Builds a complete 68-slot `BamHostApi` populating all 27 core slots plus all 41 extended/ABI-`0.3.0`
+/// slots with zero-side-effect stubs.
 fn make_full_api(struct_size: u32, abi_version: u32) -> BamHostApi {
     let mut api = make_core_api(struct_size, abi_version);
     api.par_for_each_chunk = Some(stub_par_chunks);
@@ -572,6 +576,8 @@ fn make_full_api(struct_size: u32, abi_version: u32) -> BamHostApi {
     api
 }
 
+/// Validates `api` against `ABI_VERSION` and constructs a `Host` preserving typed function
+/// pointers for CBMC via `Host::from_api_for_kani`.
 fn make_valid_host(api: BamHostApi, host_ctx: *const BamHostCtx) -> Host {
     assert_eq!(api.validate_for_guest(ABI_VERSION), FfiResult::OK);
     Host::from_api_for_kani(api, host_ctx)

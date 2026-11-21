@@ -39,8 +39,10 @@ pub unsafe extern "C" fn dummy_getter(_ptr: *const c_void) -> u32 {
     42
 }
 
+/// Canonical UUID registered for [`VALID_VTABLE`].
 pub static VALID_VTABLE_UUID: ComponentUuid = ComponentUuid::from_parts("mock::Dummy", 8, 4, 0);
 
+/// Valid `DummyVTable` fixture matching [`VALID_VTABLE_UUID`] and `ABI_VERSION`.
 pub static VALID_VTABLE: DummyVTable = DummyVTable {
     header: VTableHeader::from_raw_parts(
         core::mem::size_of::<DummyVTable>() as u32,
@@ -51,6 +53,7 @@ pub static VALID_VTABLE: DummyVTable = DummyVTable {
     getter: Some(dummy_getter),
 };
 
+/// Undersized header-only fixture (`struct_size == VTableHeader::MIN_V0_2_SIZE`) for rejection tests.
 pub static TRUNCATED_HEADER: VTableHeader = VTableHeader {
     struct_size: VTableHeader::MIN_V0_2_SIZE as u32,
     abi_version: ABI_VERSION,
@@ -59,6 +62,7 @@ pub static TRUNCATED_HEADER: VTableHeader = VTableHeader {
     align: 4,
 };
 
+/// Version-mismatched (`0.1.0`) `DummyVTable` fixture for `INVALID_VERSION` rejection tests.
 pub static WRONG_VERSION_VTABLE: DummyVTable = DummyVTable {
     header: VTableHeader {
         struct_size: core::mem::size_of::<DummyVTable>() as u32,
