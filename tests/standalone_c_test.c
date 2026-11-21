@@ -1165,10 +1165,12 @@ static void test_extended_wire_descriptors(void) {
     assert((sys_desc.flags & BAM_SYSTEM_KNOWN_FLAGS) == BAM_SYSTEM_FLAG_AMBIGUOUS_WITH_ALL);
 
     api = build_mock_host_api();
-    assert(BAM_HOST_API_SLOT_COUNT == 68u);
-    assert(api.struct_size >= (uint32_t)(offsetof(BamHostApi, migrate_component_column) + sizeof(BamMigrateComponentColumnFn)));
+    assert(BAM_HOST_API_SLOT_COUNT == 69u);
+    assert(api.struct_size >= (uint32_t)(offsetof(BamHostApi, iter_next_chunk_batch) + sizeof(BamIterNextChunkBatchFn)));
     assert(bam_host_api_covers_slot(&api, BAM_HOST_API_OFFSET_LOG_DIAGNOSTIC, sizeof(BamLogDiagnosticFn)));
     assert(bam_host_api_covers_slot(&api, BAM_HOST_API_OFFSET_MIGRATE_COMPONENT_COLUMN, sizeof(BamMigrateComponentColumnFn)));
+    assert(bam_host_api_covers_slot(&api, BAM_HOST_API_OFFSET_ITER_NEXT_CHUNK_BATCH, sizeof(BamIterNextChunkBatchFn)));
+    assert(api.iter_next_chunk_batch == NULL);
     assert(api.cmd_spawn_persistent == NULL);
     assert(api.cmd_spawn_batch == NULL);
     assert(api.cmd_despawn_all == NULL);

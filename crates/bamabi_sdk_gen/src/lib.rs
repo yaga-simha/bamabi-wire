@@ -79,7 +79,7 @@
 //!
 //! let c99 = render_c99_header().expect("bamabi_sys layouts must be valid");
 //! assert!(c99.contains("#define BAM_ABI_VERSION 0x00030000u"));
-//! assert!(c99.contains("#define BAM_HOST_API_SLOT_COUNT    68u"));
+//! assert!(c99.contains("#define BAM_HOST_API_SLOT_COUNT    69u"));
 //! assert!(c99.contains("#define BAM_HOST_API_OFFSET_MIGRATE_COMPONENT_COLUMN"));
 //!
 //! let out_dir = std::env::temp_dir().join(format!("bamabi_sdk_doctest_{}", std::process::id()));

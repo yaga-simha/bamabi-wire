@@ -111,12 +111,13 @@ inline constexpr std::size_t CMD_ROLLBACK = BAM_HOST_API_OFFSET_CMD_ROLLBACK;
 inline constexpr std::size_t CMD_INSERT_RELATION = BAM_HOST_API_OFFSET_CMD_INSERT_RELATION;
 inline constexpr std::size_t CMD_REMOVE_RELATION = BAM_HOST_API_OFFSET_CMD_REMOVE_RELATION;
 inline constexpr std::size_t MIGRATE_COMPONENT_COLUMN = BAM_HOST_API_OFFSET_MIGRATE_COMPONENT_COLUMN;
+inline constexpr std::size_t ITER_NEXT_CHUNK_BATCH = BAM_HOST_API_OFFSET_ITER_NEXT_CHUNK_BATCH;
 
 static_assert(STRUCT_SIZE == 0u, "BamHostApi::struct_size must be at offset 0");
 static_assert(ABI_VERSION == 4u, "BamHostApi::abi_version must be at offset 4");
 static_assert(GET_PROC_ADDRESS == 8u, "BamHostApi slot 0 must be at offset 8");
 static_assert(
-    MIGRATE_COMPONENT_COLUMN + sizeof(BamMigrateComponentColumnFn) == sizeof(BamHostApi),
+    ITER_NEXT_CHUNK_BATCH + sizeof(BamIterNextChunkBatchFn) == sizeof(BamHostApi),
     "BamHostApi tail slot must end at sizeof(BamHostApi)"
 );
 
@@ -424,6 +425,32 @@ public:
             return false;
         }
         BamBool ok = api_->iter_next_chunk(iter_, &out_len);
+        count_ = (ok != BAM_FALSE) ? out_len : 0u;
+        return ok != BAM_FALSE;
+    }
+
+    bool next_chunk_batch(
+        size_t& out_len,
+        const BamEntity** out_entities,
+        uint8_t** out_col_ptrs,
+        size_t col_count,
+        uint32_t mark_changed_mask
+    ) noexcept {
+        if (api_ == nullptr || iter_ == nullptr ||
+            !bam_host_api_covers_slot(api_, BAM_HOST_API_OFFSET_ITER_NEXT_CHUNK_BATCH, sizeof(BamIterNextChunkBatchFn)) ||
+            api_->iter_next_chunk_batch == nullptr) {
+            count_ = 0u;
+            out_len = 0u;
+            return false;
+        }
+        BamBool ok = api_->iter_next_chunk_batch(
+            iter_,
+            &out_len,
+            out_entities,
+            out_col_ptrs,
+            col_count,
+            mark_changed_mask
+        );
         count_ = (ok != BAM_FALSE) ? out_len : 0u;
         return ok != BAM_FALSE;
     }
@@ -1114,6 +1141,7 @@ pub const offsets = struct {
     pub const CMD_INSERT_RELATION: usize = @offsetOf(c.BamHostApi, "cmd_insert_relation");
     pub const CMD_REMOVE_RELATION: usize = @offsetOf(c.BamHostApi, "cmd_remove_relation");
     pub const MIGRATE_COMPONENT_COLUMN: usize = @offsetOf(c.BamHostApi, "migrate_component_column");
+    pub const ITER_NEXT_CHUNK_BATCH: usize = @offsetOf(c.BamHostApi, "iter_next_chunk_batch");
 };
 
 pub const BAM_HOST_API_OFFSET_GET_PROC_ADDRESS: usize = offsets.GET_PROC_ADDRESS;
@@ -1184,12 +1212,13 @@ pub const BAM_HOST_API_OFFSET_CMD_ROLLBACK: usize = offsets.CMD_ROLLBACK;
 pub const BAM_HOST_API_OFFSET_CMD_INSERT_RELATION: usize = offsets.CMD_INSERT_RELATION;
 pub const BAM_HOST_API_OFFSET_CMD_REMOVE_RELATION: usize = offsets.CMD_REMOVE_RELATION;
 pub const BAM_HOST_API_OFFSET_MIGRATE_COMPONENT_COLUMN: usize = offsets.MIGRATE_COMPONENT_COLUMN;
+pub const BAM_HOST_API_OFFSET_ITER_NEXT_CHUNK_BATCH: usize = offsets.ITER_NEXT_CHUNK_BATCH;
 
 comptime {
     if (offsets.STRUCT_SIZE != 0 or offsets.ABI_VERSION != 4 or offsets.GET_PROC_ADDRESS != 8) {
         @compileError("BamHostApi header offsets mismatch");
     }
-    if (offsets.MIGRATE_COMPONENT_COLUMN + @sizeOf(usize) != @sizeOf(c.BamHostApi)) {
+    if (offsets.ITER_NEXT_CHUNK_BATCH + @sizeOf(usize) != @sizeOf(c.BamHostApi)) {
         @compileError("BamHostApi tail slot offset mismatch");
     }
 }
@@ -1517,6 +1546,33 @@ pub const ChunkView = struct {
         const f = self.api.iter_next_chunk orelse return null;
         var count: usize = 0;
         if (f(self.iter, &count) == c.BAM_FALSE) {
+            self.len = 0;
+            return null;
+        }
+        self.len = count;
+        return count;
+    }
+
+    pub fn nextChunkBatch(
+        self: *ChunkView,
+        out_entities: ?*?[*]const c.BamEntity,
+        out_col_ptrs: []?[*]u8,
+        mark_changed_mask: u32,
+    ) BamError!?usize {
+        if (!coversHostApiSlot(self.api, offsets.ITER_NEXT_CHUNK_BATCH, @sizeOf(c.BamIterNextChunkBatchFn))) {
+            return error.Unsupported;
+        }
+        const f = self.api.iter_next_chunk_batch orelse return error.Unsupported;
+        var count: usize = 0;
+        const ok = f(
+            self.iter,
+            &count,
+            if (out_entities) |p| @ptrCast(p) else null,
+            if (out_col_ptrs.len > 0) @ptrCast(out_col_ptrs.ptr) else null,
+            out_col_ptrs.len,
+            mark_changed_mask,
+        );
+        if (ok == c.BAM_FALSE) {
             self.len = 0;
             return null;
         }

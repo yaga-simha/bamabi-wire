@@ -450,6 +450,16 @@ unsafe extern "C" fn stub_migrate_col(
 ) -> FfiResult {
     FfiResult::OK
 }
+unsafe extern "C" fn stub_iter_next_chunk_batch(
+    _: *mut BamIter,
+    _: *mut usize,
+    _: *mut *const FfiEntity,
+    _: *mut *mut u8,
+    _: usize,
+    _: u32,
+) -> FfiBool {
+    FfiBool::FALSE
+}
 
 /// Builds a minimal `BamHostApi` populating only the 27 core ABI `0.2` slots and leaving all 41
 /// extended/ABI-`0.3.0` slots as `None`.
@@ -525,6 +535,7 @@ fn make_core_api(struct_size: u32, abi_version: u32) -> BamHostApi {
         cmd_insert_relation: None,
         cmd_remove_relation: None,
         migrate_component_column: None,
+        iter_next_chunk_batch: None,
     }
 }
 
@@ -573,6 +584,7 @@ fn make_full_api(struct_size: u32, abi_version: u32) -> BamHostApi {
     api.cmd_insert_relation = Some(stub_cmd_insert_rel);
     api.cmd_remove_relation = Some(stub_cmd_remove_rel);
     api.migrate_component_column = Some(stub_migrate_col);
+    api.iter_next_chunk_batch = Some(stub_iter_next_chunk_batch);
     api
 }
 
@@ -630,6 +642,7 @@ fn assert_all_41_extended_slots_none(api: &BamHostApi) {
     assert!(host_slot!(api, cmd_insert_relation).is_none());
     assert!(host_slot!(api, cmd_remove_relation).is_none());
     assert!(host_slot!(api, migrate_component_column).is_none());
+    assert!(host_slot!(api, iter_next_chunk_batch).is_none());
 }
 
 /// PO-G1: `host_slot!` across all 41 extended/ABI-0.3 slots returns `Some` iff `populated` and
@@ -693,11 +706,12 @@ fn po_g1_host_slot_bounds_all_41_extended_slots() {
     check_slot!(cmd_insert_relation);
     check_slot!(cmd_remove_relation);
     check_slot!(migrate_component_column);
+    check_slot!(iter_next_chunk_batch);
 
     kani::cover!(host_slot!(&api, par_for_each_chunk).is_some());
     kani::cover!(host_slot!(&api, par_for_each_chunk).is_none());
-    kani::cover!(host_slot!(&api, migrate_component_column).is_some());
-    kani::cover!(host_slot!(&api, migrate_component_column).is_none());
+    kani::cover!(host_slot!(&api, iter_next_chunk_batch).is_some());
+    kani::cover!(host_slot!(&api, iter_next_chunk_batch).is_none());
 }
 
 /// PO-G1: `Host::from_raw` and `Host::from_load_ctx` reject null pointers, misaligned `api_ptr`,

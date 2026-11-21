@@ -179,6 +179,17 @@ pub trait QueryTerm: private::TermSealed {
     /// `true` if this term never requests mutable column access (`WRITE` / `OPTIONAL_WRITE`).
     const IS_READ_ONLY: bool = true;
 
+    /// Number of [`BamTermDesc`] entries emitted by this term (`0` for [`FfiEntity`], `1` for
+    /// single-component terms, `T::BRANCH_COUNT` for [`Or<T>`]).
+    const TERM_COUNT: usize = 1;
+
+    /// `true` if this term accesses the chunk's contiguous `FfiEntity` slice.
+    const NEEDS_ENTITIES: bool = false;
+
+    /// Bitmask (relative to bit `0` of this term) of writable columns whose change ticks should
+    /// be marked when fetched via `BamHostApi::iter_next_chunk_batch`.
+    const MARK_CHANGED_MASK: u32 = 0;
+
     /// Resolves and appends the corresponding [`BamTermDesc`] (if any) during system registration.
     fn push_desc(
         host: &Host,
@@ -195,6 +206,8 @@ pub trait QueryTerm: private::TermSealed {
 impl private::TermSealed for FfiEntity {}
 impl QueryTerm for FfiEntity {
     type Slice<'chunk> = &'chunk [FfiEntity];
+    const TERM_COUNT: usize = 0;
+    const NEEDS_ENTITIES: bool = true;
 
     /// No-op: entity IDs are always present on every chunk without declaring a component term.
     #[inline]
@@ -243,6 +256,7 @@ impl<T: GuestComponent> private::TermSealed for &mut T {}
 impl<T: GuestComponent> QueryTerm for &mut T {
     type Slice<'chunk> = &'chunk mut [T];
     const IS_READ_ONLY: bool = false;
+    const MARK_CHANGED_MASK: u32 = 1;
 
     /// Appends an [`AccessMode::WRITE`] descriptor for `T`.
     #[inline]
@@ -292,6 +306,7 @@ impl<T: GuestComponent> private::TermSealed for Option<&mut T> {}
 impl<T: GuestComponent> QueryTerm for Option<&mut T> {
     type Slice<'chunk> = Option<&'chunk mut [T]>;
     const IS_READ_ONLY: bool = false;
+    const MARK_CHANGED_MASK: u32 = 1;
 
     /// Appends an [`AccessMode::OPTIONAL_WRITE`] descriptor for `T`.
     #[inline]
@@ -537,6 +552,7 @@ impl_or_filter_tuple!(8 => T0, T1, T2, T3, T4, T5, T6, T7);
 impl<T: OrFilterTuple> private::TermSealed for Or<T> {}
 impl<T: OrFilterTuple> QueryTerm for Or<T> {
     type Slice<'chunk> = ();
+    const TERM_COUNT: usize = T::BRANCH_COUNT;
 
     /// Allocates a fresh non-zero `or_group` ID and appends every branch descriptor in `T`.
     #[inline]
@@ -566,6 +582,16 @@ pub trait QueryTuple: private::TupleSealed {
     /// `true` if no term in this tuple requests mutable column access (`WRITE` / `OPTIONAL_WRITE`).
     const IS_READ_ONLY: bool;
 
+    /// Total number of [`BamTermDesc`] entries declared by this query tuple.
+    const TERM_COUNT: usize;
+
+    /// `true` if any term in this query tuple accesses the chunk's `FfiEntity` slice.
+    const NEEDS_ENTITIES: bool;
+
+    /// Bitmask of writable term indices (`0..32`) whose change ticks should be marked by
+    /// `BamHostApi::iter_next_chunk_batch`.
+    const MARK_CHANGED_MASK: u32;
+
     /// Collects the ordered [`BamTermDesc`] list for this query tuple.
     fn collect_descs(host: &Host, manifest_name: &str) -> Result<Vec<BamTermDesc>, FfiResult>;
 
@@ -582,6 +608,9 @@ macro_rules! impl_single_query_tuple {
         impl<$($lifetime,)? $ty_param: $bound> QueryTuple for $target {
             type Slices<'chunk> = <Self as QueryTerm>::Slice<'chunk>;
             const IS_READ_ONLY: bool = <Self as QueryTerm>::IS_READ_ONLY;
+            const TERM_COUNT: usize = <Self as QueryTerm>::TERM_COUNT;
+            const NEEDS_ENTITIES: bool = <Self as QueryTerm>::NEEDS_ENTITIES;
+            const MARK_CHANGED_MASK: u32 = <Self as QueryTerm>::MARK_CHANGED_MASK;
 
             /// Collects the single term descriptor for this shorthand query.
             #[inline]
@@ -609,6 +638,9 @@ impl private::TupleSealed for FfiEntity {}
 impl QueryTuple for FfiEntity {
     type Slices<'chunk> = &'chunk [FfiEntity];
     const IS_READ_ONLY: bool = true;
+    const TERM_COUNT: usize = 0;
+    const NEEDS_ENTITIES: bool = true;
+    const MARK_CHANGED_MASK: u32 = 0;
 
     /// Returns an empty descriptor list because entity IDs require no component term.
     #[inline]
@@ -640,6 +672,9 @@ impl<T: OrFilterTuple> private::TupleSealed for Or<T> {}
 impl<T: OrFilterTuple> QueryTuple for Or<T> {
     type Slices<'chunk> = ();
     const IS_READ_ONLY: bool = true;
+    const TERM_COUNT: usize = T::BRANCH_COUNT;
+    const NEEDS_ENTITIES: bool = false;
+    const MARK_CHANGED_MASK: u32 = 0;
 
     /// Collects all branch filter descriptors in `T` under a single allocated `or_group` ID.
     #[inline]
@@ -666,6 +701,20 @@ macro_rules! impl_query_tuple {
         impl<$($term: QueryTerm),+> QueryTuple for ($($term,)+) {
             type Slices<'chunk> = ($($term::Slice<'chunk>,)+);
             const IS_READ_ONLY: bool = true $(&& $term::IS_READ_ONLY)+;
+            const TERM_COUNT: usize = 0 $(+ $term::TERM_COUNT)+;
+            const NEEDS_ENTITIES: bool = false $(|| $term::NEEDS_ENTITIES)+;
+            const MARK_CHANGED_MASK: u32 = {
+                let mut mask = 0u32;
+                let mut offset = 0usize;
+                $(
+                    if offset < 32 {
+                        mask |= $term::MARK_CHANGED_MASK << offset;
+                    }
+                    offset += $term::TERM_COUNT;
+                )+
+                let _ = offset;
+                mask
+            };
 
             /// Collects descriptors for every tuple element in declaration order.
             #[inline]
@@ -746,7 +795,9 @@ impl<'iter, 'ctx, Q: QueryTuple> TypedChunkIter<'iter, 'ctx, Q> {
     /// layout/UUID/access mismatch, or `None` when exhausted.
     #[inline]
     pub fn try_next_chunk(&mut self) -> Option<Result<Q::Slices<'_>, FfiResult>> {
-        self.iter.inner.next_chunk()?;
+        self.iter
+            .inner
+            .advance_batch(Q::TERM_COUNT, Q::NEEDS_ENTITIES, Q::MARK_CHANGED_MASK)?;
         let mut dispenser = ChunkColumnDispenser::new(&mut self.iter.inner);
         Some(Q::fetch_slices(&mut dispenser))
     }

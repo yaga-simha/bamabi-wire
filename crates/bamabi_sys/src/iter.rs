@@ -222,6 +222,33 @@ const _: () = {
 pub type BamIterNextChunkFn =
     unsafe extern "C" fn(iter: *mut BamIter, out_len: *mut usize) -> FfiBool;
 
+/// Advances `iter` to the next non-empty chunk and populates `*out_len`, `*out_entities` (when
+/// `out_entities` is non-null), and `out_col_ptrs[0..col_count]` in a single FFI call.
+///
+/// For each `term_index` in `0..col_count`:
+/// - Dense `READ` / `CHANGED` / `ADDED` / `HAS` / `OPTIONAL_READ`: writes the read-only byte
+///   pointer (or null if absent on `OPTIONAL_READ`, or if sparse-set/non-column).
+/// - Dense `WRITE` / `OPTIONAL_WRITE`: writes the mutable byte pointer (or null if absent on
+///   `OPTIONAL_WRITE`), marking the chunk's change ticks iff `(mark_changed_mask & (1u32 << term_index)) != 0`.
+/// - Pure filters (`FILTER_ONLY`, `WITHOUT`, `ALLOW`), `RESOURCE_*`, `MESSAGE_*`, `REMOVED_READ`,
+///   or `SparseSet` columns: writes null.
+///
+/// Returns [`FfiBool::TRUE`] while chunks remain or [`FfiBool::FALSE`] when exhausted.
+///
+/// # Safety
+/// - `iter` must point to an active [`BamIter`] belonging to the running system invocation.
+/// - `out_len` must be a valid writable pointer to `usize` (or null, returning `FfiBool::FALSE`).
+/// - If `out_entities` is non-null, it must point to writable `*const FfiEntity` storage.
+/// - If `col_count > 0`, `out_col_ptrs` must point to `col_count` writable `*mut u8` slots.
+pub type BamIterNextChunkBatchFn = unsafe extern "C" fn(
+    iter: *mut BamIter,
+    out_len: *mut usize,
+    out_entities: *mut *const FfiEntity,
+    out_col_ptrs: *mut *mut u8,
+    col_count: usize,
+    mark_changed_mask: u32,
+) -> FfiBool;
+
 /// Resets `iter` back to its initial chunk so nested query loops can re-traverse without allocation.
 ///
 /// # Safety

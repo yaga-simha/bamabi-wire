@@ -106,7 +106,7 @@ extern "C" {
 
 #define BAM_MAX_TERMS_PER_QUERY    32u
 #define BAM_MAX_QUERIES_PER_SYSTEM 8u
-#define BAM_HOST_API_SLOT_COUNT    68u
+#define BAM_HOST_API_SLOT_COUNT    69u
 
 #define BAM_SIPHASH_KEY_0 0x42414d5f55554944ull
 #define BAM_SIPHASH_KEY_1 0x56305f3253495048ull
@@ -662,6 +662,7 @@ typedef BamResult (*BamCmdRollbackFn)(BamCommands* commands, size_t checkpoint);
 typedef BamResult (*BamCmdInsertRelationFn)(BamCommands* commands, BamEntity entity, BamComponent relation, BamEntity target, const void* data, size_t data_size);
 typedef BamResult (*BamCmdRemoveRelationFn)(BamCommands* commands, BamEntity entity, BamComponent relation, BamEntity target);
 typedef BamResult (*BamMigrateComponentColumnFn)(BamLoadCtx* load_ctx, BamComponent component, uint64_t old_fingerprint, const BamComponentDesc* new_desc, BamRowMigrateFn migrate_fn, void* user_data);
+typedef BamBool   (*BamIterNextChunkBatchFn)(BamIter* iter, size_t* out_len, const BamEntity** out_entities, uint8_t** out_col_ptrs, size_t col_count, uint32_t mark_changed_mask);
 
 struct BamHostApi {
 uint32_t struct_size;
@@ -750,6 +751,7 @@ BamCmdRollbackFn            cmd_rollback;
 BamCmdInsertRelationFn      cmd_insert_relation;
 BamCmdRemoveRelationFn      cmd_remove_relation;
 BamMigrateComponentColumnFn migrate_component_column;
+BamIterNextChunkBatchFn     iter_next_chunk_batch;
 };
 
 #define BAM_MANIFEST_MIN_V0_2_SIZE            (offsetof(BamManifest, reserved0) + sizeof(uint32_t))
@@ -766,9 +768,9 @@ BamMigrateComponentColumnFn migrate_component_column;
 #define BAM_SCHEDULE_SET_DESC_MIN_V0_3_SIZE   sizeof(BamScheduleSetDesc)
 #define BAM_VTABLE_HEADER_MIN_V0_2_SIZE       (offsetof(BamVTableHeader, align) + sizeof(size_t))
 #define BAM_HOST_API_MIN_V0_2_SIZE            (offsetof(BamHostApi, cmd_remove) + sizeof(BamCmdRemoveFn))
-#define BAM_HOST_API_MIN_V0_3_SIZE            sizeof(BamHostApi)
+#define BAM_HOST_API_MIN_V0_3_SIZE            (offsetof(BamHostApi, migrate_component_column) + sizeof(BamMigrateComponentColumnFn))
 
-/* Byte offset constants for every BamHostApi function-pointer slot (0..67): */
+/* Byte offset constants for every BamHostApi function-pointer slot (0..68): */
 #define BAM_HOST_API_OFFSET_GET_PROC_ADDRESS offsetof(BamHostApi, get_proc_address)
 #define BAM_HOST_API_OFFSET_LAST_ERROR offsetof(BamHostApi, last_error)
 #define BAM_HOST_API_OFFSET_LOAD_HOST_CTX offsetof(BamHostApi, load_host_ctx)
@@ -837,6 +839,7 @@ BamMigrateComponentColumnFn migrate_component_column;
 #define BAM_HOST_API_OFFSET_CMD_INSERT_RELATION offsetof(BamHostApi, cmd_insert_relation)
 #define BAM_HOST_API_OFFSET_CMD_REMOVE_RELATION offsetof(BamHostApi, cmd_remove_relation)
 #define BAM_HOST_API_OFFSET_MIGRATE_COMPONENT_COLUMN offsetof(BamHostApi, migrate_component_column)
+#define BAM_HOST_API_OFFSET_ITER_NEXT_CHUNK_BATCH offsetof(BamHostApi, iter_next_chunk_batch)
 
 /* ==========================================================================
 * 5. ISO C99 Inline Helpers (`bam_*`)
@@ -1544,7 +1547,7 @@ BAM_STATIC_ASSERT(BAM_ALIGNOF(BamMappedStringVTable) == 8u, bam_mapped_string_vt
 BAM_STATIC_ASSERT(offsetof(BamMappedStringVTable, header) == 0u, bam_mapped_string_vtable_off_header_64);
 BAM_STATIC_ASSERT(offsetof(BamMappedStringVTable, get) == 40u, bam_mapped_string_vtable_off_get_64);
 BAM_STATIC_ASSERT(offsetof(BamMappedStringVTable, set) == 48u, bam_mapped_string_vtable_off_set_64);
-BAM_STATIC_ASSERT(sizeof(BamHostApi) == 552u, bam_host_api_size_64);
+BAM_STATIC_ASSERT(sizeof(BamHostApi) == 560u, bam_host_api_size_64);
 BAM_STATIC_ASSERT(BAM_ALIGNOF(BamHostApi) == 8u, bam_host_api_align_64);
 BAM_STATIC_ASSERT(offsetof(BamHostApi, struct_size) == 0u, bam_host_api_off_struct_size_64);
 BAM_STATIC_ASSERT(offsetof(BamHostApi, abi_version) == 4u, bam_host_api_off_abi_version_64);
@@ -1616,6 +1619,7 @@ BAM_STATIC_ASSERT(offsetof(BamHostApi, cmd_rollback) == 520u, bam_host_api_off_c
 BAM_STATIC_ASSERT(offsetof(BamHostApi, cmd_insert_relation) == 528u, bam_host_api_off_cmd_insert_relation_64);
 BAM_STATIC_ASSERT(offsetof(BamHostApi, cmd_remove_relation) == 536u, bam_host_api_off_cmd_remove_relation_64);
 BAM_STATIC_ASSERT(offsetof(BamHostApi, migrate_component_column) == 544u, bam_host_api_off_migrate_component_column_64);
+BAM_STATIC_ASSERT(offsetof(BamHostApi, iter_next_chunk_batch) == 552u, bam_host_api_off_iter_next_chunk_batch_64);
 BAM_STATIC_ASSERT(BAM_MANIFEST_MIN_V0_2_SIZE == 32u, bam_manifest_min_64);
 BAM_STATIC_ASSERT(BAM_QUERY_DESC_MIN_V0_2_SIZE == 24u, bam_query_desc_min_64);
 BAM_STATIC_ASSERT(BAM_SYSTEM_DESC_MIN_V0_2_SIZE == 104u, bam_system_desc_min_64);
@@ -1830,7 +1834,7 @@ BAM_STATIC_ASSERT(BAM_ALIGNOF(BamMappedStringVTable) == 4u, bam_mapped_string_vt
 BAM_STATIC_ASSERT(offsetof(BamMappedStringVTable, header) == 0u, bam_mapped_string_vtable_off_header_32);
 BAM_STATIC_ASSERT(offsetof(BamMappedStringVTable, get) == 32u, bam_mapped_string_vtable_off_get_32);
 BAM_STATIC_ASSERT(offsetof(BamMappedStringVTable, set) == 36u, bam_mapped_string_vtable_off_set_32);
-BAM_STATIC_ASSERT(sizeof(BamHostApi) == 280u, bam_host_api_size_32);
+BAM_STATIC_ASSERT(sizeof(BamHostApi) == 284u, bam_host_api_size_32);
 BAM_STATIC_ASSERT(BAM_ALIGNOF(BamHostApi) == 4u, bam_host_api_align_32);
 BAM_STATIC_ASSERT(offsetof(BamHostApi, struct_size) == 0u, bam_host_api_off_struct_size_32);
 BAM_STATIC_ASSERT(offsetof(BamHostApi, abi_version) == 4u, bam_host_api_off_abi_version_32);
@@ -1902,6 +1906,7 @@ BAM_STATIC_ASSERT(offsetof(BamHostApi, cmd_rollback) == 264u, bam_host_api_off_c
 BAM_STATIC_ASSERT(offsetof(BamHostApi, cmd_insert_relation) == 268u, bam_host_api_off_cmd_insert_relation_32);
 BAM_STATIC_ASSERT(offsetof(BamHostApi, cmd_remove_relation) == 272u, bam_host_api_off_cmd_remove_relation_32);
 BAM_STATIC_ASSERT(offsetof(BamHostApi, migrate_component_column) == 276u, bam_host_api_off_migrate_component_column_32);
+BAM_STATIC_ASSERT(offsetof(BamHostApi, iter_next_chunk_batch) == 280u, bam_host_api_off_iter_next_chunk_batch_32);
 BAM_STATIC_ASSERT(BAM_MANIFEST_MIN_V0_2_SIZE == 24u, bam_manifest_min_32);
 BAM_STATIC_ASSERT(BAM_QUERY_DESC_MIN_V0_2_SIZE == 16u, bam_query_desc_min_32);
 BAM_STATIC_ASSERT(BAM_SYSTEM_DESC_MIN_V0_2_SIZE == 60u, bam_system_desc_min_32);

@@ -1038,8 +1038,13 @@ impl<'a, T: AbiPod> SparseRowsMut<'a, T> {
 /// per-resource `BamHostApi::iter_column_info` FFI calls.
 const INLINE_COL_INFO_CAP: usize = 4;
 
+/// Maximum number of column pointers cached inline per chunk inside [`ValidatedIter`] when
+/// advancing via `BamHostApi::iter_next_chunk_batch` (slot 68).
+const INLINE_BATCH_COL_CAP: usize = 8;
+
 const _: () = {
     assert!(INLINE_COL_INFO_CAP <= 8);
+    assert!(INLINE_BATCH_COL_CAP <= 32);
 };
 
 /// Validated query chunk and singleton resource accessor wrapping `*mut BamIter`.
@@ -1049,6 +1054,9 @@ pub struct ValidatedIter<'a> {
     lazy_host: Option<&'a LazyInvocationHost<'a>>,
     current_len: usize,
     col_info_mask: Cell<u8>,
+    batch_col_count: u8,
+    batch_entities: Option<*const FfiEntity>,
+    batch_col_ptrs: [MaybeUninit<*mut u8>; INLINE_BATCH_COL_CAP],
     col_infos: UnsafeCell<[MaybeUninit<BamColumnInfo>; INLINE_COL_INFO_CAP]>,
 }
 
@@ -1068,6 +1076,9 @@ impl<'a> ValidatedIter<'a> {
             lazy_host: None,
             current_len: 0,
             col_info_mask: Cell::new(0),
+            batch_col_count: 0,
+            batch_entities: None,
+            batch_col_ptrs: [const { MaybeUninit::uninit() }; INLINE_BATCH_COL_CAP],
             col_infos: UnsafeCell::new([const { MaybeUninit::uninit() }; INLINE_COL_INFO_CAP]),
         }
     }
@@ -1089,6 +1100,9 @@ impl<'a> ValidatedIter<'a> {
             lazy_host,
             current_len: 0,
             col_info_mask: Cell::new(0),
+            batch_col_count: 0,
+            batch_entities: None,
+            batch_col_ptrs: [const { MaybeUninit::uninit() }; INLINE_BATCH_COL_CAP],
             col_infos: UnsafeCell::new([const { MaybeUninit::uninit() }; INLINE_COL_INFO_CAP]),
         }
     }
@@ -1102,6 +1116,9 @@ impl<'a> ValidatedIter<'a> {
             lazy_host: None,
             current_len: 0,
             col_info_mask: Cell::new(0),
+            batch_col_count: 0,
+            batch_entities: None,
+            batch_col_ptrs: [const { MaybeUninit::uninit() }; INLINE_BATCH_COL_CAP],
             col_infos: UnsafeCell::new([const { MaybeUninit::uninit() }; INLINE_COL_INFO_CAP]),
         }
     }
@@ -1147,6 +1164,8 @@ impl<'a> ValidatedIter<'a> {
     /// `None` when exhausted.
     #[inline]
     pub fn next_chunk(&mut self) -> Option<usize> {
+        self.batch_col_count = 0;
+        self.batch_entities = None;
         if self.raw.is_null() {
             self.current_len = 0;
             return None;
@@ -1167,10 +1186,135 @@ impl<'a> ValidatedIter<'a> {
         }
     }
 
+    /// Advances to the next non-empty chunk via `BamHostApi::iter_next_chunk_batch` (slot 68) when
+    /// available and `col_count <= INLINE_BATCH_COL_CAP`, populating `self`'s inline column pointer
+    /// cache for subsequent [`ChunkColumnDispenser`] reads; otherwise falls back to
+    /// [`Self::next_chunk`].
+    #[inline]
+    pub fn advance_batch(
+        &mut self,
+        col_count: usize,
+        needs_entities: bool,
+        mark_changed_mask: u32,
+    ) -> Option<usize> {
+        if col_count <= INLINE_BATCH_COL_CAP
+            && let Some(batch_fn) = host_slot!(self.host.api(), iter_next_chunk_batch)
+        {
+            if self.raw.is_null() {
+                self.current_len = 0;
+                self.batch_col_count = 0;
+                self.batch_entities = None;
+                return None;
+            }
+            // Pre-zero only the active `0..col_count` entries so a buggy/hostile host that omits
+            // an entry cannot leave uninitialized bytes in `batch_col_ptrs[0..col_count]`.
+            for slot in &mut self.batch_col_ptrs[..col_count] {
+                slot.write(core::ptr::null_mut());
+            }
+            let mut len: usize = 0;
+            let mut entities_ptr: *const FfiEntity = core::ptr::null();
+            let ent_out = if needs_entities {
+                core::ptr::from_mut(&mut entities_ptr)
+            } else {
+                core::ptr::null_mut()
+            };
+            let col_out = if col_count > 0 {
+                self.batch_col_ptrs.as_mut_ptr().cast::<*mut u8>()
+            } else {
+                core::ptr::null_mut()
+            };
+            // SAFETY: `self.raw` is a valid active `BamIter` for `'a`, `len` is writable stack
+            // storage, `ent_out` is either null or points to `entities_ptr`, and `col_out` points
+            // to `col_count` initialized writable `*mut u8` slots when `col_count > 0`.
+            let has_more = unsafe {
+                batch_fn(
+                    self.raw,
+                    &mut len,
+                    ent_out,
+                    col_out,
+                    col_count,
+                    mark_changed_mask,
+                )
+            };
+            if has_more.get() {
+                self.current_len = len;
+                self.batch_col_count = col_count as u8;
+                self.batch_entities = if needs_entities {
+                    Some(entities_ptr)
+                } else {
+                    None
+                };
+                return Some(len);
+            }
+            self.current_len = 0;
+            self.batch_col_count = 0;
+            self.batch_entities = None;
+            return None;
+        }
+        self.next_chunk()
+    }
+
+    /// Advances to the next non-empty chunk and populates `out_entities` (when `Some`) and
+    /// `out_col_ptrs` in a single FFI call via `BamHostApi::iter_next_chunk_batch` (slot 68).
+    ///
+    /// Returns:
+    /// - `Ok(Some(len))` when a chunk was fetched via slot 68.
+    /// - `Ok(None)` when the iterator is exhausted or null.
+    /// - `Err(FfiResult::UNSUPPORTED)` when the host does not cover or provide slot 68.
+    #[inline]
+    pub fn next_chunk_batch(
+        &mut self,
+        mut out_entities: Option<&mut *const FfiEntity>,
+        out_col_ptrs: &mut [*mut u8],
+        mark_changed_mask: u32,
+    ) -> Result<Option<usize>, FfiResult> {
+        self.batch_col_count = 0;
+        self.batch_entities = None;
+        let batch_fn =
+            host_slot!(self.host.api(), iter_next_chunk_batch).ok_or(FfiResult::UNSUPPORTED)?;
+        if self.raw.is_null() {
+            self.current_len = 0;
+            if let Some(ent) = out_entities.as_deref_mut() {
+                *ent = core::ptr::null();
+            }
+            out_col_ptrs.fill(core::ptr::null_mut());
+            return Ok(None);
+        }
+        let mut len: usize = 0;
+        let ent_ptr = out_entities.map_or(core::ptr::null_mut(), core::ptr::from_mut);
+        let col_ptr = if out_col_ptrs.is_empty() {
+            core::ptr::null_mut()
+        } else {
+            out_col_ptrs.as_mut_ptr()
+        };
+        // SAFETY: `self.raw` is a valid active `BamIter` for `'a`, `len` is writable stack storage,
+        // `ent_ptr` is either null or writable `*const FfiEntity` storage, and `col_ptr` points to
+        // `out_col_ptrs.len()` writable `*mut u8` slots when non-empty.
+        let has_more = unsafe {
+            batch_fn(
+                self.raw,
+                &mut len,
+                ent_ptr,
+                col_ptr,
+                out_col_ptrs.len(),
+                mark_changed_mask,
+            )
+        };
+        if has_more.get() {
+            self.current_len = len;
+            Ok(Some(len))
+        } else {
+            self.current_len = 0;
+            Ok(None)
+        }
+    }
+
     /// Resets the iterator back to its initial chunk so nested query loops can re-traverse.
     #[inline]
     pub fn reset(&mut self) -> FfiResult {
         self.current_len = 0;
+        self.batch_col_count = 0;
+        self.batch_entities = None;
         if self.raw.is_null() {
             return FfiResult::NULL_POINTER;
         }
@@ -3252,14 +3396,18 @@ impl<'chunk, 'ctx> ChunkColumnDispenser<'chunk, 'ctx> {
         if len == 0 {
             return Ok(&[]);
         }
-        let ent_fn = self
-            .iter
-            .host
-            .api()
-            .iter_entities
-            .ok_or(FfiResult::NULL_POINTER)?;
-        // SAFETY: `self.iter.raw` is active at a chunk of `len` entities for `'chunk`.
-        let ptr = unsafe { ent_fn(self.iter.raw.cast_const()) };
+        let ptr = if let Some(ptr) = self.iter.batch_entities {
+            ptr
+        } else {
+            let ent_fn = self
+                .iter
+                .host
+                .api()
+                .iter_entities
+                .ok_or(FfiResult::NULL_POINTER)?;
+            // SAFETY: `self.iter.raw` is active at a chunk of `len` entities for `'chunk`.
+            unsafe { ent_fn(self.iter.raw.cast_const()) }
+        };
         if ptr.is_null() || !(ptr as usize).is_multiple_of(core::mem::align_of::<FfiEntity>()) {
             return Err(FfiResult::NULL_POINTER);
         }
@@ -3374,6 +3522,13 @@ impl<'chunk, 'ctx> ChunkColumnDispenser<'chunk, 'ctx> {
         let len = self.iter.current_len();
         let ptr = if len == 0 || core::mem::size_of::<T>() == 0 {
             core::ptr::NonNull::<u8>::dangling().as_ptr().cast_const()
+        } else if term_index < self.iter.batch_col_count as usize {
+            // SAFETY: `advance_batch` initialized `iter.batch_col_ptrs[0..batch_col_count]`.
+            unsafe {
+                self.iter.batch_col_ptrs[term_index]
+                    .assume_init()
+                    .cast_const()
+            }
         } else {
             let col_fn = self
                 .iter
@@ -3403,13 +3558,18 @@ impl<'chunk, 'ctx> ChunkColumnDispenser<'chunk, 'ctx> {
         let len = self.iter.current_len();
         let ptr = if len == 0 || core::mem::size_of::<T>() == 0 {
             if len > 0
+                && term_index >= self.iter.batch_col_count as usize
                 && let Some(col_fn) = self.iter.host.api().iter_column_mutable
             {
-                // Mark ZST change ticks via host `iter_column_mutable`.
+                // Mark ZST change ticks via host `iter_column_mutable` when not already marked by
+                // `iter_next_chunk_batch`.
                 // SAFETY: `self.iter.raw` is active at a valid chunk.
                 let _ = unsafe { col_fn(self.iter.raw, term_index) };
             }
             core::ptr::NonNull::<u8>::dangling().as_ptr()
+        } else if term_index < self.iter.batch_col_count as usize {
+            // SAFETY: `advance_batch` initialized `iter.batch_col_ptrs[0..batch_col_count]`.
+            unsafe { self.iter.batch_col_ptrs[term_index].assume_init() }
         } else {
             let col_fn = self
                 .iter
@@ -3439,14 +3599,23 @@ impl<'chunk, 'ctx> ChunkColumnDispenser<'chunk, 'ctx> {
             return Err(FfiResult::TYPE_MISMATCH);
         }
         let len = self.iter.current_len();
-        let col_fn = self
-            .iter
-            .host
-            .api()
-            .iter_column_readonly
-            .ok_or(FfiResult::NULL_POINTER)?;
-        // SAFETY: `self.iter.raw` is active at a chunk of `len` rows for `'chunk`.
-        let ptr = unsafe { col_fn(self.iter.raw.cast_const(), term_index) };
+        let ptr = if term_index < self.iter.batch_col_count as usize {
+            // SAFETY: `advance_batch` initialized `iter.batch_col_ptrs[0..batch_col_count]`.
+            unsafe {
+                self.iter.batch_col_ptrs[term_index]
+                    .assume_init()
+                    .cast_const()
+            }
+        } else {
+            let col_fn = self
+                .iter
+                .host
+                .api()
+                .iter_column_readonly
+                .ok_or(FfiResult::NULL_POINTER)?;
+            // SAFETY: `self.iter.raw` is active at a chunk of `len` rows for `'chunk`.
+            unsafe { col_fn(self.iter.raw.cast_const(), term_index) }
+        };
         if ptr.is_null() {
             return Ok(None);
         }
@@ -3469,14 +3638,19 @@ impl<'chunk, 'ctx> ChunkColumnDispenser<'chunk, 'ctx> {
             return Err(FfiResult::TYPE_MISMATCH);
         }
         let len = self.iter.current_len();
-        let col_fn = self
-            .iter
-            .host
-            .api()
-            .iter_column_mutable
-            .ok_or(FfiResult::NULL_POINTER)?;
-        // SAFETY: `self.iter.raw` is active at a chunk of `len` rows for `'chunk`.
-        let ptr = unsafe { col_fn(self.iter.raw, term_index) };
+        let ptr = if term_index < self.iter.batch_col_count as usize {
+            // SAFETY: `advance_batch` initialized `iter.batch_col_ptrs[0..batch_col_count]`.
+            unsafe { self.iter.batch_col_ptrs[term_index].assume_init() }
+        } else {
+            let col_fn = self
+                .iter
+                .host
+                .api()
+                .iter_column_mutable
+                .ok_or(FfiResult::NULL_POINTER)?;
+            // SAFETY: `self.iter.raw` is active at a chunk of `len` rows for `'chunk`.
+            unsafe { col_fn(self.iter.raw, term_index) }
+        };
         if ptr.is_null() {
             return Ok(None);
         }
@@ -3550,6 +3724,23 @@ impl<'chunk, 'ctx> ChunkColumnDispenser<'chunk, 'ctx> {
         {
             return Err(FfiResult::TYPE_MISMATCH);
         }
+        if term_index < self.iter.batch_col_count as usize {
+            if self.iter.current_len() == 0 {
+                return Err(FfiResult::NULL_POINTER);
+            }
+            // SAFETY: `advance_batch` initialized `iter.batch_col_ptrs[0..batch_col_count]`.
+            let ptr = unsafe {
+                self.iter.batch_col_ptrs[term_index]
+                    .assume_init()
+                    .cast_const()
+            };
+            if ptr.is_null() {
+                return Err(FfiResult::NULL_POINTER);
+            }
+            // SAFETY: For `AccessMode::HAS` on an active chunk, `iter_next_chunk_batch` writes a
+            // non-null pointer to a 1-byte `FfiBool` (`0` or `1`).
+            return Ok(unsafe { (*ptr.cast::<FfiBool>()).get() });
+        }
         self.iter
             .has_column(term_index)
             .ok_or(FfiResult::NULL_POINTER)
@@ -3571,6 +3762,23 @@ impl<'chunk, 'ctx> ChunkColumnDispenser<'chunk, 'ctx> {
             && !filter.matches(info.uuid)
         {
             return Err(FfiResult::TYPE_MISMATCH);
+        }
+        if term_index < self.iter.batch_col_count as usize {
+            if self.iter.current_len() == 0 {
+                return Err(FfiResult::NULL_POINTER);
+            }
+            // SAFETY: `advance_batch` initialized `iter.batch_col_ptrs[0..batch_col_count]`.
+            let ptr = unsafe {
+                self.iter.batch_col_ptrs[term_index]
+                    .assume_init()
+                    .cast_const()
+            };
+            if ptr.is_null() {
+                return Err(FfiResult::NULL_POINTER);
+            }
+            // SAFETY: For `AccessMode::HAS` on an active chunk, `iter_next_chunk_batch` writes a
+            // non-null pointer to a 1-byte `FfiBool` (`0` or `1`).
+            return Ok(unsafe { (*ptr.cast::<FfiBool>()).get() });
         }
         self.iter
             .has_column(term_index)

@@ -1504,6 +1504,7 @@ fn make_v02_only_host_api(truncated_struct_size: bool) -> BamHostApi {
         cmd_insert_relation: None,
         cmd_remove_relation: None,
         migrate_component_column: None,
+        iter_next_chunk_batch: None,
     }
 }
 

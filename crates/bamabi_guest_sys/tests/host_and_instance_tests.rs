@@ -779,3 +779,271 @@ fn validated_iter_caches_column_info_per_term_across_repeated_lookups() {
     assert_eq!(iter.column_info(7), Err(FfiResult::OUT_OF_RANGE));
     assert_eq!(INFO_CALLS.load(Ordering::SeqCst), 6);
 }
+
+/// Verifies that `BamHostApi::iter_next_chunk_batch` (slot 68) fetches chunk length, entities,
+/// and all dense/optional/`HAS` column pointers in a single FFI call without invoking
+/// `iter_next_chunk` / `iter_entities` / `iter_column_readonly` / `iter_column_mutable`, still
+/// enforces overlap rejection on hostile batch pointers, and falls back cleanly on older
+/// `MIN_V0_3_SIZE` hosts where slot 68 is uncovered.
+#[test]
+fn validated_iter_advance_batch_uses_slot_68_and_falls_back_on_v03_prefix() {
+    use bamabi_guest_sys::ChunkColumnDispenser;
+
+    struct MockBatchState {
+        chunks_left: usize,
+        entities: [FfiEntity; 2],
+        col0_write: [u32; 2],
+        col1_read: [u32; 2],
+        has_flag: FfiBool,
+        hostile_overlap: bool,
+        batch_calls: usize,
+        legacy_next_calls: usize,
+        legacy_ent_calls: usize,
+        legacy_ro_calls: usize,
+        legacy_rw_calls: usize,
+        last_mark_mask: u32,
+    }
+
+    unsafe extern "C" fn mock_col_info(
+        _iter: *const bamabi_sys::BamIter,
+        term_index: usize,
+        out_info: *mut bamabi_sys::BamColumnInfo,
+    ) -> FfiResult {
+        let mode = match term_index {
+            0 => AccessMode::WRITE,
+            1 => AccessMode::READ,
+            2 => AccessMode::OPTIONAL_READ,
+            3 => AccessMode::HAS,
+            _ => return FfiResult::OUT_OF_RANGE,
+        };
+        let (size, align) = if term_index == 3 { (1, 1) } else { (4, 4) };
+        // SAFETY: `out_info` is writable stack storage.
+        unsafe {
+            *out_info = bamabi_sys::BamColumnInfo {
+                component: BamComponent::from_raw((term_index + 1) as u32),
+                mode,
+                uuid: ComponentUuid::ZERO,
+                size,
+                align,
+                storage_flags: 0,
+                reserved0: 0,
+            };
+        }
+        FfiResult::OK
+    }
+
+    unsafe extern "C" fn mock_next_chunk_batch(
+        iter: *mut bamabi_sys::BamIter,
+        out_len: *mut usize,
+        out_entities: *mut *const FfiEntity,
+        out_col_ptrs: *mut *mut u8,
+        col_count: usize,
+        mark_changed_mask: u32,
+    ) -> FfiBool {
+        // SAFETY: `iter` points to `MockBatchState`.
+        let st = unsafe { &mut *iter.cast::<MockBatchState>() };
+        st.batch_calls += 1;
+        st.last_mark_mask = mark_changed_mask;
+        if st.chunks_left == 0 {
+            // SAFETY: `out_len` is writable.
+            unsafe { *out_len = 0 };
+            return FfiBool::FALSE;
+        }
+        st.chunks_left -= 1;
+        // SAFETY: Output pointers are valid per `BamIterNextChunkBatchFn` contract.
+        unsafe {
+            *out_len = st.entities.len();
+            if !out_entities.is_null() {
+                *out_entities = st.entities.as_ptr();
+            }
+            let col0_ptr = (&raw mut st.col0_write).cast::<u8>();
+            if col_count >= 1 && !out_col_ptrs.is_null() {
+                *out_col_ptrs.add(0) = col0_ptr;
+            }
+            if col_count >= 2 && !out_col_ptrs.is_null() {
+                *out_col_ptrs.add(1) = if st.hostile_overlap {
+                    col0_ptr
+                } else {
+                    (&raw const st.col1_read).cast::<u8>().cast_mut()
+                };
+            }
+            if col_count >= 3 && !out_col_ptrs.is_null() {
+                *out_col_ptrs.add(2) = core::ptr::null_mut();
+            }
+            if col_count >= 4 && !out_col_ptrs.is_null() {
+                *out_col_ptrs.add(3) = (&raw mut st.has_flag).cast::<u8>();
+            }
+        }
+        FfiBool::TRUE
+    }
+
+    unsafe extern "C" fn mock_legacy_next(
+        iter: *mut bamabi_sys::BamIter,
+        out_len: *mut usize,
+    ) -> FfiBool {
+        // SAFETY: `iter` points to `MockBatchState`.
+        let st = unsafe { &mut *iter.cast::<MockBatchState>() };
+        st.legacy_next_calls += 1;
+        if st.chunks_left == 0 {
+            // SAFETY: `out_len` is writable.
+            unsafe { *out_len = 0 };
+            return FfiBool::FALSE;
+        }
+        st.chunks_left -= 1;
+        // SAFETY: `out_len` is writable.
+        unsafe { *out_len = st.entities.len() };
+        FfiBool::TRUE
+    }
+
+    unsafe extern "C" fn mock_legacy_entities(
+        iter: *const bamabi_sys::BamIter,
+    ) -> *const FfiEntity {
+        // SAFETY: `iter` points to `MockBatchState`.
+        let st = unsafe { &mut *iter.cast::<MockBatchState>().cast_mut() };
+        st.legacy_ent_calls += 1;
+        st.entities.as_ptr()
+    }
+
+    unsafe extern "C" fn mock_legacy_ro(
+        iter: *const bamabi_sys::BamIter,
+        term_index: usize,
+    ) -> *const u8 {
+        // SAFETY: `iter` points to `MockBatchState`.
+        let st = unsafe { &mut *iter.cast::<MockBatchState>().cast_mut() };
+        st.legacy_ro_calls += 1;
+        match term_index {
+            1 => st.col1_read.as_ptr().cast::<u8>(),
+            3 => (&raw const st.has_flag).cast::<u8>(),
+            _ => core::ptr::null(),
+        }
+    }
+
+    unsafe extern "C" fn mock_legacy_rw(
+        iter: *mut bamabi_sys::BamIter,
+        term_index: usize,
+    ) -> *mut u8 {
+        // SAFETY: `iter` points to `MockBatchState`.
+        let st = unsafe { &mut *iter.cast::<MockBatchState>() };
+        st.legacy_rw_calls += 1;
+        if term_index == 0 {
+            st.col0_write.as_mut_ptr().cast::<u8>()
+        } else {
+            core::ptr::null_mut()
+        }
+    }
+
+    // 1. Batched fast path: slot 68 covered and populated -> 0 legacy calls.
+    let mut api = make_mock_api();
+    api.iter_column_info = Some(mock_col_info);
+    api.iter_next_chunk = Some(mock_legacy_next);
+    api.iter_entities = Some(mock_legacy_entities);
+    api.iter_column_readonly = Some(mock_legacy_ro);
+    api.iter_column_mutable = Some(mock_legacy_rw);
+    api.iter_next_chunk_batch = Some(mock_next_chunk_batch);
+
+    let mut dummy_ctx = 1u8;
+    // SAFETY: Stack pointers remain valid for the duration of this test.
+    let host = unsafe { Host::from_raw(&raw const api, (&raw mut dummy_ctx).cast()) }.unwrap();
+    let mut state = MockBatchState {
+        chunks_left: 2,
+        entities: [FfiEntity::from_bits(10), FfiEntity::from_bits(20)],
+        col0_write: [1, 2],
+        col1_read: [30, 40],
+        has_flag: FfiBool::TRUE,
+        hostile_overlap: false,
+        batch_calls: 0,
+        legacy_next_calls: 0,
+        legacy_ent_calls: 0,
+        legacy_ro_calls: 0,
+        legacy_rw_calls: 0,
+        last_mark_mask: 0,
+    };
+
+    {
+        // SAFETY: `state` outlives `iter`.
+        let mut iter = unsafe {
+            ValidatedIter::from_raw((&raw mut state).cast::<bamabi_sys::BamIter>(), &host)
+        };
+        let mut chunks_seen = 0usize;
+        while let Some(len) = iter.advance_batch(4, true, 0b0001) {
+            assert_eq!(len, 2);
+            let mut dispenser = ChunkColumnDispenser::new(&mut iter);
+            let ents = dispenser.entities().unwrap();
+            let c0 = dispenser.next_write::<u32>(None).unwrap();
+            let c1 = dispenser.next_read::<u32>(AccessMode::READ, None).unwrap();
+            let c2 = dispenser.next_optional_read::<u32>(None).unwrap();
+            let c3 = dispenser.next_has::<u8>(None).unwrap();
+            assert_eq!(ents, &[FfiEntity::from_bits(10), FfiEntity::from_bits(20)]);
+            c0[0] += c1[0];
+            c0[1] += c1[1];
+            assert!(c2.is_none());
+            assert!(c3);
+            chunks_seen += 1;
+        }
+        assert_eq!(chunks_seen, 2);
+    }
+    assert_eq!(state.col0_write, [61, 82]);
+    assert_eq!(state.batch_calls, 3); // 2 chunks + 1 exhaustion call
+    assert_eq!(state.last_mark_mask, 0b0001);
+    assert_eq!(state.legacy_next_calls, 0);
+    assert_eq!(state.legacy_ent_calls, 0);
+    assert_eq!(state.legacy_ro_calls, 0);
+    assert_eq!(state.legacy_rw_calls, 0);
+
+    // 2. Hostile overlapping batch pointers are still rejected with ACCESS_CONFLICT.
+    state.chunks_left = 1;
+    state.hostile_overlap = true;
+    {
+        // SAFETY: `state` outlives `iter`.
+        let mut iter = unsafe {
+            ValidatedIter::from_raw((&raw mut state).cast::<bamabi_sys::BamIter>(), &host)
+        };
+        assert_eq!(iter.advance_batch(2, false, 0b01), Some(2));
+        let mut dispenser = ChunkColumnDispenser::new(&mut iter);
+        let _c0 = dispenser.next_write::<u32>(None).unwrap();
+        assert_eq!(
+            dispenser.next_read::<u32>(AccessMode::READ, None),
+            Err(FfiResult::ACCESS_CONFLICT)
+        );
+    }
+
+    // 3. Older MIN_V0_3_SIZE host (slot 68 uncovered): next_chunk_batch returns UNSUPPORTED and
+    //    advance_batch falls back to legacy per-column FFI calls cleanly.
+    let mut v03_api = api;
+    v03_api.struct_size = bamabi_sys::BamHostApi::MIN_V0_3_SIZE as u32;
+    // SAFETY: Stack pointers remain valid for the duration of this test.
+    let v03_host =
+        unsafe { Host::from_raw(&raw const v03_api, (&raw mut dummy_ctx).cast()) }.unwrap();
+    state.chunks_left = 1;
+    state.hostile_overlap = false;
+    let prev_batch_calls = state.batch_calls;
+    {
+        // SAFETY: `state` outlives `iter`.
+        let mut iter = unsafe {
+            ValidatedIter::from_raw((&raw mut state).cast::<bamabi_sys::BamIter>(), &v03_host)
+        };
+        let mut ptrs = [core::ptr::null_mut::<u8>(); 2];
+        assert_eq!(
+            iter.next_chunk_batch(None, &mut ptrs, 0b01),
+            Err(FfiResult::UNSUPPORTED)
+        );
+        assert_eq!(iter.advance_batch(4, true, 0b0001), Some(2));
+        let mut dispenser = ChunkColumnDispenser::new(&mut iter);
+        assert_eq!(dispenser.entities().unwrap().len(), 2);
+        assert_eq!(dispenser.next_write::<u32>(None).unwrap().len(), 2);
+        assert_eq!(
+            dispenser
+                .next_read::<u32>(AccessMode::READ, None)
+                .unwrap()
+                .len(),
+            2
+        );
+        assert!(dispenser.next_optional_read::<u32>(None).unwrap().is_none());
+        assert!(dispenser.next_has::<u8>(None).unwrap());
+    }
+    assert_eq!(state.batch_calls, prev_batch_calls);
+    assert_eq!(state.legacy_next_calls, 1);
+    assert_eq!(state.legacy_ent_calls, 1);
+    assert_eq!(state.legacy_rw_calls, 1);
+    assert_eq!(state.legacy_ro_calls, 3);
+}

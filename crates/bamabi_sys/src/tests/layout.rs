@@ -398,6 +398,7 @@ fn populated_host_api() -> BamHostApi {
         cmd_insert_relation: None,
         cmd_remove_relation: None,
         migrate_component_column: None,
+        iter_next_chunk_batch: None,
     }
 }
 
@@ -528,7 +529,7 @@ fn abi_v0_2_exact_sizes_alignments_and_offsets() {
         assert_eq!(size_of::<BamColumnInfo>(), 48);
         assert_eq!(size_of::<VTableHeader>(), 40);
         assert_eq!(VTableHeader::MIN_V0_2_SIZE, 40);
-        assert_eq!(size_of::<BamHostApi>(), 552);
+        assert_eq!(size_of::<BamHostApi>(), 560);
         assert_eq!(BamHostApi::MIN_V0_2_SIZE, 224);
         assert_eq!(BamHostApi::MIN_V0_3_SIZE, 552);
     }
@@ -553,7 +554,7 @@ fn abi_v0_2_exact_sizes_alignments_and_offsets() {
         assert_eq!(size_of::<BamColumnInfo>(), 40);
         assert_eq!(size_of::<VTableHeader>(), 32);
         assert_eq!(VTableHeader::MIN_V0_2_SIZE, 32);
-        assert_eq!(size_of::<BamHostApi>(), 280);
+        assert_eq!(size_of::<BamHostApi>(), 284);
         assert_eq!(BamHostApi::MIN_V0_2_SIZE, 116);
         assert_eq!(BamHostApi::MIN_V0_3_SIZE, 280);
     }

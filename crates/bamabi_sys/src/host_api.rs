@@ -20,8 +20,9 @@ use crate::{
         BamChangeTicks, BamIter, BamIterColumnInfoFn, BamIterColumnMutableFn,
         BamIterColumnMutableUntrackedFn, BamIterColumnReadonlyFn, BamIterColumnRowsMutableFn,
         BamIterColumnRowsReadonlyFn, BamIterEntitiesFn, BamIterMarkChangedRangeFn,
-        BamIterNextChunkFn, BamIterReadRemovedFn, BamIterResetFn, BamMsgReadBatchFn, BamMsgSendFn,
-        BamMsgWriteBatchFn, BamParForEachChunkFn, BamResMutPtrFn, BamResPtrFn, BamResTicksFn,
+        BamIterNextChunkBatchFn, BamIterNextChunkFn, BamIterReadRemovedFn, BamIterResetFn,
+        BamMsgReadBatchFn, BamMsgSendFn, BamMsgWriteBatchFn, BamParForEachChunkFn, BamResMutPtrFn,
+        BamResPtrFn, BamResTicksFn,
     },
     primitives::{
         BamComponent, BamSymbol, BamSystem, BamSystemSet, ComponentUuid, FfiAssetHandle,
@@ -636,8 +637,8 @@ pub type BamMigrateComponentColumnFn = unsafe extern "C" fn(
     user_data: *mut c_void,
 ) -> FfiResult;
 
-/// Total number of function-pointer slots in the ABI `0.3.0` [`BamHostApi`] table (`68`).
-pub const BAM_HOST_API_SLOT_COUNT: usize = 68;
+/// Total number of function-pointer slots in the ABI `0.3.0` [`BamHostApi`] table (`69`).
+pub const BAM_HOST_API_SLOT_COUNT: usize = 69;
 
 /// Complete versioned host function table passed to `bamabi_init`
 /// (`typedef struct BamHostApi BamHostApi;`).
@@ -646,8 +647,8 @@ pub const BAM_HOST_API_SLOT_COUNT: usize = 68;
 /// null-pointer checks are sound without raw pointer byte-probing.
 ///
 /// Layout:
-/// - 64-bit: `MIN_V0_2_SIZE = 224` bytes (`8`B header + `27 * 8`B core slots; `size_of = 552` bytes with all 68 ABI `0.3` slots), `8`-byte alignment.
-/// - 32-bit: `MIN_V0_2_SIZE = 116` bytes (`8`B header + `27 * 4`B core slots; `size_of = 280` bytes with all 68 ABI `0.3` slots), `4`-byte alignment.
+/// - 64-bit: `MIN_V0_2_SIZE = 224` bytes (`8`B header + `27 * 8`B core slots; `MIN_V0_3_SIZE = 552` bytes for the first 68 slots; `size_of = 560` bytes with all 69 slots), `8`-byte alignment.
+/// - 32-bit: `MIN_V0_2_SIZE = 116` bytes (`8`B header + `27 * 4`B core slots; `MIN_V0_3_SIZE = 280` bytes for the first 68 slots; `size_of = 284` bytes with all 69 slots), `4`-byte alignment.
 #[repr(C)]
 #[derive(Debug, Copy, Clone)]
 pub struct BamHostApi {
@@ -809,6 +810,8 @@ pub struct BamHostApi {
     pub cmd_remove_relation: Option<BamCmdRemoveRelationFn>,
     /// Migrate live component rows across schemas (`offset 544` / `276`).
     pub migrate_component_column: Option<BamMigrateComponentColumnFn>,
+    /// Advance iterator and fetch chunk length, entities pointer, and column pointers in one FFI call (`offset 552` / `280`).
+    pub iter_next_chunk_batch: Option<BamIterNextChunkBatchFn>,
 }
 
 impl BamHostApi {
@@ -816,8 +819,9 @@ impl BamHostApi {
     pub const MIN_V0_2_SIZE: usize =
         core::mem::offset_of!(Self, cmd_remove) + core::mem::size_of::<Option<BamCmdRemoveFn>>();
 
-    /// Full ABI `0.3` size of `BamHostApi` (`552` on 64-bit, `280` on 32-bit, all 68 slots).
-    pub const MIN_V0_3_SIZE: usize = core::mem::size_of::<Self>();
+    /// Frozen minimum valid `BamHostApi` size in ABI `0.3` (`552` on 64-bit, `280` on 32-bit, first 68 slots).
+    pub const MIN_V0_3_SIZE: usize = core::mem::offset_of!(Self, migrate_component_column)
+        + core::mem::size_of::<Option<BamMigrateComponentColumnFn>>();
 
     /// Safely reads the `struct_size` header at offset `0` from a potentially smaller `BamHostApi`
     /// allocation without forming a full `&BamHostApi` reference.
@@ -943,10 +947,12 @@ impl BamHostApi {
             && self.migrate_component_column.is_some()
     }
 
-    /// Returns `true` if all 68 ABI `0.3` function-pointer slots are `Some`.
+    /// Returns `true` if all 69 ABI `0.3` function-pointer slots are `Some`.
     #[inline]
     pub const fn has_all_slots(&self) -> bool {
-        self.has_all_v0_2_extended_slots() && self.has_all_v0_3_slots()
+        self.has_all_v0_2_extended_slots()
+            && self.has_all_v0_3_slots()
+            && self.iter_next_chunk_batch.is_some()
     }
 
     /// Validates `struct_size >= MIN_V0_2_SIZE`, SemVer compatibility against `guest_version`,
@@ -967,12 +973,13 @@ impl BamHostApi {
 }
 
 const _: () = {
-    assert!(BamHostApi::MIN_V0_2_SIZE <= core::mem::size_of::<BamHostApi>());
-    assert!(BamHostApi::MIN_V0_3_SIZE == core::mem::size_of::<BamHostApi>());
+    assert!(BamHostApi::MIN_V0_2_SIZE <= BamHostApi::MIN_V0_3_SIZE);
+    assert!(BamHostApi::MIN_V0_3_SIZE <= core::mem::size_of::<BamHostApi>());
     #[cfg(target_pointer_width = "64")]
     {
         assert!(BamHostApi::MIN_V0_2_SIZE == 224);
-        assert!(core::mem::size_of::<BamHostApi>() == 552);
+        assert!(BamHostApi::MIN_V0_3_SIZE == 552);
+        assert!(core::mem::size_of::<BamHostApi>() == 560);
         assert!(core::mem::align_of::<BamHostApi>() == 8);
         assert!(core::mem::offset_of!(BamHostApi, struct_size) == 0);
         assert!(core::mem::offset_of!(BamHostApi, abi_version) == 4);
@@ -1044,11 +1051,13 @@ const _: () = {
         assert!(core::mem::offset_of!(BamHostApi, cmd_insert_relation) == 528);
         assert!(core::mem::offset_of!(BamHostApi, cmd_remove_relation) == 536);
         assert!(core::mem::offset_of!(BamHostApi, migrate_component_column) == 544);
+        assert!(core::mem::offset_of!(BamHostApi, iter_next_chunk_batch) == 552);
     }
     #[cfg(target_pointer_width = "32")]
     {
         assert!(BamHostApi::MIN_V0_2_SIZE == 116);
-        assert!(core::mem::size_of::<BamHostApi>() == 280);
+        assert!(BamHostApi::MIN_V0_3_SIZE == 280);
+        assert!(core::mem::size_of::<BamHostApi>() == 284);
         assert!(core::mem::align_of::<BamHostApi>() == 4);
         assert!(core::mem::offset_of!(BamHostApi, struct_size) == 0);
         assert!(core::mem::offset_of!(BamHostApi, abi_version) == 4);
@@ -1120,6 +1129,7 @@ const _: () = {
         assert!(core::mem::offset_of!(BamHostApi, cmd_insert_relation) == 268);
         assert!(core::mem::offset_of!(BamHostApi, cmd_remove_relation) == 272);
         assert!(core::mem::offset_of!(BamHostApi, migrate_component_column) == 276);
+        assert!(core::mem::offset_of!(BamHostApi, iter_next_chunk_batch) == 280);
     }
 };
 
@@ -1131,15 +1141,15 @@ unsafe impl ExtensibleStruct for BamHostApi {
 
 /// Compile-time byte offsets for every header field and function-pointer slot of [`BamHostApi`].
 ///
-/// Exports three constant families for all 70 fields of [`BamHostApi`] (`struct_size`,
-/// `abi_version`, and all 68 function-pointer slots):
+/// Exports three constant families for all 71 fields of [`BamHostApi`] (`struct_size`,
+/// `abi_version`, and all 69 function-pointer slots):
 ///
 /// - `<FIELD>`: Pointer-width-native byte offset (`core::mem::offset_of!(BamHostApi, <field>)`)
 ///   for the active compilation target.
 /// - `OFF64_<FIELD>`: Architecture-independent 64-bit byte offset (`struct_size` at `0`,
-///   `abi_version` at `4`, slot `k` at `8 + 8 * k`, total [`offsets::SIZE_64`] = `552` bytes).
+///   `abi_version` at `4`, slot `k` at `8 + 8 * k`, total [`offsets::SIZE_64`] = `560` bytes).
 /// - `OFF32_<FIELD>`: Architecture-independent 32-bit byte offset (`struct_size` at `0`,
-///   `abi_version` at `4`, slot `k` at `8 + 4 * k`, total [`offsets::SIZE_32`] = `280` bytes).
+///   `abi_version` at `4`, slot `k` at `8 + 4 * k`, total [`offsets::SIZE_32`] = `284` bytes).
 ///
 /// Cross-target code generators and JIT backends (such as `bql_jit`) can import exact slot
 /// offsets without hardcoding magic numbers, while compile-time assertions guarantee agreement
@@ -1147,14 +1157,14 @@ unsafe impl ExtensibleStruct for BamHostApi {
 pub mod offsets {
     use super::{BAM_HOST_API_SLOT_COUNT, BamHostApi};
 
-    /// Total number of function-pointer slots in ABI `0.3.0` [`BamHostApi`] (`68`).
+    /// Total number of function-pointer slots in ABI `0.3.0` [`BamHostApi`] (`69`).
     pub const SLOT_COUNT: usize = BAM_HOST_API_SLOT_COUNT;
 
-    /// Total byte size of ABI `0.3.0` [`BamHostApi`] on 64-bit targets (`552` bytes).
-    pub const SIZE_64: usize = 552;
+    /// Total byte size of ABI `0.3.0` [`BamHostApi`] on 64-bit targets (`560` bytes).
+    pub const SIZE_64: usize = 560;
 
-    /// Total byte size of ABI `0.3.0` [`BamHostApi`] on 32-bit targets (`280` bytes).
-    pub const SIZE_32: usize = 280;
+    /// Total byte size of ABI `0.3.0` [`BamHostApi`] on 32-bit targets (`284` bytes).
+    pub const SIZE_32: usize = 284;
 
     macro_rules! define_host_api_offsets {
         (
@@ -1234,7 +1244,7 @@ pub mod offsets {
             )*
 
             const _: () = {
-                assert!(SLOT_COUNT == 68);
+                assert!(SLOT_COUNT == 69);
                 assert!(SIZE_64 == 8 + 8 * SLOT_COUNT);
                 assert!(SIZE_32 == 8 + 4 * SLOT_COUNT);
                 $(
@@ -1341,6 +1351,7 @@ pub mod offsets {
             (65, cmd_insert_relation, CMD_INSERT_RELATION, OFF64_CMD_INSERT_RELATION, 528, OFF32_CMD_INSERT_RELATION, 268),
             (66, cmd_remove_relation, CMD_REMOVE_RELATION, OFF64_CMD_REMOVE_RELATION, 536, OFF32_CMD_REMOVE_RELATION, 272),
             (67, migrate_component_column, MIGRATE_COMPONENT_COLUMN, OFF64_MIGRATE_COMPONENT_COLUMN, 544, OFF32_MIGRATE_COMPONENT_COLUMN, 276),
+            (68, iter_next_chunk_batch, ITER_NEXT_CHUNK_BATCH, OFF64_ITER_NEXT_CHUNK_BATCH, 552, OFF32_ITER_NEXT_CHUNK_BATCH, 280),
         ]
     }
 }
@@ -1349,17 +1360,17 @@ pub mod offsets {
 mod offset_tests {
     use super::{BAM_HOST_API_SLOT_COUNT, BamHostApi, offsets};
 
-    /// Test scenario (Proof Obligation PO-W6): verifies that `BAM_HOST_API_SLOT_COUNT == 68`,
-    /// `SIZE_64 == 552`, `SIZE_32 == 280`, header offsets sit at `0`/`4`, every slot `k` in
-    /// `0..68` satisfies `OFF64_k == 8 + 8*k` and `OFF32_k == 8 + 4*k` matching native
+    /// Test scenario (Proof Obligation PO-W6): verifies that `BAM_HOST_API_SLOT_COUNT == 69`,
+    /// `SIZE_64 == 560`, `SIZE_32 == 284`, header offsets sit at `0`/`4`, every slot `k` in
+    /// `0..69` satisfies `OFF64_k == 8 + 8*k` and `OFF32_k == 8 + 4*k` matching native
     /// `offset_of!`, and `MIN_V0_2_SIZE`/`MIN_V0_3_SIZE` terminate exactly after `cmd_remove`
     /// and `migrate_component_column` respectively.
     #[test]
-    fn host_api_offset_constants_cover_all_68_slots_monotonically() {
-        assert_eq!(BAM_HOST_API_SLOT_COUNT, 68);
-        assert_eq!(offsets::SLOT_COUNT, 68);
-        assert_eq!(offsets::SIZE_64, 552);
-        assert_eq!(offsets::SIZE_32, 280);
+    fn host_api_offset_constants_cover_all_69_slots_monotonically() {
+        assert_eq!(BAM_HOST_API_SLOT_COUNT, 69);
+        assert_eq!(offsets::SLOT_COUNT, 69);
+        assert_eq!(offsets::SIZE_64, 560);
+        assert_eq!(offsets::SIZE_32, 284);
         assert_eq!(offsets::STRUCT_SIZE, 0);
         assert_eq!(offsets::OFF64_STRUCT_SIZE, 0);
         assert_eq!(offsets::OFF32_STRUCT_SIZE, 0);
@@ -1707,6 +1718,11 @@ mod offset_tests {
                 offsets::MIGRATE_COMPONENT_COLUMN,
                 offsets::OFF64_MIGRATE_COMPONENT_COLUMN,
                 offsets::OFF32_MIGRATE_COMPONENT_COLUMN,
+            ),
+            (
+                offsets::ITER_NEXT_CHUNK_BATCH,
+                offsets::OFF64_ITER_NEXT_CHUNK_BATCH,
+                offsets::OFF32_ITER_NEXT_CHUNK_BATCH,
             ),
         ];
 

@@ -99,13 +99,14 @@
 //! - [`BamManifest`]: Static identity struct returned by `bamabi_manifest()` (`MIN_V0_2_SIZE` =
 //!   `32` B / `24` B; full `48` B / `32` B with optional `save_state` / `restore_state` hot-reload
 //!   callbacks).
-//! - [`BamHostApi`]: Complete **68-slot** host function-pointer table passed to `bamabi_init`
+//! - [`BamHostApi`]: Complete **69-slot** host function-pointer table passed to `bamabi_init`
 //!   (`MIN_V0_2_SIZE` = `224` B / `116` B covering the 27 mandatory `0.2` slots; `MIN_V0_3_SIZE` =
-//!   `552` B / `280` B covering all 68 live slots). Probes `struct_size` / `abi_version` safely via
+//!   `552` B / `280` B covering the first 68 slots; full `560` B / `284` B with slot 68
+//!   `iter_next_chunk_batch`). Probes `struct_size` / `abi_version` safely via
 //!   [`BamHostApi::raw_struct_size`], [`BamHostApi::raw_abi_version`], and [`BamHostApi::covers_slot`].
 //! - [`offsets`]: Exports target-native (`<FIELD>`), 64-bit (`OFF64_<FIELD>`, [`offsets::SIZE_64`] =
-//!   `552`), and 32-bit (`OFF32_<FIELD>`, [`offsets::SIZE_32`] = `280`) byte offsets for all 70
-//!   fields (`struct_size`, `abi_version`, and slots `0..68`, [`offsets::SLOT_COUNT`] = `68`).
+//!   `560`), and 32-bit (`OFF32_<FIELD>`, [`offsets::SIZE_32`] = `284`) byte offsets for all 71
+//!   fields (`struct_size`, `abi_version`, and slots `0..69`, [`offsets::SLOT_COUNT`] = `69`).
 //! - [`ExtensibleStruct`]: Contract for all 13 `struct_size`-prefixed `#[repr(C)]` structs whose
 //!   fields are zero-valid (`Option<unsafe extern "C" fn(...)>` niche optimization). Use
 //!   [`read_extensible_struct`] and [`read_descriptor`] to copy `min(struct_size, size_of::<T>())`
@@ -266,9 +267,10 @@ pub use iter::{
     BAM_STORAGE_FLAG_SPARSE_SET, BAM_STORAGE_FLAG_SUMMARY_TICK, BamChangeTicks, BamChunkTaskFn,
     BamColumnInfo, BamIter, BamIterColumnInfoFn, BamIterColumnMutableFn,
     BamIterColumnMutableUntrackedFn, BamIterColumnReadonlyFn, BamIterColumnRowsMutableFn,
-    BamIterColumnRowsReadonlyFn, BamIterEntitiesFn, BamIterMarkChangedRangeFn, BamIterNextChunkFn,
-    BamIterReadRemovedFn, BamIterResetFn, BamMsgReadBatchFn, BamMsgSendFn, BamMsgWriteBatchFn,
-    BamParForEachChunkFn, BamResMutPtrFn, BamResPtrFn, BamResTicksFn,
+    BamIterColumnRowsReadonlyFn, BamIterEntitiesFn, BamIterMarkChangedRangeFn,
+    BamIterNextChunkBatchFn, BamIterNextChunkFn, BamIterReadRemovedFn, BamIterResetFn,
+    BamMsgReadBatchFn, BamMsgSendFn, BamMsgWriteBatchFn, BamParForEachChunkFn, BamResMutPtrFn,
+    BamResPtrFn, BamResTicksFn,
 };
 pub use primitives::{
     BAM_CHILD_OF_NAME, BAM_CHILDREN_NAME, BAM_DISABLED_NAME, BamComponent, BamSymbol, BamSystem,

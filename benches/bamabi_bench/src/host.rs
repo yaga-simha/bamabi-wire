@@ -1523,6 +1523,116 @@ unsafe extern "C" fn host_iter_next_chunk(iter: *mut BamIter, out_len: *mut usiz
     FfiBool::FALSE
 }
 
+/// Slot 68: `iter_next_chunk_batch`.
+unsafe extern "C" fn host_iter_next_chunk_batch(
+    iter: *mut BamIter,
+    out_len: *mut usize,
+    out_entities: *mut *const FfiEntity,
+    out_col_ptrs: *mut *mut u8,
+    col_count: usize,
+    mark_changed_mask: u32,
+) -> FfiBool {
+    if iter.is_null() || out_len.is_null() {
+        return FfiBool::FALSE;
+    }
+    // SAFETY: `iter` points to a valid `IterState` for this query slot.
+    let state = unsafe { &mut *iter.cast::<IterState>() };
+    // SAFETY: `state.world` is valid and its `chunks` slice is immutable during system execution.
+    let world = unsafe { &*state.world };
+    let limit = state
+        .end_chunk_idx
+        .map_or(world.chunks.len(), |end| end.min(world.chunks.len()));
+    while state.next_chunk_idx < limit {
+        let idx = state.next_chunk_idx;
+        state.next_chunk_idx += 1;
+        let chunk = &world.chunks[idx];
+        if !chunk.entities.is_empty() && chunk_matches_terms(chunk, &state.terms) {
+            state.active_chunk_idx = Some(idx);
+            // SAFETY: Caller guarantees `out_len` is writable `usize` storage.
+            unsafe {
+                *out_len = chunk.entities.len();
+            }
+            if !out_entities.is_null() {
+                // SAFETY: Caller guarantees `out_entities` is writable `*const FfiEntity` storage.
+                unsafe {
+                    *out_entities = chunk.entities.as_ptr();
+                }
+            }
+            if col_count > 0 && !out_col_ptrs.is_null() {
+                for term_index in 0..col_count {
+                    let ptr = match state.terms.get(term_index) {
+                        None => core::ptr::null_mut(),
+                        Some(term) if term.mode.is_has() => {
+                            let b = if chunk.has_component(term.component) {
+                                core::ptr::from_ref(&FFI_BOOL_TRUE_BYTE)
+                            } else {
+                                core::ptr::from_ref(&FFI_BOOL_FALSE_BYTE)
+                            };
+                            b.cast_mut()
+                        }
+                        Some(term) if !term.mode.has_entity_column_data() => core::ptr::null_mut(),
+                        Some(term) => {
+                            let is_mut = term.mode.is_mutable();
+                            let disallow_flags = if is_mut {
+                                BAM_COMPONENT_FLAG_SPARSE_SET | BAM_COMPONENT_FLAG_IMMUTABLE
+                            } else {
+                                BAM_COMPONENT_FLAG_SPARSE_SET
+                            };
+                            match world.comp_meta(term.component) {
+                                Some(meta) if (meta.flags & disallow_flags) == 0 => {
+                                    match term.component.to_raw().checked_sub(1) {
+                                        Some(comp_idx) => chunk
+                                            .dense_columns
+                                            .get(comp_idx as usize)
+                                            .and_then(Option::as_ref)
+                                            .map_or(core::ptr::null_mut(), |words| {
+                                                if is_mut
+                                                    && term_index < 32
+                                                    && (mark_changed_mask & (1u32 << term_index))
+                                                        != 0
+                                                {
+                                                    chunk.mark_changed(term.component);
+                                                }
+                                                UnsafeCell::raw_get(words.as_ptr()).cast::<u8>()
+                                            }),
+                                        None => core::ptr::null_mut(),
+                                    }
+                                }
+                                _ => core::ptr::null_mut(),
+                            }
+                        }
+                    };
+                    // SAFETY: Caller guarantees `out_col_ptrs` has `col_count` writable slots.
+                    unsafe {
+                        *out_col_ptrs.add(term_index) = ptr;
+                    }
+                }
+            }
+            return FfiBool::TRUE;
+        }
+    }
+    state.active_chunk_idx = None;
+    // SAFETY: Caller guarantees `out_len` is writable `usize` storage.
+    unsafe {
+        *out_len = 0;
+    }
+    if !out_entities.is_null() {
+        // SAFETY: Caller guarantees `out_entities` is writable `*const FfiEntity` storage.
+        unsafe {
+            *out_entities = core::ptr::null();
+        }
+    }
+    if col_count > 0 && !out_col_ptrs.is_null() {
+        for term_index in 0..col_count {
+            // SAFETY: Caller guarantees `out_col_ptrs` has `col_count` writable slots.
+            unsafe {
+                *out_col_ptrs.add(term_index) = core::ptr::null_mut();
+            }
+        }
+    }
+    FfiBool::FALSE
+}
+
 /// Slot 10: `iter_reset`.
 unsafe extern "C" fn host_iter_reset(iter: *mut BamIter) -> FfiResult {
     if iter.is_null() {
@@ -3339,6 +3449,7 @@ pub(crate) fn make_host_api() -> BamHostApi {
         cmd_insert_relation: Some(host_cmd_insert_relation),
         cmd_remove_relation: Some(host_cmd_remove_relation),
         migrate_component_column: Some(host_migrate_component_column),
+        iter_next_chunk_batch: Some(host_iter_next_chunk_batch),
     };
     debug_assert!(api.has_all_slots());
     api

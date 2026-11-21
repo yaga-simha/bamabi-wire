@@ -1700,6 +1700,12 @@ fn wire_struct_specs() -> Vec<StructLayoutSpec> {
                     offset_32: host_api_offsets::OFF32_MIGRATE_COMPONENT_COLUMN,
                     rust_host_offset: host_api_offsets::MIGRATE_COMPONENT_COLUMN,
                 },
+                FieldLayoutSpec {
+                    c_name: "iter_next_chunk_batch",
+                    offset_64: host_api_offsets::OFF64_ITER_NEXT_CHUNK_BATCH,
+                    offset_32: host_api_offsets::OFF32_ITER_NEXT_CHUNK_BATCH,
+                    rust_host_offset: host_api_offsets::ITER_NEXT_CHUNK_BATCH,
+                },
             ],
         },
     ]
@@ -2515,7 +2521,8 @@ pub fn render_c99_header() -> Result<String, String> {
          typedef BamResult (*BamCmdRollbackFn)(BamCommands* commands, size_t checkpoint);\n\
          typedef BamResult (*BamCmdInsertRelationFn)(BamCommands* commands, BamEntity entity, BamComponent relation, BamEntity target, const void* data, size_t data_size);\n\
          typedef BamResult (*BamCmdRemoveRelationFn)(BamCommands* commands, BamEntity entity, BamComponent relation, BamEntity target);\n\
-         typedef BamResult (*BamMigrateComponentColumnFn)(BamLoadCtx* load_ctx, BamComponent component, uint64_t old_fingerprint, const BamComponentDesc* new_desc, BamRowMigrateFn migrate_fn, void* user_data);\n\n\
+         typedef BamResult (*BamMigrateComponentColumnFn)(BamLoadCtx* load_ctx, BamComponent component, uint64_t old_fingerprint, const BamComponentDesc* new_desc, BamRowMigrateFn migrate_fn, void* user_data);\n\
+         typedef BamBool   (*BamIterNextChunkBatchFn)(BamIter* iter, size_t* out_len, const BamEntity** out_entities, uint8_t** out_col_ptrs, size_t col_count, uint32_t mark_changed_mask);\n\n\
          struct BamHostApi {\n\
              uint32_t struct_size;\n\
              uint32_t abi_version;\n\n\
@@ -2595,6 +2602,7 @@ pub fn render_c99_header() -> Result<String, String> {
              BamCmdInsertRelationFn      cmd_insert_relation;\n\
              BamCmdRemoveRelationFn      cmd_remove_relation;\n\
              BamMigrateComponentColumnFn migrate_component_column;\n\
+             BamIterNextChunkBatchFn     iter_next_chunk_batch;\n\
          };\n\n\
          #define BAM_MANIFEST_MIN_V0_2_SIZE            (offsetof(BamManifest, reserved0) + sizeof(uint32_t))\n\
          #define BAM_QUERY_DESC_MIN_V0_2_SIZE          (offsetof(BamQueryDesc, term_count) + sizeof(size_t))\n\
@@ -2610,8 +2618,8 @@ pub fn render_c99_header() -> Result<String, String> {
          #define BAM_SCHEDULE_SET_DESC_MIN_V0_3_SIZE   sizeof(BamScheduleSetDesc)\n\
          #define BAM_VTABLE_HEADER_MIN_V0_2_SIZE       (offsetof(BamVTableHeader, align) + sizeof(size_t))\n\
          #define BAM_HOST_API_MIN_V0_2_SIZE            (offsetof(BamHostApi, cmd_remove) + sizeof(BamCmdRemoveFn))\n\
-         #define BAM_HOST_API_MIN_V0_3_SIZE            sizeof(BamHostApi)\n\n\
-         /* Byte offset constants for every BamHostApi function-pointer slot (0..67): */\n",
+         #define BAM_HOST_API_MIN_V0_3_SIZE            (offsetof(BamHostApi, migrate_component_column) + sizeof(BamMigrateComponentColumnFn))\n\n\
+         /* Byte offset constants for every BamHostApi function-pointer slot (0..68): */\n",
     );
 
     for field in host_api_spec.fields {
@@ -3276,7 +3284,7 @@ mod tests {
         let second = render_c99_header().expect("second render must succeed");
         assert_eq!(first, second);
         assert!(first.contains("#define BAM_ABI_VERSION 0x00030000u"));
-        assert!(first.contains("#define BAM_HOST_API_SLOT_COUNT    68u"));
+        assert!(first.contains("#define BAM_HOST_API_SLOT_COUNT    69u"));
         assert!(
             first.contains("#define BAM_DISABLED_NAME \"bevy_ecs::entity_disabling::Disabled\"")
         );
@@ -3306,12 +3314,13 @@ mod tests {
             "#define BAM_HOST_API_OFFSET_LOG_DIAGNOSTIC offsetof(BamHostApi, log_diagnostic)"
         ));
         assert!(first.contains("#define BAM_HOST_API_OFFSET_MIGRATE_COMPONENT_COLUMN offsetof(BamHostApi, migrate_component_column)"));
+        assert!(first.contains("#define BAM_HOST_API_OFFSET_ITER_NEXT_CHUNK_BATCH offsetof(BamHostApi, iter_next_chunk_batch)"));
         assert!(first.contains("typedef struct BamHostApi   BamHostApi;"));
         assert!(
-            first.contains("BAM_STATIC_ASSERT(sizeof(BamHostApi) == 552u, bam_host_api_size_64);")
+            first.contains("BAM_STATIC_ASSERT(sizeof(BamHostApi) == 560u, bam_host_api_size_64);")
         );
         assert!(
-            first.contains("BAM_STATIC_ASSERT(sizeof(BamHostApi) == 280u, bam_host_api_size_32);")
+            first.contains("BAM_STATIC_ASSERT(sizeof(BamHostApi) == 284u, bam_host_api_size_32);")
         );
         assert!(first.contains(
             "BAM_STATIC_ASSERT(sizeof(BamComponentDesc) == 176u, bam_component_desc_size_64);"

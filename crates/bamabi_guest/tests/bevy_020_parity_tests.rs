@@ -648,6 +648,7 @@ impl MockHost {
             cmd_insert_relation: None,
             cmd_remove_relation: None,
             migrate_component_column: None,
+            iter_next_chunk_batch: None,
         }
     }
 }
