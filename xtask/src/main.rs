@@ -47,6 +47,33 @@
 //! 3. Implement `cmd_<name>(root: &Path, ...)` and route to it in `dispatch`.
 //! 4. Add parser unit tests in the `tests` module verifying both valid flag combinations and
 //!    rejected/conflicting flags.
+//!
+//! # Workspace & Crate Documentation
+//!
+//! - [`docs::architecture`]: Deep dive into `xtask` CLI parsing, toolchain isolation, and all 11
+//!   subcommand runners (`ARCHITECTURE.md`).
+//! - [`docs::tests`]: Unit test inventory covering CLI parsing and checked-in component-header
+//!   parity (`TESTS.md`).
+//! - [Workspace Guides (`bamabi_sys::docs::workspace`)](../bamabi_sys/docs/workspace/index.html) and
+//!   [Guest Workspace Docs (`bamabi_guest::docs::workspace`)](../bamabi_guest/docs/workspace/index.html):
+//!   Root `README.md`, `ARCHITECTURE.md` (with the 6-crate end-to-end walkthrough),
+//!   `DEVELOPMENT.md`, and `TESTING.md` rendered directly inside `cargo docs --open`.
+
+#[cfg(doc)]
+#[allow(unreachable_pub)]
+pub mod docs {
+    //! Embedded `xtask` architecture and verification documentation.
+
+    /// Embedded `xtask/ARCHITECTURE.md`.
+    pub mod architecture {
+        #![doc = include_str!("../ARCHITECTURE.md")]
+    }
+
+    /// Embedded `xtask/TESTS.md`.
+    pub mod tests {
+        #![doc = include_str!("../TESTS.md")]
+    }
+}
 
 mod component_headers;
 

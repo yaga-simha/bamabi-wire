@@ -6,8 +6,17 @@ Refactored from the original [`bevy_mod_abi`](https://github.com/yaga-simha/bevy
 
 ## Documentation & Onboarding
 
-- **[`ARCHITECTURE.md`](ARCHITECTURE.md)** — Layer 0 crate DAG, zero-Bevy / zero-shared-Rust-ABI invariants, `ABI 0.3.0` (`0x0003_0000`) host-guest lifecycle, allocator & panic boundaries, polyglot SDK pipeline, and per-crate onboarding index.
-- **[`DEVELOPMENT.md`](DEVELOPMENT.md)** — Setting up Rust (`1.87`/`1.95`), C99/ASan/UBSan, optional Miri/Kani/`audit` tools, building workspace & guest `.cdylib` mods, generating C99/C++17/Zig headers, and `bamabi-dev-overlay`.
+The primary way to browse the full workspace overview, end-to-end architecture walkthrough, per-crate incremental API guides, and test catalogs locally is `rustdoc` via the `.cargo/config.toml` alias:
+
+```bash
+# Build and open all workspace, crate, architecture, and test docs locally
+cargo docs --open
+# Equivalent full command:
+cargo doc --workspace --no-deps --open
+```
+
+- **[`ARCHITECTURE.md`](ARCHITECTURE.md)** — Layer 0 crate DAG, zero-Bevy / zero-shared-Rust-ABI invariants, `ABI 0.3.0` (`0x0003_0000`) host-guest lifecycle, allocator & panic boundaries, polyglot SDK pipeline, end-to-end 6-crate walkthrough, and per-crate onboarding index.
+- **[`DEVELOPMENT.md`](DEVELOPMENT.md)** — Setting up Rust (`1.87`/`1.95`), C99/ASan/UBSan, optional Miri/Kani/`audit` tools, browsing `cargo docs --open`, building workspace & guest `.cdylib` mods, generating C99/C++17/Zig headers, and `bamabi-dev-overlay`.
 - **[`TESTING.md`](TESTING.md)** — Multi-tier verification pyramid (unit/integration, doctests, `trybuild`, `proptest`, header parity, C99 ASan/UBSan, Miri, Kani `PO-W1..PO-W8` & `PO-G1..PO-G9`, `audit`, nightly `-Zrandomize-layout`) and Layer 0 benchmarking/stress notes.
 - **[`spec.md`](spec.md)** — Canonical byte-level wire specification, struct layouts, offsets, and error codes.
 
@@ -50,6 +59,9 @@ All checks run standalone inside `bamabi-wire` with zero sibling repositories re
 ```bash
 # Build workspace (default / --no-default-features / --all-features)
 cargo build --workspace --all-features
+
+# Browse workspace + crate + architecture + test docs locally in rustdoc
+cargo docs --open
 
 # Default local CI gate: fmt, header parity checks, lint (forbid-unsafe, zero-Bevy, clippy, rustdoc), tests, C99 + ASan/UBSan
 cargo xtask ci
