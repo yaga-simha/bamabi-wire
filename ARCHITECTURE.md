@@ -163,7 +163,7 @@ Everything begins in [`bamabi_sys`](crates/bamabi_sys/README.md) (`#![no_std]`, 
 
 When a developer writes a cross-language POD component (or a rich `String`/`Vec` host component):
 
-```rust
+```rust,ignore
 #[repr(C)]
 #[derive(Copy, Clone, ModComponent, GuestComponent)]
 #[mod_component(name = "combat::Health", summary_tick)]
