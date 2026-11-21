@@ -55,13 +55,14 @@ const _: () = {
     assert!(core::mem::align_of::<SimParams>() == 4);
 };
 
-/// Resolves `T` on the host world, registering it if the host has not pre-registered it.
-fn resolve_or_register<T: GuestComponent>(
+/// Resolves `T` as an init-validated [`TypedComponent<T>`] on the host world, registering it if
+/// the host has not pre-registered it.
+fn resolve_or_register_typed<T: GuestComponent>(
     app: &mut GuestApp<'_>,
-) -> Result<BamComponent, FfiResult> {
-    match app.resolve_component::<T>() {
+) -> Result<TypedComponent<T>, FfiResult> {
+    match app.resolve_component_typed::<T>() {
         Ok(comp) => Ok(comp),
-        Err(FfiResult::NOT_FOUND) => app.register_component::<T>(),
+        Err(FfiResult::NOT_FOUND) => app.register_component_typed::<T>(),
         Err(err) => Err(err),
     }
 }
@@ -75,14 +76,14 @@ impl GuestPlugin for BenchGuestRust {
     const VERSION: &'static CStr = c"0.3.0";
 
     fn build(&mut self, app: &mut GuestApp<'_>) -> FfiResult {
-        let pos_comp = match resolve_or_register::<Position>(app) {
+        let pos_comp = match resolve_or_register_typed::<Position>(app) {
             Ok(c) => c,
             Err(err) => return err,
         };
-        if let Err(err) = resolve_or_register::<Velocity>(app) {
+        if let Err(err) = resolve_or_register_typed::<Velocity>(app) {
             return err;
         }
-        if let Err(err) = resolve_or_register::<SimParams>(app) {
+        if let Err(err) = resolve_or_register_typed::<SimParams>(app) {
             return err;
         }
 
@@ -131,7 +132,7 @@ impl GuestPlugin for BenchGuestRust {
                         Ok(e) => e,
                         Err(err) => return err,
                     };
-                    let status = cmds.insert(entity, pos_comp, &sample_pos);
+                    let status = cmds.insert_typed(entity, pos_comp, &sample_pos);
                     if !status.is_ok() {
                         return status;
                     }

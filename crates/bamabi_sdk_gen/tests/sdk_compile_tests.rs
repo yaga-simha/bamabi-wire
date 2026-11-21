@@ -169,6 +169,17 @@ int main() {
         tx.commit();
     }
     assert(cmds.rollbacks == 1u);
+
+#define BAM_TEST_STR_IMPL(x) #x
+#define BAM_TEST_STR(x) BAM_TEST_STR_IMPL(x)
+#if defined(__GNUC__) || defined(__clang__)
+    assert(std::strcmp(BAM_TEST_STR(BAM_RESTRICT), "__restrict__") == 0);
+#endif
+    float src_col[2] = {1.25f, 2.5f};
+    float dst_col[2] = {0.0f, 0.0f};
+    bam::copy_column_restricted(dst_col, src_col, 2u);
+    assert(dst_col[0] == 1.25f && dst_col[1] == 2.5f);
+
     return 0;
 }
 "#,

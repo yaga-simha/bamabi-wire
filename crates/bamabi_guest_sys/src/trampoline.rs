@@ -2531,14 +2531,26 @@ pub fn verify_same_mod_dynamic_component<T: ModComponent>(
     }
     let expected_vtable = T::erased_vtable_ptr();
     if matches_qualified
-        && let Ok(ptr) = resolve_vtable_symbol_for_name(host, &qualified_name)
+        && let Ok(ptr) = host.cached_symbol_lookup(
+            (
+                core::any::TypeId::of::<T>(),
+                crate::host::symbol_cache_kind::VTABLE_QUALIFIED,
+            ),
+            || resolve_vtable_symbol_for_name(host, &qualified_name),
+        )
         && core::ptr::eq(ptr, expected_vtable)
     {
         return true;
     }
     if matches_canonical
         && qualified_name != T::CANONICAL_NAME
-        && let Ok(ptr) = resolve_vtable_symbol_for_name(host, T::CANONICAL_NAME)
+        && let Ok(ptr) = host.cached_symbol_lookup(
+            (
+                core::any::TypeId::of::<T>(),
+                crate::host::symbol_cache_kind::VTABLE_CANONICAL,
+            ),
+            || resolve_vtable_symbol_for_name(host, T::CANONICAL_NAME),
+        )
         && core::ptr::eq(ptr, expected_vtable)
     {
         return true;

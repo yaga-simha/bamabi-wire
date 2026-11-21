@@ -3,8 +3,8 @@
 use core::ffi::{CStr, c_void};
 
 use bamabi_guest_sys::{
-    Host, LazyCommands, ValidatedCommands, ValidatedIter, ValidatedSystemInvocation,
-    ValidatedSystemRef, resolve_component,
+    Host, LazyCommands, TypedComponent, ValidatedCommands, ValidatedIter,
+    ValidatedSystemInvocation, ValidatedSystemRef, resolve_component,
 };
 use bamabi_sys::{
     AbiPod, BamChangeTicks, BamComponent, BamHostApi, BamSystemCtx, ComponentUuid, FfiEntity,
@@ -610,6 +610,27 @@ impl<'a> SystemContext<'a> {
             .map(|(val, ticks)| GuestResMut::new(val, ticks))
     }
 
+    /// Looks up a shared singleton resource `R` wrapped in [`GuestRes`] by an init-validated
+    /// [`TypedComponent<R>`] handle, returning `None` if undeclared or absent.
+    #[inline]
+    pub fn res_typed_by_handle<R: AbiPod>(
+        &self,
+        handle: TypedComponent<R>,
+    ) -> Option<GuestRes<'_, R>> {
+        self.res_by_handle(handle.handle())
+    }
+
+    /// Looks up an exclusive mutable singleton resource `R` wrapped in [`GuestResMut`] by an
+    /// init-validated [`TypedComponent<R>`] handle, returning `None` if undeclared with
+    /// `ResourceWrite`, immutable, or absent.
+    #[inline]
+    pub fn res_mut_typed_by_handle<R: AbiPod>(
+        &mut self,
+        handle: TypedComponent<R>,
+    ) -> Option<GuestResMut<'_, R>> {
+        self.res_mut_by_handle(handle.handle())
+    }
+
     /// Reads Bevy change-detection ticks for the singleton resource declared at `decl_index`.
     #[inline]
     pub fn resource_ticks(&self, decl_index: usize) -> Result<BamChangeTicks, FfiResult> {
@@ -855,11 +876,16 @@ impl<'a> SystemContext<'a> {
         term_index: usize,
         entities: [FfiEntity; N],
     ) -> Option<[&T; N]> {
-        let mut refs = Vec::with_capacity(N);
-        for entity in entities {
-            refs.push(self.get::<T>(query_index, term_index, entity)?);
+        if N == 0 {
+            let empty: &[&T] = &[];
+            return empty.try_into().ok();
         }
-        refs.try_into().ok()
+        let first = self.get::<T>(query_index, term_index, entities[0])?;
+        let mut out = [first; N];
+        for i in 1..N {
+            out[i] = self.get::<T>(query_index, term_index, entities[i])?;
+        }
+        Some(out)
     }
 
     /// Drains unread messages (`M: GuestComponent`) declared at `decl_index`, validating `M`'s UUID.

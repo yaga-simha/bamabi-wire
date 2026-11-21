@@ -1196,3 +1196,137 @@ fn guest_sdk_child_of_ticks_and_in_set_smoke() {
     *rm += 5;
     assert_eq!(*rm, 15);
 }
+
+/// Scenario: Verifies `TypedComponent` validation (`register_component_typed`,
+/// `resolve_component_typed`, layout mismatch / invalid handle rejection), `SpawnEntry::typed`,
+/// `insert_typed`, `insert_if_new_typed`, empty `spawn(&[])` fast-path to `SpawnEmpty`,
+/// `res_typed_by_handle` / `res_mut_typed_by_handle`, and stack-only `get_many` (`N = 0` and
+/// `N = 2`).
+#[test]
+fn typed_component_commands_empty_spawn_and_stack_get_many() {
+    use bamabi_guest::TypedComponent;
+    use common::RecordedCommand;
+
+    let mut world = MockHostWorld::new();
+    // Wire `cmd_insert_if_new` to `cmd_insert` so `insert_if_new_typed` exercises the live FFI path.
+    world.api.cmd_insert_if_new = world.api.cmd_insert;
+    let pos_h = world.expose_component::<Pos>("game::Pos", Pos::UUID, 0, false);
+    let vel_h = world.expose_component::<Vel>("game::Vel", Vel::UUID, 0, false);
+    let _shield_h = world.expose_component::<Shield>("game::Shield", Shield::UUID, 0, false);
+    let score_h = world.insert_resource::<Score>("game::Score", Score::UUID, Score { points: 40 });
+
+    let e1 = FfiEntity::from_bits(10);
+    let e2 = FfiEntity::from_bits(20);
+    let e_missing = FfiEntity::from_bits(999);
+    let mut chunk = MockChunkData::new(vec![e1, e2]);
+    chunk.insert_dense(pos_h, &[Pos { x: 1.0, y: 2.0 }, Pos { x: 3.0, y: 4.0 }]);
+    chunk.insert_dense(vel_h, &[Vel { dx: 5.0, dy: 6.0 }, Vel { dx: 7.0, dy: 8.0 }]);
+    world.chunks.push(chunk);
+
+    let inst = world
+        .load_fn(c"typed_mod", move |app| {
+            let typed_pos = app
+                .resolve_component_typed::<Pos>()
+                .expect("resolve_component_typed Pos");
+            assert_eq!(typed_pos.handle(), pos_h);
+            assert_eq!(typed_pos.raw(), pos_h);
+            let typed_vel = app
+                .resolve_component_typed::<Vel>()
+                .expect("resolve_component_typed Vel");
+            let typed_score = app
+                .resolve_component_typed::<Score>()
+                .expect("resolve_component_typed Score");
+            assert_eq!(typed_score.handle(), score_h);
+
+            // Register a brand-new component via `register_component_typed`.
+            let typed_tag = app
+                .register_component_typed::<Tag>()
+                .expect("register_component_typed Tag");
+            assert!(typed_tag.handle().is_valid());
+
+            // `TypedComponent::validate` fails closed on invalid handle and size/align mismatch.
+            assert_eq!(
+                TypedComponent::<Pos>::validate(app.host(), BamComponent::INVALID),
+                Err(FfiResult::INVALID_COMPONENT)
+            );
+            assert_eq!(
+                TypedComponent::<Shield>::validate(app.host(), pos_h),
+                Err(FfiResult::TYPE_MISMATCH)
+            );
+
+            // `Copy`, `Eq`, `Hash`, `Debug` work for `TypedComponent<T>` even when `T` has `f32`.
+            let copy_pos = typed_pos;
+            assert_eq!(copy_pos, typed_pos);
+            let _dbg = format!("{typed_pos:?}");
+
+            app.system(c"typed_cmd_and_get_many")
+                .query_typed::<(&Pos, &Vel)>()
+                .resource_write::<Score>()
+                .build(move |ctx| {
+                    // Stack-only `get_many` with N = 0 and N = 2.
+                    let empty = ctx.get_many::<0, Pos>(0, 0, []).expect("N=0 get_many");
+                    assert!(empty.is_empty());
+
+                    let pair = ctx
+                        .get_many::<2, Pos>(0, 0, [e1, e2])
+                        .expect("N=2 get_many");
+                    assert_eq!(*pair[0], Pos { x: 1.0, y: 2.0 });
+                    assert_eq!(*pair[1], Pos { x: 3.0, y: 4.0 });
+
+                    assert!(ctx.get_many::<2, Pos>(0, 0, [e1, e_missing]).is_none());
+
+                    // Typed resource handle lookups delegate cleanly to `res_by_handle` /
+                    // `res_mut_by_handle` (returning `None` when `sys_res_ptr` is absent on the
+                    // mock host).
+                    assert!(ctx.res_typed_by_handle(typed_score).is_none());
+                    assert!(ctx.res_mut_typed_by_handle(typed_score).is_none());
+
+                    let cmds = ctx.commands();
+                    // Empty `spawn(&[])` fast-paths directly to `spawn_empty`.
+                    let spawned_empty = cmds.spawn(&[])?;
+                    assert!(!spawned_empty.is_null());
+
+                    // `SpawnEntry::typed` avoids per-command `component_layout_info`.
+                    let spawned_typed = cmds.spawn(&[
+                        SpawnEntry::typed(typed_pos, &Pos { x: 9.0, y: 10.0 }),
+                        SpawnEntry::typed(typed_vel, &Vel { dx: 1.0, dy: -1.0 }),
+                    ])?;
+                    assert!(!spawned_typed.is_null());
+
+                    // `insert_typed` and `insert_if_new_typed`.
+                    assert_eq!(
+                        cmds.insert_typed(spawned_empty, typed_pos, &Pos { x: 2.0, y: 3.0 }),
+                        FfiResult::OK
+                    );
+                    cmds.insert_if_new_typed(spawned_empty, typed_vel, &Vel { dx: 4.0, dy: 5.0 })?;
+                    Ok(())
+                })
+        })
+        .expect("load typed_mod");
+
+    assert_eq!(world.run_system(0), FfiResult::OK);
+
+    // Verify `spawn(&[])` took the `SpawnEmpty` fast-path and `SpawnEntry::typed`,
+    // `insert_typed`, and `insert_if_new_typed` recorded expected commands.
+    assert!(matches!(
+        world.commands.first(),
+        Some(RecordedCommand::SpawnEmpty(_))
+    ));
+    assert!(matches!(
+        world.commands.get(1),
+        Some(RecordedCommand::SpawnBatch { components, .. })
+            if components == &[(pos_h, core::mem::size_of::<Pos>()), (vel_h, core::mem::size_of::<Vel>())]
+    ));
+    assert!(matches!(
+        world.commands.get(2),
+        Some(RecordedCommand::Insert { component, byte_len, .. })
+            if *component == pos_h && *byte_len == core::mem::size_of::<Pos>()
+    ));
+    assert!(matches!(
+        world.commands.get(3),
+        Some(RecordedCommand::Insert { component, byte_len, .. })
+            if *component == vel_h && *byte_len == core::mem::size_of::<Vel>()
+    ));
+
+    world.unload_instance(inst);
+}

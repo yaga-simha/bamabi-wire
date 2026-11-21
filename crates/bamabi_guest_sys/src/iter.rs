@@ -759,20 +759,20 @@ unsafe impl<T: AbiPod> Send for SparseRows<'_, T> {}
 unsafe impl<T: AbiPod> Sync for SparseRows<'_, T> {}
 
 impl<'a, T: AbiPod> SparseRows<'a, T> {
-    /// Validates `ptrs[0..len]` and constructs a [`SparseRows`] view.
+    /// Validates the outer `ptrs` array (`len * size_of::<*const u8>() <= isize::MAX`, non-null,
+    /// and aligned when `len > 0`) in `O(1)` and constructs a [`SparseRows`] view.
     ///
-    /// When `allow_null_rows` is `false`, returns `None` if any row pointer is null or unaligned
-    /// for `T`. When `allow_null_rows` is `true` (`OPTIONAL_READ`), null row pointers are accepted
-    /// and yielded as `None` by [`Self::get`], while non-null unaligned pointers still return `None`.
+    /// Individual inner row pointers are validated lazily in [`Self::get`]: null rows and
+    /// misaligned non-ZST row pointers yield `None` without dereferencing.
     ///
     /// # Safety
     /// If `len > 0`, `ptrs` must be non-null, aligned to `*const u8`, and readable for `len`
-    /// pointers for lifetime `'a`, where every non-null `ptrs[i]` points to an initialized `T`
-    /// valid for shared reads during `'a`.
+    /// pointers for lifetime `'a`, where every non-null, properly aligned `ptrs[i]` points to an
+    /// initialized `T` valid for shared reads during `'a`.
     pub unsafe fn from_raw_parts(
         ptrs: *const *const u8,
         len: usize,
-        allow_null_rows: bool,
+        _allow_null_rows: bool,
     ) -> Option<Self> {
         if len == 0 {
             return Some(Self {
@@ -788,19 +788,6 @@ impl<'a, T: AbiPod> SparseRows<'a, T> {
                 .is_none_or(|bytes| bytes > isize::MAX as usize)
         {
             return None;
-        }
-        let align = core::mem::align_of::<T>();
-        let elem_size = core::mem::size_of::<T>();
-        for i in 0..len {
-            // SAFETY: `ptrs` is non-null, aligned, and readable for `len` pointers per caller contract.
-            let row_ptr = unsafe { *ptrs.add(i) };
-            if row_ptr.is_null() {
-                if !allow_null_rows {
-                    return None;
-                }
-            } else if elem_size > 0 && !(row_ptr as usize).is_multiple_of(align) {
-                return None;
-            }
         }
         Some(Self {
             ptrs,
@@ -821,8 +808,8 @@ impl<'a, T: AbiPod> SparseRows<'a, T> {
         self.len == 0
     }
 
-    /// Returns `&T` for `row`, or `None` if `row >= self.len()` or the optional component is absent
-    /// on that entity row.
+    /// Returns `&T` for `row`, or `None` if `row >= self.len()`, the row pointer is null, or
+    /// (for non-ZST `T`) the row pointer is misaligned for `T`.
     #[inline]
     pub fn get(&self, row: usize) -> Option<&T> {
         if row >= self.len {
@@ -837,8 +824,11 @@ impl<'a, T: AbiPod> SparseRows<'a, T> {
             // SAFETY: Zero-sized `T: AbiPod` may be referenced via `NonNull::dangling()`.
             return Some(unsafe { core::ptr::NonNull::<T>::dangling().as_ref() });
         }
-        // SAFETY: `from_raw_parts` verified every non-null `row_ptr` is aligned to `T` and points
-        // to an initialized `T` valid for `'a`.
+        if !(row_ptr as usize).is_multiple_of(core::mem::align_of::<T>()) {
+            return None;
+        }
+        // SAFETY: Verified `row_ptr` is non-null and aligned to `T`; `from_raw_parts` caller
+        // contract guarantees every non-null aligned entry points to an initialized `T` valid for `'a`.
         Some(unsafe { &*row_ptr.cast::<T>() })
     }
 
@@ -921,16 +911,20 @@ unsafe impl<T: AbiPod> Send for SparseRowsMut<'_, T> {}
 unsafe impl<T: AbiPod> Sync for SparseRowsMut<'_, T> {}
 
 impl<'a, T: AbiPod> SparseRowsMut<'a, T> {
-    /// Validates `ptrs[0..len]` and constructs a [`SparseRowsMut`] view.
+    /// Validates the outer `ptrs` array (`len * size_of::<*mut u8>() <= isize::MAX`, non-null,
+    /// and aligned when `len > 0`) in `O(1)` and constructs a [`SparseRowsMut`] view.
+    ///
+    /// Individual inner row pointers are validated lazily in [`Self::get`] and [`Self::get_mut`]:
+    /// null rows and misaligned non-ZST row pointers yield `None` without dereferencing.
     ///
     /// # Safety
     /// If `len > 0`, `ptrs` must be non-null, aligned to `*mut u8`, and readable for `len` pointers
-    /// for lifetime `'a`, where every non-null `ptrs[i]` points to an initialized `T` valid for
-    /// exclusive mutable access during `'a`.
+    /// for lifetime `'a`, where every non-null, properly aligned `ptrs[i]` points to an initialized
+    /// `T` valid for exclusive mutable access during `'a`.
     pub unsafe fn from_raw_parts(
         ptrs: *const *mut u8,
         len: usize,
-        allow_null_rows: bool,
+        _allow_null_rows: bool,
     ) -> Option<Self> {
         if len == 0 {
             return Some(Self {
@@ -946,19 +940,6 @@ impl<'a, T: AbiPod> SparseRowsMut<'a, T> {
                 .is_none_or(|bytes| bytes > isize::MAX as usize)
         {
             return None;
-        }
-        let align = core::mem::align_of::<T>();
-        let elem_size = core::mem::size_of::<T>();
-        for i in 0..len {
-            // SAFETY: `ptrs` is non-null, aligned, and readable for `len` pointers per caller contract.
-            let row_ptr = unsafe { *ptrs.add(i) };
-            if row_ptr.is_null() {
-                if !allow_null_rows {
-                    return None;
-                }
-            } else if elem_size > 0 && !(row_ptr as usize).is_multiple_of(align) {
-                return None;
-            }
         }
         Some(Self {
             ptrs,
@@ -979,7 +960,7 @@ impl<'a, T: AbiPod> SparseRowsMut<'a, T> {
         self.len == 0
     }
 
-    /// Borrows row `row` immutably (`None` if out of bounds or absent on an optional column).
+    /// Borrows row `row` immutably (`None` if out of bounds, null, or misaligned for non-ZST `T`).
     #[inline]
     pub fn get(&self, row: usize) -> Option<&T> {
         if row >= self.len {
@@ -994,11 +975,15 @@ impl<'a, T: AbiPod> SparseRowsMut<'a, T> {
             // SAFETY: Zero-sized `T: AbiPod` may be referenced via `NonNull::dangling()`.
             return Some(unsafe { core::ptr::NonNull::<T>::dangling().as_ref() });
         }
-        // SAFETY: `from_raw_parts` verified alignment and initialization; `&self` prevents concurrent mutation.
+        if !(row_ptr as usize).is_multiple_of(core::mem::align_of::<T>()) {
+            return None;
+        }
+        // SAFETY: Verified `row_ptr` is non-null and aligned to `T`; caller contract guarantees
+        // initialization, and `&self` prevents concurrent mutation.
         Some(unsafe { &*row_ptr.cast_const().cast::<T>() })
     }
 
-    /// Borrows row `row` mutably (`None` if out of bounds or absent on an optional column).
+    /// Borrows row `row` mutably (`None` if out of bounds, null, or misaligned for non-ZST `T`).
     #[inline]
     pub fn get_mut(&mut self, row: usize) -> Option<&mut T> {
         if row >= self.len {
@@ -1013,8 +998,12 @@ impl<'a, T: AbiPod> SparseRowsMut<'a, T> {
             // SAFETY: Zero-sized `T: AbiPod` may be mutably referenced via `NonNull::dangling()`.
             return Some(unsafe { core::ptr::NonNull::<T>::dangling().as_mut() });
         }
-        // SAFETY: `from_raw_parts` verified alignment and initialization; tying the borrow to
-        // `&mut self` guarantees at most one `&mut T` exists at any instant.
+        if !(row_ptr as usize).is_multiple_of(core::mem::align_of::<T>()) {
+            return None;
+        }
+        // SAFETY: Verified `row_ptr` is non-null and aligned to `T`; caller contract guarantees
+        // initialization, and tying the borrow to `&mut self` guarantees at most one `&mut T`
+        // exists at any instant.
         Some(unsafe { &mut *row_ptr.cast::<T>() })
     }
 
@@ -2359,9 +2348,20 @@ impl<'a> ValidatedIter<'a> {
     /// Verifies that the host registered the `"bam.v0.<M>.non_pod_message"` custom symbol for `M`,
     /// confirming non-POD message wire compatibility before marshaling.
     fn verify_non_pod_message_marker<M: ModComponent>(&self) -> Result<(), FfiResult> {
-        let marker_sym = CString::new(format!("bam.v0.{}.non_pod_message", M::CANONICAL_NAME))
-            .map_err(|_| FfiResult::TYPE_MISMATCH)?;
-        let Ok(ptr) = self.host().resolve_custom_symbol(&marker_sym) else {
+        let host = self.host();
+        let Ok(ptr) = host.cached_symbol_lookup(
+            (
+                core::any::TypeId::of::<M>(),
+                crate::host::symbol_cache_kind::NON_POD_MESSAGE_MARKER,
+            ),
+            || {
+                let marker_sym =
+                    CString::new(format!("bam.v0.{}.non_pod_message", M::CANONICAL_NAME))
+                        .map_err(|_| FfiResult::TYPE_MISMATCH)?;
+                host.resolve_custom_symbol(&marker_sym)
+                    .map_err(|_| FfiResult::TYPE_MISMATCH)
+            },
+        ) else {
             return Err(FfiResult::TYPE_MISMATCH);
         };
         if ptr.is_null() {
@@ -2414,19 +2414,35 @@ impl<'a> ValidatedIter<'a> {
             sink_ctx: *mut c_void,
         ) -> FfiResult;
 
-        let export_sym_name = CString::new(format!("bam.v0.{}.export_fields", M::CANONICAL_NAME))
-            .map_err(|_| FfiResult::INVALID_ARGUMENT)?;
-        let host_export_ptr = self.host().resolve_custom_symbol(&export_sym_name)?;
+        let host = self.host();
+        let host_export_ptr = host.cached_symbol_lookup(
+            (
+                core::any::TypeId::of::<M>(),
+                crate::host::symbol_cache_kind::HOST_EXPORT_FIELDS,
+            ),
+            || {
+                let export_sym_name =
+                    CString::new(format!("bam.v0.{}.export_fields", M::CANONICAL_NAME))
+                        .map_err(|_| FfiResult::INVALID_ARGUMENT)?;
+                host.resolve_custom_symbol(&export_sym_name)
+            },
+        )?;
         if host_export_ptr.is_null() {
             return Err(FfiResult::UNSUPPORTED);
         }
         // SAFETY: Host registered `"bam.v0.<M>.export_fields"` with the exact witness `ExportFieldsFn` ABI.
         let host_export_fn: ExportFieldsFn = unsafe { core::mem::transmute(host_export_ptr) };
 
-        let guest_import_sym = format!("bam.v0.{}.import_field", M::CANONICAL_NAME);
-        let Some(guest_import_ptr) = M::resolve_symbol(&guest_import_sym) else {
-            return Err(FfiResult::UNSUPPORTED);
-        };
+        let guest_import_ptr = host.cached_symbol_lookup(
+            (
+                core::any::TypeId::of::<M>(),
+                crate::host::symbol_cache_kind::GUEST_IMPORT_FIELD,
+            ),
+            || {
+                let guest_import_sym = format!("bam.v0.{}.import_field", M::CANONICAL_NAME);
+                M::resolve_symbol(&guest_import_sym).ok_or(FfiResult::UNSUPPORTED)
+            },
+        )?;
         if guest_import_ptr.is_null() {
             return Err(FfiResult::UNSUPPORTED);
         }
@@ -2527,20 +2543,25 @@ impl<'a> ValidatedIter<'a> {
             sink_ctx: *mut c_void,
         ) -> FfiResult;
 
-        let export_sym = format!("bam.v0.{}.export_fields", M::CANONICAL_NAME);
-        let Some(export_ptr) = M::resolve_symbol(&export_sym) else {
-            return FfiResult::UNSUPPORTED;
+        let host = self.host();
+        let export_ptr = match host.cached_symbol_lookup(
+            (
+                core::any::TypeId::of::<M>(),
+                crate::host::symbol_cache_kind::GUEST_EXPORT_FIELDS,
+            ),
+            || {
+                let export_sym = format!("bam.v0.{}.export_fields", M::CANONICAL_NAME);
+                M::resolve_symbol(&export_sym).ok_or(FfiResult::UNSUPPORTED)
+            },
+        ) {
+            Ok(ptr) if !ptr.is_null() => ptr,
+            Ok(_) => return FfiResult::UNSUPPORTED,
+            Err(err) => return err,
         };
-        if export_ptr.is_null() {
-            return FfiResult::UNSUPPORTED;
-        }
         // SAFETY: `M::symbols()` exports `"bam.v0.<M>.export_fields"` with `ExportFieldsFn` ABI.
         let export_fn: ExportFieldsFn = unsafe { core::mem::transmute(export_ptr) };
 
-        let mut builder = PacketBuilder {
-            buf: vec![0u8; 4],
-            field_count: 0,
-        };
+        let mut builder = PacketBuilder::new();
         // SAFETY: `msg` is a valid `&M` and `builder` stays pinned on the stack across `export_fn`.
         let status = unsafe {
             export_fn(
@@ -2552,17 +2573,11 @@ impl<'a> ValidatedIter<'a> {
         if !status.is_ok() {
             return status;
         }
-        builder.buf[0..4].copy_from_slice(&builder.field_count.to_le_bytes());
+        builder.buf.as_mut_slice()[0..4].copy_from_slice(&builder.field_count.to_le_bytes());
+        let packet = builder.buf.as_slice();
         // SAFETY: `self.raw` is active, `validate_non_pod_message_info` verified `MESSAGE_WRITE`,
-        // and `builder.buf` holds the serialized witness packet of `builder.buf.len()` bytes.
-        unsafe {
-            send_fn(
-                self.raw,
-                term_index,
-                builder.buf.as_ptr(),
-                builder.buf.len(),
-            )
-        }
+        // and `packet` holds the serialized witness packet of `packet.len()` bytes.
+        unsafe { send_fn(self.raw, term_index, packet.as_ptr(), packet.len()) }
     }
 
     /// Reads the synthesized per-chunk [`AccessMode::HAS`] boolean presence indicator for
@@ -3072,10 +3087,92 @@ pub(crate) unsafe extern "C" fn forward_field(
     })
 }
 
+/// Hybrid stack/heap byte buffer for witness field packets, avoiding heap allocation for small
+/// messages (up to 256 bytes) before spilling seamlessly into a `Vec<u8>`.
+pub(crate) struct PacketBuf {
+    stack: [u8; 256],
+    stack_len: usize,
+    heap: Vec<u8>,
+}
+
+impl PacketBuf {
+    /// Creates a packet buffer initialized with 4 zeroed header bytes for `field_count`.
+    #[inline]
+    pub(crate) const fn with_header() -> Self {
+        Self {
+            stack: [0u8; 256],
+            stack_len: 4,
+            heap: Vec::new(),
+        }
+    }
+
+    /// Appends `bytes` to the stack buffer while it fits, spilling into `heap` on overflow.
+    #[inline]
+    pub(crate) fn extend_from_slice(&mut self, bytes: &[u8]) {
+        if self.heap.is_empty() {
+            if let Some(new_len) = self.stack_len.checked_add(bytes.len())
+                && new_len <= self.stack.len()
+            {
+                self.stack[self.stack_len..new_len].copy_from_slice(bytes);
+                self.stack_len = new_len;
+                return;
+            }
+            self.heap
+                .reserve(self.stack_len.saturating_add(bytes.len()));
+            self.heap.extend_from_slice(&self.stack[..self.stack_len]);
+            self.heap.extend_from_slice(bytes);
+        } else {
+            self.heap.extend_from_slice(bytes);
+        }
+    }
+
+    /// Returns the written packet bytes as a contiguous slice.
+    #[inline]
+    pub(crate) fn as_slice(&self) -> &[u8] {
+        if self.heap.is_empty() {
+            &self.stack[..self.stack_len]
+        } else {
+            self.heap.as_slice()
+        }
+    }
+
+    /// Returns the written packet bytes as a mutable contiguous slice.
+    #[inline]
+    pub(crate) fn as_mut_slice(&mut self) -> &mut [u8] {
+        if self.heap.is_empty() {
+            &mut self.stack[..self.stack_len]
+        } else {
+            self.heap.as_mut_slice()
+        }
+    }
+
+    /// Returns the number of bytes currently written to the packet buffer.
+    #[cfg_attr(not(kani), allow(dead_code))]
+    #[inline]
+    pub(crate) fn len(&self) -> usize {
+        if self.heap.is_empty() {
+            self.stack_len
+        } else {
+            self.heap.len()
+        }
+    }
+}
+
 /// Accumulator serializing exported `ModComponent` fields into a length-prefixed wire packet.
 pub(crate) struct PacketBuilder {
-    pub(crate) buf: Vec<u8>,
+    pub(crate) buf: PacketBuf,
     pub(crate) field_count: u32,
+}
+
+impl PacketBuilder {
+    /// Creates a new [`PacketBuilder`] initialized with a 4-byte zeroed `field_count` header.
+    #[inline]
+    pub(crate) const fn new() -> Self {
+        Self {
+            buf: PacketBuf::with_header(),
+            field_count: 0,
+        }
+    }
 }
 
 /// C-ABI field-sink callback invoked by `M::export_fields` to append one encoded field to `PacketBuilder`.

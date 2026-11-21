@@ -1,6 +1,6 @@
 //! Idiomatic prelude for Rust guest mods (`use bamabi_guest::prelude::*;`).
 
-pub use bamabi_guest_sys::SpawnEntry;
+pub use bamabi_guest_sys::{SpawnEntry, TypedComponent};
 pub use bamabi_sys::{
     ABI_VERSION, AbiPod, AccessMode, BAM_COMPONENT_FLAG_IMMUTABLE, BAM_COMPONENT_FLAG_SPARSE_SET,
     BAM_COMPONENT_FLAG_SUMMARY_TICK, BAM_DISABLED_NAME, BAM_LOG_DEBUG, BAM_LOG_ERROR, BAM_LOG_INFO,

@@ -3,7 +3,7 @@
 use core::ffi::{CStr, c_void};
 
 use bamabi_guest_sys::{
-    GuestInstance, Host, PreparedRunIf, SystemRegistrationConfig, ValidatedLoadCtx,
+    GuestInstance, Host, PreparedRunIf, SystemRegistrationConfig, TypedComponent, ValidatedLoadCtx,
     ValidatedSystemInvocation, resolve_component, resolve_mod_component,
 };
 use bamabi_sys::{
@@ -351,6 +351,16 @@ impl<'a> GuestApp<'a> {
         resolve_guest_component::<T>(self.instance.host(), self.instance.manifest_name())
     }
 
+    /// Resolves `T: GuestComponent` and validates its registered layout against `T` into a
+    /// [`TypedComponent<T>`].
+    #[inline]
+    pub fn resolve_component_typed<T: GuestComponent>(
+        &self,
+    ) -> Result<TypedComponent<T>, FfiResult> {
+        let handle = self.resolve_component::<T>()?;
+        TypedComponent::validate(self.host(), handle)
+    }
+
     /// Resolves a [`BamComponent`] handle by explicit `name` and/or `uuid`.
     #[inline]
     pub fn resolve_component_named(
@@ -369,6 +379,16 @@ impl<'a> GuestApp<'a> {
     #[inline]
     pub fn register_component<T: GuestComponent>(&mut self) -> Result<BamComponent, FfiResult> {
         self.register_component_with_flags::<T>(T::FLAGS)
+    }
+
+    /// Registers `T: GuestComponent` on the host `World` and validates its registered layout into
+    /// a [`TypedComponent<T>`].
+    #[inline]
+    pub fn register_component_typed<T: GuestComponent>(
+        &mut self,
+    ) -> Result<TypedComponent<T>, FfiResult> {
+        let handle = self.register_component::<T>()?;
+        TypedComponent::validate(self.host(), handle)
     }
 
     /// Registers `T: GuestComponent` with explicit `BAM_COMPONENT_FLAG_*` flags (e.g.

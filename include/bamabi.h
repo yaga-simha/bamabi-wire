@@ -67,6 +67,8 @@ extern "C" {
 #  define BAM_RESTRICT __restrict
 #elif !defined(__cplusplus) && defined(__STDC_VERSION__) && (__STDC_VERSION__ >= 199901L)
 #  define BAM_RESTRICT restrict
+#elif defined(__GNUC__) || defined(__clang__)
+#  define BAM_RESTRICT __restrict__
 #else
 #  define BAM_RESTRICT
 #endif

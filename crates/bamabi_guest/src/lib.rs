@@ -331,7 +331,7 @@ pub mod macros;
 pub mod prelude;
 pub mod raw;
 
-pub use bamabi_guest_sys::SpawnEntry;
+pub use bamabi_guest_sys::{SpawnEntry, TypedComponent};
 pub use bamabi_sys::{
     ABI_VERSION, ABI_VERSION_MAJOR, ABI_VERSION_MINOR, ABI_VERSION_PATCH, AbiPod, AccessMode,
     BAM_COMPONENT_FLAG_IMMUTABLE, BAM_COMPONENT_FLAG_SPARSE_SET, BAM_COMPONENT_FLAG_SUMMARY_TICK,

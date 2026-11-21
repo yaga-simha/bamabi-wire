@@ -1018,19 +1018,15 @@ proptest! {
         let mut ptrs_ro: Vec<*const u8> = Vec::with_capacity(len);
         let mut ptrs_mut: Vec<*mut u8> = Vec::with_capacity(len);
         let mut expected_vals: Vec<Option<usize>> = Vec::with_capacity(len);
-        let mut has_null = false;
-        let mut has_misaligned_u64 = false;
 
         for plan in &row_plans {
             match *plan {
                 RowPtrPlan::Null => {
-                    has_null = true;
                     ptrs_ro.push(core::ptr::null());
                     ptrs_mut.push(core::ptr::null_mut());
                     expected_vals.push(None);
                 }
                 RowPtrPlan::Misaligned(offset) => {
-                    has_misaligned_u64 = true;
                     // SAFETY: `offset` in `1..8` stays inside the 16-u64 `backing` allocation.
                     let p = unsafe { backing.as_mut_ptr().cast::<u8>().add(offset) };
                     ptrs_ro.push(p.cast_const());
@@ -1094,77 +1090,69 @@ proptest! {
                 prop_assert!(rw.is_none());
             }
             OuterArrayPlan::Valid if use_zst => {
-                let expect_ok = len == 0 || allow_null_rows || !has_null;
                 // SAFETY: `ptrs_ro` is valid for `len` pointers; `ZstPod` never dereferences row pointers.
-                let ro = unsafe { SparseRows::<ZstPod>::from_raw_parts(ptrs_ro.as_ptr(), len, allow_null_rows) };
-                prop_assert_eq!(ro.is_some(), expect_ok);
-                if let Some(rows) = ro {
-                    prop_assert_eq!(rows.len(), len);
-                    let mut present = 0usize;
-                    for (i, plan) in row_plans.iter().enumerate() {
-                        let is_present = !matches!(plan, RowPtrPlan::Null);
-                        prop_assert_eq!(rows.get(i).is_some(), is_present);
-                        if is_present {
-                            present += 1;
-                        }
+                let rows = unsafe { SparseRows::<ZstPod>::from_raw_parts(ptrs_ro.as_ptr(), len, allow_null_rows) }
+                    .expect("valid outer pointer array must construct SparseRows");
+                prop_assert_eq!(rows.len(), len);
+                let mut present = 0usize;
+                for (i, plan) in row_plans.iter().enumerate() {
+                    let is_present = !matches!(plan, RowPtrPlan::Null);
+                    prop_assert_eq!(rows.get(i).is_some(), is_present);
+                    if is_present {
+                        present += 1;
                     }
-                    prop_assert!(rows.get(len).is_none());
-                    prop_assert_eq!(rows.iter().count(), present);
                 }
+                prop_assert!(rows.get(len).is_none());
+                prop_assert_eq!(rows.iter().count(), present);
 
                 // SAFETY: `ptrs_mut` is valid for `len` pointers; `ZstPod` never dereferences row pointers.
-                let rw = unsafe { SparseRowsMut::<ZstPod>::from_raw_parts(ptrs_mut.as_ptr(), len, allow_null_rows) };
-                prop_assert_eq!(rw.is_some(), expect_ok);
-                if let Some(mut rows_mut) = rw {
-                    let mut visited = 0usize;
-                    rows_mut.for_each_mut(|_, _| visited += 1);
-                    let expected_present = row_plans.iter().filter(|p| !matches!(p, RowPtrPlan::Null)).count();
-                    prop_assert_eq!(visited, expected_present);
-                }
+                let mut rows_mut = unsafe { SparseRowsMut::<ZstPod>::from_raw_parts(ptrs_mut.as_ptr(), len, allow_null_rows) }
+                    .expect("valid outer pointer array must construct SparseRowsMut");
+                let mut visited = 0usize;
+                rows_mut.for_each_mut(|_, _| visited += 1);
+                let expected_present = row_plans.iter().filter(|p| !matches!(p, RowPtrPlan::Null)).count();
+                prop_assert_eq!(visited, expected_present);
             }
             OuterArrayPlan::Valid => {
-                let expect_ok = len == 0 || (!has_misaligned_u64 && (allow_null_rows || !has_null));
-                // SAFETY: `ptrs_ro` is valid for `len` pointers, and `from_raw_parts` validates
-                // alignment/nulls before any row dereference.
-                let ro = unsafe { SparseRows::<u64>::from_raw_parts(ptrs_ro.as_ptr(), len, allow_null_rows) };
-                prop_assert_eq!(ro.is_some(), expect_ok);
-                if let Some(rows) = ro {
-                    prop_assert_eq!(rows.len(), len);
-                    let mut iter_vals = Vec::new();
-                    for (i, slot_opt) in expected_vals.iter().enumerate() {
-                        match slot_opt {
-                            Some(slot) => {
-                                let expected = backing[*slot];
-                                prop_assert_eq!(rows.get(i).copied(), Some(expected));
-                                prop_assert_eq!(rows[i], expected);
-                                iter_vals.push(expected);
-                            }
-                            None => prop_assert_eq!(rows.get(i), None),
+                // SAFETY: `ptrs_ro` is valid for `len` pointers, and `get` validates per-row
+                // alignment/nulls lazily before any row dereference.
+                let rows = unsafe { SparseRows::<u64>::from_raw_parts(ptrs_ro.as_ptr(), len, allow_null_rows) }
+                    .expect("valid outer pointer array must construct SparseRows");
+                prop_assert_eq!(rows.len(), len);
+                let mut iter_vals = Vec::new();
+                for (i, slot_opt) in expected_vals.iter().enumerate() {
+                    match slot_opt {
+                        Some(slot) => {
+                            let expected = backing[*slot];
+                            prop_assert_eq!(rows.get(i).copied(), Some(expected));
+                            prop_assert_eq!(rows[i], expected);
+                            iter_vals.push(expected);
                         }
+                        None => prop_assert_eq!(rows.get(i), None),
                     }
-                    prop_assert!(rows.get(len).is_none());
-                    let actual_iter: Vec<u64> = rows.iter().copied().collect();
-                    prop_assert_eq!(actual_iter, iter_vals);
                 }
+                prop_assert!(rows.get(len).is_none());
+                let actual_iter: Vec<u64> = rows.iter().copied().collect();
+                prop_assert_eq!(actual_iter, iter_vals);
 
-                // SAFETY: `ptrs_mut` is valid for `len` pointers; `SparseRowsMut` lends one `&mut u64`
-                // at a time so duplicate row pointers remain sound.
-                let rw = unsafe { SparseRowsMut::<u64>::from_raw_parts(ptrs_mut.as_ptr(), len, allow_null_rows) };
-                prop_assert_eq!(rw.is_some(), expect_ok);
-                if let Some(mut rows_mut) = rw {
-                    let mut count = 0usize;
-                    rows_mut.for_each_mut(|_, v| {
-                        *v = v.wrapping_add(1);
-                        count += 1;
-                    });
-                    let expected_present = expected_vals.iter().filter(|o| o.is_some()).count();
-                    prop_assert_eq!(count, expected_present);
-                    for (i, slot_opt) in expected_vals.iter().enumerate() {
-                        if let Some(slot) = slot_opt {
-                            prop_assert_eq!(rows_mut.get(i).copied(), Some(backing[*slot]));
-                        } else {
-                            prop_assert!(rows_mut.get_mut(i).is_none());
-                        }
+                // SAFETY: `ptrs_mut` is valid for `len` pointers; `SparseRowsMut` validates per-row
+                // alignment/nulls lazily and lends one `&mut u64` at a time so duplicate row pointers
+                // remain sound.
+                let mut rows_mut = unsafe { SparseRowsMut::<u64>::from_raw_parts(ptrs_mut.as_ptr(), len, allow_null_rows) }
+                    .expect("valid outer pointer array must construct SparseRowsMut");
+                let mut count = 0usize;
+                rows_mut.for_each_mut(|_, v| {
+                    *v = v.wrapping_add(1);
+                    count += 1;
+                });
+                let expected_present = expected_vals.iter().filter(|o| o.is_some()).count();
+                prop_assert_eq!(count, expected_present);
+                for (i, slot_opt) in expected_vals.iter().enumerate() {
+                    if let Some(slot) = slot_opt {
+                        prop_assert_eq!(rows_mut.get(i).copied(), Some(backing[*slot]));
+                    } else {
+                        prop_assert!(rows_mut.get(i).is_none());
+                        prop_assert!(rows_mut.get_mut(i).is_none());
                     }
                 }
             }

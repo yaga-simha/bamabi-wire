@@ -61,6 +61,9 @@ unsafe fn drop_boxed<T>(ptr: *mut c_void) {
 /// Thread-safe append-only tracker for runtime observer/closure allocations created after
 /// `bamabi_init` (such as `ValidatedCommands::observe`), owned by [`GuestInstance`] and
 /// drained in LIFO order during `bamabi_shutdown` prior to init-time allocations.
+///
+/// Also hosts the per-instance `"bam.v0.*"` resolved symbol/VTable cache shared across all
+/// [`Host`] handles belonging to the same [`GuestInstance`].
 pub(crate) struct RuntimeAllocTracker {
     #[cfg(not(kani))]
     pinned_host: AtomicPtr<Host>,
@@ -70,6 +73,8 @@ pub(crate) struct RuntimeAllocTracker {
     allocations: std::sync::Mutex<Vec<ErasedAllocation>>,
     #[cfg(kani)]
     allocations: core::cell::RefCell<Vec<ErasedAllocation>>,
+    #[cfg(not(kani))]
+    symbol_cache: std::sync::Mutex<HashMap<(core::any::TypeId, u8), GuestSymbolPtr>>,
 }
 
 #[cfg(kani)]
@@ -88,7 +93,37 @@ impl RuntimeAllocTracker {
             allocations: std::sync::Mutex::new(Vec::new()),
             #[cfg(kani)]
             allocations: core::cell::RefCell::new(Vec::new()),
+            #[cfg(not(kani))]
+            symbol_cache: std::sync::Mutex::new(HashMap::new()),
         }
+    }
+
+    /// Looks up a cached `"bam.v0.*"` symbol or VTable pointer keyed by `(TypeId, kind)`, calling
+    /// `resolve` outside the lock on a cache miss and storing only non-null `Ok` pointers.
+    #[cfg(not(kani))]
+    pub(crate) fn cached_symbol_lookup(
+        &self,
+        key: (core::any::TypeId, u8),
+        resolve: impl FnOnce() -> Result<*const c_void, FfiResult>,
+    ) -> Result<*const c_void, FfiResult> {
+        {
+            let guard = self
+                .symbol_cache
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if let Some(&cached) = guard.get(&key) {
+                return Ok(cached.0);
+            }
+        }
+        let ptr = resolve()?;
+        if !ptr.is_null() {
+            let mut guard = self
+                .symbol_cache
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            guard.insert(key, GuestSymbolPtr(ptr));
+        }
+        Ok(ptr)
     }
 
     /// Binds the owning [`GuestInstance`]'s stable heap-pinned [`Host`] pointer so runtime

@@ -30,6 +30,8 @@ pub const CPP17_HEADER: &str = r#"#ifndef BAMABI_HPP
 #ifndef BAM_RESTRICT
 #  if defined(_MSC_VER)
 #    define BAM_RESTRICT __restrict
+#  elif defined(__GNUC__) || defined(__clang__)
+#    define BAM_RESTRICT __restrict__
 #  else
 #    define BAM_RESTRICT
 #  endif
@@ -2141,7 +2143,13 @@ mod tests {
         assert!(h_content.contains(
             "#elif !defined(__cplusplus) && defined(__STDC_VERSION__) && (__STDC_VERSION__ >= 199901L)\n#  define BAM_RESTRICT restrict\n"
         ));
+        assert!(h_content.contains(
+            "#elif defined(__GNUC__) || defined(__clang__)\n#  define BAM_RESTRICT __restrict__\n"
+        ));
         assert!(CPP17_HEADER.contains("#ifndef BAM_RESTRICT"));
+        assert!(CPP17_HEADER.contains(
+            "#  elif defined(__GNUC__) || defined(__clang__)\n#    define BAM_RESTRICT __restrict__\n"
+        ));
         assert!(CPP17_HEADER.contains("T* BAM_RESTRICT dst"));
         assert!(CPP17_HEADER.contains(
             "inline constexpr std::size_t STRUCT_SIZE = offsetof(BamHostApi, struct_size);"

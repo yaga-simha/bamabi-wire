@@ -30,6 +30,22 @@ use crate::{
 /// Required namespace prefix for custom game symbols looked up via `BamHostApi::get_proc_address`.
 pub const CUSTOM_SYMBOL_PREFIX: &[u8] = b"bam.v0.";
 
+/// Per-instance `"bam.v0.*"` symbol cache kind discriminants paired with `TypeId`.
+pub(crate) mod symbol_cache_kind {
+    /// Manifest-qualified `"bam.v0.<manifest>::<Name>.vtable"` host symbol.
+    pub(crate) const VTABLE_QUALIFIED: u8 = 1;
+    /// Unqualified canonical `"bam.v0.<Name>.vtable"` host symbol.
+    pub(crate) const VTABLE_CANONICAL: u8 = 2;
+    /// Host `"bam.v0.<M>.non_pod_message"` marker symbol.
+    pub(crate) const NON_POD_MESSAGE_MARKER: u8 = 3;
+    /// Host `"bam.v0.<M>.export_fields"` witness symbol.
+    pub(crate) const HOST_EXPORT_FIELDS: u8 = 4;
+    /// Guest `"bam.v0.<M>.import_field"` witness symbol.
+    pub(crate) const GUEST_IMPORT_FIELD: u8 = 5;
+    /// Guest `"bam.v0.<M>.export_fields"` witness symbol.
+    pub(crate) const GUEST_EXPORT_FIELDS: u8 = 6;
+}
+
 /// `Send + Sync` newtype wrapping the opaque world-scoped `*const BamHostCtx` pointer.
 ///
 /// Exists so [`Host`] can be embedded in `Send` guest system/observer closures while keeping raw
@@ -317,6 +333,34 @@ impl Host {
         // `RuntimeAllocTracker` inside `GuestInstance` outliving `&self`.
         let ptr = unsafe { (&*self.runtime_allocs_ptr.0).pinned_host_ptr() };
         (!ptr.is_null()).then_some(ptr)
+    }
+
+    /// Looks up a cached `"bam.v0.*"` symbol or VTable pointer keyed by `(TypeId, kind)` on the
+    /// owning [`GuestInstance`], invoking `resolve` on a cache miss and storing only non-null `Ok`
+    /// pointers.
+    ///
+    /// When this [`Host`] was constructed standalone without a [`GuestInstance`] (or under
+    /// `#[cfg(kani)]`), `resolve` is called directly without caching.
+    #[inline]
+    pub(crate) fn cached_symbol_lookup(
+        &self,
+        key: (core::any::TypeId, u8),
+        resolve: impl FnOnce() -> Result<*const c_void, FfiResult>,
+    ) -> Result<*const c_void, FfiResult> {
+        #[cfg(kani)]
+        {
+            let _ = key;
+            resolve()
+        }
+        #[cfg(not(kani))]
+        {
+            if self.runtime_allocs_ptr.0.is_null() {
+                return resolve();
+            }
+            // SAFETY: `with_runtime_allocs` guarantees `runtime_allocs_ptr.0` points to a live
+            // `RuntimeAllocTracker` inside `GuestInstance` outliving `&self`.
+            unsafe { (&*self.runtime_allocs_ptr.0).cached_symbol_lookup(key, resolve) }
+        }
     }
 
     /// Returns the owning mod instance's manifest name (`""` when constructed standalone via

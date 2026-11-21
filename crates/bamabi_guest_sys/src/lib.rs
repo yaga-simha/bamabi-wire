@@ -254,7 +254,7 @@ mod kani_proofs;
 
 pub use bamabi_sys::{BamSystemCtx, FfiBool, FfiResult};
 
-pub use commands::{SpawnBatchColumn, SpawnEntry, ValidatedCommands};
+pub use commands::{SpawnBatchColumn, SpawnEntry, TypedComponent, ValidatedCommands};
 pub use component::{
     PodComponentHooks, generic_drop_trampoline, migrate_component_column_pod,
     migrate_component_column_raw, migrate_mod_component_column, migrate_pod_component_column,

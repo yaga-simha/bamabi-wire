@@ -86,6 +86,40 @@ impl<'cmd, 'a> GuestEntityCommands<'cmd, 'a> {
         self
     }
 
+    /// Queues deferred insertion of `value` (`T: AbiPod`) under an init-validated
+    /// [`crate::TypedComponent`] without a per-command `component_layout_info` FFI round-trip.
+    #[inline]
+    pub fn insert_typed<T: AbiPod>(
+        &mut self,
+        component: crate::TypedComponent<T>,
+        value: &T,
+    ) -> &mut Self {
+        if self.first_error.is_none() {
+            let status = self.commands.insert_typed(self.entity, component, value);
+            self.record(status);
+        }
+        self
+    }
+
+    /// Queues deferred conditional insertion (`InsertMode::Keep`) of `value` (`T: AbiPod`) under
+    /// an init-validated [`crate::TypedComponent`] without a per-command `component_layout_info`
+    /// FFI round-trip.
+    #[inline]
+    pub fn insert_if_new_typed<T: AbiPod>(
+        &mut self,
+        component: crate::TypedComponent<T>,
+        value: &T,
+    ) -> &mut Self {
+        if self.first_error.is_none()
+            && let Err(err) = self
+                .commands
+                .insert_if_new_typed(self.entity, component, value)
+        {
+            self.record(err);
+        }
+        self
+    }
+
     /// Resolves `T: GuestComponent` and queues deferred insertion of `value`.
     #[inline]
     pub fn insert_component<T: GuestComponent>(&mut self, value: &T) -> &mut Self {

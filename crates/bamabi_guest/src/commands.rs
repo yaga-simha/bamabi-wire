@@ -5,8 +5,8 @@ use core::{
     ops::{Deref, DerefMut},
 };
 
-pub use bamabi_guest_sys::SpawnBatchColumn;
 use bamabi_guest_sys::{Host, SpawnEntry, ValidatedCommands, resolve_component};
+pub use bamabi_guest_sys::{SpawnBatchColumn, TypedComponent};
 use bamabi_sys::{
     AbiPod, BamCommands, BamComponent, BamTermDesc, ComponentUuid, FfiEntity, FfiResult,
 };
@@ -104,6 +104,18 @@ impl<'a> GuestCommands<'a> {
         value: &T,
     ) -> FfiResult {
         self.inner.insert(entity, component, value)
+    }
+
+    /// Queues deferred insertion of `value` (`T: AbiPod`) onto `entity` using an init-validated
+    /// [`TypedComponent<T>`] handle.
+    #[inline]
+    pub fn insert_typed<T: AbiPod>(
+        &mut self,
+        entity: FfiEntity,
+        component: TypedComponent<T>,
+        value: &T,
+    ) -> FfiResult {
+        self.inner.insert_typed(entity, component, value)
     }
 
     /// Queues deferred insertion of host-constructed `T::default()` for pre-resolved `component`
@@ -237,6 +249,19 @@ impl<'a> GuestCommands<'a> {
         value: &T,
     ) -> Result<(), FfiResult> {
         let status = self.inner.insert_if_new(entity, component, value);
+        if status.is_ok() { Ok(()) } else { Err(status) }
+    }
+
+    /// Queues a deferred conditional insertion (`InsertMode::Keep`) of `value` (`T: AbiPod`) onto
+    /// `entity` using an init-validated [`TypedComponent<T>`] handle.
+    #[inline]
+    pub fn insert_if_new_typed<T: AbiPod>(
+        &mut self,
+        entity: FfiEntity,
+        component: TypedComponent<T>,
+        value: &T,
+    ) -> Result<(), FfiResult> {
+        let status = self.inner.insert_if_new_typed(entity, component, value);
         if status.is_ok() { Ok(()) } else { Err(status) }
     }
 

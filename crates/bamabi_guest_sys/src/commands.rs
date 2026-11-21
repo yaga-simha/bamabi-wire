@@ -18,6 +18,100 @@ use crate::{
 /// Stack scratch capacity before falling back to a temporary `Vec` in [`ValidatedCommands::spawn`].
 const INLINE_SPAWN_CAP: usize = 16;
 
+/// Init-validated component handle statically bound to `T: AbiPod`.
+///
+/// Constructed via [`TypedComponent::validate`] (which verifies the handle and its host-registered
+/// `(size, align)` once against `Host::component_layout_info`) or [`TypedComponent::from_raw_unchecked`],
+/// enabling hot-path commands (`SpawnEntry::typed`, `ValidatedCommands::insert_typed`,
+/// `ValidatedCommands::insert_if_new_typed`) to skip redundant per-command `component_layout_info`
+/// FFI round-trips.
+#[repr(transparent)]
+pub struct TypedComponent<T: AbiPod> {
+    handle: BamComponent,
+    _marker: PhantomData<fn() -> T>,
+}
+
+impl<T: AbiPod> Copy for TypedComponent<T> {}
+
+impl<T: AbiPod> Clone for TypedComponent<T> {
+    #[inline]
+    fn clone(&self) -> Self {
+        *self
+    }
+}
+
+impl<T: AbiPod> core::fmt::Debug for TypedComponent<T> {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("TypedComponent")
+            .field("handle", &self.handle)
+            .finish()
+    }
+}
+
+impl<T: AbiPod> PartialEq for TypedComponent<T> {
+    #[inline]
+    fn eq(&self, other: &Self) -> bool {
+        self.handle == other.handle
+    }
+}
+
+impl<T: AbiPod> Eq for TypedComponent<T> {}
+
+impl<T: AbiPod> core::hash::Hash for TypedComponent<T> {
+    #[inline]
+    fn hash<H: core::hash::Hasher>(&self, state: &mut H) {
+        self.handle.hash(state);
+    }
+}
+
+impl<T: AbiPod> TypedComponent<T> {
+    /// Validates `handle` against `host.component_layout_info(handle)`, verifying `handle.is_valid()`
+    /// and that the registered `(size, align)` matches `T`.
+    ///
+    /// Fails closed with [`FfiResult::INVALID_COMPONENT`], [`FfiResult::TYPE_MISMATCH`], or any
+    /// host error (including [`FfiResult::UNSUPPORTED`] on older ABI `0.2` hosts).
+    #[inline]
+    pub fn validate(host: &Host, handle: BamComponent) -> Result<Self, FfiResult> {
+        if !handle.is_valid() {
+            return Err(FfiResult::INVALID_COMPONENT);
+        }
+        let info = host.component_layout_info(handle)?;
+        if info.size != core::mem::size_of::<T>() || info.align != core::mem::align_of::<T>() {
+            return Err(FfiResult::TYPE_MISMATCH);
+        }
+        Ok(Self {
+            handle,
+            _marker: PhantomData,
+        })
+    }
+
+    /// Constructs a [`TypedComponent<T>`] from a raw [`BamComponent`] handle without querying
+    /// `Host::component_layout_info`.
+    ///
+    /// # Safety
+    /// `handle` must be a valid host-registered component handle whose registered byte size and
+    /// alignment match `core::mem::size_of::<T>()` and `core::mem::align_of::<T>()`.
+    #[inline]
+    pub const unsafe fn from_raw_unchecked(handle: BamComponent) -> Self {
+        Self {
+            handle,
+            _marker: PhantomData,
+        }
+    }
+
+    /// Returns the underlying [`BamComponent`] handle.
+    #[inline]
+    pub const fn handle(self) -> BamComponent {
+        self.handle
+    }
+
+    /// Returns the underlying [`BamComponent`] handle (alias for [`Self::handle`]).
+    #[inline]
+    pub const fn raw(self) -> BamComponent {
+        self.handle
+    }
+}
+
 /// Type-erased `(BamComponent, *const u8)` pair for batched single-archetype [`ValidatedCommands::spawn`].
 ///
 /// Constructed safely via [`SpawnEntry::new`] / [`SpawnEntry::marker`] carrying exact byte layout
@@ -41,6 +135,19 @@ impl<'a> SpawnEntry<'a> {
             data_ptr: core::ptr::from_ref(value).cast::<u8>(),
             size: Some(core::mem::size_of::<T>()),
             align: Some(core::mem::align_of::<T>()),
+            _marker: PhantomData,
+        }
+    }
+
+    /// Binds an init-validated [`TypedComponent<T>`] handle to an `AbiPod` component value for
+    /// batched spawn, skipping the per-call `Host::component_layout_info` FFI round-trip.
+    #[inline]
+    pub const fn typed<T: AbiPod>(component: TypedComponent<T>, value: &'a T) -> Self {
+        Self {
+            component: component.handle(),
+            data_ptr: core::ptr::from_ref(value).cast::<u8>(),
+            size: None,
+            align: None,
             _marker: PhantomData,
         }
     }
@@ -361,19 +468,34 @@ impl<'a> ValidatedCommands<'a> {
         if self.raw.is_null() {
             return Err(FfiResult::NULL_POINTER);
         }
+        if entries.is_empty() {
+            return if persistent {
+                // SAFETY: Empty slices require no component payload pointers.
+                unsafe { self.spawn_persistent_raw(&[], &[]) }
+            } else {
+                self.spawn_empty()
+            };
+        }
         if entries.len() <= INLINE_SPAWN_CAP {
-            let mut comps = [BamComponent::INVALID; INLINE_SPAWN_CAP];
-            let mut ptrs = [core::ptr::null::<u8>(); INLINE_SPAWN_CAP];
+            let mut comps =
+                [const { core::mem::MaybeUninit::<BamComponent>::uninit() }; INLINE_SPAWN_CAP];
+            let mut ptrs =
+                [const { core::mem::MaybeUninit::<*const u8>::uninit() }; INLINE_SPAWN_CAP];
             for (i, entry) in entries.iter().enumerate() {
                 validate_spawn_entry(self.host, entry)?;
-                comps[i] = entry.component;
-                ptrs[i] = entry.data_ptr;
+                comps[i].write(entry.component);
+                ptrs[i].write(entry.data_ptr);
             }
-            let c = &comps[..entries.len()];
-            let p = &ptrs[..entries.len()];
-            // SAFETY: Each safe `SpawnEntry` passed `component_layout_info` validation and covers
-            // its registered layout for the duration of `entries`; raw entries satisfy `from_raw`.
+            // SAFETY: The loop above initialized `comps[0..entries.len()]` and
+            // `ptrs[0..entries.len()]`, `MaybeUninit<T>` is `#[repr(transparent)]`, and each safe
+            // `SpawnEntry` passed `validate_spawn_entry` while raw entries satisfy `from_raw`.
             unsafe {
+                let c = core::slice::from_raw_parts(
+                    comps.as_ptr().cast::<BamComponent>(),
+                    entries.len(),
+                );
+                let p =
+                    core::slice::from_raw_parts(ptrs.as_ptr().cast::<*const u8>(), entries.len());
                 if persistent {
                     self.spawn_persistent_raw(c, p)
                 } else {
@@ -474,6 +596,22 @@ impl<'a> ValidatedCommands<'a> {
         // SAFETY: `value` is a live `&T` (`T: AbiPod`) readable via raw byte copy for `size_of::<T>()`
         // bytes without forming `&[u8]` over any padding bytes.
         unsafe { self.insert_raw(entity, component, data_ptr, data_len) }
+    }
+
+    /// Queues deferred insertion of `value` (`T: AbiPod`) onto `entity` using an init-validated
+    /// [`TypedComponent<T>`] handle without querying `Host::component_layout_info`.
+    #[inline]
+    pub fn insert_typed<T: AbiPod>(
+        &mut self,
+        entity: FfiEntity,
+        component: TypedComponent<T>,
+        value: &T,
+    ) -> FfiResult {
+        let data_ptr = core::ptr::from_ref(value).cast::<u8>();
+        let data_len = core::mem::size_of::<T>();
+        // SAFETY: `component` was validated against `T`'s layout and `value` is a live `&T`
+        // (`T: AbiPod`) readable for `size_of::<T>()` bytes without forming `&[u8]` over padding.
+        unsafe { self.insert_raw(entity, component.handle(), data_ptr, data_len) }
     }
 
     /// Queues deferred raw byte insertion (`data_ptr[0..data_len]`) for `component` onto `entity`.
@@ -776,6 +914,23 @@ impl<'a> ValidatedCommands<'a> {
         let data_len = core::mem::size_of::<T>();
         // SAFETY: `value` is a live `&T` (`T: AbiPod`) readable for `size_of::<T>()` bytes.
         unsafe { self.insert_if_new_raw(entity, component, data_ptr, data_len) }
+    }
+
+    /// Queues deferred conditional insertion of `value` (`T: AbiPod`) onto `entity` only if
+    /// `component` is not already present, using an init-validated [`TypedComponent<T>`] handle
+    /// without querying `Host::component_layout_info`.
+    #[inline]
+    pub fn insert_if_new_typed<T: AbiPod>(
+        &mut self,
+        entity: FfiEntity,
+        component: TypedComponent<T>,
+        value: &T,
+    ) -> FfiResult {
+        let data_ptr = core::ptr::from_ref(value).cast::<u8>();
+        let data_len = core::mem::size_of::<T>();
+        // SAFETY: `component` was validated against `T`'s layout and `value` is a live `&T`
+        // (`T: AbiPod`) readable for `size_of::<T>()` bytes.
+        unsafe { self.insert_if_new_raw(entity, component.handle(), data_ptr, data_len) }
     }
 
     /// Raw deferred conditional insertion (`cmd_insert_if_new`).

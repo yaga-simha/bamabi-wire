@@ -1886,6 +1886,8 @@ pub fn render_c99_header() -> Result<String, String> {
          #  define BAM_RESTRICT __restrict\n\
          #elif !defined(__cplusplus) && defined(__STDC_VERSION__) && (__STDC_VERSION__ >= 199901L)\n\
          #  define BAM_RESTRICT restrict\n\
+         #elif defined(__GNUC__) || defined(__clang__)\n\
+         #  define BAM_RESTRICT __restrict__\n\
          #else\n\
          #  define BAM_RESTRICT\n\
          #endif\n\n\
@@ -3297,6 +3299,9 @@ mod tests {
         assert!(first.contains("#if defined(_MSC_VER)\n#  define BAM_RESTRICT __restrict\n"));
         assert!(first.contains(
             "#elif !defined(__cplusplus) && defined(__STDC_VERSION__) && (__STDC_VERSION__ >= 199901L)\n#  define BAM_RESTRICT restrict\n"
+        ));
+        assert!(first.contains(
+            "#elif defined(__GNUC__) || defined(__clang__)\n#  define BAM_RESTRICT __restrict__\n"
         ));
         assert!(first.contains("#else\n#  define BAM_RESTRICT\n#endif"));
         let slots = host_api_slot_names();

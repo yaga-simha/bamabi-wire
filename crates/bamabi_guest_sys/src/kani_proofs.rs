@@ -1435,9 +1435,9 @@ fn po_g4_dispenser_overlapping_write_then_read_soundness() {
 // PO-G5: `SparseRows` & `SparseRowsMut` Validation & Bounds
 // ============================================================================
 
-/// PO-G5: `SparseRows` and `SparseRowsMut` reject null/misaligned/overflowing outer arrays,
-/// reject null rows when `!allow_null_rows`, reject misaligned non-null rows for non-ZST `u64`,
-/// and provide panic-free `get`/`get_mut` over arbitrary `row: usize`.
+/// PO-G5: `SparseRows` and `SparseRowsMut` reject null/misaligned/overflowing outer arrays in
+/// `O(1)` at construction time, reject null and misaligned non-ZST inner rows lazily in
+/// `get`/`get_mut` without dereferencing, and remain panic-free over arbitrary `row: usize`.
 #[kani::proof]
 #[kani::unwind(6)]
 fn po_g5_sparse_rows_and_mut_validation() {
@@ -1491,37 +1491,44 @@ fn po_g5_sparse_rows_and_mut_validation() {
     let mut_ptrs: [*mut u8; 3] = [p0, p1, p2];
     let ro_ptrs: [*const u8; 3] = [p0.cast_const(), p1.cast_const(), p2.cast_const()];
 
-    let any_misaligned = kind0 == 1 || kind1 == 1 || kind2 == 1;
-    let any_null = kind0 == 0 || kind1 == 0 || kind2 == 0;
-    let expect_ok = !any_misaligned && (allow_null || !any_null);
-
     // SAFETY: `ro_ptrs` is readable for 3 pointers; non-null aligned entries point into `vals`.
-    let ro_res = unsafe { SparseRows::<u64>::from_raw_parts(ro_ptrs.as_ptr(), 3, allow_null) };
-    assert_eq!(ro_res.is_some(), expect_ok);
-    if let Some(rows) = ro_res {
-        let q: usize = kani::any();
-        let got = rows.get(q);
-        match q {
-            0 => assert_eq!(got, (kind0 == 2).then_some(&101)),
-            1 => assert_eq!(got, (kind1 == 2).then_some(&202)),
-            2 => assert_eq!(got, (kind2 == 2).then_some(&303)),
-            _ => {
-                assert!(got.is_none());
-            }
+    let rows = unsafe { SparseRows::<u64>::from_raw_parts(ro_ptrs.as_ptr(), 3, allow_null) }
+        .expect("valid outer pointer array must construct SparseRows");
+    let q: usize = kani::any();
+    let got = rows.get(q);
+    match q {
+        0 => assert_eq!(got, (kind0 == 2).then_some(&101)),
+        1 => assert_eq!(got, (kind1 == 2).then_some(&202)),
+        2 => assert_eq!(got, (kind2 == 2).then_some(&303)),
+        _ => {
+            assert!(got.is_none());
         }
     }
 
     // SAFETY: `mut_ptrs` is readable for 3 pointers; non-null aligned entries point to distinct `vals` elements.
-    let mut_res = unsafe { SparseRowsMut::<u64>::from_raw_parts(mut_ptrs.as_ptr(), 3, allow_null) };
-    assert_eq!(mut_res.is_some(), expect_ok);
-    if let Some(mut rows_mut) = mut_res {
-        let q: usize = kani::any();
-        let got = rows_mut.get_mut(q);
-        if q >= 3 {
-            assert!(got.is_none());
-        } else if let Some(slot) = got {
+    let mut rows_mut =
+        unsafe { SparseRowsMut::<u64>::from_raw_parts(mut_ptrs.as_ptr(), 3, allow_null) }
+            .expect("valid outer pointer array must construct SparseRowsMut");
+    let q_mut: usize = kani::any();
+    let got_mut = rows_mut.get_mut(q_mut);
+    match q_mut {
+        0 if kind0 == 2 => {
+            let slot = got_mut.expect("valid row 0");
             *slot = 777;
-            assert_eq!(rows_mut.get(q), Some(&777));
+            assert_eq!(rows_mut.get(0), Some(&777));
+        }
+        1 if kind1 == 2 => {
+            let slot = got_mut.expect("valid row 1");
+            *slot = 777;
+            assert_eq!(rows_mut.get(1), Some(&777));
+        }
+        2 if kind2 == 2 => {
+            let slot = got_mut.expect("valid row 2");
+            *slot = 777;
+            assert_eq!(rows_mut.get(2), Some(&777));
+        }
+        _ => {
+            assert!(got_mut.is_none());
         }
     }
 
@@ -1536,8 +1543,8 @@ fn po_g5_sparse_rows_and_mut_validation() {
     assert!(zst_rows.get(0).is_some());
     assert!(zst_rows.get(1).is_none());
     assert!(zst_rows.get(2).is_none());
-    kani::cover!(expect_ok);
-    kani::cover!(!expect_ok);
+    kani::cover!(got.is_some());
+    kani::cover!(got.is_none());
 }
 
 // ============================================================================
@@ -3088,10 +3095,7 @@ fn po_g8_non_pod_message_witness_callbacks() {
     }
 
     // 2. `append_field`: null/misaligned ctx, null views, `isize::MAX`/`u32` length & count overflow.
-    let mut builder = PacketBuilder {
-        buf: vec![0u8; 4],
-        field_count: 0,
-    };
+    let mut builder = PacketBuilder::new();
     let builder_ptr = (&raw mut builder).cast::<c_void>();
     let bad_builder_ctx = core::ptr::from_mut(&mut align_buf)
         .cast::<u8>()

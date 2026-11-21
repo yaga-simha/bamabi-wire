@@ -3,8 +3,12 @@
 mod common;
 
 use core::ffi::{CStr, c_char, c_void};
+use core::sync::atomic::{AtomicUsize, Ordering};
 
-use bamabi_guest_sys::{Host, UuidFilter, ValidatedIter};
+use bamabi_guest_sys::{
+    GuestInstance, Host, SparseRows, SparseRowsMut, UuidFilter, ValidatedIter,
+    verify_same_mod_dynamic_component,
+};
 use bamabi_sys::{
     AccessMode, BAM_STORAGE_FLAG_MESSAGE, BamColumnInfo, BamComponent, BamHostCtx, BamIter,
     ComponentUuid, FfiResult, FfiSlice, ModComponent, StrView, SymbolEntry,
@@ -322,5 +326,191 @@ fn validated_iter_non_pod_message_read_and_send_encode_witness_packets() {
             &MockPodWithoutMarker,
         ),
         FfiResult::TYPE_MISMATCH
+    );
+}
+
+/// Verifies that [`SparseRows`] and [`SparseRowsMut`] construct in `O(1)` without scanning inner
+/// row pointers upfront, and lazily reject null and misaligned non-ZST row pointers in `get` /
+/// `get_mut` while leaving valid rows accessible.
+#[test]
+fn sparse_rows_and_mut_validate_inner_pointers_lazily_without_scanning_untouched_rows() {
+    let mut vals: [u64; 3] = [10, 20, 40];
+    let (v0, rest) = vals.split_at_mut(1);
+    let (v1, v2) = rest.split_at_mut(1);
+
+    let valid0 = core::ptr::from_mut(&mut v0[0]).cast::<u8>();
+    // Misaligned pointer (+1 byte into v1's 8-byte allocation).
+    let misaligned1 = core::ptr::from_mut(&mut v1[0]).cast::<u8>().wrapping_add(1);
+    let null2 = core::ptr::null_mut::<u8>();
+    let valid3 = core::ptr::from_mut(&mut v2[0]).cast::<u8>();
+
+    let ro_ptrs: [*const u8; 4] = [
+        valid0.cast_const(),
+        misaligned1.cast_const(),
+        null2,
+        valid3.cast_const(),
+    ];
+    // SAFETY: `ro_ptrs` is aligned and readable for 4 entries; valid aligned entries point into `vals`.
+    let rows = unsafe { SparseRows::<u64>::from_raw_parts(ro_ptrs.as_ptr(), ro_ptrs.len(), false) }
+        .expect("from_raw_parts must succeed in O(1) without scanning inner row pointers");
+    assert_eq!(rows.len(), 4);
+    assert_eq!(rows.get(0), Some(&10));
+    assert_eq!(rows.get(1), None);
+    assert_eq!(rows.get(2), None);
+    assert_eq!(rows.get(3), Some(&40));
+    assert_eq!(rows.get(4), None);
+    let collected: Vec<u64> = rows.iter().copied().collect();
+    assert_eq!(collected, vec![10, 40]);
+
+    let mut_ptrs: [*mut u8; 4] = [valid0, misaligned1, null2, valid3];
+    // SAFETY: `mut_ptrs` is aligned and readable for 4 entries; valid aligned entries point to distinct `vals`.
+    let mut rows_mut =
+        unsafe { SparseRowsMut::<u64>::from_raw_parts(mut_ptrs.as_ptr(), mut_ptrs.len(), false) }
+            .expect("from_raw_parts must succeed in O(1) without scanning inner row pointers");
+    assert_eq!(rows_mut.get(0), Some(&10));
+    assert_eq!(rows_mut.get(1), None);
+    assert_eq!(rows_mut.get(2), None);
+    assert_eq!(rows_mut.get_mut(1), None);
+    assert_eq!(rows_mut.get_mut(2), None);
+    *rows_mut.get_mut(0).unwrap() = 11;
+    *rows_mut.get_mut(3).unwrap() = 44;
+    let mut visited = Vec::new();
+    rows_mut.for_each_mut(|idx, v| {
+        *v += 1;
+        visited.push((idx, *v));
+    });
+    assert_eq!(visited, vec![(0, 12), (3, 45)]);
+    assert_eq!(vals[0], 12);
+    assert_eq!(vals[2], 45);
+}
+
+/// Verifies that repeated `read_non_pod_messages_checked`, `send_non_pod_message_checked`, and
+/// `verify_same_mod_dynamic_component` calls cache resolved `"bam.v0.*"` symbols on
+/// [`GuestInstance`] (hitting `get_proc_address` at most once per symbol), and that `PacketBuf`
+/// encodes both small (stack) and large (>256B heap-spilled) witness packets identically.
+#[test]
+fn guest_instance_caches_symbol_lookups_and_spills_large_witness_packets() {
+    struct SymbolLookupCounters {
+        marker_lookups: AtomicUsize,
+        export_lookups: AtomicUsize,
+        vtable_lookups: AtomicUsize,
+    }
+
+    unsafe extern "C" fn counting_get_proc(
+        ctx: *const BamHostCtx,
+        sym: *const c_char,
+    ) -> *const c_void {
+        // SAFETY: `ctx` points to `SymbolLookupCounters` and `sym` is a valid C string.
+        let counters = unsafe { &*ctx.cast::<SymbolLookupCounters>() };
+        // SAFETY: Caller passes valid NUL-terminated CStr.
+        let name = unsafe { CStr::from_ptr(sym) };
+        match name.to_bytes() {
+            b"bam.v0.mock::NonPodChat.non_pod_message" => {
+                counters.marker_lookups.fetch_add(1, Ordering::Relaxed);
+                mock_msg_read_batch as *const c_void
+            }
+            b"bam.v0.mock::NonPodChat.export_fields" => {
+                counters.export_lookups.fetch_add(1, Ordering::Relaxed);
+                mock_export_fields as *const c_void
+            }
+            b"bam.v0.mock::NonPodChat.vtable" => {
+                counters.vtable_lookups.fetch_add(1, Ordering::Relaxed);
+                MockNonPodMsg::erased_vtable_ptr()
+            }
+            _ => core::ptr::null(),
+        }
+    }
+
+    let mut api = make_mock_api();
+    api.get_proc_address = Some(counting_get_proc);
+    api.iter_column_info = Some(mock_col_info);
+    api.msg_read_batch = Some(mock_msg_read_batch);
+    api.msg_send = Some(mock_msg_send);
+
+    let counters = SymbolLookupCounters {
+        marker_lookups: AtomicUsize::new(0),
+        export_lookups: AtomicUsize::new(0),
+        vtable_lookups: AtomicUsize::new(0),
+    };
+    let mut world = MockMsgWorld {
+        stored: vec![MockNonPodMsg {
+            label: "cached".to_owned(),
+            nums: vec![1, 2, 3],
+        }],
+        sent_packets: Vec::new(),
+    };
+    let host_ctx = (&raw const counters).cast::<BamHostCtx>();
+    // SAFETY: `api` and `host_ctx` live for the duration of this test.
+    let raw_host = unsafe { Host::from_raw(&api, host_ctx) }.unwrap();
+    let instance = GuestInstance::new(raw_host, "cache_test_mod");
+    let host = instance.host();
+
+    // SAFETY: `raw_iter` points to `world`, disjoint from `counters`.
+    let mut iter = unsafe { ValidatedIter::from_raw((&raw mut world).cast::<BamIter>(), host) };
+
+    for _ in 0..4 {
+        let got = iter
+            .read_non_pod_messages_checked::<MockNonPodMsg>(
+                0,
+                Some(UuidFilter::exact(MockNonPodMsg::UUID)),
+                4,
+            )
+            .unwrap();
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].label, "cached");
+    }
+
+    // Small packet (fits in 256-byte stack scratch buffer).
+    let small_msg = MockNonPodMsg {
+        label: "tiny".to_owned(),
+        nums: vec![42],
+    };
+    // Large packet (> 256 bytes, spills seamlessly to heap Vec<u8>).
+    let large_msg = MockNonPodMsg {
+        label: "x".repeat(320),
+        nums: (0..40).collect(),
+    };
+    for i in 0..4 {
+        let msg = if i % 2 == 0 { &small_msg } else { &large_msg };
+        assert_eq!(
+            iter.send_non_pod_message_checked::<MockNonPodMsg>(
+                0,
+                Some(UuidFilter::exact(MockNonPodMsg::UUID)),
+                msg,
+            ),
+            FfiResult::OK
+        );
+    }
+
+    assert_eq!(world.sent_packets.len(), 4);
+    assert!(world.sent_packets[0].len() <= 256);
+    assert!(world.sent_packets[1].len() > 256);
+    for pkt in &world.sent_packets {
+        assert_eq!(u32::from_le_bytes(pkt[0..4].try_into().unwrap()), 2);
+    }
+
+    for _ in 0..4 {
+        assert!(verify_same_mod_dynamic_component::<MockNonPodMsg>(
+            host,
+            MockNonPodMsg::UUID,
+            core::mem::size_of::<MockNonPodMsg>(),
+            core::mem::align_of::<MockNonPodMsg>(),
+        ));
+    }
+
+    assert_eq!(
+        counters.marker_lookups.load(Ordering::Relaxed),
+        1,
+        "non_pod_message marker should be resolved once per GuestInstance"
+    );
+    assert_eq!(
+        counters.export_lookups.load(Ordering::Relaxed),
+        1,
+        "host export_fields should be resolved once per GuestInstance"
+    );
+    assert_eq!(
+        counters.vtable_lookups.load(Ordering::Relaxed),
+        1,
+        "vtable symbol should be resolved once per GuestInstance"
     );
 }
