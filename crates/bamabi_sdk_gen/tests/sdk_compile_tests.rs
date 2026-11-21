@@ -1,8 +1,12 @@
 //! Polyglot compiler verification tests for `bamabi_sdk_gen` (`bamabi.h`, `bamabi.hpp`, `bamabi.zig`).
 //!
 //! Exports the ABI `0.3.0` SDK bundle to a temporary directory and compiles/executes strict
-//! ISO C++17 (`-std=c++17 -Wall -Wextra -Wpedantic -Werror`) and Zig (`b.addTranslateC`)
+//! ISO C++17 (`-std=c++17 -Wall -Wextra -Wpedantic -Werror`) and Zig `0.16` (`b.addTranslateC`)
 //! verification harnesses when the host toolchain provides `c++` / `zig`.
+//!
+//! Why this suite exists: string-matching unit tests cannot catch C++ standard-compliance warnings,
+//! `static_assert` layout failures, `ScopedTransaction` RAII lifetime bugs, or Zig `translate-c`
+//! type-translation mismatches. These tests prove the emitted files actually compile and execute.
 
 #![forbid(unsafe_code)]
 
@@ -11,6 +15,8 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
+/// RAII temporary directory guard that deletes its directory on drop so compiler test artifacts
+/// never leak into the system temp directory even when assertions panic.
 struct TempDirGuard(PathBuf);
 
 impl TempDirGuard {
@@ -37,6 +43,14 @@ impl Drop for TempDirGuard {
 /// Scenario: exports `bamabi.h` and `bamabi.hpp`, compiles a strict ISO C++17 test exercising
 /// `HostContextView`, `LoadContextView`, `ChunkView`, `CommandsView`, `ScopedTransaction`, and
 /// `SystemContextView` under `-std=c++17 -Wall -Wextra -Wpedantic -Werror`, and runs it.
+///
+/// Proves:
+/// - `bamabi.hpp` and `bamabi.h` compile cleanly under strict C++17 warnings-as-errors.
+/// - `bam::offsets::*` `static_assert`s hold on the host C++ ABI.
+/// - Prefix-checked extension slots (`asset_load`, `intern_symbol`, `bind_named_object`) safely
+///   return `BAM_RESULT_UNSUPPORTED` when zeroed/absent instead of dereferencing null pointers.
+/// - `ScopedTransaction` rolls back automatically on scope exit when uncommitted and suppresses
+///   rollback once `commit()` is called.
 #[test]
 fn exported_cpp17_header_compiles_and_passes_strict_checks() {
     let Ok(check) = Command::new("c++").arg("--version").output() else {
@@ -195,6 +209,13 @@ int main() {
 /// Scenario: exports `bamabi.h` and `bamabi.zig`, builds a Zig test suite via `b.addTranslateC`
 /// verifying all 18 `BamResult` round-trips and semantic compilation of all 68 slot wrappers on
 /// `HostContextView`, `LoadContextView`, `ChunkView`, `CommandsView`, and `SystemContextView`.
+///
+/// Proves:
+/// - `bamabi.h` translates cleanly via Zig `0.16` `b.addTranslateC` into `"bam_c"`.
+/// - `bamabi.zig` `comptime` offset assertions (`STRUCT_SIZE`, `ABI_VERSION`, `GET_PROC_ADDRESS`,
+///   and `MIGRATE_COMPONENT_COLUMN`) match `c.BamHostApi` exactly.
+/// - All 18 `BamResult` codes round-trip losslessly through `checkResult` / `mapError`.
+/// - All 68 slot wrapper methods type-check cleanly and enforce `null` / `error.Unsupported` guards.
 #[test]
 fn exported_zig_sdk_compiles_and_passes_with_translate_c() {
     let Ok(ver_out) = Command::new("zig").arg("version").output() else {
