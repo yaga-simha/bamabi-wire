@@ -3556,9 +3556,9 @@ impl<'chunk, 'ctx> ChunkColumnDispenser<'chunk, 'ctx> {
         let changed_end = changed_start
             .checked_add(byte_len)
             .ok_or(FfiResult::OUT_OF_RANGE)?;
-        for idx in 0..self.borrowed_count {
+        for slot in &self.borrowed[..self.borrowed_count] {
             // SAFETY: Entries `0..self.borrowed_count` are initialized by `check_and_record_borrow`.
-            let prev = unsafe { self.borrowed[idx].assume_init_ref() };
+            let prev = unsafe { slot.assume_init_ref() };
             if prev.is_mut
                 && prev.end > prev.start
                 && ((added_start < prev.end && prev.start < added_end)
@@ -3607,9 +3607,9 @@ impl<'chunk, 'ctx> ChunkColumnDispenser<'chunk, 'ctx> {
         {
             return Err(FfiResult::ACCESS_CONFLICT);
         }
-        for idx in 0..self.borrowed_count {
+        for slot in &self.borrowed[..self.borrowed_count] {
             // SAFETY: Entries `0..self.borrowed_count` are initialized by `check_and_record_borrow`.
-            let prev = unsafe { self.borrowed[idx].assume_init_ref() };
+            let prev = unsafe { slot.assume_init_ref() };
             if is_mut || prev.is_mut {
                 if prev.component == component {
                     return Err(FfiResult::ACCESS_CONFLICT);
@@ -3669,9 +3669,9 @@ impl<'chunk, 'ctx> ChunkColumnDispenser<'chunk, 'ctx> {
         {
             return Err(FfiResult::ACCESS_CONFLICT);
         }
-        for idx in 0..self.borrowed_count {
+        for slot in &self.borrowed[..self.borrowed_count] {
             // SAFETY: Entries `0..self.borrowed_count` are initialized by `check_and_record_borrow`.
-            let prev = unsafe { self.borrowed[idx].assume_init_ref() };
+            let prev = unsafe { slot.assume_init_ref() };
             if prev.is_mut && prev.end > prev.start && start < prev.end && prev.start < end {
                 return Err(FfiResult::ACCESS_CONFLICT);
             }

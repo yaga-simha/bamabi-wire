@@ -224,8 +224,7 @@ BamResult register_bench_system(
     std::size_t query_count,
     BamSystemFn callback
 ) noexcept {
-    BamSystemDesc sys_desc;
-    std::memset(&sys_desc, 0, sizeof(sys_desc));
+    BamSystemDesc sys_desc{};
     sys_desc.struct_size = static_cast<uint32_t>(sizeof(BamSystemDesc));
     sys_desc.flags = 0u;
     sys_desc.name = name;
