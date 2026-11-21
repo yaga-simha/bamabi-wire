@@ -8,6 +8,12 @@
 //! [`bamabi_sys`] into byte-identical C99, C++17, Zig, and component declaration headers without
 //! depending on `bevy_*` or spawning compiler subprocesses at library runtime.
 //!
+//! ## Workspace & Crate Documentation
+//!
+//! - **Crate guides:** [`docs::architecture`] (`crates/bamabi_sdk_gen/ARCHITECTURE.md`) · [`docs::tests`] (`crates/bamabi_sdk_gen/TESTS.md`)
+//! - **Workspace guides:** [`bamabi_sys::docs::workspace`](../bamabi_sys/docs/workspace/index.html) · [`bamabi_guest::docs::workspace`](../bamabi_guest/docs/workspace/index.html)
+//! - **Sibling crates:** [`bamabi_sys`](../bamabi_sys/index.html) · [`bamabi_macros`](../bamabi_macros/index.html) · [`bamabi_guest_sys`](../bamabi_guest_sys/index.html) · [`bamabi_guest`](../bamabi_guest/index.html) · [`xtask`](../xtask/index.html)
+//!
 //! # Learning Path
 //!
 //! ## Step 1: Role — Deterministic Polyglot SDK Emitter with Zero Bevy Dependencies
@@ -139,6 +145,20 @@
 //! ```
 
 pub mod component_header;
+#[cfg(doc)]
+pub mod docs {
+    //! Embedded architecture and test documentation for `bamabi_sdk_gen`.
+
+    /// Crate architecture and C99/C++17/Zig emitter internals (`crates/bamabi_sdk_gen/ARCHITECTURE.md`).
+    pub mod architecture {
+        #![doc = include_str!("../ARCHITECTURE.md")]
+    }
+
+    /// Crate parity, C/C++/Zig compiler, and sanitizer test catalog (`crates/bamabi_sdk_gen/TESTS.md`).
+    pub mod tests {
+        #![doc = include_str!("../TESTS.md")]
+    }
+}
 pub mod header_gen;
 pub mod sdk;
 

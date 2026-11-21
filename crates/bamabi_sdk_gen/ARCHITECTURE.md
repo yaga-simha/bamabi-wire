@@ -151,7 +151,7 @@ Shared host/guest ECS components derive `ModComponent` from `bamabi_macros`, whi
    - Auto-generated warning banner.
    - `#ifndef <guard_macro>` / `#define <guard_macro>`.
    - `#include "<abi_header_include>"` (e.g., `"../bamabi.h"` for `include/generated/testbed_components.h`).
-   - `extern "C"` wrapper around every `/* Component: \`<name>\` (IS_ABI_POD = <bool>) */` block and its `c_decl`.
+   - `extern "C"` wrapper around every ``/* Component: `<name>` (IS_ABI_POD = <bool>) */`` block and its `c_decl`.
 3. In `bamabi-wire`, [`xtask/src/component_headers.rs`](../../xtask/src/component_headers.rs) defines the 19 canonical testbed `ModComponent` structs and calls `render_component_header("BAMABI_GENERATED_TESTBED_COMPONENTS_H", "../bamabi.h", ...)` to generate [`include/generated/testbed_components.h`](../../include/generated/testbed_components.h).
 
 ---
