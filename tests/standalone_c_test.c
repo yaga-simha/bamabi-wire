@@ -1,6 +1,15 @@
 /*
  * Standalone ISO C99 Conformance, Layout & Mock Lifecycle Suite (`ABI 0.3.0`)
  * Compiled with: `cc -std=c99 -Wall -Wextra -Werror -pedantic -Iinclude tests/standalone_c_test.c`
+ * Also compiled and executed under ASan + UBSan via `cargo xtask c-test`.
+ *
+ * Why this suite exists:
+ * - Including `"bamabi.h"` under `-std=c99 -Wall -Wextra -Werror -pedantic` proves every
+ *   exported macro, struct definition, inline helper, and 64/32-bit `BAM_STATIC_ASSERT`
+ *   layout guard is strictly ISO C99 compliant with zero GNU/MSVC extensions leaked.
+ * - Running the mock host/guest lifecycle under ASan + UBSan proves zero out-of-bounds
+ *   reads/writes, zero misaligned accesses, zero null-pointer dereferences, and zero
+ *   strict-aliasing or signed-overflow UB across `bam_*` inline helpers and wire descriptors.
  */
 
 #include "bamabi.h"
@@ -12,6 +21,11 @@
 
 /* ==========================================================================
  * Mock Host & Guest Structures
+ *
+ * `bamabi.h` declares `BamHostCtx`, `BamLoadCtx`, `BamIter`, `BamCommands`,
+ * `BamSystemCtx`, and `BamInstance` as opaque forward-declared structs. This
+ * test harness provides concrete in-memory definitions so C99 guests can be
+ * exercised end-to-end without linking a full Rust/Bevy host runtime.
  * ========================================================================== */
 
 typedef struct MockPosition {
@@ -657,7 +671,12 @@ static void mock_guest_shutdown(BamInstance* instance) {
  * ========================================================================== */
 
 /* Scenario: Verifies ABI 0.3.0 version packing/compatibility rules, `bam_result_name` strings,
- * relation/schedule-set flag bitmasks, and `BamStrView` construction (including NULL input). */
+ * relation/schedule-set flag bitmasks, and `BamStrView` construction (including NULL input).
+ *
+ * Proves:
+ * - `0.x` semver requires exact minor match while `1.x` allows host minor >= guest minor.
+ * - `bam_result_name` handles known codes and returns `"UNKNOWN"` for out-of-range codes.
+ * - `bam_str_view(NULL)` returns `{ NULL, 0 }` without invoking `strlen(NULL)` (no UB). */
 static void test_versions_and_result_names(void) {
     assert(BAM_ABI_VERSION == 0x00030000u);
     assert(bam_version_major(BAM_ABI_VERSION) == 0u);
@@ -696,7 +715,11 @@ static void test_versions_and_result_names(void) {
 }
 
 /* Scenario: Verifies C99 `bam_uuid_from_parts` and `bam_uuid_from_canonical_name` produce exact
- * byte-for-byte golden SipHash-2-4 digests matching Rust `bamabi_sys::ComponentUuid`. */
+ * byte-for-byte golden SipHash-2-4 digests matching Rust `bamabi_sys::ComponentUuid`.
+ *
+ * Proves:
+ * - Pure C99 `BamSipHasher128` matches Rust's `const fn` SipHash-2-4-128 implementation across
+ *   endianness-independent little-endian byte encoding, with namespace isolation. */
 static void test_cross_language_siphash_uuids(void) {
     /* Exact 16-byte golden digests produced by `bamabi_sys::ComponentUuid::from_parts` */
     static const uint8_t expected_health_uuid[16] = {
@@ -719,7 +742,13 @@ static void test_cross_language_siphash_uuids(void) {
 }
 
 /* Scenario: Verifies `bam_host_api_copy_bounded` zero-fills trailing future slots when copying
- * an older host table into a larger guest struct, and rejects under-sized tables with INVALID_VERSION. */
+ * an older host table into a larger guest struct, and rejects under-sized tables with INVALID_VERSION.
+ *
+ * Proves:
+ * - Prefix extensibility never reads past `src->struct_size` (checked by ASan) and zeroes
+ *   unpopulated trailing slots (overwriting `0xAA` poison bytes with `NULL`) so guests can
+ *   safely null-check extension slots.
+ * - Truncated tables (`struct_size < BAM_HOST_API_MIN_V0_2_SIZE`) fail fast with `INVALID_VERSION`. */
 static void test_extensible_host_api_copy_bounded(void) {
     typedef struct FutureGuestHostApiV03 {
         BamHostApi v0_2;
@@ -755,7 +784,12 @@ static void test_extensible_host_api_copy_bounded(void) {
 
 /* Scenario: Runs a full C99 mod lifecycle (manifest check, `init`, component/system registration,
  * custom VTable lookup, `last_error` reporting, `run_if`, chunk iteration, untracked mutation +
- * `mark_changed_range`, batched `cmd_spawn`, drop hook, and `shutdown`). */
+ * `mark_changed_range`, batched `cmd_spawn`, drop hook, and `shutdown`).
+ *
+ * Proves:
+ * - All 27 baseline v0.2 `BamHostApi` slots, opaque context pointers, dense SoA columns,
+ *   sparse-row pointer arrays, singleton resources, and custom VTable headers interoperate cleanly
+ *   under strict C99 aliasing and ASan/UBSan bounds checks. */
 static void test_end_to_end_c99_lifecycle_and_vtable(void) {
     BamManifestFn manifest_fn = mock_guest_manifest;
     BamInitFn init_fn = mock_guest_init;
@@ -885,7 +919,13 @@ static BamResult mock_observer_cb(BamEntity target_entity, const void* event_dat
 }
 
 /* Scenario: Verifies `BamChildOf` layout/UUID, `BamChangeTicks` wraparound detection, dynamic
- * layout registration helper, 64-bit entity packing in `BamObserverDesc`, and `SystemDesc.in_sets`. */
+ * layout registration helper, 64-bit entity packing in `BamObserverDesc`, and `SystemDesc.in_sets`.
+ *
+ * Proves:
+ * - `bam_ticks_is_newer` uses unsigned wrapping subtraction (`this_run - tick`) without signed
+ *   overflow UB across the `UINT32_MAX` -> `0` wraparound boundary.
+ * - `bam_desc_component_with_layout` and `bam_observer_desc` initialize `struct_size`, UUIDs,
+ *   and split 64-bit `entity_lo`/`entity_hi` halves accurately. */
 static void test_hierarchy_ticks_layout_and_observer_descriptors(void) {
     BamChildOf child_of;
     BamChangeTicks ticks;
@@ -999,7 +1039,14 @@ static BamResult mock_mut_observer_cb(
 
 /* Scenario: Verifies ABI 0.3.0 extended wire types (`BAM_OPTION_STRUCT`, `BamAssetHandle`,
  * `BamAccessMode` ALLOW/HAS/REMOVED_READ, `or_group`, extended `BamComponentDesc`/`BamObserverDesc`/
- * `BamTriggerDesc`/`BamSystemDesc`, and all 68 `BamHostApi` slots + `covers_slot` checks). */
+ * `BamTriggerDesc`/`BamSystemDesc`, and all 68 `BamHostApi` slots + `covers_slot` checks).
+ *
+ * Proves:
+ * - `BAM_OPTION_STRUCT` matches Rust `FfiOption<T>` layout (`is_some` at 0, `value` at 4).
+ * - Inline predicates (`bam_disabled_uuid`, `bam_schedule_is_valid`, `bam_field_kind_is_valid`,
+ *   `bam_event_kind_is_lifecycle`, `bam_asset_load_state_is_*`) match Rust `bamabi_sys` bounds.
+ * - `bam_host_api_covers_slot` accurately validates slot offsets/sizes up to slot 67
+ *   (`BAM_HOST_API_OFFSET_MIGRATE_COMPONENT_COLUMN`). */
 static void test_extended_wire_descriptors(void) {
     BamOptionU32 opt_u32;
     BamOptionEntity opt_ent;

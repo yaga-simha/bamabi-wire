@@ -1,11 +1,20 @@
 //! Integration parity tests verifying checked-in C99 headers against `bamabi_sdk_gen`.
+//!
+//! Why this suite exists: non-Rust guests and `xtask` C99 compiler gates consume the checked-in
+//! `include/bamabi.h` and `include/generated/testbed_components.h` artifacts directly. These tests
+//! fail immediately if `bamabi_sys` changes without regenerating the checked-in C99 headers.
 
 use std::fs;
 use std::path::Path;
 
 /// Test scenario: verifies strict byte-for-byte parity between `bamabi_sdk_gen::render_c99_header()`
 /// and the checked-in repository artifact `include/bamabi.h`, as well as `write_or_check_header`
-/// in `check_only = true` mode, catching any ABI drift between Rust (`bamabi_sys`) and C99.
+/// in `check_only = true` mode.
+///
+/// Proves:
+/// - Zero drift between Rust `bamabi_sys` layouts/constants and `include/bamabi.h`.
+/// - Deterministic rendering (`render_c99_header()` reproduces the exact bytes on disk).
+/// - `write_or_check_header(repo_root, true)` accepts the checked-in artifact without error.
 #[test]
 fn checked_in_c99_header_matches_render_c99_header_byte_for_byte() {
     let repo_root = Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -49,8 +58,11 @@ fn checked_in_c99_header_matches_render_c99_header_byte_for_byte() {
 }
 
 /// Test scenario: when `include/generated/testbed_components.h` is present in the checkout,
-/// verifies that it includes `"../bamabi.h"` so generated component headers resolve the root
-/// ABI header cleanly without extra include-path flags.
+/// verifies that it includes `"../bamabi.h"`.
+///
+/// Proves:
+/// - Generated component headers under `include/generated/` resolve the root `bamabi.h` ABI
+///   header via relative include without requiring caller-supplied extra include-path overrides.
 #[test]
 fn generated_testbed_components_header_includes_parent_bamabi_h() {
     let repo_root = Path::new(env!("CARGO_MANIFEST_DIR"))
