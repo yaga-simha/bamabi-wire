@@ -51,13 +51,13 @@
 //! function table and `*mut BamLoadCtx`:
 //!
 //! 1. **Bounded Table Copy & ABI Handshake:** [`Host::from_load_ctx`] (or [`Host::from_raw`] when
-//!    paired with an active [`BamHostCtx`](bamabi_sys::BamHostCtx)) verifies non-nullness and
+//!    paired with an active [`BamHostCtx`](../bamabi_sys/struct.BamHostCtx.html)) verifies non-nullness and
 //!    alignment, performs a bounded prefix copy via `read_descriptor::<BamHostApi>` up to
-//!    `min(struct_size, size_of::<BamHostApi>())`, checks [`ABI_VERSION`](bamabi_sys::ABI_VERSION)
+//!    `min(struct_size, size_of::<BamHostApi>())`, checks [`ABI_VERSION`](../bamabi_sys/constant.ABI_VERSION.html)
 //!    SemVer compatibility, and verifies all 27 mandatory core ABI `0.2` slots
 //!    (`BamHostApi::MIN_V0_2_SIZE` = `224` B on 64-bit, `116` B on 32-bit).
 //! 2. **68-Slot `covers_slot` + `UNSUPPORTED` Fallback:** The full ABI `0.3.0`
-//!    [`BamHostApi`](bamabi_sys::BamHostApi) contains **68** slots (`MIN_V0_3_SIZE` = `552` B on
+//!    [`BamHostApi`](../bamabi_sys/host_api/struct.BamHostApi.html) contains **68** slots (`MIN_V0_3_SIZE` = `552` B on
 //!    64-bit, `280` B on 32-bit). All **41** optional/extended slots beyond the 27 core slots
 //!    (23 extended `0.2` slots + 18 `0.3.0` slots) are resolved through `host_slot!`, which checks
 //!    `api.covers_slot(offset_of!(..), size_of_val(..))` and `Option::is_some()`, returning
@@ -65,7 +65,7 @@
 //! 3. **Custom Symbols & VTables:** [`Host::resolve_custom_symbol`] and [`Host::resolve_custom_fn`]
 //!    enforce the [`CUSTOM_SYMBOL_PREFIX`] (`"bam.v0."`) namespace. [`Host::resolve_vtable`],
 //!    [`Host::resolve_mapped_wire_vtable`], and [`Host::resolve_mapped_string_vtable`] validate
-//!    the leading [`VTableHeader`](bamabi_sys::VTableHeader) (`struct_size`, `abi_version`, and
+//!    the leading [`VTableHeader`](../bamabi_sys/struct.VTableHeader.html) (`struct_size`, `abi_version`, and
 //!    `ComponentUuid`) before forming `&V`.
 //! 4. **Init-Time Registration:** [`ValidatedLoadCtx`] wraps the active `*mut BamLoadCtx` during
 //!    `bamabi_init` for registering POD/dynamic components, relationships, schedule sets, systems,
@@ -105,7 +105,7 @@
 //! ## Step 4: Validated Data Plane (`iter`, `commands`, `component`, `trampoline`, `wire_types`)
 //!
 //! - **[`iter`] — Validated Chunk, Sparse-Row & Resource Views:** [`ValidatedIter`] introspects
-//!   [`BamColumnInfo`](bamabi_sys::BamColumnInfo) (`mode`, `size`, `align`, `uuid`, storage flags)
+//!   [`BamColumnInfo`](../bamabi_sys/struct.BamColumnInfo.html) (`mode`, `size`, `align`, `uuid`, storage flags)
 //!   to vend [`ValidatedSlice`] / [`ValidatedSliceMut`], indirect [`SparseRows`] /
 //!   [`SparseRowsMut`], untracked writes paired with [`ValidatedIter::mark_changed_range`],
 //!   non-destructive [`ValidatedIter::count`], [`ValidatedIter::up_cascade_checked`], work-stealing
@@ -130,7 +130,7 @@
 //!   owns up to `MAX_QUERIES_PER_SYSTEM` query slots plus an affine, non-`Copy`
 //!   [`ValidatedSystemRef`] token (enforcing single mutable access on handle-based resource lookups).
 //!   Also provides [`SystemRegistrationConfig`], [`PreparedRunIf`], `wrap_system_callback!`,
-//!   `wrap_run_condition!`, and same-mod [`ModComponent`](bamabi_sys::ModComponent) VTable
+//!   `wrap_run_condition!`, and same-mod [`ModComponent`](../bamabi_sys/trait.ModComponent.html) VTable
 //!   provenance verification (`verify_same_mod_dynamic_component`, `insert_moved`, `spawn_moved`).
 //! - **[`wire_types`] — Unconditional Bevy `0.20` POD Projections:** Zero-Bevy `#[repr(C)]` /
 //!   `#[repr(transparent)]` `AbiPod` structs with compile-time zero-padding assertions and
@@ -149,7 +149,7 @@
 //! | 2 | [`host`] | Bounded `Host` API copy, `host_slot!` guards, `"bam.v0.*"` / `VTableHeader` checks, [`ValidatedLoadCtx`] |
 //! | 3 | [`instance`] | Per-World [`GuestInstance`], LIFO teardown, `RuntimeAllocTracker`, init rollback, state transfer |
 //! | 4 | [`trampoline`] | [`ReentrantCell`], [`ValidatedSystemInvocation`], [`ValidatedSystemRef`], system/observer trampolines |
-//! | 5 | [`component`] | POD/drop component & relation registration, [`PodComponentHooks`], [`BamRowMigrateFn`](bamabi_sys::BamRowMigrateFn) migrations |
+//! | 5 | [`component`] | POD/drop component & relation registration, [`PodComponentHooks`], [`BamRowMigrateFn`](../bamabi_sys/type.BamRowMigrateFn.html) migrations |
 //! | 6 | [`iter`] | [`ValidatedIter`], [`ValidatedSlice`]/[`ValidatedSliceMut`], [`SparseRows`]/[`SparseRowsMut`], [`ChunkColumnDispenser`] |
 //! | 7 | [`commands`] | [`ValidatedCommands`], [`SpawnEntry`], [`SpawnBatchColumn`], checkpoints, relations, triggers |
 //! | 8 | [`wire_types`] | Unconditional Bevy `0.20` `AbiPod` mirrors (`std_types`, `lifecycle`, `picking`, `camera_light`, `audio`, `ui`, `render`) |
