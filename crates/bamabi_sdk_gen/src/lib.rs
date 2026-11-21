@@ -11,7 +11,7 @@
 //! ## Workspace & Crate Documentation
 //!
 //! - **Crate guides:** [`docs::architecture`] (`crates/bamabi_sdk_gen/ARCHITECTURE.md`) · [`docs::tests`] (`crates/bamabi_sdk_gen/TESTS.md`)
-//! - **Workspace guides:** [`bamabi_sys::docs::workspace`](../bamabi_sys/docs/workspace/index.html) · [`bamabi_guest::docs::workspace`](../bamabi_guest/docs/workspace/index.html)
+//! - **Workspace guides:** [`bamabi_docs`](../bamabi_docs/index.html) ([`architecture`](../bamabi_docs/architecture/index.html), [`development`](../bamabi_docs/development/index.html), [`testing`](../bamabi_docs/testing/index.html))
 //! - **Sibling crates:** [`bamabi_sys`](../bamabi_sys/index.html) · [`bamabi_macros`](../bamabi_macros/index.html) · [`bamabi_guest_sys`](../bamabi_guest_sys/index.html) · [`bamabi_guest`](../bamabi_guest/index.html) · [`xtask`](../xtask/index.html)
 //!
 //! # Learning Path

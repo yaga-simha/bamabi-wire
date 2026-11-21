@@ -13,7 +13,7 @@
 //! ## Workspace & Crate Documentation
 //!
 //! - **Crate guides:** [`docs::architecture`] (`crates/bamabi_sys/ARCHITECTURE.md`) · [`docs::tests`] (`crates/bamabi_sys/TESTS.md`)
-//! - **Workspace guides:** [`docs::workspace`] ([`overview`](docs::workspace::overview), [`architecture`](docs::workspace::architecture), [`development`](docs::workspace::development), [`testing`](docs::workspace::testing), [`wire_spec`](docs::workspace::wire_spec))
+//! - **Workspace guides:** [`bamabi_docs`](../bamabi_docs/index.html) ([`architecture`](../bamabi_docs/architecture/index.html), [`development`](../bamabi_docs/development/index.html), [`testing`](../bamabi_docs/testing/index.html), [`wire_spec`](../bamabi_docs/wire_spec/index.html))
 //! - **Sibling crates:** [`bamabi_macros`](../bamabi_macros/index.html) · [`bamabi_sdk_gen`](../bamabi_sdk_gen/index.html) · [`bamabi_guest_sys`](../bamabi_guest_sys/index.html) · [`bamabi_guest`](../bamabi_guest/index.html) · [`xtask`](../xtask/index.html)
 //!
 //! ---
@@ -202,7 +202,7 @@ mod version;
 
 #[cfg(doc)]
 pub mod docs {
-    //! Embedded architecture, testing, and workspace documentation for `bamabi_sys`.
+    //! Embedded architecture and testing documentation for `bamabi_sys`.
 
     /// Crate architecture and C-ABI `0.3.0` wire specification internals (`crates/bamabi_sys/ARCHITECTURE.md`).
     pub mod architecture {
@@ -212,42 +212,6 @@ pub mod docs {
     /// Crate test suite, proptest, Miri, and Kani formal proof catalog (`crates/bamabi_sys/TESTS.md`).
     pub mod tests {
         #![doc = include_str!("../TESTS.md")]
-    }
-
-    /// Workspace-wide overview, architecture, development, testing, and ABI wire specification guides.
-    pub mod workspace {
-        //! Workspace-wide guides for `bamabi-wire`:
-        //!
-        //! - [`overview`](crate::docs::workspace::overview) (`README.md`) — workspace summary, crate map, and quick start
-        //! - [`architecture`](crate::docs::workspace::architecture) (`ARCHITECTURE.md`) — 6-crate DAG, Layer 0 wire design, and end-to-end walkthrough
-        //! - [`development`](crate::docs::workspace::development) (`DEVELOPMENT.md`) — toolchain setup, codegen commands, and CI workflow
-        //! - [`testing`](crate::docs::workspace::testing) (`TESTING.md`) — unit, proptest, UI, C99 ASan/UBSan, Miri, and Kani gates
-        //! - [`wire_spec`](crate::docs::workspace::wire_spec) (`spec.md`) — complete C-ABI `0.3.0` wire specification
-
-        /// Workspace overview (`README.md`).
-        pub mod overview {
-            #![doc = include_str!("../../../README.md")]
-        }
-
-        /// Workspace architecture and end-to-end crate integration (`ARCHITECTURE.md`).
-        pub mod architecture {
-            #![doc = include_str!("../../../ARCHITECTURE.md")]
-        }
-
-        /// Workspace development setup, workflows, and CI gates (`DEVELOPMENT.md`).
-        pub mod development {
-            #![doc = include_str!("../../../DEVELOPMENT.md")]
-        }
-
-        /// Workspace testing, Miri, Kani, and C99 sanitizer matrix (`TESTING.md`).
-        pub mod testing {
-            #![doc = include_str!("../../../TESTING.md")]
-        }
-
-        /// Full ABI wire specification (`spec.md`).
-        pub mod wire_spec {
-            #![doc = include_str!("../../../spec.md")]
-        }
     }
 }
 

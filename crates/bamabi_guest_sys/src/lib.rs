@@ -12,12 +12,11 @@
 //!     `wire_types`.
 //!   - [`docs::tests`] — Integration tests, soundness regressions (`S1`–`S10`), `proptest` fuzzing,
 //!     and Kani formal proofs (`PO-G1`, `PO-G3`..`PO-G9`).
-//! - **Workspace-Wide Guides ("How Everything Ties Together"):**
-//!   - [`bamabi_guest::docs::workspace`](../bamabi_guest/docs/workspace/index.html) — Workspace
-//!     landing guide across all 6 crates (`bamabi_sys` -> `bamabi_macros` -> `bamabi_sdk_gen` ->
-//!     `bamabi_guest_sys` -> `bamabi_guest` -> `xtask`).
-//!   - [`bamabi_sys::docs::workspace`](../bamabi_sys/docs/workspace/index.html) — Wire-contract
-//!     workspace documentation hub.
+//! - **Workspace-Wide Guides:**
+//!   - [`bamabi_docs`](../bamabi_docs/index.html) — Workspace landing hub across all crates
+//!     (`bamabi_sys` -> `bamabi_macros` -> `bamabi_sdk_gen` -> `bamabi_guest_sys` -> `bamabi_guest`
+//!     -> `xtask`).
+//!   - [`architecture`](../bamabi_docs/architecture/index.html) · [`development`](../bamabi_docs/development/index.html) · [`testing`](../bamabi_docs/testing/index.html)
 //! - **Sibling Crates:**
 //!   [`bamabi_sys`](../bamabi_sys/index.html) ·
 //!   [`bamabi_macros`](../bamabi_macros/index.html) ·

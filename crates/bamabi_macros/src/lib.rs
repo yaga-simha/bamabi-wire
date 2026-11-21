@@ -11,7 +11,7 @@
 //! ## Workspace & Crate Documentation
 //!
 //! - **Crate guides:** [Architecture Guide](#bamabi_macros-architecture--implementation-guide) (`crates/bamabi_macros/ARCHITECTURE.md`) · [Test & Verification Guide](#bamabi_macros-test--verification-guide) (`crates/bamabi_macros/TESTS.md`)
-//! - **Workspace guides:** [`bamabi_sys::docs::workspace`](../bamabi_sys/docs/workspace/index.html) · [`bamabi_guest::docs::workspace`](../bamabi_guest/docs/workspace/index.html)
+//! - **Workspace guides:** [`bamabi_docs`](../bamabi_docs/index.html) ([`architecture`](../bamabi_docs/architecture/index.html), [`development`](../bamabi_docs/development/index.html), [`testing`](../bamabi_docs/testing/index.html))
 //! - **Sibling crates:** [`bamabi_sys`](../bamabi_sys/index.html) · [`bamabi_sdk_gen`](../bamabi_sdk_gen/index.html) · [`bamabi_guest_sys`](../bamabi_guest_sys/index.html) · [`bamabi_guest`](../bamabi_guest/index.html) · [`xtask`](../xtask/index.html)
 //!
 //! > Note: `bamabi_macros` is a `proc-macro` crate, which Rust forbids from exporting `pub mod` items; therefore its `ARCHITECTURE.md` and `TESTS.md` are embedded directly below on the crate root doc page.
