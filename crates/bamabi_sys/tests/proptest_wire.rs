@@ -4,7 +4,7 @@
 use bamabi_sys::{ComponentUuid, SIPHASH_KEY_0, SIPHASH_KEY_1, siphash24_128};
 use proptest::prelude::*;
 
-/// Independent reference SipHash-2-4-128 implementation (Aumasson & Bernstein, DOUBLE mode).
+/// Independent reference SipRound permutation over 4x64-bit state words.
 fn ref_sipround(v: &mut [u64; 4]) {
     v[0] = v[0].wrapping_add(v[1]);
     v[1] = v[1].rotate_left(13);
@@ -25,6 +25,10 @@ fn ref_sipround(v: &mut [u64; 4]) {
     v[2] = v[2].rotate_left(32);
 }
 
+/// Independent reference SipHash-2-4-128 implementation (Aumasson & Bernstein, DOUBLE mode).
+///
+/// Serves as the differential oracle for verifying `bamabi_sys::siphash24_128` and streaming
+/// `ConstSipHasher128` across arbitrary keys and chunk boundaries.
 fn ref_siphash24_128(data: &[u8], k0: u64, k1: u64) -> [u8; 16] {
     let mut v = [
         0x736f_6d65_7073_6575_u64 ^ k0,
@@ -104,6 +108,8 @@ fn ref_parse_uuid_hex(input: &str) -> Option<ComponentUuid> {
     Some(ComponentUuid::from_bytes(out))
 }
 
+/// Formats 16 UUID bytes into canonical 36-char hyphenated or 32-char compact hex with
+/// per-nibble upper/lower casing for case-insensitivity property tests.
 fn format_uuid_hex(bytes: [u8; 16], hyphenated: bool, upper_nibbles: [bool; 32]) -> String {
     const LOWER: &[u8; 16] = b"0123456789abcdef";
     const UPPER: &[u8; 16] = b"0123456789ABCDEF";
@@ -132,6 +138,8 @@ fn format_uuid_hex(bytes: [u8; 16], hyphenated: bool, upper_nibbles: [bool; 32])
     s
 }
 
+/// Structural string mutation operators applied to valid UUID strings to fuzz malformed-input
+/// handling in `ComponentUuid::try_parse_hex`.
 #[derive(Debug, Clone)]
 enum HexMutation {
     ReplaceChar { idx: usize, ch: char },
@@ -141,6 +149,8 @@ enum HexMutation {
     Truncate { len: usize },
 }
 
+/// Proptest strategy generating single-character replacements, insertions, deletions, swaps,
+/// and truncations (including non-ASCII multi-byte UTF-8 characters).
 fn mutation_strategy() -> impl Strategy<Value = HexMutation> {
     let weird_chars = prop_oneof![
         any::<char>(),
@@ -158,6 +168,7 @@ fn mutation_strategy() -> impl Strategy<Value = HexMutation> {
     ]
 }
 
+/// Applies one [`HexMutation`] to `s` on Unicode scalar value (`char`) boundaries.
 fn apply_mutation(s: &mut String, m: HexMutation) {
     let mut chars: Vec<char> = s.chars().collect();
     match m {
@@ -190,6 +201,8 @@ fn apply_mutation(s: &mut String, m: HexMutation) {
     *s = chars.into_iter().collect();
 }
 
+/// Caps proptest cases to `4` under Miri so Tree/Stacked Borrows runs finish in seconds while
+/// keeping full default (`256`) case counts on native targets.
 fn proptest_config() -> ProptestConfig {
     if cfg!(miri) {
         ProptestConfig {
@@ -205,6 +218,9 @@ fn proptest_config() -> ProptestConfig {
 proptest! {
     #![proptest_config(proptest_config())]
 
+    /// Proves that `bamabi_sys::siphash24_128` matches the independent reference SipHash-2-4-128
+    /// oracle for arbitrary 128-bit keys and byte payloads across all 0..=300 byte lengths
+    /// (covering empty input, partial <8-byte tails, exact 8-byte blocks, and length modulo 256).
     #[test]
     fn siphash24_128_matches_reference(
         k0 in any::<u64>(),
@@ -216,6 +232,9 @@ proptest! {
         prop_assert_eq!(actual, expected);
     }
 
+    /// Proves that streaming multi-chunk `ConstSipHasher128` inside `ComponentUuid::from_parts`
+    /// (and `from_namespaced` / `from_canonical_name`) produces the exact same 16-byte digest as
+    /// hashing the flat concatenated buffer in one shot, guarding against tail-buffering bugs.
     #[test]
     fn const_sip_hasher_multi_chunk_from_parts_matches_flat_oneshot(
         canonical_name in any::<String>(),
@@ -246,6 +265,9 @@ proptest! {
         prop_assert_eq!(oneshot, ref_digest);
     }
 
+    /// Proves that iterative `ComponentUuid::hash_field_schema` folds `(prev_hash, field_name,
+    /// field_type_tag, field_offset)` via `ConstSipHasher128` identically to flat one-shot
+    /// SipHash-2-4-128 across 1..=8 chained fields.
     #[test]
     fn const_sip_hasher_multi_chunk_field_schema_matches_flat_oneshot(
         init_hash in any::<u64>(),
@@ -271,6 +293,8 @@ proptest! {
         }
     }
 
+    /// Proves lossless round-tripping for `ComponentUuid::try_parse_hex`, `parse_hex`, and
+    /// `from_u128`/`to_u128` across arbitrary 16-byte payloads in both 32-char and 36-char mixed-case hex.
     #[test]
     fn try_parse_hex_valid_roundtrip(
         bytes in any::<[u8; 16]>(),
@@ -285,6 +309,8 @@ proptest! {
         prop_assert_eq!(ComponentUuid::from_u128(expected.to_u128()), expected);
     }
 
+    /// Proves panic-free differential parity of `ComponentUuid::try_parse_hex` against
+    /// `ref_parse_uuid_hex` on arbitrary UTF-8 strings and near-valid 28..=40-char adversarial strings.
     #[test]
     fn try_parse_hex_arbitrary_utf8_matches_reference(
         s in prop_oneof![
@@ -303,6 +329,9 @@ proptest! {
         }
     }
 
+    /// Proves differential parity of `ComponentUuid::try_parse_hex` against `ref_parse_uuid_hex`
+    /// under 1..=6 targeted mutations of valid UUID strings (bad hyphen positions, truncation,
+    /// swapped characters, and multi-byte UTF-8 insertion at byte length 32 or 36).
     #[test]
     fn try_parse_hex_mutated_valid_strings(
         bytes in any::<[u8; 16]>(),

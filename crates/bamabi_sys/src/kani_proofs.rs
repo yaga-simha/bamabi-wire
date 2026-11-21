@@ -4,6 +4,9 @@
 //! Specification over full symbolic integer spaces (`u32`, `usize`) and all 13 `ExtensibleStruct`
 //! wire types, plus every `unsafe` boundary primitive (`FfiSlice`, `StrView`, `FfiOption`,
 //! `raw_struct_size`, `raw_abi_version`) in `bamabi_sys`.
+//!
+//! Note: Proof Obligation `PO-W5` (strict unknown-flag and non-zero reserved-field rejection across
+//! descriptors) is discharged deterministically by unit tests in `src/tests/layout.rs`.
 
 use core::{
     ffi::c_void,
@@ -288,6 +291,12 @@ fn verify_extensible_struct_contract<
 
 macro_rules! po_w3_extensible_harness {
     ($fn_name:ident, $ty:ty) => {
+        #[doc = concat!(
+            "PO-W3: Verifies null safety, undersized-header rejection, prefix zero-extension, ",
+            "and future-tail truncation of `read_extensible_struct` / `read_descriptor` for `",
+            stringify!($ty),
+            "`."
+        )]
         #[kani::proof]
         fn $fn_name() {
             verify_extensible_struct_contract::<

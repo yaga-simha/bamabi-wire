@@ -4,31 +4,184 @@
 
 //! # `bamabi_sys`: Zero-Dependency C-ABI `0.3.0` Wire Contract for `bamabi`
 //!
-//! This crate defines the `#![no_std]`, zero-dependency C-ABI `0.3.0` wire specification connecting
-//! Bevy ECS host applications to native dynamic guest mods (`.so`, `.dylib`, `.dll`) written in
-//! Rust, C99, C++, or Zig.
+//! This crate defines the `#![no_std]`, zero-dependency C-ABI `0.3.0` (`0x0003_0000`) wire
+//! specification connecting Bevy ECS host applications to native dynamic guest mods (`.so`,
+//! `.dylib`, `.dll`) written in Rust, ISO C99, C++17/20, or Zig.
 //!
-//! ## Core Architectural Invariants
+//! Follow the six steps below in order to build a complete mental model of the crate.
+//!
+//! ---
+//!
+//! ## Step 1: Mental Model & Zero-Shared-Rust-ABI Design
+//!
+//! `bamabi_sys` sits at **Layer 0** of the `bamabi` workspace. It defines the binary wire boundary
+//! between a Bevy host and dynamically loaded guest libraries without pulling in `bevy_*`, `std`,
+//! or `alloc`:
 //!
 //! 1. **Zero Shared Rust ABI Assumptions:** Every wire struct is `#[repr(C)]` or
-//!    `#[repr(transparent)]`, every foreign callback slot is `Option<unsafe extern "C" fn(...)>`,
-//!    and arrays/strings cross the boundary via [`FfiSlice`] / [`StrView`] or NUL-terminated C
-//!    strings rather than Rust fat pointers.
-//! 2. **Strict Memory & Allocator Isolation:** Host-allocated memory is freed exclusively by the
+//!    `#[repr(transparent)]` with zero implicit padding, every foreign callback slot is
+//!    `Option<unsafe extern "C" fn(...)>`, status/enum-like codes are `u32` newtypes rather than
+//!    Rust `enum`s, and arrays/strings cross the boundary via [`FfiSlice`] / [`StrView`] or
+//!    NUL-terminated C strings rather than Rust fat pointers (`&[T]`, `&str`, `dyn Trait`).
+//! 2. **Strict Memory & Allocator Isolation (Owner-Frees):** Host-allocated memory (`World`
+//!    columns, `String`/`Vec` component payloads, command arenas) is freed exclusively by the
 //!    host, and guest-allocated memory (such as per-World [`BamInstance`] state) is freed
 //!    exclusively by the guest in `bamabi_shutdown`.
 //! 3. **Pre-Resolved Handles & Zero-Allocation Hot Paths:** Components and resources resolve once
-//!    at load time into 1-based [`BamComponent`] handles; hot-path commands and declaration-indexed
+//!    at load time into 1-based [`BamComponent`] handles; per-frame iteration, commands, and
 //!    resource accessors perform zero string parsing or hashing.
 //! 4. **Nounwind `extern "C"` Boundary:** Unwinding across `extern "C"` is forbidden. Unwinding
 //!    Rust guests catch panics inside their own runtime and return [`FfiResult::PANIC_CAUGHT`].
+//! 5. **Why `#![no_std]` and Zero External Dependencies?** Keeping `bamabi_sys` strictly `#![no_std]`
+//!    with zero external dependencies guarantees that guest mods, proc-macro expansions, polyglot
+//!    header generators, and the host engine share one identical binary contract without coupling
+//!    to Bevy internals or a specific heap allocator.
 //!
-//! ## Why `#![no_std]` and Zero External Dependencies?
+//! ---
 //!
-//! Keeping `bamabi_sys` strictly `#![no_std]` with zero external dependencies (no `bevy`,
-//! no `alloc`, no `std`) guarantees that guest mods, proc-macro expansions, and the host engine
-//! share the exact same wire types without pulling in Bevy's ECS internals or coupling to any
-//! specific heap allocator.
+//! ## Step 2: Core Primitives & Handles
+//!
+//! All cross-boundary primitives avoid Rust-specific layout or invalid-discriminant hazards:
+//!
+//! - [`FfiResult`]: `#[repr(transparent)]` `u32` status newtype (`18` canonical codes `0..=16`
+//!   plus `99`, including [`FfiResult::CYCLE_DETECTED`]); foreign integer values never cause UB.
+//! - [`FfiBool`]: `#[repr(transparent)]` `u8` boolean (`0` = false, any non-zero `u8` = true),
+//!   avoiding Rust `bool` validity UB on bytes `2..=255`.
+//! - [`FfiOption`]: `#[repr(C)]` `{ is_some: FfiBool, value: T }` optional value wrapper replacing
+//!   Rust `Option<T>` across C99/C++17/Zig.
+//! - [`FfiSlice`] & [`StrView`]: Non-owning `{ ptr, len }` views (`StrView = FfiSlice<u8>`). Empty
+//!   C slices `(NULL, 0)` safely substitute `NonNull::dangling()` in [`FfiSlice::as_slice`].
+//! - [`BamComponent`]: 1-based world-scoped component/resource handle (`0` = [`BamComponent::INVALID`]).
+//!   Paired with [`BamSystem`], [`BamSystemSet`], and [`BamSymbol`] (`u32::MAX` = `INVALID`).
+//! - [`ComponentUuid`]: 16-byte (`align = 1`) deterministic component identity computed in `const`
+//!   via keyed SipHash-2-4-128 ([`ComponentUuid::from_parts`], [`ComponentUuid::from_canonical_name`],
+//!   [`ComponentUuid::hash_field_schema`], [`ComponentUuid::parse_hex`]).
+//! - Built-in entity, hierarchy, disabling, and asset primitives: [`FfiEntity`], [`FfiChildOf`],
+//!   [`FfiDisabled`], [`FfiAssetHandle`], and [`FfiAssetLoadState`].
+//!
+//! ```
+//! use bamabi_sys::{
+//!     BamComponent, ComponentUuid, FfiBool, FfiOption, FfiResult, StrView,
+//! };
+//!
+//! let uuid = ComponentUuid::from_parts("my_game::Health", 4, 4, 0);
+//! assert!(!uuid.is_zero());
+//!
+//! let handle = BamComponent::from_raw(1);
+//! assert!(handle.is_valid());
+//!
+//! let opt = FfiOption::some(FfiBool::TRUE);
+//! assert_eq!(opt.into_option(), Some(FfiBool::TRUE));
+//!
+//! let view = StrView::from_str("bamabi");
+//! // SAFETY: `view` borrows the `'static` string literal `"bamabi"`.
+//! assert_eq!(unsafe { view.try_as_str() }, Ok("bamabi"));
+//! assert!(FfiResult::OK.is_ok());
+//! ```
+//!
+//! ---
+//!
+//! ## Step 3: Host Contract & Versioning
+//!
+//! Version negotiation and ABI extension rely on packed SemVer words and `struct_size`-prefixed
+//! tables:
+//!
+//! - [`ABI_VERSION`]: Packed `u32` `(major << 24) | (minor << 16) | patch` (`0x0003_0000` for
+//!   `0.3.0`; mirrored in C99 as `BAM_ABI_VERSION`), manipulated via [`pack_abi_version`],
+//!   [`unpack_abi_version`], and [`abi_version_is_compatible`]. Pre-1.0 requires exact `minor`
+//!   equality (ignoring `patch`); post-1.0 accepts `guest_minor <= host_minor`.
+//! - [`BamManifest`]: Static identity struct returned by `bamabi_manifest()` (`MIN_V0_2_SIZE` =
+//!   `32` B / `24` B; full `48` B / `32` B with optional `save_state` / `restore_state` hot-reload
+//!   callbacks).
+//! - [`BamHostApi`]: Complete **68-slot** host function-pointer table passed to `bamabi_init`
+//!   (`MIN_V0_2_SIZE` = `224` B / `116` B covering the 27 mandatory `0.2` slots; `MIN_V0_3_SIZE` =
+//!   `552` B / `280` B covering all 68 live slots). Probes `struct_size` / `abi_version` safely via
+//!   [`BamHostApi::raw_struct_size`], [`BamHostApi::raw_abi_version`], and [`BamHostApi::covers_slot`].
+//! - [`offsets`]: Exports target-native (`<FIELD>`), 64-bit (`OFF64_<FIELD>`, [`offsets::SIZE_64`] =
+//!   `552`), and 32-bit (`OFF32_<FIELD>`, [`offsets::SIZE_32`] = `280`) byte offsets for all 70
+//!   fields (`struct_size`, `abi_version`, and slots `0..68`, [`offsets::SLOT_COUNT`] = `68`).
+//! - [`ExtensibleStruct`]: Contract for all 13 `struct_size`-prefixed `#[repr(C)]` structs whose
+//!   fields are zero-valid (`Option<unsafe extern "C" fn(...)>` niche optimization). Use
+//!   [`read_extensible_struct`] and [`read_descriptor`] to copy `min(struct_size, size_of::<T>())`
+//!   bytes, zero-extending missing trailing fields and truncating unknown future fields.
+//!
+//! ---
+//!
+//! ## Step 4: Descriptors & Component Traits
+//!
+//! Component metadata, POD safety proofs, and registration descriptors build on those primitives:
+//!
+//! - **Traits & VTable Headers:**
+//!   - [`ModComponent`]: Trait generated by `#[derive(ModComponent)]` exposing canonical name,
+//!     [`ComponentUuid`], `SCHEMA_FINGERPRINT`, `BAM_FIELDS`, `REQUIRED_COMPONENTS`, `C_DECL`,
+//!     `ZIG_DECL`, and a static [`VTableHeader`]-prefixed VTable without requiring `Default` or
+//!     [`RawInsertable`].
+//!   - [`AbiPod`]: `unsafe trait` for cross-language Plain Old Data (`#[repr(C)]` /
+//!     `#[repr(transparent)]`, `Copy`, no drop glue, zero implicit padding; excludes `u128`, `i128`,
+//!     `usize`, `isize`, `bool`, and `char`).
+//!   - [`RawInsertable`]: `unsafe trait` for same-process raw byte moves (includes `AbiPod` plus
+//!     `u128`, `i128`, `usize`, `isize`).
+//!   - [`VTableHeader`]: Self-describing header at byte offset `0` of every `<Struct>VTable`,
+//!     [`MappedWireVTable`], and [`MappedStringVTable`].
+//! - **ECS Descriptors:**
+//!   - [`BamSystemDesc`], [`BamQueryDesc`], and [`BamTermDesc`] (with [`AccessMode`] and
+//!     [`ScheduleId`]) define multi-query systems, `Or<(...)>` groups, schedule placement, ordering,
+//!     and `run_if` predicates.
+//!   - [`BamRelationDesc`] defines typed entity relationship flags (`EXCLUSIVE`, `CASCADE_DESPAWN`,
+//!     `SYMMETRIC`, `ACYCLIC`, `CLEANUP_REMOVE`) and optional edge payloads.
+//!   - [`BamScheduleSetDesc`] configures named schedule sets (`SEQUENCE`, `SEQUENCE_WEAK`,
+//!     `PARALLEL`, `BEFORE_WEAK`, `AFTER_WEAK`).
+//!   - [`BamObserverDesc`] and [`BamTriggerDesc`] configure custom, lifecycle (`ADD`..=`READY`),
+//!     mutable, and relationship-propagating observers/triggers.
+//!   - [`ComponentDesc`], [`BamFieldDesc`], [`BamRequiredComponent`], [`BamLayoutInfo`],
+//!     [`BamColumnInfo`], and [`BamChangeTicks`] describe dynamic component registration, field
+//!     reflection, required-component initializers, and column change tracking.
+//!
+//! ---
+//!
+//! ## Step 5: Module Map & Reading Order
+//!
+//! Except for [`host_api`] (which exposes [`offsets`]), internal modules are private and re-exported
+//! flat at the crate root. Recommended source reading order:
+//!
+//! 1. `src/version.rs` — ABI version packing and SemVer rules.
+//! 2. `src/primitives/` (`mod.rs`, `bool.rs`, `entity.rs`, `option.rs`, `slice.rs`, `asset.rs`,
+//!    `uuid.rs`) — FFI-safe primitives, handles, and const SipHash-2-4-128.
+//! 3. `src/extensible.rs` — [`ExtensibleStruct`] prefix copying and truncation.
+//! 4. `src/access.rs` — [`AccessMode`], [`ScheduleId`], [`BamTermDesc`], and query limits.
+//! 5. `src/component.rs` — [`ComponentDesc`], [`VTableHeader`], reflection, relations, and schedule sets.
+//! 6. `src/system.rs` & `src/commands.rs` — [`BamQueryDesc`], [`BamSystemDesc`], [`BamObserverDesc`],
+//!    [`BamTriggerDesc`], and deferred command prototypes.
+//! 7. `src/iter.rs` — [`BamIter`], [`BamChangeTicks`], [`BamColumnInfo`], and iteration callbacks.
+//! 8. `src/host_api.rs` — [`BamManifest`], 68-slot [`BamHostApi`], and [`offsets`].
+//! 9. `src/traits.rs` — [`RawInsertable`], [`AbiPod`], [`SymbolEntry`], and [`ModComponent`].
+//!
+//! For deep architectural notes and a complete test/proof inventory, see `ARCHITECTURE.md` and
+//! `TESTS.md` in `crates/bamabi_sys/`.
+//!
+//! ---
+//!
+//! ## Step 6: Setup, Build, Test & Formal Verification
+//!
+//! ```bash
+//! # Check host and 32-bit / Wasm wire layout parity
+//! cargo check -p bamabi_sys
+//! cargo check -p bamabi_sys --target i686-unknown-linux-gnu
+//! cargo check -p bamabi_sys --target wasm32-unknown-unknown
+//!
+//! # Lint and rustdoc gate (zero warnings)
+//! cargo fmt -p bamabi_sys -- --check
+//! cargo clippy -p bamabi_sys --all-targets --all-features -- -D warnings
+//! RUSTDOCFLAGS="-D warnings" cargo doc -p bamabi_sys --no-deps --all-features
+//!
+//! # Unit tests, property tests, and doctests
+//! cargo test -p bamabi_sys --all-features
+//! cargo test --doc -p bamabi_sys --all-features
+//!
+//! # Undefined Behavior & Formal Verification (nightly Miri + Kani)
+//! MIRIFLAGS="-Zmiri-tree-borrows -Zmiri-strict-provenance" cargo +nightly miri test -p bamabi_sys
+//! cargo kani -p bamabi_sys
+//! ```
 
 mod access;
 mod commands;
