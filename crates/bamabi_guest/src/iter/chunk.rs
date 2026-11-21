@@ -86,7 +86,7 @@ impl<'iter, 'ctx> Chunk<'iter, 'ctx> {
     /// Returns `None` on UUID or layout mismatch.
     #[inline]
     pub fn component<T: GuestComponent>(&self, col: usize) -> Option<&[T]> {
-        let filter = guest_uuid_filter::<T>(self.iter.host().manifest_name());
+        let filter = guest_uuid_filter::<T>(self.iter.base_host().manifest_name());
         self.iter.column_checked::<T>(col, Some(filter))
     }
 
@@ -114,7 +114,7 @@ impl<'iter, 'ctx> Chunk<'iter, 'ctx> {
     /// UUID in addition to `(size, align, mode, storage)` and marking chunk rows changed.
     #[inline]
     pub fn component_mut<T: GuestComponent>(&mut self, col: usize) -> Option<&mut [T]> {
-        let filter = guest_uuid_filter::<T>(self.iter.host().manifest_name());
+        let filter = guest_uuid_filter::<T>(self.iter.base_host().manifest_name());
         self.iter.column_mut_checked::<T>(col, Some(filter))
     }
 
@@ -141,7 +141,7 @@ impl<'iter, 'ctx> Chunk<'iter, 'ctx> {
     /// Untracked mutable column slice for `T: GuestComponent`, validating `T`'s UUID.
     #[inline]
     pub fn component_mut_untracked<T: GuestComponent>(&mut self, col: usize) -> Option<&mut [T]> {
-        let filter = guest_uuid_filter::<T>(self.iter.host().manifest_name());
+        let filter = guest_uuid_filter::<T>(self.iter.base_host().manifest_name());
         self.iter
             .column_mut_untracked_checked::<T>(col, Some(filter))
     }
@@ -183,7 +183,7 @@ impl<'iter, 'ctx> Chunk<'iter, 'ctx> {
         read_col: usize,
         write_col: usize,
     ) -> Option<(&[R], &mut [W])> {
-        let manifest = self.iter.host().manifest_name();
+        let manifest = self.iter.base_host().manifest_name();
         let r_filter = guest_uuid_filter::<R>(manifest);
         let w_filter = guest_uuid_filter::<W>(manifest);
         self.iter
@@ -209,7 +209,7 @@ impl<'iter, 'ctx> Chunk<'iter, 'ctx> {
         col_a: usize,
         col_b: usize,
     ) -> Option<(&mut [W1], &mut [W2])> {
-        let manifest = self.iter.host().manifest_name();
+        let manifest = self.iter.base_host().manifest_name();
         let filter_a = guest_uuid_filter::<W1>(manifest);
         let filter_b = guest_uuid_filter::<W2>(manifest);
         self.iter
@@ -233,7 +233,7 @@ impl<'iter, 'ctx> Chunk<'iter, 'ctx> {
         &mut self,
         write_col: usize,
     ) -> Option<(&[FfiEntity], &mut [W])> {
-        let filter = guest_uuid_filter::<W>(self.iter.host().manifest_name());
+        let filter = guest_uuid_filter::<W>(self.iter.base_host().manifest_name());
         self.iter
             .entities_and_column_mut_checked::<W>(write_col, Some(filter))
     }
@@ -258,7 +258,7 @@ impl<'iter, 'ctx> Chunk<'iter, 'ctx> {
         read_col: usize,
         write_col: usize,
     ) -> Option<(&[FfiEntity], &[R], &mut [W])> {
-        let manifest = self.iter.host().manifest_name();
+        let manifest = self.iter.base_host().manifest_name();
         let r_filter = guest_uuid_filter::<R>(manifest);
         let w_filter = guest_uuid_filter::<W>(manifest);
         self.iter.entities_and_read_write_checked::<R, W>(
@@ -279,7 +279,7 @@ impl<'iter, 'ctx> Chunk<'iter, 'ctx> {
     /// `T`'s UUID.
     #[inline]
     pub fn component_rows<T: GuestComponent>(&mut self, col: usize) -> Option<SparseRows<'_, T>> {
-        let filter = guest_uuid_filter::<T>(self.iter.host().manifest_name());
+        let filter = guest_uuid_filter::<T>(self.iter.base_host().manifest_name());
         self.iter.rows_checked::<T>(col, Some(filter))
     }
 
@@ -297,7 +297,7 @@ impl<'iter, 'ctx> Chunk<'iter, 'ctx> {
         &mut self,
         col: usize,
     ) -> Option<SparseRowsMut<'_, T>> {
-        let filter = guest_uuid_filter::<T>(self.iter.host().manifest_name());
+        let filter = guest_uuid_filter::<T>(self.iter.base_host().manifest_name());
         self.iter.rows_mut_checked::<T>(col, Some(filter))
     }
 
@@ -330,7 +330,7 @@ impl<'iter, 'ctx> Chunk<'iter, 'ctx> {
     /// `R`'s UUID.
     #[inline]
     pub fn component_resource<R: GuestComponent>(&self, term_index: usize) -> Option<&R> {
-        let filter = guest_uuid_filter::<R>(self.iter.host().manifest_name());
+        let filter = guest_uuid_filter::<R>(self.iter.base_host().manifest_name());
         self.iter.resource_checked::<R>(term_index, Some(filter))
     }
 
@@ -347,7 +347,7 @@ impl<'iter, 'ctx> Chunk<'iter, 'ctx> {
         &mut self,
         term_index: usize,
     ) -> Option<&mut R> {
-        let filter = guest_uuid_filter::<R>(self.iter.host().manifest_name());
+        let filter = guest_uuid_filter::<R>(self.iter.base_host().manifest_name());
         self.iter
             .resource_mut_checked::<R>(term_index, Some(filter))
     }
@@ -372,7 +372,7 @@ impl<'iter, 'ctx> Chunk<'iter, 'ctx> {
         &mut self,
         term_index: usize,
     ) -> Result<Vec<M>, FfiResult> {
-        let filter = guest_uuid_filter::<M>(self.iter.host().manifest_name());
+        let filter = guest_uuid_filter::<M>(self.iter.base_host().manifest_name());
         self.iter
             .drain_messages_checked::<M>(term_index, Some(filter))
     }
@@ -386,7 +386,7 @@ impl<'iter, 'ctx> Chunk<'iter, 'ctx> {
     /// Sends a message (`M: GuestComponent`) on `term_index`, validating `M`'s UUID.
     #[inline]
     pub fn send_message<M: GuestComponent>(&mut self, term_index: usize, msg: &M) -> FfiResult {
-        let filter = guest_uuid_filter::<M>(self.iter.host().manifest_name());
+        let filter = guest_uuid_filter::<M>(self.iter.base_host().manifest_name());
         self.iter
             .send_message_checked::<M>(term_index, Some(filter), msg)
     }

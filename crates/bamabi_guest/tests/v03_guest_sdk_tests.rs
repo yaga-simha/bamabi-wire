@@ -187,6 +187,8 @@ struct MockV03World {
     mounted_systems: Vec<(BamSystem, ScheduleId, BamSystemSet)>,
     commands: Vec<RecordedCmd>,
     rollback_calls: usize,
+    sys_host_ctx_calls: AtomicUsize,
+    sys_commands_calls: AtomicUsize,
     next_entity_bits: u64,
     logs: Vec<(u32, String)>,
     faults: Vec<String>,
@@ -249,6 +251,8 @@ impl V03TestHost {
                 mounted_systems: Vec::new(),
                 commands: Vec::new(),
                 rollback_calls: 0,
+                sys_host_ctx_calls: AtomicUsize::new(0),
+                sys_commands_calls: AtomicUsize::new(0),
                 next_entity_bits: 1000,
                 logs: Vec::new(),
                 faults: Vec::new(),
@@ -594,6 +598,8 @@ unsafe extern "C" fn host_register_system(
 /// Mock `BamHostApi::sys_host_ctx` returning the world pointer from `MockSystemFrame`.
 unsafe extern "C" fn host_sys_host_ctx(sys_ctx: *const BamSystemCtx) -> *const BamHostCtx {
     let frame = unsafe { &*sys_ctx.cast::<MockSystemFrame>() };
+    let world = unsafe { &*frame.world };
+    world.sys_host_ctx_calls.fetch_add(1, Ordering::Relaxed);
     frame.world.cast::<BamHostCtx>()
 }
 
@@ -617,6 +623,8 @@ unsafe extern "C" fn host_sys_commands(
     out_commands: *mut *mut BamCommands,
 ) -> FfiResult {
     let frame = unsafe { &*sys_ctx.cast::<MockSystemFrame>() };
+    let world = unsafe { &*frame.world };
+    world.sys_commands_calls.fetch_add(1, Ordering::Relaxed);
     unsafe { *out_commands = frame.world.cast::<BamCommands>() };
     FfiResult::OK
 }
@@ -3133,5 +3141,86 @@ fn sixteen_term_query_tuple_and_eight_branch_or() {
         vec![C1 { v: 120 }, C1 { v: 1200 }]
     );
     assert_eq!(host.run_system(1), FfiResult::OK);
+    host.unload(inst);
+}
+
+/// Scenario: Verifies that `SystemContext` avoids `sys_host_ctx` and `sys_commands` FFI calls on
+/// `noop` and query-only systems (including `queries_3_mut`), while lazily calling each at most
+/// once per tick when `ctx.commands()` or `ctx.intern_symbol()` / `ctx.host()` are invoked.
+#[test]
+fn system_context_defers_sys_host_ctx_and_sys_commands_on_noop_and_queries() {
+    #[repr(C)]
+    #[derive(Clone, Copy, Default, AbiPod, GuestComponent)]
+    #[guest_component(name = "lazy_test::A")]
+    struct CompA(u32);
+
+    #[repr(C)]
+    #[derive(Clone, Copy, Default, AbiPod, GuestComponent)]
+    #[guest_component(name = "lazy_test::B")]
+    struct CompB(u32);
+
+    #[repr(C)]
+    #[derive(Clone, Copy, Default, AbiPod, GuestComponent)]
+    #[guest_component(name = "lazy_test::C")]
+    struct CompC(u32);
+
+    let mut host = V03TestHost::new();
+    let ha = host.expose_component::<CompA>("lazy_test::A", CompA::UUID, 0, &[]);
+    let hb = host.expose_component::<CompB>("lazy_test::B", CompB::UUID, 0, &[]);
+    let hc = host.expose_component::<CompC>("lazy_test::C", CompC::UUID, 0, &[]);
+    let mut chunk = MockChunk::new(vec![FfiEntity::from_bits(1)]);
+    chunk.insert_dense(ha, &[CompA(1)]);
+    chunk.insert_dense(hb, &[CompB(2)]);
+    chunk.insert_dense(hc, &[CompC(3)]);
+    host.chunks.push(chunk);
+
+    let inst = host
+        .load_fn(c"lazy_sdk_mod", |app| {
+            // System 0: pure noop.
+            let rc = app.system(c"noop_sys").build(|_ctx| FfiResult::OK);
+            assert_eq!(rc, FfiResult::OK);
+
+            // System 1: 3-query system calling `queries_3_mut` (must NOT trigger `sys_commands` or `sys_host_ctx`).
+            let rc = app
+                .system(c"three_query_sys")
+                .query(|q| q.read::<CompA>())
+                .query(|q| q.read::<CompB>())
+                .query(|q| q.read::<CompC>())
+                .build(|ctx| {
+                    let (q0, q1, q2) = ctx.queries_3_mut(0, 1, 2).expect("3 queries");
+                    assert!(q0.next_chunk().is_some());
+                    assert!(q1.next_chunk().is_some());
+                    assert!(q2.next_chunk().is_some());
+                    FfiResult::OK
+                });
+            assert_eq!(rc, FfiResult::OK);
+
+            // System 2: invokes `commands()` twice and `intern_symbol()` twice (1 FFI call each).
+            app.system(c"cmds_and_host_sys").build(|ctx| {
+                let _ = ctx.commands().spawn_empty().unwrap();
+                let _ = ctx.commands().spawn_empty().unwrap();
+                let s1 = ctx.intern_symbol("lazy.sym").unwrap();
+                let s2 = ctx.intern_symbol("lazy.sym").unwrap();
+                assert_eq!(s1, s2);
+                FfiResult::OK
+            })
+        })
+        .unwrap();
+
+    // System 0 (noop): 0 sys_host_ctx, 0 sys_commands.
+    assert_eq!(host.run_system(0), FfiResult::OK);
+    assert_eq!(host.sys_host_ctx_calls.load(Ordering::Relaxed), 0);
+    assert_eq!(host.sys_commands_calls.load(Ordering::Relaxed), 0);
+
+    // System 1 (queries_3_mut): still 0 sys_host_ctx, 0 sys_commands.
+    assert_eq!(host.run_system(1), FfiResult::OK);
+    assert_eq!(host.sys_host_ctx_calls.load(Ordering::Relaxed), 0);
+    assert_eq!(host.sys_commands_calls.load(Ordering::Relaxed), 0);
+
+    // System 2 (commands + intern_symbol twice each): exactly 1 sys_host_ctx, 1 sys_commands.
+    assert_eq!(host.run_system(2), FfiResult::OK);
+    assert_eq!(host.sys_host_ctx_calls.load(Ordering::Relaxed), 1);
+    assert_eq!(host.sys_commands_calls.load(Ordering::Relaxed), 1);
+
     host.unload(inst);
 }

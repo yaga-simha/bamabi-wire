@@ -52,7 +52,7 @@ use crate::{
         raw_dense_slice, raw_dense_slice_mut,
     },
     trampoline::{
-        ObserverTrampolineState, RunIfClosureState, SystemClosureState,
+        ObserverTrampolineState, PinnedHostPtr, RunIfClosureState, SystemClosureState,
         lifecycle_observer_closure_trampoline, observer_closure_trampoline,
         observer_mut_closure_trampoline, run_if_closure_trampoline, system_closure_trampoline,
     },
@@ -2076,7 +2076,7 @@ fn po_g7_guest_state_and_observer_trampolines() {
     }
 
     let mut obs_state = ObserverTrampolineState::<MutObsFn> {
-        host,
+        host: PinnedHostPtr::new(&raw const host),
         callback: ReentrantCell::new(mut_obs_inc),
     };
     let ud = core::ptr::from_mut(&mut obs_state).cast::<c_void>();
@@ -2159,7 +2159,7 @@ fn po_g7_guest_state_and_observer_trampolines() {
     let orig_reent_ev = reent_ev;
     let mut reent_prop = FfiBool::from_bool(init_prop);
     let mut reent_state = ObserverTrampolineState::<MutObsFn> {
-        host,
+        host: PinnedHostPtr::new(&raw const host),
         callback: ReentrantCell::new(mut_obs_noop),
     };
     let reent_ud = core::ptr::from_mut(&mut reent_state).cast::<c_void>();
@@ -2187,7 +2187,7 @@ fn po_g7_guest_state_and_observer_trampolines() {
 
     // ZST `observer_closure_trampoline` accepts null `event_data` cleanly.
     let mut zst_obs = ObserverTrampolineState::<ZstObsFn> {
-        host,
+        host: PinnedHostPtr::new(&raw const host),
         callback: ReentrantCell::new(zst_obs_noop),
     };
     let zst_obs_res = unsafe {
@@ -2563,7 +2563,7 @@ fn po_g8_system_and_run_if_trampolines() {
         }
     };
     let mut sys_state = SystemClosureState {
-        host,
+        host: PinnedHostPtr::new(&raw const host),
         total_query_count: 1,
         user_query_count: 1,
         resource_query_index: None,
@@ -2632,7 +2632,7 @@ fn po_g8_system_and_run_if_trampolines() {
         pred_flag
     };
     let mut run_if_state = RunIfClosureState {
-        host,
+        host: PinnedHostPtr::new(&raw const host),
         closure: ReentrantCell::new(run_if_fn),
     };
     let run_ud = core::ptr::from_mut(&mut run_if_state).cast::<c_void>();
@@ -2693,7 +2693,7 @@ fn po_g8_lifecycle_observer_trampoline() {
         }
     };
     let mut state = ObserverTrampolineState {
-        host,
+        host: PinnedHostPtr::new(&raw const host),
         callback: ReentrantCell::new(cb),
     };
     let ud = core::ptr::from_mut(&mut state).cast::<c_void>();

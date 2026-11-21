@@ -306,6 +306,19 @@ impl Host {
         Some(unsafe { (&*self.runtime_allocs_ptr.0).track(boxed) })
     }
 
+    /// Returns the owning [`GuestInstance`]'s stable heap-pinned `*const Host` pointer, or `None`
+    /// if this [`Host`] was constructed standalone without a [`GuestInstance`].
+    #[inline]
+    pub(crate) fn pinned_host_ptr(&self) -> Option<*const Host> {
+        if self.runtime_allocs_ptr.0.is_null() {
+            return None;
+        }
+        // SAFETY: `with_runtime_allocs` guarantees `runtime_allocs_ptr.0` points to a live
+        // `RuntimeAllocTracker` inside `GuestInstance` outliving `&self`.
+        let ptr = unsafe { (&*self.runtime_allocs_ptr.0).pinned_host_ptr() };
+        (!ptr.is_null()).then_some(ptr)
+    }
+
     /// Returns the owning mod instance's manifest name (`""` when constructed standalone via
     /// [`Self::from_raw`] without a [`GuestInstance`]).
     #[inline]

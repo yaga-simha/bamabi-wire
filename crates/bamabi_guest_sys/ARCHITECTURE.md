@@ -68,10 +68,10 @@
 
 ### 2.2 `instance.rs` — Per-World Isolation, LIFO Teardown & Hot-Reload (`src/instance.rs`)
 
-- **Move-Safe Raw Provenance (`OwnedRuntimeAllocs` & `OwnedManifestBytes`):**
+- **Move-Safe Raw Provenance (`OwnedPinnedHost`, `OwnedRuntimeAllocs`, & `OwnedManifestBytes`):**
   - `GuestInstance` is constructed on the stack in `init_guest_instance` and then moved into `Box::into_raw(Box::new(instance))` at return.
-  - Because `Host` (copied into every system/`run_if`/observer closure) holds `*const u8` (manifest name) and `*const RuntimeAllocTracker`, storing those allocations as `Box<T>` inside `GuestInstance` would retag `Unique` provenance on move and trigger UB under Miri Stacked/Tree Borrows.
-  - `OwnedRuntimeAllocs` and `OwnedManifestBytes` allocate via `Box::into_raw` and free via `Box::from_raw` only in their `Drop` impls, declared **last** in `GuestInstance` so Rust drops them strictly *after* `GuestInstance::drop` tears down every closure holding a `Host`.
+  - Because every system, `run_if`, and observer trampoline stores an 8-byte `PinnedHostPtr` (`*const Host`) pointing into `GuestInstance`'s heap-pinned `Host` (avoiding per-closure 584-byte `Host` copies), and `Host` itself holds `*const u8` (manifest name) and `*const RuntimeAllocTracker`, storing those allocations as `Box<T>` inside `GuestInstance` would retag `Unique` provenance on move and trigger UB under Miri Stacked/Tree Borrows.
+  - `OwnedPinnedHost`, `OwnedRuntimeAllocs`, and `OwnedManifestBytes` allocate via `Box::into_raw` and free via `Box::from_raw` only in their `Drop` impls, declared **last** in `GuestInstance` (with `pinned_host` before `_runtime_allocs` and `_manifest_bytes`) so Rust drops them strictly *after* `GuestInstance::drop` tears down every closure, observer, and hook referencing them.
 - **Deterministic LIFO Teardown Order:**
   - `GuestInstance::shutdown_guest_instance` invokes `run_shutdown_hooks()` (popping and running each `FnOnce()` inside `catch_guest_unit`), then drops `GuestInstance`:
     1. `self.shutdown_hooks.clear()` (discards unrun hooks on failed-init rollback without running them).
@@ -104,9 +104,9 @@
   - `try_with_mut` executes `in_use.compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)`.
   - An RAII `ReleaseGuard(&self.in_use)` stores `false` with `Ordering::Release` on drop—even if the closure panics and unwinds into `catch_guest_result` / `catch_guest_bool`.
   - Re-entrant or concurrent invocation observes `Err` and returns `None` *before* forming `&mut *self.value.get()`, mapping to `FfiResult::ACCESS_CONFLICT` (or `FfiBool::FALSE`).
-- **System Execution Frame (`ValidatedSystemInvocation` & `ValidatedSystemRef`):**
-  - `system_closure_trampoline` refreshes `Host::host_ctx` per invocation via `BamHostApi::sys_host_ctx(sys_ctx)` so diagnostics and symbol queries target the active world context, then builds `ValidatedSystemInvocation<'a>` (clamping `total_query_count` to `MAX_QUERIES_PER_SYSTEM`).
-  - Query slots (`queries: [Option<ValidatedIter<'a>>; MAX_QUERIES_PER_SYSTEM]`) and `commands` are fetched lazily on first access; `queries_2_mut` / `queries_2_and_commands_mut` reject `idx_a == idx_b` and use `split_at_mut` for disjoint `&mut ValidatedIter` borrows.
+- **System Execution Frame (`ValidatedSystemInvocation`, `ValidatedSystemRef`, & `LazyCommands`):**
+  - `system_closure_trampoline` borrows `GuestInstance`'s pinned `Host` directly via `PinnedHostPtr` without copying 584 bytes or calling `BamHostApi::sys_host_ctx(sys_ctx)` eagerly; a stack-pinned `LazyInvocationHost` resolves and caches `sys_host_ctx(sys_ctx)` at most once per tick on first `host()` / `commands()` demand (preserving `raw_ctx` pointer provenance under Miri Stacked/Tree Borrows) before building `ValidatedSystemInvocation<'a>` (clamping `total_query_count` to `MAX_QUERIES_PER_SYSTEM`).
+  - Query slots (`queries: [MaybeUninit<ValidatedIter<'a>>; MAX_QUERIES_PER_SYSTEM]` tracked by `u8` init/taken bitmasks) and `commands` (or single-use `LazyCommands<'a>` via `take_lazy_commands()`) are fetched lazily on first access; `queries_2_mut` / `queries_2_and_commands_mut` reject `idx_a == idx_b` and use `split_at_mut` for disjoint `&mut ValidatedIter` borrows.
   - `ValidatedSystemRef<'a>` is intentionally **non-`Copy` and non-`Clone`** (`take_system_ref` succeeds at most once). Its `&mut self` methods (`entity_get_mut_checked`, `res_mut_ptr_by_handle_with_uuid_checked`, `write_mapped_wire_resource_by_handle`) prevent duplicate `&mut` aliasing to the same resource or entity component.
   - All handle-based resource lookups fail closed via `Host::component_layout_info`: if `component_layout_info` is `UNSUPPORTED` (ABI `0.2`), or if `(size, align, uuid, !immutable)` disagree, they return `None` / `Err(...)`.
 - **Descriptor Ownership (`OwnedDescriptorStorage`):**

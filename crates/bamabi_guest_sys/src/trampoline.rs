@@ -2,9 +2,9 @@
 //! unified [`BamSystemDesc`] registration.
 
 use core::{
-    cell::UnsafeCell,
+    cell::{Cell, UnsafeCell},
     ffi::{CStr, c_char, c_void},
-    mem::ManuallyDrop,
+    mem::{ManuallyDrop, MaybeUninit},
     sync::atomic::{AtomicBool, Ordering},
 };
 use std::ffi::CString;
@@ -96,17 +96,239 @@ impl<T> ReentrantCell<T> {
     }
 }
 
+const _: () = {
+    assert!(MAX_QUERIES_PER_SYSTEM <= 8);
+    assert!(!core::mem::needs_drop::<ValidatedIter<'static>>());
+};
+
+/// `Send + Sync` newtype wrapping a stable `*const Host` pointer owned by [`GuestInstance`].
+///
+/// Replaces embedding a 584-byte [`Host`] value inside [`SystemClosureState`],
+/// [`RunIfClosureState`], and [`ObserverTrampolineState`] with an 8-byte pointer.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct PinnedHostPtr(*const Host);
+
+// SAFETY: Points to an immutable, heap-pinned `Host` (`Host: Send + Sync`) owned by
+// `GuestInstance` that drops strictly after all closures and observers referencing this pointer.
+unsafe impl Send for PinnedHostPtr {}
+// SAFETY: Shared reads through `*const Host` are concurrently safe because `Host` is immutable and
+// `Send + Sync`.
+unsafe impl Sync for PinnedHostPtr {}
+
+impl PinnedHostPtr {
+    /// Wraps a stable `*const Host` pointer that outlives the trampoline state holding it.
+    #[inline]
+    pub(crate) const fn new(ptr: *const Host) -> Self {
+        Self(ptr)
+    }
+
+    /// Borrows the pinned [`Host`] for `'a`.
+    ///
+    /// # Safety
+    /// The pointed-to [`Host`] must remain alive, aligned, and unmutated for `'a`.
+    #[inline]
+    pub(crate) const unsafe fn as_ref<'a>(self) -> &'a Host {
+        // SAFETY: Caller guarantees the pointed-to `Host` is valid and immutable for `'a`.
+        unsafe { &*self.0 }
+    }
+}
+
+/// Stack-pinned lazy per-tick [`Host`] resolver allocated on `system_closure_trampoline`'s stack
+/// frame.
+///
+/// Systems that never inspect `Host::host_ctx` pay zero `BamHostApi::sys_host_ctx` FFI calls and
+/// zero 584-byte `Host` struct copies. On first demand, `sys_host_ctx(sys_ctx)` is queried at most
+/// once; if it returns null or the slot is absent, `base_host` is reused directly. Otherwise an
+/// updated `Host` stamped with `raw_ctx` (preserving its exact pointer provenance under Miri
+/// Tree/Stacked Borrows even when `raw_ctx` shares the same address as `base_host.host_ctx()`) is
+/// materialized once in `storage`.
+pub(crate) struct LazyInvocationHost<'base> {
+    base_host: &'base Host,
+    sys_ctx: *mut BamSystemCtx,
+    resolved: Cell<*const Host>,
+    storage: UnsafeCell<MaybeUninit<Host>>,
+}
+
+impl<'base> LazyInvocationHost<'base> {
+    /// Creates an unresolved lazy host frame referencing `base_host` and `sys_ctx` without
+    /// initializing the 584-byte `storage` slot or calling `sys_host_ctx`.
+    #[inline]
+    pub(crate) const fn new(base_host: &'base Host, sys_ctx: *mut BamSystemCtx) -> Self {
+        Self {
+            base_host,
+            sys_ctx,
+            resolved: Cell::new(core::ptr::null()),
+            storage: UnsafeCell::new(MaybeUninit::uninit()),
+        }
+    }
+
+    /// Returns the init-time base [`Host`] immediately without calling `sys_host_ctx`.
+    #[inline]
+    pub(crate) const fn base_host(&self) -> &'base Host {
+        self.base_host
+    }
+
+    /// Resolves and caches the active per-tick [`Host`] reference at most once per invocation.
+    #[inline]
+    pub(crate) fn resolve(&self) -> &Host {
+        let cached = self.resolved.get();
+        if !cached.is_null() {
+            // SAFETY: `cached` was set by `resolve_slow` and points either to `self.base_host`
+            // (valid for `'base: 'self`) or to initialized `self.storage` (never mutated again
+            // after `resolved` becomes non-null, valid for `'self`).
+            return unsafe { &*cached };
+        }
+        self.resolve_slow()
+    }
+
+    /// Cold path performing the one-time `BamHostApi::sys_host_ctx(sys_ctx)` FFI query and
+    /// materializing an updated `Host` in `self.storage` only if the runtime `BamHostCtx` differs.
+    #[cold]
+    #[inline(never)]
+    fn resolve_slow(&self) -> &Host {
+        let ptr: *const Host = if !self.sys_ctx.is_null()
+            && let Some(sys_host_ctx_fn) = host_slot!(self.base_host.api(), sys_host_ctx)
+        {
+            // SAFETY: `self.sys_ctx` is non-null and active for the duration of this system call.
+            let raw_ctx = unsafe { sys_host_ctx_fn(self.sys_ctx.cast_const()) };
+            if raw_ctx.is_null() {
+                core::ptr::from_ref(self.base_host)
+            } else {
+                // Always stamp `raw_ctx` rather than comparing addresses with `base_host.host_ctx()`:
+                // under strict provenance / Tree Borrows, `raw_ctx` may carry a fresh borrow tag
+                // at the same numeric address as the init-time `host_ctx`.
+                // SAFETY: `raw_ctx` was returned by `BamHostApi::sys_host_ctx(sys_ctx)` and
+                // remains valid for the duration of this system invocation.
+                let updated = unsafe { self.base_host.with_host_ctx_ptr(raw_ctx) };
+                let slot_ptr: *mut Host = self.storage.get().cast::<Host>();
+                // SAFETY: `LazyInvocationHost` is `!Sync`, `self.resolved` is still null so no
+                // shared reference into `self.storage` exists yet, and writing directly via
+                // `ptr::write` preserves `SharedReadWrite` raw provenance without forming `&mut`.
+                unsafe { slot_ptr.write(updated) };
+                slot_ptr.cast_const()
+            }
+        } else {
+            core::ptr::from_ref(self.base_host)
+        };
+        self.resolved.set(ptr);
+        // SAFETY: `ptr` points either to `self.base_host` or to the just-initialized `self.storage`,
+        // which is never mutated again for the remainder of `&self`'s lifetime.
+        unsafe { &*ptr }
+    }
+}
+
+/// Fetches query slot `index` via `BamHostApi::sys_query` out-of-line using only scalar register
+/// arguments so callers' [`ValidatedSystemInvocation`] frames never escape to the stack.
+#[inline(never)]
+fn fetch_query_slot_raw<'a>(
+    sys_ctx: *mut BamSystemCtx,
+    host: &'a Host,
+    lazy_host: Option<&'a LazyInvocationHost<'a>>,
+    index: usize,
+) -> ValidatedIter<'a> {
+    if sys_ctx.is_null() {
+        return ValidatedIter::empty(host);
+    }
+    if let Some(sys_query_fn) = host.api().sys_query {
+        let mut raw_iter: *mut BamIter = core::ptr::null_mut();
+        // SAFETY: `sys_ctx` is active for `'a`, `index < total_query_count`, and
+        // `raw_iter` is writable stack storage.
+        let status = unsafe { sys_query_fn(sys_ctx, index, &mut raw_iter) };
+        if status.is_ok() && !raw_iter.is_null() {
+            // SAFETY: `raw_iter` was returned by `sys_query` for query `index` on `sys_ctx`.
+            return unsafe { ValidatedIter::from_raw_with_lazy_host(raw_iter, host, lazy_host) };
+        }
+    }
+    ValidatedIter::empty(host)
+}
+
+/// Fetches the active invocation's [`ValidatedCommands`] buffer via `BamHostApi::sys_commands`,
+/// returning an empty disabled buffer if unavailable.
+#[inline]
+fn fetch_commands_from_raw<'a>(
+    sys_ctx: *mut BamSystemCtx,
+    host: &'a Host,
+) -> ValidatedCommands<'a> {
+    if sys_ctx.is_null() {
+        return ValidatedCommands::empty(host);
+    }
+    let Some(sys_cmds_fn) = host.api().sys_commands else {
+        return ValidatedCommands::empty(host);
+    };
+    let mut raw_cmds: *mut BamCommands = core::ptr::null_mut();
+    // SAFETY: `sys_ctx` is active for `'a` and `raw_cmds` is writable stack storage.
+    let status = unsafe { sys_cmds_fn(sys_ctx, &mut raw_cmds) };
+    if status.is_ok() && !raw_cmds.is_null() {
+        // SAFETY: `raw_cmds` was returned by `sys_commands` for `sys_ctx`.
+        unsafe { ValidatedCommands::from_raw(raw_cmds, host) }
+    } else {
+        ValidatedCommands::empty(host)
+    }
+}
+
+/// Internal state backing [`LazyCommands`].
+enum LazyCommandsState<'a> {
+    Pending {
+        sys_ctx: *mut BamSystemCtx,
+        host: &'a Host,
+        lazy_host: Option<&'a LazyInvocationHost<'a>>,
+    },
+    Ready(ValidatedCommands<'a>),
+}
+
+/// Single-use, non-`Copy`, non-`Clone` lazy handle to the per-system [`BamCommands`] buffer.
+///
+/// Extracted at most once from [`ValidatedSystemInvocation::take_lazy_commands`] so systems that
+/// never touch commands avoid the `BamHostApi::sys_commands` FFI call while preserving single-owner
+/// exclusivity (no duplicate [`ValidatedCommands`] handles can be created for the same tick).
+pub struct LazyCommands<'a> {
+    state: LazyCommandsState<'a>,
+}
+
+impl<'a> LazyCommands<'a> {
+    /// Constructs a disabled [`LazyCommands`] that resolves to [`ValidatedCommands::empty`].
+    #[inline]
+    pub const fn empty(host: &'a Host) -> Self {
+        Self {
+            state: LazyCommandsState::Ready(ValidatedCommands::empty(host)),
+        }
+    }
+
+    /// Consumes this handle and materializes the per-system [`ValidatedCommands`] buffer on demand
+    /// via `BamHostApi::sys_commands`, lazily resolving the active per-tick `BamHostCtx` when
+    /// backed by a trampoline frame.
+    #[inline]
+    pub fn resolve(self) -> ValidatedCommands<'a> {
+        match self.state {
+            LazyCommandsState::Ready(cmds) => cmds,
+            LazyCommandsState::Pending {
+                sys_ctx,
+                host,
+                lazy_host,
+            } => {
+                let active_host = match lazy_host {
+                    Some(lazy) => lazy.resolve(),
+                    None => host,
+                };
+                fetch_commands_from_raw(sys_ctx, active_host)
+            }
+        }
+    }
+}
+
 /// Validated per-tick system execution frame wrapping `*mut BamSystemCtx`, up to
 /// [`MAX_QUERIES_PER_SYSTEM`] disjoint [`ValidatedIter`] slots, and a lazy [`ValidatedCommands`] slot.
 pub struct ValidatedSystemInvocation<'a> {
     sys_ctx: *mut BamSystemCtx,
     host: &'a Host,
+    lazy_host: Option<&'a LazyInvocationHost<'a>>,
     total_query_count: usize,
     user_query_count: usize,
     resource_query_index: Option<usize>,
     sys_ref: Option<ValidatedSystemRef<'a>>,
-    queries: [Option<ValidatedIter<'a>>; MAX_QUERIES_PER_SYSTEM],
-    query_taken: [bool; MAX_QUERIES_PER_SYSTEM],
+    queries: [MaybeUninit<ValidatedIter<'a>>; MAX_QUERIES_PER_SYSTEM],
+    query_init_mask: u8,
+    query_taken_mask: u8,
     empty_iter: ValidatedIter<'a>,
     commands: Option<ValidatedCommands<'a>>,
     commands_taken: bool,
@@ -114,14 +336,12 @@ pub struct ValidatedSystemInvocation<'a> {
 }
 
 impl<'a> ValidatedSystemInvocation<'a> {
-    /// Creates a new system execution frame over `sys_ctx` and `host`.
-    ///
-    /// # Safety
-    /// `sys_ctx` must be a non-null, active [`BamSystemCtx`] supplied by the host for the duration
-    /// of `'a` with `total_query_count <= MAX_QUERIES_PER_SYSTEM`.
-    pub unsafe fn from_raw(
+    /// Internal constructor shared by [`Self::from_raw`] and [`Self::from_raw_with_lazy_host`].
+    #[inline]
+    unsafe fn from_parts(
         sys_ctx: *mut BamSystemCtx,
         host: &'a Host,
+        lazy_host: Option<&'a LazyInvocationHost<'a>>,
         total_query_count: usize,
         user_query_count: usize,
         resource_query_index: Option<usize>,
@@ -131,16 +351,76 @@ impl<'a> ValidatedSystemInvocation<'a> {
         Self {
             sys_ctx,
             host,
+            lazy_host,
             total_query_count: clamped_total,
             user_query_count: clamped_user,
             resource_query_index: resource_query_index.filter(|&idx| idx < clamped_total),
-            sys_ref: Some(ValidatedSystemRef { sys_ctx, host }),
-            queries: [const { None }; MAX_QUERIES_PER_SYSTEM],
-            query_taken: [false; MAX_QUERIES_PER_SYSTEM],
+            sys_ref: Some(ValidatedSystemRef {
+                sys_ctx,
+                host,
+                lazy_host,
+            }),
+            queries: [const { MaybeUninit::uninit() }; MAX_QUERIES_PER_SYSTEM],
+            query_init_mask: 0,
+            query_taken_mask: 0,
             empty_iter: ValidatedIter::empty(host),
             commands: None,
             commands_taken: false,
             empty_commands: ValidatedCommands::empty(host),
+        }
+    }
+
+    /// Creates a new system execution frame over `sys_ctx` and `host`.
+    ///
+    /// # Safety
+    /// `sys_ctx` must be a non-null, active [`BamSystemCtx`] supplied by the host for the duration
+    /// of `'a` with `total_query_count <= MAX_QUERIES_PER_SYSTEM`.
+    #[inline]
+    pub unsafe fn from_raw(
+        sys_ctx: *mut BamSystemCtx,
+        host: &'a Host,
+        total_query_count: usize,
+        user_query_count: usize,
+        resource_query_index: Option<usize>,
+    ) -> Self {
+        // SAFETY: Forwarding caller contract on `sys_ctx` and query counts.
+        unsafe {
+            Self::from_parts(
+                sys_ctx,
+                host,
+                None,
+                total_query_count,
+                user_query_count,
+                resource_query_index,
+            )
+        }
+    }
+
+    /// Creates a new system execution frame backed by a stack-pinned [`LazyInvocationHost`],
+    /// deferring `BamHostApi::sys_host_ctx(sys_ctx)` until a caller actually requests the active
+    /// [`Host`].
+    ///
+    /// # Safety
+    /// `sys_ctx` must be a non-null, active [`BamSystemCtx`] matching `lazy_host` for `'a` with
+    /// `total_query_count <= MAX_QUERIES_PER_SYSTEM`.
+    #[inline]
+    pub(crate) unsafe fn from_raw_with_lazy_host(
+        sys_ctx: *mut BamSystemCtx,
+        lazy_host: &'a LazyInvocationHost<'a>,
+        total_query_count: usize,
+        user_query_count: usize,
+        resource_query_index: Option<usize>,
+    ) -> Self {
+        // SAFETY: Forwarding caller contract on `sys_ctx` and query counts.
+        unsafe {
+            Self::from_parts(
+                sys_ctx,
+                lazy_host.base_host(),
+                Some(lazy_host),
+                total_query_count,
+                user_query_count,
+                resource_query_index,
+            )
         }
     }
 
@@ -170,10 +450,22 @@ impl<'a> ValidatedSystemInvocation<'a> {
         self.sys_ref.take()
     }
 
-    /// Returns the cached [`Host`] table for this mod instance.
+    /// Returns the init-time base [`Host`] table without invoking `BamHostApi::sys_host_ctx`.
+    ///
+    /// Safe for immutable per-instance metadata (`api()`, `manifest_name()`) on hot paths.
     #[inline]
-    pub const fn host(&self) -> &'a Host {
+    pub const fn base_host(&self) -> &'a Host {
         self.host
+    }
+
+    /// Returns the active [`Host`] table for this system invocation, lazily resolving
+    /// `BamHostApi::sys_host_ctx(sys_ctx)` at most once per tick when backed by a trampoline frame.
+    #[inline]
+    pub fn host(&self) -> &'a Host {
+        match self.lazy_host {
+            Some(lazy) => lazy.resolve(),
+            None => self.host,
+        }
     }
 
     /// Returns the number of entity/explicit queries declared on this system (`0..=MAX_QUERIES_PER_SYSTEM`).
@@ -188,16 +480,88 @@ impl<'a> ValidatedSystemInvocation<'a> {
         self.resource_query_index
     }
 
+    /// Fetches query slot `index` via `BamHostApi::sys_query` without touching `self.queries`.
+    #[inline]
+    fn fetch_query_slot(&self, index: usize) -> ValidatedIter<'a> {
+        fetch_query_slot_raw(self.sys_ctx, self.host, self.lazy_host, index)
+    }
+
+    /// Borrows initialized query slot `index` immutably if populated in `self.queries`.
+    #[inline]
+    fn query_slot_ref(&self, index: usize) -> Option<&ValidatedIter<'a>> {
+        if index >= MAX_QUERIES_PER_SYSTEM {
+            return None;
+        }
+        let bit = 1u8 << index;
+        if (self.query_init_mask & bit) != 0 {
+            // SAFETY: `query_init_mask & bit != 0` proves `self.queries[index]` is initialized.
+            Some(unsafe { self.queries[index].assume_init_ref() })
+        } else {
+            None
+        }
+    }
+
+    /// Borrows initialized query slot `index` mutably if populated in `self.queries`.
+    #[inline]
+    fn query_slot_mut(&mut self, index: usize) -> Option<&mut ValidatedIter<'a>> {
+        if index >= MAX_QUERIES_PER_SYSTEM {
+            return None;
+        }
+        let bit = 1u8 << index;
+        if (self.query_init_mask & bit) != 0 {
+            // SAFETY: `query_init_mask & bit != 0` proves `self.queries[index]` is initialized.
+            Some(unsafe { self.queries[index].assume_init_mut() })
+        } else {
+            None
+        }
+    }
+
     /// Extracts validated query slot `index` (`0..total_query_count`) by value (succeeds at most once
     /// per slot).
     #[inline]
     pub fn take_raw_query_slot(&mut self, index: usize) -> Option<ValidatedIter<'a>> {
-        if index >= self.total_query_count || self.query_taken[index] {
+        if index >= self.total_query_count {
             return None;
         }
-        self.ensure_query_slot(index);
-        self.query_taken[index] = true;
-        self.queries[index].take()
+        let bit = 1u8 << index;
+        if (self.query_taken_mask & bit) != 0 {
+            return None;
+        }
+        self.query_taken_mask |= bit;
+        if (self.query_init_mask & bit) != 0 {
+            self.query_init_mask &= !bit;
+            // SAFETY: `query_init_mask & bit != 0` proved `self.queries[index]` was initialized,
+            // and clearing `bit` ensures it is never read again without re-initialization.
+            Some(unsafe { self.queries[index].assume_init_read() })
+        } else {
+            Some(self.fetch_query_slot(index))
+        }
+    }
+
+    /// Extracts a single-use [`LazyCommands`] token deferring `BamHostApi::sys_commands` until
+    /// [`LazyCommands::resolve`] is invoked.
+    ///
+    /// Returns a disabled [`LazyCommands`] if commands were already extracted via
+    /// [`Self::take_commands`] or [`Self::take_lazy_commands`].
+    #[inline]
+    pub fn take_lazy_commands(&mut self) -> LazyCommands<'a> {
+        if self.commands_taken {
+            return LazyCommands::empty(self.host);
+        }
+        self.commands_taken = true;
+        if let Some(cmds) = self.commands.take() {
+            LazyCommands {
+                state: LazyCommandsState::Ready(cmds),
+            }
+        } else {
+            LazyCommands {
+                state: LazyCommandsState::Pending {
+                    sys_ctx: self.sys_ctx,
+                    host: self.host,
+                    lazy_host: self.lazy_host,
+                },
+            }
+        }
     }
 
     /// Fetches a [`ValidatedCommands`] buffer for this system invocation by value (returns an empty
@@ -218,50 +582,23 @@ impl<'a> ValidatedSystemInvocation<'a> {
     /// `BamHostApi::sys_query` if not already fetched or extracted.
     #[inline]
     fn ensure_query_slot(&mut self, index: usize) {
-        if index >= self.total_query_count
-            || self.query_taken[index]
-            || self.queries[index].is_some()
-        {
+        if index >= self.total_query_count {
             return;
         }
-        let iter = if self.sys_ctx.is_null() {
-            ValidatedIter::empty(self.host)
-        } else if let Some(sys_query_fn) = self.host.api().sys_query {
-            let mut raw_iter: *mut BamIter = core::ptr::null_mut();
-            // SAFETY: `self.sys_ctx` is active for `'a`, `index < total_query_count`, and
-            // `raw_iter` is writable stack storage.
-            let status = unsafe { sys_query_fn(self.sys_ctx, index, &mut raw_iter) };
-            if status.is_ok() && !raw_iter.is_null() {
-                // SAFETY: `raw_iter` was returned by `sys_query` for query `index` on `self.sys_ctx`.
-                unsafe { ValidatedIter::from_raw(raw_iter, self.host) }
-            } else {
-                ValidatedIter::empty(self.host)
-            }
-        } else {
-            ValidatedIter::empty(self.host)
-        };
-        self.queries[index] = Some(iter);
+        let bit = 1u8 << index;
+        if ((self.query_taken_mask | self.query_init_mask) & bit) != 0 {
+            return;
+        }
+        let iter = self.fetch_query_slot(index);
+        self.queries[index].write(iter);
+        self.query_init_mask |= bit;
     }
 
     /// Fetches the active invocation's [`ValidatedCommands`] buffer via `BamHostApi::sys_commands`,
     /// returning an empty disabled buffer if unavailable.
     #[inline]
     fn fetch_commands_slot(&self) -> ValidatedCommands<'a> {
-        if self.sys_ctx.is_null() {
-            return ValidatedCommands::empty(self.host);
-        }
-        let Some(sys_cmds_fn) = self.host.api().sys_commands else {
-            return ValidatedCommands::empty(self.host);
-        };
-        let mut raw_cmds: *mut BamCommands = core::ptr::null_mut();
-        // SAFETY: `self.sys_ctx` is active for `'a` and `raw_cmds` is writable stack storage.
-        let status = unsafe { sys_cmds_fn(self.sys_ctx, &mut raw_cmds) };
-        if status.is_ok() && !raw_cmds.is_null() {
-            // SAFETY: `raw_cmds` was returned by `sys_commands` for `self.sys_ctx`.
-            unsafe { ValidatedCommands::from_raw(raw_cmds, self.host) }
-        } else {
-            ValidatedCommands::empty(self.host)
-        }
+        fetch_commands_from_raw(self.sys_ctx, self.host())
     }
 
     /// Populates `self.commands` on first access if not already fetched or taken.
@@ -280,7 +617,12 @@ impl<'a> ValidatedSystemInvocation<'a> {
             return &mut self.empty_iter;
         }
         self.ensure_query_slot(0);
-        self.queries[0].as_mut().unwrap_or(&mut self.empty_iter)
+        if (self.query_init_mask & 1u8) != 0 {
+            // SAFETY: `query_init_mask & 1 != 0` proves `self.queries[0]` is initialized.
+            unsafe { self.queries[0].assume_init_mut() }
+        } else {
+            &mut self.empty_iter
+        }
     }
 
     /// Borrows declared query `index` (`0..query_count()`) mutably, returning `None` if out of range.
@@ -290,7 +632,7 @@ impl<'a> ValidatedSystemInvocation<'a> {
             return None;
         }
         self.ensure_query_slot(index);
-        self.queries[index].as_mut()
+        self.query_slot_mut(index)
     }
 
     /// Simultaneously borrows two distinct queries `idx_a` and `idx_b` (`None` if `idx_a == idx_b`
@@ -305,12 +647,18 @@ impl<'a> ValidatedSystemInvocation<'a> {
         }
         self.ensure_query_slot(idx_a);
         self.ensure_query_slot(idx_b);
+        let mask = self.query_init_mask;
+        if (mask & (1u8 << idx_a)) == 0 || (mask & (1u8 << idx_b)) == 0 {
+            return None;
+        }
         if idx_a < idx_b {
             let (left, right) = self.queries.split_at_mut(idx_b);
-            Some((left[idx_a].as_mut()?, right[0].as_mut()?))
+            // SAFETY: Both `idx_a` and `idx_b` are initialized per `query_init_mask` and disjoint.
+            Some(unsafe { (left[idx_a].assume_init_mut(), right[0].assume_init_mut()) })
         } else {
             let (left, right) = self.queries.split_at_mut(idx_a);
-            Some((right[0].as_mut()?, left[idx_b].as_mut()?))
+            // SAFETY: Both `idx_a` and `idx_b` are initialized per `query_init_mask` and disjoint.
+            Some(unsafe { (right[0].assume_init_mut(), left[idx_b].assume_init_mut()) })
         }
     }
 
@@ -346,10 +694,11 @@ impl<'a> ValidatedSystemInvocation<'a> {
         } else {
             self.commands.as_mut().unwrap_or(&mut self.empty_commands)
         };
-        let iter = if self.user_query_count == 0 {
+        let iter = if self.user_query_count == 0 || (self.query_init_mask & 1u8) == 0 {
             &mut self.empty_iter
         } else {
-            self.queries[0].as_mut().unwrap_or(&mut self.empty_iter)
+            // SAFETY: `query_init_mask & 1 != 0` proves `self.queries[0]` is initialized.
+            unsafe { self.queries[0].assume_init_mut() }
         };
         (iter, cmds)
     }
@@ -370,13 +719,31 @@ impl<'a> ValidatedSystemInvocation<'a> {
         self.ensure_query_slot(idx_a);
         self.ensure_query_slot(idx_b);
         self.ensure_commands_slot();
+        let mask = self.query_init_mask;
+        if (mask & (1u8 << idx_a)) == 0 || (mask & (1u8 << idx_b)) == 0 {
+            return None;
+        }
         let cmds = self.commands.as_mut()?;
         if idx_a < idx_b {
             let (left, right) = self.queries.split_at_mut(idx_b);
-            Some((left[idx_a].as_mut()?, right[0].as_mut()?, cmds))
+            // SAFETY: Both `idx_a` and `idx_b` are initialized per `query_init_mask` and disjoint.
+            Some(unsafe {
+                (
+                    left[idx_a].assume_init_mut(),
+                    right[0].assume_init_mut(),
+                    cmds,
+                )
+            })
         } else {
             let (left, right) = self.queries.split_at_mut(idx_a);
-            Some((right[0].as_mut()?, left[idx_b].as_mut()?, cmds))
+            // SAFETY: Both `idx_a` and `idx_b` are initialized per `query_init_mask` and disjoint.
+            Some(unsafe {
+                (
+                    right[0].assume_init_mut(),
+                    left[idx_b].assume_init_mut(),
+                    cmds,
+                )
+            })
         }
     }
 
@@ -393,8 +760,7 @@ impl<'a> ValidatedSystemInvocation<'a> {
             return None;
         }
         self.ensure_query_slot(q_idx);
-        self.queries[q_idx]
-            .as_ref()?
+        self.query_slot_ref(q_idx)?
             .resource_checked::<R>(decl_index, expected_uuid)
     }
 
@@ -411,8 +777,7 @@ impl<'a> ValidatedSystemInvocation<'a> {
             return None;
         }
         self.ensure_query_slot(q_idx);
-        self.queries[q_idx]
-            .as_mut()?
+        self.query_slot_mut(q_idx)?
             .resource_mut_checked::<R>(decl_index, expected_uuid)
     }
 }
@@ -426,6 +791,7 @@ impl<'a> ValidatedSystemInvocation<'a> {
 pub struct ValidatedSystemRef<'a> {
     sys_ctx: *mut BamSystemCtx,
     host: &'a Host,
+    lazy_host: Option<&'a LazyInvocationHost<'a>>,
 }
 
 impl<'a> ValidatedSystemRef<'a> {
@@ -436,6 +802,7 @@ impl<'a> ValidatedSystemRef<'a> {
         Self {
             sys_ctx: core::ptr::null_mut(),
             host,
+            lazy_host: None,
         }
     }
 
@@ -445,10 +812,22 @@ impl<'a> ValidatedSystemRef<'a> {
         self.sys_ctx
     }
 
-    /// Returns the cached [`Host`] table for this mod instance.
+    /// Returns the init-time base [`Host`] table without querying `BamHostApi::sys_host_ctx`.
+    ///
+    /// Safe for immutable per-instance metadata (`api()`, `manifest_name()`) on hot paths.
     #[inline]
-    pub const fn host(&self) -> &'a Host {
+    pub const fn base_host(&self) -> &'a Host {
         self.host
+    }
+
+    /// Returns the active [`Host`] table for this system invocation, lazily resolving
+    /// `BamHostApi::sys_host_ctx(sys_ctx)` at most once per tick when backed by a trampoline frame.
+    #[inline]
+    pub fn host(&self) -> &'a Host {
+        match self.lazy_host {
+            Some(lazy) => lazy.resolve(),
+            None => self.host,
+        }
     }
 
     /// Validates `iter.column_info(term_index)` via `check_info` and invokes
@@ -596,7 +975,7 @@ impl<'a> ValidatedSystemRef<'a> {
         if self.sys_ctx.is_null() || !component.is_valid() {
             return None;
         }
-        let info = self.host.component_layout_info(component).ok()?;
+        let info = self.host().component_layout_info(component).ok()?;
         if info.size != core::mem::size_of::<R>() || info.align != core::mem::align_of::<R>() {
             return None;
         }
@@ -640,7 +1019,7 @@ impl<'a> ValidatedSystemRef<'a> {
         if self.sys_ctx.is_null() || !component.is_valid() {
             return None;
         }
-        let info = self.host.component_layout_info(component).ok()?;
+        let info = self.host().component_layout_info(component).ok()?;
         if (info.flags & BAM_STORAGE_FLAG_IMMUTABLE) != 0
             || info.size != core::mem::size_of::<R>()
             || info.align != core::mem::align_of::<R>()
@@ -732,7 +1111,7 @@ impl<'a> ValidatedSystemRef<'a> {
         vtable: &ValidatedWireVTable<W>,
         require_mutable: bool,
     ) -> Result<(), FfiResult> {
-        let info = self.host.component_layout_info(component)?;
+        let info = self.host().component_layout_info(component)?;
         if info.size != vtable.host_size()
             || info.align != vtable.host_align()
             || (vtable.host_size() > 0
@@ -826,28 +1205,29 @@ impl<'a> ValidatedSystemRef<'a> {
     }
 }
 
-/// Heap-pinned system callback state owned by [`GuestInstance`], pairing the cached [`Host`],
-/// query slot metadata, and a [`ReentrantCell`]-guarded guest closure.
+/// Heap-pinned system callback state owned by [`GuestInstance`], pairing a pointer to the
+/// instance's pinned [`Host`], query slot metadata, and a [`ReentrantCell`]-guarded guest closure.
 pub(crate) struct SystemClosureState<F> {
-    pub(crate) host: Host,
+    pub(crate) host: PinnedHostPtr,
     pub(crate) total_query_count: usize,
     pub(crate) user_query_count: usize,
     pub(crate) resource_query_index: Option<usize>,
     pub(crate) closure: ReentrantCell<F>,
 }
 
-/// Heap-pinned `run_if` predicate state owned by [`GuestInstance`], pairing the cached [`Host`]
-/// with a [`ReentrantCell`]-guarded guest predicate closure.
+/// Heap-pinned `run_if` predicate state owned by [`GuestInstance`], pairing a pointer to the
+/// instance's pinned [`Host`] with a [`ReentrantCell`]-guarded guest predicate closure.
 pub(crate) struct RunIfClosureState<R> {
-    pub(crate) host: Host,
+    pub(crate) host: PinnedHostPtr,
     pub(crate) closure: ReentrantCell<R>,
 }
 
 /// Panic-safe, re-entrancy-guarded `extern "C"` [`BamSystemFn`] trampoline.
 ///
-/// Refreshes [`Host::host_ctx`] from `BamHostApi::sys_host_ctx(sys_ctx)` so per-tick diagnostics
-/// and symbol queries use the active world context, constructs a [`ValidatedSystemInvocation`],
-/// and returns [`FfiResult::ACCESS_CONFLICT`] on re-entry or [`FfiResult::PANIC_CAUGHT`] on panic.
+/// Borrows the instance's heap-pinned [`Host`] directly without copying it or calling
+/// `BamHostApi::sys_host_ctx(sys_ctx)` eagerly; per-tick `BamHostCtx` refresh is performed lazily
+/// via [`LazyInvocationHost`] only when the system actually accesses `Host`. Returns
+/// [`FfiResult::ACCESS_CONFLICT`] on re-entry or [`FfiResult::PANIC_CAUGHT`] on panic.
 pub(crate) unsafe extern "C" fn system_closure_trampoline<F>(
     sys_ctx: *mut BamSystemCtx,
     user_data: *mut c_void,
@@ -865,25 +1245,16 @@ where
         // SAFETY: `user_data` is non-null, aligned, and allocated via
         // `GuestInstance::track_allocation` for `SystemClosureState<F>`.
         let state = unsafe { &*user_data.cast::<SystemClosureState<F>>() };
-        let inv_host = if let Some(sys_host_ctx_fn) = host_slot!(state.host.api(), sys_host_ctx) {
-            // SAFETY: `sys_ctx` is non-null and active for the duration of this `BamSystemFn` call.
-            let raw_ctx = unsafe { sys_host_ctx_fn(sys_ctx.cast_const()) };
-            if raw_ctx.is_null() {
-                state.host
-            } else {
-                // SAFETY: `raw_ctx` was returned by `BamHostApi::sys_host_ctx(sys_ctx)` and
-                // remains valid for the duration of this system invocation.
-                unsafe { state.host.with_host_ctx_ptr(raw_ctx) }
-            }
-        } else {
-            state.host
-        };
+        // SAFETY: `state.host` points to `GuestInstance`'s heap-pinned `Host` which remains
+        // alive and immutable until after `state` is dropped on `bamabi_shutdown`.
+        let base_host = unsafe { state.host.as_ref() };
         let Some(result) = state.closure.try_with_mut(|func| {
+            let lazy_host = LazyInvocationHost::new(base_host, sys_ctx);
             // SAFETY: `sys_ctx` is non-null and active for the duration of this `BamSystemFn` call.
             let mut invocation = unsafe {
-                ValidatedSystemInvocation::from_raw(
+                ValidatedSystemInvocation::from_raw_with_lazy_host(
                     sys_ctx,
-                    &inv_host,
+                    &lazy_host,
                     state.total_query_count,
                     state.user_query_count,
                     state.resource_query_index,
@@ -912,9 +1283,11 @@ where
         // SAFETY: `user_data` is non-null, aligned, and allocated via
         // `GuestInstance::track_allocation` for `RunIfClosureState<R>`.
         let state = unsafe { &*user_data.cast::<RunIfClosureState<R>>() };
+        // SAFETY: `state.host` points to `GuestInstance`'s heap-pinned `Host` outliving `state`.
+        let host = unsafe { state.host.as_ref() };
         match state
             .closure
-            .try_with_mut(|pred| FfiBool::from_bool(pred(&state.host)))
+            .try_with_mut(|pred| FfiBool::from_bool(pred(host)))
         {
             Some(flag) => flag,
             None => FfiBool::FALSE,
@@ -934,7 +1307,7 @@ pub fn allocate_system_trampoline<F>(
 where
     F: FnMut(&mut ValidatedSystemInvocation<'_>) -> FfiResult + Send + 'static,
 {
-    let host = *instance.host();
+    let host = PinnedHostPtr::new(instance.pinned_host_ptr());
     let raw = instance.track_allocation(Box::new(SystemClosureState {
         host,
         total_query_count,
@@ -987,7 +1360,7 @@ pub fn allocate_run_if_trampoline<R>(
 where
     R: FnMut(&Host) -> bool + Send + 'static,
 {
-    let host = *instance.host();
+    let host = PinnedHostPtr::new(instance.pinned_host_ptr());
     let raw = instance.track_allocation(Box::new(RunIfClosureState {
         host,
         closure: ReentrantCell::new(predicate),
@@ -1509,9 +1882,10 @@ pub unsafe fn mount_system_in_schedule(
 }
 
 /// Heap-pinned observer closure state owned by [`GuestInstance`] (or its [`RuntimeAllocTracker`]),
-/// pairing the cached [`Host`] with a [`ReentrantCell`]-guarded observer callback.
+/// pairing a pointer to the instance's pinned [`Host`] with a [`ReentrantCell`]-guarded observer
+/// callback.
 pub(crate) struct ObserverTrampolineState<F> {
-    pub(crate) host: Host,
+    pub(crate) host: PinnedHostPtr,
     pub(crate) callback: ReentrantCell<F>,
 }
 
@@ -1544,6 +1918,8 @@ where
         // SAFETY: `user_data` is non-null, aligned, and points to `ObserverTrampolineState<F>`
         // owned by `GuestInstance`.
         let state = unsafe { &*user_data.cast::<ObserverTrampolineState<F>>() };
+        // SAFETY: `state.host` points to `GuestInstance`'s heap-pinned `Host` outliving `state`.
+        let host = unsafe { state.host.as_ref() };
         state
             .callback
             .try_with_mut(|cb| {
@@ -1556,7 +1932,7 @@ where
                     unsafe { &*event_data.cast::<E>() }
                 };
                 // SAFETY: `commands` is stack-scoped for this observer invocation.
-                let mut cmds = unsafe { ValidatedCommands::from_raw(commands, &state.host) };
+                let mut cmds = unsafe { ValidatedCommands::from_raw(commands, host) };
                 cb(target, event_ref, &mut cmds)
             })
             .unwrap_or(FfiResult::ACCESS_CONFLICT)
@@ -1571,11 +1947,14 @@ enum ObserverAllocTarget<'a> {
 }
 
 impl ObserverAllocTarget<'_> {
-    /// Returns a copy of the cached [`Host`] associated with this allocation target.
-    fn host(&self) -> Host {
+    /// Returns a stable [`PinnedHostPtr`] guaranteed to outlive the observer trampoline state.
+    fn pinned_host_ptr(&self) -> Result<PinnedHostPtr, FfiResult> {
         match self {
-            Self::Init(inst) => *inst.host(),
-            Self::Runtime(host) => **host,
+            Self::Init(inst) => Ok(PinnedHostPtr::new(inst.pinned_host_ptr())),
+            Self::Runtime(host) => host
+                .pinned_host_ptr()
+                .map(PinnedHostPtr::new)
+                .ok_or(FfiResult::INVALID_STATE),
         }
     }
 
@@ -1646,7 +2025,7 @@ fn build_observer_desc<F: Send + 'static>(
         (unsafe { (*raw_watched).as_ptr() }, len)
     };
 
-    let host = alloc.host();
+    let host = alloc.pinned_host_ptr()?;
     let raw_state = alloc.track(Box::new(ObserverTrampolineState {
         host,
         callback: ReentrantCell::new(callback),
@@ -1786,6 +2165,8 @@ where
         // SAFETY: `user_data` is non-null, aligned, and points to `ObserverTrampolineState<F>`
         // owned by `GuestInstance`.
         let state = unsafe { &*user_data.cast::<ObserverTrampolineState<F>>() };
+        // SAFETY: `state.host` points to `GuestInstance`'s heap-pinned `Host` outliving `state`.
+        let host = unsafe { state.host.as_ref() };
         // Acquire re-entrancy exclusivity BEFORE materializing `&mut E` or touching `*propagate`
         // so any re-entrant call rejects with `ACCESS_CONFLICT` without aliasing UB or state clobbering.
         state
@@ -1807,7 +2188,7 @@ where
                     unsafe { (*propagate).get() }
                 };
                 // SAFETY: `commands` is stack-scoped for this observer invocation.
-                let mut cmds = unsafe { ValidatedCommands::from_raw(commands, &state.host) };
+                let mut cmds = unsafe { ValidatedCommands::from_raw(commands, host) };
                 let status = cb(target, event_ref, &mut prop_val, &mut cmds);
                 if !propagate.is_null() {
                     // SAFETY: `propagate` is non-null and writable for the duration of this callback.
@@ -1843,8 +2224,10 @@ where
         // SAFETY: `user_data` is non-null, aligned, and points to `ObserverTrampolineState<F>`
         // owned by `GuestInstance`.
         let state = unsafe { &*user_data.cast::<ObserverTrampolineState<F>>() };
+        // SAFETY: `state.host` points to `GuestInstance`'s heap-pinned `Host` outliving `state`.
+        let host = unsafe { state.host.as_ref() };
         // SAFETY: `commands` is stack-scoped for this observer invocation.
-        let mut cmds = unsafe { ValidatedCommands::from_raw(commands, &state.host) };
+        let mut cmds = unsafe { ValidatedCommands::from_raw(commands, host) };
         state
             .callback
             .try_with_mut(|cb| cb(target, &mut cmds))
@@ -2316,7 +2699,7 @@ impl<'a> ValidatedSystemRef<'a> {
         term_index: usize,
         entity: FfiEntity,
     ) -> Option<&'b T> {
-        let host = self.host;
+        let host = self.host();
         let ptr = self.raw_entity_ptr_ro(iter, query_index, term_index, entity, |info| {
             verify_same_mod_dynamic_component::<T>(host, info.uuid, info.size, info.align)
         })?;
@@ -2334,7 +2717,7 @@ impl<'a> ValidatedSystemRef<'a> {
         term_index: usize,
         entity: FfiEntity,
     ) -> Option<&'b mut T> {
-        let host = self.host;
+        let host = self.host();
         let ptr = self.raw_entity_ptr_mut(iter, query_index, term_index, entity, |info| {
             verify_same_mod_dynamic_component::<T>(host, info.uuid, info.size, info.align)
         })?;

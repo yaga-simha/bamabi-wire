@@ -3,6 +3,8 @@
 
 use core::ffi::{CStr, c_char, c_void};
 #[cfg(not(kani))]
+use core::sync::atomic::{AtomicPtr, Ordering};
+#[cfg(not(kani))]
 use std::collections::HashMap;
 use std::ffi::CString;
 
@@ -61,6 +63,10 @@ unsafe fn drop_boxed<T>(ptr: *mut c_void) {
 /// drained in LIFO order during `bamabi_shutdown` prior to init-time allocations.
 pub(crate) struct RuntimeAllocTracker {
     #[cfg(not(kani))]
+    pinned_host: AtomicPtr<Host>,
+    #[cfg(kani)]
+    pinned_host: core::cell::Cell<*mut Host>,
+    #[cfg(not(kani))]
     allocations: std::sync::Mutex<Vec<ErasedAllocation>>,
     #[cfg(kani)]
     allocations: core::cell::RefCell<Vec<ErasedAllocation>>,
@@ -75,9 +81,36 @@ impl RuntimeAllocTracker {
     fn new() -> Self {
         Self {
             #[cfg(not(kani))]
+            pinned_host: AtomicPtr::new(core::ptr::null_mut()),
+            #[cfg(kani)]
+            pinned_host: core::cell::Cell::new(core::ptr::null_mut()),
+            #[cfg(not(kani))]
             allocations: std::sync::Mutex::new(Vec::new()),
             #[cfg(kani)]
             allocations: core::cell::RefCell::new(Vec::new()),
+        }
+    }
+
+    /// Binds the owning [`GuestInstance`]'s stable heap-pinned [`Host`] pointer so runtime
+    /// observer allocations can borrow it without duplicating the 584-byte `Host` table.
+    #[inline]
+    fn set_pinned_host(&self, ptr: *mut Host) {
+        #[cfg(not(kani))]
+        self.pinned_host.store(ptr, Ordering::Release);
+        #[cfg(kani)]
+        self.pinned_host.set(ptr);
+    }
+
+    /// Returns the owning [`GuestInstance`]'s stable `*const Host` pointer (`null` if unbound).
+    #[inline]
+    pub(crate) fn pinned_host_ptr(&self) -> *const Host {
+        #[cfg(not(kani))]
+        {
+            self.pinned_host.load(Ordering::Acquire).cast_const()
+        }
+        #[cfg(kani)]
+        {
+            self.pinned_host.get().cast_const()
         }
     }
 
@@ -225,6 +258,58 @@ impl Drop for OwnedManifestBytes {
     }
 }
 
+/// Raw-pointer owner for a heap-pinned [`Host`] inside [`GuestInstance`].
+///
+/// Uses `Box::into_raw` instead of `Box<Host>` so moving `GuestInstance` (for example when
+/// boxing it at the end of `init_guest_instance`) does not retag or invalidate `*const Host`
+/// pointers stored in closure and observer trampolines under Miri Stacked/Tree Borrows.
+struct OwnedPinnedHost(*mut Host);
+
+// SAFETY: `OwnedPinnedHost` uniquely owns a heap-allocated immutable `Host` created via
+// `Box::into_raw` (avoiding `Box` `Unique` retagging when `GuestInstance` moves) and freed
+// exclusively in `OwnedPinnedHost::drop` after `GuestInstance::drop` has torn down every
+// closure, observer, and hook holding a `*const Host` pointer to it.
+unsafe impl Send for OwnedPinnedHost {}
+// SAFETY: Shared references only expose immutable `&Host` / `*const Host`; `Host` is `Send + Sync`.
+unsafe impl Sync for OwnedPinnedHost {}
+
+impl OwnedPinnedHost {
+    /// Heap-allocates `host` with stable raw provenance.
+    fn new(host: Host) -> Self {
+        Self(Box::into_raw(Box::new(host)))
+    }
+
+    /// Returns the raw `*mut Host` allocation handle for binding onto [`RuntimeAllocTracker`].
+    #[inline]
+    const fn as_mut_ptr(&self) -> *mut Host {
+        self.0
+    }
+
+    /// Returns the stable `*const Host` pointer embedded in per-instance trampolines.
+    #[inline]
+    const fn as_ptr(&self) -> *const Host {
+        self.0.cast_const()
+    }
+
+    /// Returns a shared reference to the pinned [`Host`].
+    #[inline]
+    const fn as_ref(&self) -> &Host {
+        // SAFETY: `self.0` was allocated via `Box::into_raw(Box::new(host))` in
+        // `OwnedPinnedHost::new` and remains alive and unmutated until `Drop`.
+        unsafe { &*self.0 }
+    }
+}
+
+impl Drop for OwnedPinnedHost {
+    /// Reclaims the heap-allocated [`Host`] after `GuestInstance::drop` has already torn down
+    /// every closure, observer, and hook referencing it.
+    fn drop(&mut self) {
+        // SAFETY: `self.0` was allocated via `Box::into_raw(Box::new(host))` and
+        // `GuestInstance::drop` already tore down every closure/hook holding `*const Host`.
+        drop(unsafe { Box::from_raw(self.0) });
+    }
+}
+
 /// `Send + Sync` newtype wrapping a `'static` guest-exported `"bam.v0.*"` function or VTable
 /// address stored in [`GuestInstance::symbols`].
 #[derive(Clone, Copy)]
@@ -244,7 +329,6 @@ unsafe impl Sync for GuestSymbolPtr {}
 /// shutdown hooks so loading the same `.cdylib` into multiple Bevy `World`s simultaneously shares
 /// zero mutable global state.
 pub struct GuestInstance {
-    host: Host,
     allocations: Vec<ErasedAllocation>,
     shutdown_hooks: Vec<Box<dyn FnOnce() + Send + 'static>>,
     save_state_hook: Option<ReentrantCell<SaveStateHook>>,
@@ -254,7 +338,9 @@ pub struct GuestInstance {
     #[cfg(kani)]
     symbols: Vec<(String, GuestSymbolPtr)>,
     // Declared last so field drop runs strictly after `GuestInstance::drop` tears down every
-    // closure/hook holding a copy of `host`.
+    // closure/hook/observer holding `*const Host` or a `Host` copy. `pinned_host` drops before
+    // `_runtime_allocs` and `_manifest_bytes` because `Host` points into those two allocations.
+    pinned_host: OwnedPinnedHost,
     _runtime_allocs: OwnedRuntimeAllocs,
     _manifest_bytes: OwnedManifestBytes,
 }
@@ -266,15 +352,18 @@ impl GuestInstance {
         let runtime_allocs = OwnedRuntimeAllocs::new();
         // SAFETY: When `manifest_bytes.len > 0`, `manifest_bytes.ptr` points to immutable, valid
         // UTF-8 heap bytes that remain pinned at stable provenance until `_manifest_bytes` drops
-        // after all `shutdown_hooks`, `_runtime_allocs`, and `allocations`. Similarly,
+        // after `pinned_host`, `shutdown_hooks`, `_runtime_allocs`, and `allocations`. Similarly,
         // `runtime_allocs.as_ptr()` was created via `Box::into_raw` and never retags on move,
-        // staying valid until `_runtime_allocs` drops after all closures holding `host` finish.
+        // staying valid until `_runtime_allocs` drops after `pinned_host` and all closures finish.
         let host = unsafe {
             host.with_manifest_name(manifest_bytes.ptr.cast_const(), manifest_bytes.len)
                 .with_runtime_allocs(runtime_allocs.as_ptr())
         };
+        let pinned_host = OwnedPinnedHost::new(host);
+        runtime_allocs
+            .tracker()
+            .set_pinned_host(pinned_host.as_mut_ptr());
         Self {
-            host,
             allocations: Vec::new(),
             shutdown_hooks: Vec::new(),
             save_state_hook: None,
@@ -283,6 +372,7 @@ impl GuestInstance {
             symbols: HashMap::new(),
             #[cfg(kani)]
             symbols: Vec::new(),
+            pinned_host,
             _runtime_allocs: runtime_allocs,
             _manifest_bytes: manifest_bytes,
         }
@@ -291,13 +381,19 @@ impl GuestInstance {
     /// Returns the cached [`Host`] table for this mod instance.
     #[inline]
     pub const fn host(&self) -> &Host {
-        &self.host
+        self.pinned_host.as_ref()
+    }
+
+    /// Returns the stable heap-pinned `*const Host` pointer owned by this [`GuestInstance`].
+    #[inline]
+    pub(crate) const fn pinned_host_ptr(&self) -> *const Host {
+        self.pinned_host.as_ptr()
     }
 
     /// Returns the canonical mod name declared in [`BamManifest::name`].
     #[inline]
     pub fn manifest_name(&self) -> &str {
-        self.host.manifest_name()
+        self.pinned_host.as_ref().manifest_name()
     }
 
     /// Transfers ownership of `boxed` into this instance, returning a stable raw pointer valid

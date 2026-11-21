@@ -21,7 +21,7 @@ fn validate_removed_term<T: GuestComponent>(
     if info.size != core::mem::size_of::<T>() || info.align != core::mem::align_of::<T>() {
         return Err(FfiResult::TYPE_MISMATCH);
     }
-    let filter = guest_uuid_filter::<T>(iter.host().manifest_name());
+    let filter = guest_uuid_filter::<T>(iter.inner.base_host().manifest_name());
     if !filter.matches(info.uuid) {
         return Err(FfiResult::TYPE_MISMATCH);
     }
@@ -42,7 +42,7 @@ impl<'iter, 'ctx> Chunk<'iter, 'ctx> {
         if info.size != core::mem::size_of::<T>() || info.align != core::mem::align_of::<T>() {
             return None;
         }
-        let filter = guest_uuid_filter::<T>(self.iter.host().manifest_name());
+        let filter = guest_uuid_filter::<T>(self.iter.base_host().manifest_name());
         if !filter.matches(info.uuid) {
             return None;
         }

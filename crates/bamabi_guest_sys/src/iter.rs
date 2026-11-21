@@ -13,6 +13,7 @@ use crate::{
     host::{Host, ValidatedStringVTable, ValidatedWireVTable},
     instance::qualify_mod_component_identity,
     panic::catch_guest_result,
+    trampoline::LazyInvocationHost,
 };
 
 /// Expected [`ComponentUuid`] predicate for typed column and resource introspection.
@@ -1027,6 +1028,7 @@ impl<'a, T: AbiPod> SparseRowsMut<'a, T> {
 pub struct ValidatedIter<'a> {
     raw: *mut BamIter,
     host: &'a Host,
+    lazy_host: Option<&'a LazyInvocationHost<'a>>,
     current_len: usize,
 }
 
@@ -1043,6 +1045,26 @@ impl<'a> ValidatedIter<'a> {
         Self {
             raw,
             host,
+            lazy_host: None,
+            current_len: 0,
+        }
+    }
+
+    /// Wraps a raw [`BamIter`] pointer paired with an optional lazy per-tick host resolver.
+    ///
+    /// # Safety
+    /// If `raw` is non-null, it must point to an active [`BamIter`] belonging to the current
+    /// system invocation on `host` and must not outlive `'a`.
+    #[inline]
+    pub(crate) const unsafe fn from_raw_with_lazy_host(
+        raw: *mut BamIter,
+        host: &'a Host,
+        lazy_host: Option<&'a LazyInvocationHost<'a>>,
+    ) -> Self {
+        Self {
+            raw,
+            host,
+            lazy_host,
             current_len: 0,
         }
     }
@@ -1053,6 +1075,7 @@ impl<'a> ValidatedIter<'a> {
         Self {
             raw: core::ptr::null_mut(),
             host,
+            lazy_host: None,
             current_len: 0,
         }
     }
@@ -1069,10 +1092,22 @@ impl<'a> ValidatedIter<'a> {
         self.raw
     }
 
-    /// Returns the cached [`Host`] table.
+    /// Returns the init-time base [`Host`] table without invoking `BamHostApi::sys_host_ctx`.
+    ///
+    /// Safe for immutable per-instance metadata (`api()`, `manifest_name()`) on hot paths.
     #[inline]
-    pub const fn host(&self) -> &'a Host {
+    pub const fn base_host(&self) -> &'a Host {
         self.host
+    }
+
+    /// Returns the active [`Host`] table for this invocation, lazily resolving
+    /// `BamHostApi::sys_host_ctx` when backed by a trampoline frame.
+    #[inline]
+    pub fn host(&self) -> &'a Host {
+        match self.lazy_host {
+            Some(lazy) => lazy.resolve(),
+            None => self.host,
+        }
     }
 
     /// Returns the number of entity rows in the currently active chunk (`0` before `next_chunk` or
@@ -1797,7 +1832,7 @@ impl<'a> ValidatedIter<'a> {
         };
         self.current_len = 0;
         let task_ctx = ParChunkTaskContext {
-            host: self.host,
+            host: self.host(),
             func: f,
         };
         // SAFETY: `self.raw` is an active top-level `BamIter`, `task_ctx` stays live on the stack
@@ -1829,7 +1864,7 @@ impl<'a> ValidatedIter<'a> {
         };
         self.current_len = 0;
         let task_ctx = ParChunkTaskContext {
-            host: self.host,
+            host: self.host(),
             func: f,
         };
         // SAFETY: `self.raw` is an active top-level `BamIter`, `task_ctx` lives on the stack across
@@ -2112,7 +2147,7 @@ impl<'a> ValidatedIter<'a> {
     fn verify_non_pod_message_marker<M: ModComponent>(&self) -> Result<(), FfiResult> {
         let marker_sym = CString::new(format!("bam.v0.{}.non_pod_message", M::CANONICAL_NAME))
             .map_err(|_| FfiResult::TYPE_MISMATCH)?;
-        let Ok(ptr) = self.host.resolve_custom_symbol(&marker_sym) else {
+        let Ok(ptr) = self.host().resolve_custom_symbol(&marker_sym) else {
             return Err(FfiResult::TYPE_MISMATCH);
         };
         if ptr.is_null() {
@@ -2167,7 +2202,7 @@ impl<'a> ValidatedIter<'a> {
 
         let export_sym_name = CString::new(format!("bam.v0.{}.export_fields", M::CANONICAL_NAME))
             .map_err(|_| FfiResult::INVALID_ARGUMENT)?;
-        let host_export_ptr = self.host.resolve_custom_symbol(&export_sym_name)?;
+        let host_export_ptr = self.host().resolve_custom_symbol(&export_sym_name)?;
         if host_export_ptr.is_null() {
             return Err(FfiResult::UNSUPPORTED);
         }
@@ -3063,9 +3098,15 @@ impl<'chunk, 'ctx> ChunkColumnDispenser<'chunk, 'ctx> {
         }
     }
 
-    /// Returns the cached [`Host`] table for this iterator.
+    /// Returns the init-time base [`Host`] table without invoking `BamHostApi::sys_host_ctx`.
     #[inline]
-    pub const fn host(&self) -> &'ctx Host {
+    pub const fn base_host(&self) -> &'ctx Host {
+        self.iter.base_host()
+    }
+
+    /// Returns the active [`Host`] table for this iterator.
+    #[inline]
+    pub fn host(&self) -> &'ctx Host {
         self.iter.host()
     }
 

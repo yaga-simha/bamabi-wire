@@ -234,7 +234,7 @@ impl<T: GuestComponent> QueryTerm for &T {
     fn fetch_slice<'chunk>(
         dispenser: &mut ChunkColumnDispenser<'chunk, '_>,
     ) -> Result<Self::Slice<'chunk>, FfiResult> {
-        let filter = guest_uuid_filter::<T>(dispenser.host().manifest_name());
+        let filter = guest_uuid_filter::<T>(dispenser.base_host().manifest_name());
         dispenser.next_read::<T>(AccessMode::READ, Some(filter))
     }
 }
@@ -259,7 +259,7 @@ impl<T: GuestComponent> QueryTerm for &mut T {
     fn fetch_slice<'chunk>(
         dispenser: &mut ChunkColumnDispenser<'chunk, '_>,
     ) -> Result<Self::Slice<'chunk>, FfiResult> {
-        let filter = guest_uuid_filter::<T>(dispenser.host().manifest_name());
+        let filter = guest_uuid_filter::<T>(dispenser.base_host().manifest_name());
         dispenser.next_write::<T>(Some(filter))
     }
 }
@@ -283,7 +283,7 @@ impl<T: GuestComponent> QueryTerm for Option<&T> {
     fn fetch_slice<'chunk>(
         dispenser: &mut ChunkColumnDispenser<'chunk, '_>,
     ) -> Result<Self::Slice<'chunk>, FfiResult> {
-        let filter = guest_uuid_filter::<T>(dispenser.host().manifest_name());
+        let filter = guest_uuid_filter::<T>(dispenser.base_host().manifest_name());
         dispenser.next_optional_read::<T>(Some(filter))
     }
 }
@@ -308,7 +308,7 @@ impl<T: GuestComponent> QueryTerm for Option<&mut T> {
     fn fetch_slice<'chunk>(
         dispenser: &mut ChunkColumnDispenser<'chunk, '_>,
     ) -> Result<Self::Slice<'chunk>, FfiResult> {
-        let filter = guest_uuid_filter::<T>(dispenser.host().manifest_name());
+        let filter = guest_uuid_filter::<T>(dispenser.base_host().manifest_name());
         dispenser.next_optional_write::<T>(Some(filter))
     }
 }
@@ -332,7 +332,7 @@ impl<T: GuestComponent> QueryTerm for With<T> {
     fn fetch_slice<'chunk>(
         dispenser: &mut ChunkColumnDispenser<'chunk, '_>,
     ) -> Result<Self::Slice<'chunk>, FfiResult> {
-        let filter = guest_uuid_filter::<T>(dispenser.host().manifest_name());
+        let filter = guest_uuid_filter::<T>(dispenser.base_host().manifest_name());
         dispenser.next_filter::<T>(AccessMode::FILTER_ONLY, Some(filter))
     }
 }
@@ -356,7 +356,7 @@ impl<T: GuestComponent> QueryTerm for Without<T> {
     fn fetch_slice<'chunk>(
         dispenser: &mut ChunkColumnDispenser<'chunk, '_>,
     ) -> Result<Self::Slice<'chunk>, FfiResult> {
-        let filter = guest_uuid_filter::<T>(dispenser.host().manifest_name());
+        let filter = guest_uuid_filter::<T>(dispenser.base_host().manifest_name());
         dispenser.next_filter::<T>(AccessMode::WITHOUT, Some(filter))
     }
 }
@@ -380,7 +380,7 @@ impl<T: GuestComponent> QueryTerm for Changed<T> {
     fn fetch_slice<'chunk>(
         dispenser: &mut ChunkColumnDispenser<'chunk, '_>,
     ) -> Result<Self::Slice<'chunk>, FfiResult> {
-        let filter = guest_uuid_filter::<T>(dispenser.host().manifest_name());
+        let filter = guest_uuid_filter::<T>(dispenser.base_host().manifest_name());
         dispenser.next_read::<T>(AccessMode::CHANGED, Some(filter))
     }
 }
@@ -404,7 +404,7 @@ impl<T: GuestComponent> QueryTerm for Added<T> {
     fn fetch_slice<'chunk>(
         dispenser: &mut ChunkColumnDispenser<'chunk, '_>,
     ) -> Result<Self::Slice<'chunk>, FfiResult> {
-        let filter = guest_uuid_filter::<T>(dispenser.host().manifest_name());
+        let filter = guest_uuid_filter::<T>(dispenser.base_host().manifest_name());
         dispenser.next_read::<T>(AccessMode::ADDED, Some(filter))
     }
 }
@@ -428,7 +428,7 @@ impl<T: GuestComponent> QueryTerm for Allow<T> {
     fn fetch_slice<'chunk>(
         dispenser: &mut ChunkColumnDispenser<'chunk, '_>,
     ) -> Result<Self::Slice<'chunk>, FfiResult> {
-        let filter = guest_uuid_filter::<T>(dispenser.host().manifest_name());
+        let filter = guest_uuid_filter::<T>(dispenser.base_host().manifest_name());
         dispenser.next_filter::<T>(AccessMode::ALLOW, Some(filter))
     }
 }
@@ -452,7 +452,7 @@ impl<T: GuestComponent> QueryTerm for Has<T> {
     fn fetch_slice<'chunk>(
         dispenser: &mut ChunkColumnDispenser<'chunk, '_>,
     ) -> Result<Self::Slice<'chunk>, FfiResult> {
-        let filter = guest_uuid_filter::<T>(dispenser.host().manifest_name());
+        let filter = guest_uuid_filter::<T>(dispenser.base_host().manifest_name());
         dispenser.next_has::<T>(Some(filter))
     }
 }
@@ -478,7 +478,7 @@ macro_rules! impl_or_filter_term {
             fn fetch_filter<'chunk>(
                 dispenser: &mut ChunkColumnDispenser<'chunk, '_>,
             ) -> Result<(), FfiResult> {
-                let filter = guest_uuid_filter::<T>(dispenser.host().manifest_name());
+                let filter = guest_uuid_filter::<T>(dispenser.base_host().manifest_name());
                 dispenser.next_filter::<T>($mode, Some(filter))
             }
         }

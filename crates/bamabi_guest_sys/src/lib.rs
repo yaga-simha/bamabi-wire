@@ -83,10 +83,11 @@
 //!   that instance. If `build_fn` fails or panics, all staged allocations roll back cleanly on the
 //!   guest heap and `*instance_out` remains `null`.
 //! - **Move-Safe Provenance & Deterministic LIFO Teardown:** Internal heap anchors
-//!   (`OwnedRuntimeAllocs`, `OwnedManifestBytes`) use `Box::into_raw` so moving `GuestInstance`
-//!   does not invalidate pointers held by [`Host`] under Miri Tree/Stacked Borrows. Runtime
-//!   observer allocations created after init are tracked in a mutex-guarded `RuntimeAllocTracker`
-//!   and drained in LIFO order during [`shutdown_guest_instance`] before init-time allocations.
+//!   (`OwnedPinnedHost`, `OwnedRuntimeAllocs`, `OwnedManifestBytes`) use `Box::into_raw` so moving
+//!   `GuestInstance` does not invalidate `*const Host` or internal pointers held by trampolines
+//!   and [`Host`] under Miri Tree/Stacked Borrows. Runtime observer allocations created after init
+//!   are tracked in a mutex-guarded `RuntimeAllocTracker` and drained in LIFO order during
+//!   [`shutdown_guest_instance`] before init-time allocations.
 //! - **Lock-Free Re-entrancy Guard ([`ReentrantCell`]):** Wraps `FnMut` system, `run_if`, and
 //!   observer closures in `UnsafeCell<T>` + `AtomicBool` (`Acquire`/`Release` + RAII drop guard)
 //!   so hot per-frame dispatch avoids OS mutex overhead while rejecting nested re-entry with
@@ -275,11 +276,11 @@ pub use iter::{
 };
 pub use panic::{catch_guest_bool, catch_guest_result, catch_guest_unit};
 pub use trampoline::{
-    PreparedRunIf, ReentrantCell, SystemRegistrationConfig, ValidatedSystemInvocation,
-    ValidatedSystemRef, allocate_run_if_trampoline, allocate_system_trampoline,
-    configure_schedule_set, configure_schedule_set_raw, iter_dynamic_slice, iter_dynamic_slice_mut,
-    iter_entities_and_dynamic_slice_mut, mount_system_in_schedule,
-    register_lifecycle_observer_closure, register_observer_closure,
+    LazyCommands, PreparedRunIf, ReentrantCell, SystemRegistrationConfig,
+    ValidatedSystemInvocation, ValidatedSystemRef, allocate_run_if_trampoline,
+    allocate_system_trampoline, configure_schedule_set, configure_schedule_set_raw,
+    iter_dynamic_slice, iter_dynamic_slice_mut, iter_entities_and_dynamic_slice_mut,
+    mount_system_in_schedule, register_lifecycle_observer_closure, register_observer_closure,
     register_observer_closure_with_options, register_observer_mut_closure, register_system_closure,
     register_system_handle_closure, verify_same_mod_dynamic_component,
 };

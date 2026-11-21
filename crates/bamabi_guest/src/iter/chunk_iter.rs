@@ -64,9 +64,9 @@ impl<'a> ChunkIter<'a> {
         self.inner.as_raw()
     }
 
-    /// Returns the cached [`Host`] table for this mod instance.
+    /// Returns the active [`Host`] table for this mod instance.
     #[inline]
-    pub const fn host(&self) -> &'a Host {
+    pub fn host(&self) -> &'a Host {
         self.inner.host()
     }
 
@@ -129,7 +129,7 @@ impl<'a> ChunkIter<'a> {
         entity: FfiEntity,
         term_index: usize,
     ) -> Result<Option<(FfiEntity, &T)>, FfiResult> {
-        let filter = guest_uuid_filter::<T>(self.inner.host().manifest_name());
+        let filter = guest_uuid_filter::<T>(self.inner.base_host().manifest_name());
         self.inner
             .up_cascade_checked::<T>(relation, entity, term_index, Some(filter))
     }
@@ -203,7 +203,7 @@ impl<'a> ChunkIter<'a> {
     /// Materializes indirect read-only sparse-set row pointers for `T: GuestComponent`.
     #[inline]
     pub fn component_rows<T: GuestComponent>(&mut self, col: usize) -> Option<SparseRows<'_, T>> {
-        let filter = guest_uuid_filter::<T>(self.inner.host().manifest_name());
+        let filter = guest_uuid_filter::<T>(self.inner.base_host().manifest_name());
         self.inner.rows_checked::<T>(col, Some(filter))
     }
 
@@ -219,7 +219,7 @@ impl<'a> ChunkIter<'a> {
         &mut self,
         col: usize,
     ) -> Option<SparseRowsMut<'_, T>> {
-        let filter = guest_uuid_filter::<T>(self.inner.host().manifest_name());
+        let filter = guest_uuid_filter::<T>(self.inner.base_host().manifest_name());
         self.inner.rows_mut_checked::<T>(col, Some(filter))
     }
 
@@ -233,7 +233,7 @@ impl<'a> ChunkIter<'a> {
     /// `R`'s UUID.
     #[inline]
     pub fn component_resource<R: GuestComponent>(&self, term_index: usize) -> Option<&R> {
-        let filter = guest_uuid_filter::<R>(self.inner.host().manifest_name());
+        let filter = guest_uuid_filter::<R>(self.inner.base_host().manifest_name());
         self.inner.resource_checked::<R>(term_index, Some(filter))
     }
 
@@ -251,7 +251,7 @@ impl<'a> ChunkIter<'a> {
         &mut self,
         term_index: usize,
     ) -> Option<&mut R> {
-        let filter = guest_uuid_filter::<R>(self.inner.host().manifest_name());
+        let filter = guest_uuid_filter::<R>(self.inner.base_host().manifest_name());
         self.inner
             .resource_mut_checked::<R>(term_index, Some(filter))
     }
@@ -268,7 +268,7 @@ impl<'a> ChunkIter<'a> {
         &self,
         term_index: usize,
     ) -> Result<GuestRes<'_, R>, FfiResult> {
-        let filter = guest_uuid_filter::<R>(self.inner.host().manifest_name());
+        let filter = guest_uuid_filter::<R>(self.inner.base_host().manifest_name());
         self.inner
             .resource_with_ticks_checked::<R>(term_index, Some(filter))
             .map(|(val, ticks)| GuestRes::new(val, ticks))
@@ -282,7 +282,7 @@ impl<'a> ChunkIter<'a> {
         &mut self,
         term_index: usize,
     ) -> Result<GuestResMut<'_, R>, FfiResult> {
-        let filter = guest_uuid_filter::<R>(self.inner.host().manifest_name());
+        let filter = guest_uuid_filter::<R>(self.inner.base_host().manifest_name());
         self.inner
             .resource_mut_with_ticks_checked::<R>(term_index, Some(filter))
             .map(|(val, ticks)| GuestResMut::new(val, ticks))
@@ -385,7 +385,7 @@ impl<'a> ChunkIter<'a> {
         &mut self,
         term_index: usize,
     ) -> Result<Vec<M>, FfiResult> {
-        let filter = guest_uuid_filter::<M>(self.inner.host().manifest_name());
+        let filter = guest_uuid_filter::<M>(self.inner.base_host().manifest_name());
         self.inner
             .drain_messages_checked::<M>(term_index, Some(filter))
     }
@@ -399,7 +399,7 @@ impl<'a> ChunkIter<'a> {
     /// Sends a message (`M: GuestComponent`) on `term_index`, validating `M`'s UUID.
     #[inline]
     pub fn send_message<M: GuestComponent>(&mut self, term_index: usize, msg: &M) -> FfiResult {
-        let filter = guest_uuid_filter::<M>(self.inner.host().manifest_name());
+        let filter = guest_uuid_filter::<M>(self.inner.base_host().manifest_name());
         self.inner
             .send_message_checked::<M>(term_index, Some(filter), msg)
     }
@@ -424,7 +424,7 @@ impl<'a> ChunkIter<'a> {
         term_index: usize,
         messages: &[M],
     ) -> Result<(), FfiResult> {
-        let filter = guest_uuid_filter::<M>(self.inner.host().manifest_name());
+        let filter = guest_uuid_filter::<M>(self.inner.base_host().manifest_name());
         let status =
             self.inner
                 .send_messages_batch_checked::<M>(term_index, Some(filter), messages);

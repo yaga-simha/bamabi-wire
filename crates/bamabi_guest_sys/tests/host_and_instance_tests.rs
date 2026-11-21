@@ -617,3 +617,104 @@ fn register_dynamic_mod_component_symbols_and_moved_command_error_drops_cleanly(
     assert_eq!(spawn_res, Err(FfiResult::NULL_POINTER));
     assert_eq!(DROP_COUNT.load(Ordering::SeqCst), 3);
 }
+
+/// Verifies that `system_closure_trampoline` defers both `sys_host_ctx` and `sys_commands` until
+/// actually requested, caches `sys_host_ctx` at most once per tick (reusing the init-time `Host`
+/// when `sys_host_ctx` returns null), and enforces single-take exclusivity on `take_lazy_commands`.
+#[test]
+fn system_closure_trampoline_defers_sys_host_ctx_and_sys_commands_until_accessed() {
+    static HOST_CTX_CALLS: AtomicUsize = AtomicUsize::new(0);
+    static COMMANDS_CALLS: AtomicUsize = AtomicUsize::new(0);
+    static RUNTIME_CTX_PTR: AtomicPtr<BamHostCtx> = AtomicPtr::new(core::ptr::null_mut());
+    static DUMMY_CMDS_PTR: AtomicPtr<BamCommands> = AtomicPtr::new(core::ptr::null_mut());
+
+    /// Counting mock `sys_host_ctx` returning `RUNTIME_CTX_PTR`.
+    unsafe extern "C" fn counting_sys_host_ctx(_sys_ctx: *const BamSystemCtx) -> *const BamHostCtx {
+        HOST_CTX_CALLS.fetch_add(1, Ordering::SeqCst);
+        RUNTIME_CTX_PTR.load(Ordering::SeqCst).cast_const()
+    }
+
+    /// Counting mock `sys_commands` returning `DUMMY_CMDS_PTR`.
+    unsafe extern "C" fn counting_sys_commands(
+        _sys_ctx: *mut BamSystemCtx,
+        out_cmds: *mut *mut BamCommands,
+    ) -> FfiResult {
+        COMMANDS_CALLS.fetch_add(1, Ordering::SeqCst);
+        // SAFETY: `out_cmds` is non-null writable stack storage passed by `ValidatedSystemInvocation`.
+        unsafe { *out_cmds = DUMMY_CMDS_PTR.load(Ordering::SeqCst) };
+        FfiResult::OK
+    }
+
+    HOST_CTX_CALLS.store(0, Ordering::SeqCst);
+    COMMANDS_CALLS.store(0, Ordering::SeqCst);
+
+    let mut init_marker = 1u8;
+    let mut runtime_marker = 2u8;
+    let mut cmds_marker = 3u8;
+    let init_ctx = (&raw mut init_marker).cast::<BamHostCtx>().cast_const();
+    let runtime_ctx = (&raw mut runtime_marker).cast::<BamHostCtx>();
+    let cmds_ptr = (&raw mut cmds_marker).cast::<BamCommands>();
+    RUNTIME_CTX_PTR.store(runtime_ctx, Ordering::SeqCst);
+    DUMMY_CMDS_PTR.store(cmds_ptr, Ordering::SeqCst);
+
+    let mut api = make_mock_api();
+    api.sys_host_ctx = Some(counting_sys_host_ctx);
+    api.sys_commands = Some(counting_sys_commands);
+
+    // SAFETY: `api` and `init_ctx` are valid stack objects for this test.
+    let init_host = unsafe { Host::from_raw(&raw const api, init_ctx) }.unwrap();
+    let mut instance = GuestInstance::new(init_host, "lazy_mod");
+
+    // 1. Noop system never calls `sys_host_ctx` or `sys_commands`.
+    let (noop_fn, noop_ud) =
+        allocate_system_trampoline(&mut instance, 0, 0, None, |_inv| FfiResult::OK);
+    let mut dummy_sys = 0u64;
+    let sys_ctx = (&raw mut dummy_sys).cast::<BamSystemCtx>();
+    // SAFETY: `sys_ctx` and `noop_ud` are valid for this synchronous call.
+    assert_eq!(unsafe { noop_fn(sys_ctx, noop_ud) }, FfiResult::OK);
+    assert_eq!(HOST_CTX_CALLS.load(Ordering::SeqCst), 0);
+    assert_eq!(COMMANDS_CALLS.load(Ordering::SeqCst), 0);
+
+    // 2. Calling `inv.host()` repeatedly resolves `sys_host_ctx` once per tick, and
+    //    `take_lazy_commands()` defers `sys_commands` until `.resolve()` while enforcing
+    //    single-take exclusivity (S2).
+    let expected_runtime_addr = runtime_ctx.addr();
+    let (lazy_fn, lazy_ud) = allocate_system_trampoline(&mut instance, 0, 0, None, move |inv| {
+        let lazy_cmds = inv.take_lazy_commands();
+        // Taking the lazy token must NOT have called `sys_commands` or `sys_host_ctx` yet!
+        assert_eq!(HOST_CTX_CALLS.load(Ordering::SeqCst), 0);
+        assert_eq!(COMMANDS_CALLS.load(Ordering::SeqCst), 0);
+
+        // Single-take exclusivity: second take and `commands_mut()` must return disabled buffers.
+        assert!(!inv.take_lazy_commands().resolve().is_valid());
+        assert!(!inv.take_commands().is_valid());
+        assert!(!inv.commands_mut().is_valid());
+        assert_eq!(COMMANDS_CALLS.load(Ordering::SeqCst), 0);
+
+        // Repeated `inv.host()` calls resolve `sys_host_ctx` at most once per tick.
+        assert_eq!(inv.host().host_ctx().addr(), expected_runtime_addr);
+        assert_eq!(inv.host().host_ctx().addr(), expected_runtime_addr);
+        assert_eq!(HOST_CTX_CALLS.load(Ordering::SeqCst), 1);
+
+        // Resolving `lazy_cmds` calls `sys_commands` once and reuses the cached refreshed `Host`.
+        let cmds = lazy_cmds.resolve();
+        assert!(cmds.is_valid());
+        assert_eq!(cmds.host().host_ctx().addr(), expected_runtime_addr);
+        assert_eq!(HOST_CTX_CALLS.load(Ordering::SeqCst), 1);
+        assert_eq!(COMMANDS_CALLS.load(Ordering::SeqCst), 1);
+        FfiResult::OK
+    });
+    // SAFETY: `sys_ctx` and `lazy_ud` are valid for this synchronous call.
+    assert_eq!(unsafe { lazy_fn(sys_ctx, lazy_ud) }, FfiResult::OK);
+
+    // 3. When `sys_host_ctx` returns null, `inv.host()` falls back to the init-time `host_ctx`.
+    RUNTIME_CTX_PTR.store(core::ptr::null_mut(), Ordering::SeqCst);
+    let expected_init_addr = init_ctx.addr();
+    let (fallback_fn, fallback_ud) =
+        allocate_system_trampoline(&mut instance, 0, 0, None, move |inv| {
+            assert_eq!(inv.host().host_ctx().addr(), expected_init_addr);
+            FfiResult::OK
+        });
+    // SAFETY: `sys_ctx` and `fallback_ud` are valid for this synchronous call.
+    assert_eq!(unsafe { fallback_fn(sys_ctx, fallback_ud) }, FfiResult::OK);
+}

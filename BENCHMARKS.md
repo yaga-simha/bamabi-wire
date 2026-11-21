@@ -47,7 +47,7 @@ The host harness (`bamabi_bench`) is **always compiled in `--release` mode** (`o
 - **Sampling:** Full runs execute `15` warmup + `60` timed samples per permutation; `--quick` executes `5` warmup + `20` timed samples.
 - **Metrics:** Reports `Min`, `Median`, `P95`, and `Mean` (`ns/op`), `ns/entity` and `M ent/s` throughput for `dense_query_update`, and `vs Native` ratio (`subject median / native median`).
 - **Interpreting Results:**
-  - `noop` isolates per-system entry overhead: raw C99/C++17/Zig callbacks cross only a function pointer (`~2–5 ns`), whereas `rust:release` pays for safe `catch_unwind` + `ReentrantCell` + `sys_commands` setup (`~20 ns`).
+  - `noop` isolates per-system entry overhead: raw C99/C++17/Zig callbacks cross only a function pointer (`~2–5 ns`), whereas `rust:release` pays for safe `catch_unwind` + `ReentrantCell` atomic re-entrancy guards with lazy `sys_host_ctx` / `sys_commands` (`~6 ns`).
   - As entity count scales (`1000` -> `100000`), per-call trampoline overhead amortizes away and all four `release` guests approach `1.05x–1.35x` of the `native` baseline.
   - `debug` guest profiles show the impact of unoptimized guest codegen (`-O0` / `Debug` / `dev`) even when the host engine itself runs in `--release`.
 
@@ -82,7 +82,7 @@ cargo xtask bench --check-docs
 Updated automatically on every full 8-guest `cargo xtask bench` run (and on every `main`/`master` CI push).
 
 <!-- BENCHMARKS_RESULTS_START -->
-- **Commit:** `d60148f`
+- **Commit:** `f45ca9b`
 - **Host target:** `macos/aarch64` (`bamabi_bench` built with `--release`)
 - **Rust:** `rustc 1.98.1 (48a229cea 2026-09-01)`
 - **C99 (`cc`):** `Apple clang version 21.0.0 (clang-2100.4.1.1)`
@@ -104,81 +104,81 @@ Updated automatically on every full 8-guest `cargo xtask bench` run (and on ever
 
 #### Summary Highlights (Release Guests vs Native)
 
-| Workload                           | Native Median (ns) | Fastest Release Guest             | Safe Rust (rust:release) |
-| ---------------------------------- | -----------------: | --------------------------------- | -----------------------: |
-| noop                               |               0.68 | `zig:release`: 2.50 ns (3.68x)    |        21.93 ns (32.28x) |
-| dense_query_update (1000, c256)    |              187.9 | `zig:release`: 336.7 ns (1.79x)   |         370.8 ns (1.97x) |
-| dense_query_update (1000, c4096)   |              193.3 | `rust:release`: 249.2 ns (1.29x)  |         249.2 ns (1.29x) |
-| dense_query_update (100000, c256)  |            37366.6 | `c99:release`: 40058.4 ns (1.07x) |       51187.5 ns (1.37x) |
-| dense_query_update (100000, c4096) |            33650.0 | `c99:release`: 33783.4 ns (1.00x) |       34691.7 ns (1.03x) |
-| command_burst                      |              121.1 | `c99:release`: 394.2 ns (3.25x)   |         664.3 ns (5.49x) |
-| host_api_roundtrip                 |              815.8 | `c99:release`: 1164.2 ns (1.43x)  |        1957.1 ns (2.40x) |
+| Workload                           | Native Median (ns) | Fastest Release Guest               | Safe Rust (rust:release) |
+| ---------------------------------- | -----------------: | ----------------------------------- | -----------------------: |
+| noop                               |               1.15 | `cpp17:release`: 3.48 ns (3.03x)    |          6.21 ns (5.40x) |
+| dense_query_update (1000, c256)    |              285.8 | `cpp17:release`: 346.7 ns (1.21x)   |         531.7 ns (1.86x) |
+| dense_query_update (1000, c4096)   |              295.0 | `c99:release`: 291.7 ns (0.99x)     |         349.2 ns (1.18x) |
+| dense_query_update (100000, c256)  |            56333.4 | `cpp17:release`: 60929.2 ns (1.08x) |       77062.5 ns (1.37x) |
+| dense_query_update (100000, c4096) |            51616.6 | `cpp17:release`: 51725.0 ns (1.00x) |       53120.9 ns (1.03x) |
+| command_burst                      |              185.6 | `c99:release`: 598.2 ns (3.22x)     |         989.7 ns (5.33x) |
+| host_api_roundtrip                 |             1232.5 | `c99:release`: 1778.3 ns (1.44x)    |        2430.6 ns (1.97x) |
 
 #### Full Permutation Results
 
 | Subject       | Workload           | Entities | Chunk | Min (ns) | Median (ns) | P95 (ns) | Mean (ns) | ns/entity | M ent/s | vs Native |
 | ------------- | ------------------ | -------: | ----: | -------: | ----------: | -------: | --------: | --------: | ------: | --------: |
-| native        | noop               |        - |     - |     0.68 |        0.68 |     0.69 |      0.68 |         - |       - |     1.00x |
-| native        | dense_query_update |     1000 |   256 |    168.3 |       187.9 |    190.0 |     186.5 |     0.188 |  5321.7 |     1.00x |
-| native        | dense_query_update |     1000 |  4096 |    174.2 |       193.3 |    194.2 |     192.1 |     0.193 |  5172.2 |     1.00x |
-| native        | dense_query_update |   100000 |   256 |  37016.8 |     37366.6 |  40908.4 |   37919.5 |     0.374 |  2676.2 |     1.00x |
-| native        | dense_query_update |   100000 |  4096 |  33566.6 |     33650.0 |  37450.0 |   34228.1 |     0.337 |  2971.8 |     1.00x |
-| native        | command_burst      |        - |     - |    120.0 |       121.1 |    145.8 |     124.5 |         - |       - |     1.00x |
-| native        | host_api_roundtrip |        - |     - |    814.2 |       815.8 |    903.9 |     830.9 |         - |       - |     1.00x |
-| rust:release  | noop               |        - |     - |    21.48 |       21.93 |    23.61 |     22.21 |         - |       - |    32.28x |
-| rust:release  | dense_query_update |     1000 |   256 |    367.5 |       370.8 |    373.3 |     371.2 |     0.371 |  2696.6 |     1.97x |
-| rust:release  | dense_query_update |     1000 |  4096 |    246.7 |       249.2 |    251.7 |     249.6 |     0.249 |  4013.5 |     1.29x |
-| rust:release  | dense_query_update |   100000 |   256 |  50900.0 |     51187.5 |  53833.2 |   51819.6 |     0.512 |  1953.6 |     1.37x |
-| rust:release  | dense_query_update |   100000 |  4096 |  34533.4 |     34691.7 |  37016.6 |   35117.4 |     0.347 |  2882.5 |     1.03x |
-| rust:release  | command_burst      |        - |     - |    654.7 |       664.3 |    756.9 |     675.9 |         - |       - |     5.49x |
-| rust:release  | host_api_roundtrip |        - |     - |   1918.6 |      1957.1 |   2105.0 |    1972.1 |         - |       - |     2.40x |
-| rust:debug    | noop               |        - |     - |    133.9 |       136.4 |    139.3 |     136.6 |         - |       - |   200.83x |
-| rust:debug    | dense_query_update |     1000 |   256 |   8195.0 |      8279.6 |   8785.8 |    8364.3 |     8.280 |   120.8 |    44.06x |
-| rust:debug    | dense_query_update |     1000 |  4096 |   6414.2 |      6487.1 |   7005.8 |    6572.9 |     6.487 |   154.2 |    33.55x |
-| rust:debug    | dense_query_update |   100000 |   256 | 760441.6 |    805987.5 | 833800.0 |  808396.8 |     8.060 |   124.1 |    21.57x |
-| rust:debug    | dense_query_update |   100000 |  4096 | 545750.0 |    578929.2 | 588466.6 |  578373.6 |     5.789 |   172.7 |    17.20x |
-| rust:debug    | command_burst      |        - |     - |   4623.9 |      4740.3 |   4860.0 |    4747.5 |         - |       - |    39.14x |
-| rust:debug    | host_api_roundtrip |        - |     - |  17263.6 |     17516.5 |  18193.6 |   17615.9 |         - |       - |    21.47x |
-| c99:release   | noop               |        - |     - |     5.40 |        5.41 |     6.59 |      5.58 |         - |       - |     7.96x |
-| c99:release   | dense_query_update |     1000 |   256 |    713.3 |       715.0 |    937.5 |     738.0 |     0.715 |  1398.6 |     3.81x |
-| c99:release   | dense_query_update |     1000 |  4096 |    210.0 |       620.0 |    631.7 |     621.2 |     0.620 |  1612.9 |     3.21x |
-| c99:release   | dense_query_update |   100000 |   256 |  36508.4 |     40058.4 |  78400.0 |   43110.3 |     0.401 |  2496.4 |     1.07x |
-| c99:release   | dense_query_update |   100000 |  4096 |  33725.0 |     33783.4 |  35850.0 |   34168.3 |     0.338 |  2960.0 |     1.00x |
-| c99:release   | command_burst      |        - |     - |    377.5 |       394.2 |    418.1 |     394.5 |         - |       - |     3.25x |
-| c99:release   | host_api_roundtrip |        - |     - |   1153.6 |      1164.2 |   1220.0 |    1171.8 |         - |       - |     1.43x |
-| c99:debug     | noop               |        - |     - |     6.17 |        6.17 |     6.73 |      6.22 |         - |       - |     9.09x |
-| c99:debug     | dense_query_update |     1000 |   256 |   2351.7 |      2496.7 |   2714.2 |    2524.5 |     2.497 |   400.5 |    13.29x |
-| c99:debug     | dense_query_update |     1000 |  4096 |   2420.8 |      2432.5 |   2609.2 |    2455.4 |     2.433 |   411.1 |    12.58x |
-| c99:debug     | dense_query_update |   100000 |   256 | 262008.4 |    264191.7 | 268441.6 |  264675.0 |     2.642 |   378.5 |     7.07x |
-| c99:debug     | dense_query_update |   100000 |  4096 | 249683.4 |    258108.3 | 272866.6 |  259706.5 |     2.581 |   387.4 |     7.67x |
-| c99:debug     | command_burst      |        - |     - |    405.0 |       423.1 |    465.0 |     428.4 |         - |       - |     3.49x |
-| c99:debug     | host_api_roundtrip |        - |     - |   1202.8 |      1206.9 |   1281.4 |    1222.1 |         - |       - |     1.48x |
-| cpp17:release | noop               |        - |     - |     5.40 |        5.41 |     6.22 |      5.53 |         - |       - |     7.96x |
-| cpp17:release | dense_query_update |     1000 |   256 |    698.3 |       700.0 |    905.0 |     714.4 |     0.700 |  1428.6 |     3.73x |
-| cpp17:release | dense_query_update |     1000 |  4096 |    618.3 |       620.8 |    627.5 |     623.5 |     0.621 |  1610.8 |     3.21x |
-| cpp17:release | dense_query_update |   100000 |   256 |  36333.4 |     40216.6 |  66825.0 |   42401.3 |     0.402 |  2486.5 |     1.08x |
-| cpp17:release | dense_query_update |   100000 |  4096 |  33750.0 |     33850.0 |  35608.4 |   34235.6 |     0.339 |  2954.2 |     1.01x |
-| cpp17:release | command_burst      |        - |     - |    440.0 |       468.3 |    508.9 |     471.7 |         - |       - |     3.87x |
-| cpp17:release | host_api_roundtrip |        - |     - |   1210.8 |      1226.4 |   1343.1 |    1248.7 |         - |       - |     1.50x |
-| cpp17:debug   | noop               |        - |     - |     6.17 |        6.18 |     8.53 |      6.44 |         - |       - |     9.10x |
-| cpp17:debug   | dense_query_update |     1000 |   256 |   2293.3 |      2546.7 |   4262.5 |    2764.0 |     2.547 |   392.7 |    13.55x |
-| cpp17:debug   | dense_query_update |     1000 |  4096 |   2340.8 |      2463.3 |   2672.5 |    2485.2 |     2.463 |   406.0 |    12.74x |
-| cpp17:debug   | dense_query_update |   100000 |   256 | 250691.6 |    266629.1 | 280733.2 |  267578.9 |     2.666 |   375.1 |     7.14x |
-| cpp17:debug   | dense_query_update |   100000 |  4096 | 251141.8 |    257458.3 | 264591.8 |  258048.8 |     2.575 |   388.4 |     7.65x |
-| cpp17:debug   | command_burst      |        - |     - |    748.3 |       760.6 |    817.8 |     768.8 |         - |       - |     6.28x |
-| cpp17:debug   | host_api_roundtrip |        - |     - |   1790.6 |      1841.4 |   1958.1 |    1844.7 |         - |       - |     2.26x |
-| zig:release   | noop               |        - |     - |     2.26 |        2.50 |     3.09 |      2.56 |         - |       - |     3.68x |
-| zig:release   | dense_query_update |     1000 |   256 |    307.5 |       336.7 |    345.8 |     337.6 |     0.337 |  2970.3 |     1.79x |
-| zig:release   | dense_query_update |     1000 |  4096 |    274.2 |       275.0 |    310.0 |     281.0 |     0.275 |  3636.4 |     1.42x |
-| zig:release   | dense_query_update |   100000 |   256 |  41766.6 |     44100.1 |  49683.4 |   45135.7 |     0.441 |  2267.6 |     1.18x |
-| zig:release   | dense_query_update |   100000 |  4096 |  34941.6 |     36637.5 |  43058.4 |   37366.7 |     0.366 |  2729.4 |     1.09x |
-| zig:release   | command_burst      |        - |     - |    368.1 |       448.6 |    505.0 |     446.0 |         - |       - |     3.70x |
-| zig:release   | host_api_roundtrip |        - |     - |   1198.3 |      1234.4 |   1360.8 |    1250.8 |         - |       - |     1.51x |
-| zig:debug     | noop               |        - |     - |     2.48 |        2.69 |     4.10 |      2.90 |         - |       - |     3.96x |
-| zig:debug     | dense_query_update |     1000 |   256 |   2638.3 |      2792.1 |   3041.7 |    2834.7 |     2.792 |   358.2 |    14.86x |
-| zig:debug     | dense_query_update |     1000 |  4096 |   2359.2 |      2761.2 |   3152.5 |    2786.3 |     2.761 |   362.2 |    14.28x |
-| zig:debug     | dense_query_update |   100000 |   256 | 247741.6 |    257345.8 | 272916.6 |  258861.4 |     2.573 |   388.6 |     6.89x |
-| zig:debug     | dense_query_update |   100000 |  4096 | 277016.8 |    285670.9 | 298066.8 |  286673.1 |     2.857 |   350.1 |     8.49x |
-| zig:debug     | command_burst      |        - |     - |   1061.7 |      1073.3 |   1154.7 |    1085.9 |         - |       - |     8.86x |
-| zig:debug     | host_api_roundtrip |        - |     - |   2564.7 |      2601.5 |   2693.6 |    2617.6 |         - |       - |     3.19x |
+| native        | noop               |        - |     - |     1.14 |        1.15 |     1.16 |      1.15 |         - |       - |     1.00x |
+| native        | dense_query_update |     1000 |   256 |    282.5 |       285.8 |    294.2 |     287.8 |     0.286 |  3498.7 |     1.00x |
+| native        | dense_query_update |     1000 |  4096 |    294.2 |       295.0 |    299.2 |     296.4 |     0.295 |  3389.8 |     1.00x |
+| native        | dense_query_update |   100000 |   256 |  56216.6 |     56333.4 |  58525.0 |   56721.3 |     0.563 |  1775.1 |     1.00x |
+| native        | dense_query_update |   100000 |  4096 |  51133.4 |     51616.6 |  52941.8 |   51912.2 |     0.516 |  1937.4 |     1.00x |
+| native        | command_burst      |        - |     - |    184.4 |       185.6 |    186.4 |     185.6 |         - |       - |     1.00x |
+| native        | host_api_roundtrip |        - |     - |   1230.8 |      1232.5 |   1275.8 |    1239.5 |         - |       - |     1.00x |
+| rust:release  | noop               |        - |     - |     6.20 |        6.21 |     6.49 |      6.24 |         - |       - |     5.40x |
+| rust:release  | dense_query_update |     1000 |   256 |    525.8 |       531.7 |    540.0 |     533.0 |     0.532 |  1880.9 |     1.86x |
+| rust:release  | dense_query_update |     1000 |  4096 |    347.5 |       349.2 |    351.7 |     349.6 |     0.349 |  2864.0 |     1.18x |
+| rust:release  | dense_query_update |   100000 |   256 |  76766.6 |     77062.5 |  78608.4 |   77381.5 |     0.771 |  1297.6 |     1.37x |
+| rust:release  | dense_query_update |   100000 |  4096 |  53008.4 |     53120.9 |  54200.0 |   53354.7 |     0.531 |  1882.5 |     1.03x |
+| rust:release  | command_burst      |        - |     - |    976.7 |       989.7 |   1018.1 |     992.4 |         - |       - |     5.33x |
+| rust:release  | host_api_roundtrip |        - |     - |   2428.3 |      2430.6 |   2473.3 |    2440.0 |         - |       - |     1.97x |
+| rust:debug    | noop               |        - |     - |    139.5 |       140.0 |    141.2 |     140.1 |         - |       - |   121.73x |
+| rust:debug    | dense_query_update |     1000 |   256 |  12432.5 |     12503.3 |  12610.0 |   12500.6 |    12.503 |    80.0 |    43.75x |
+| rust:debug    | dense_query_update |     1000 |  4096 |   9853.3 |      9922.5 |  10095.0 |    9934.0 |     9.923 |   100.8 |    33.64x |
+| rust:debug    | dense_query_update |   100000 |   256 |  1188058 |     1211379 |  1275508 |   1215190 |    12.114 |    82.6 |    21.50x |
+| rust:debug    | dense_query_update |   100000 |  4096 | 856291.8 |    866641.6 | 882925.0 |  867651.4 |     8.666 |   115.4 |    16.79x |
+| rust:debug    | command_burst      |        - |     - |   7170.0 |      7210.6 |   7276.7 |    7213.7 |         - |       - |    38.86x |
+| rust:debug    | host_api_roundtrip |        - |     - |  25880.3 |     26040.7 |  26451.1 |   26074.3 |         - |       - |    21.13x |
+| c99:release   | noop               |        - |     - |     3.54 |        3.55 |     3.83 |      3.58 |         - |       - |     3.08x |
+| c99:release   | dense_query_update |     1000 |   256 |    341.7 |       347.5 |    351.7 |     347.2 |     0.347 |  2877.7 |     1.22x |
+| c99:release   | dense_query_update |     1000 |  4096 |    289.2 |       291.7 |    294.2 |     291.7 |     0.292 |  3428.6 |     0.99x |
+| c99:release   | dense_query_update |   100000 |   256 |  60766.6 |     61441.7 |  63533.2 |   61716.1 |     0.614 |  1627.6 |     1.09x |
+| c99:release   | dense_query_update |   100000 |  4096 |  51608.2 |     52291.6 |  56800.0 |   53084.5 |     0.523 |  1912.4 |     1.01x |
+| c99:release   | command_burst      |        - |     - |    531.9 |       598.2 |    621.1 |     592.1 |         - |       - |     3.22x |
+| c99:release   | host_api_roundtrip |        - |     - |   1777.5 |      1778.3 |   1819.7 |    1785.7 |         - |       - |     1.44x |
+| c99:debug     | noop               |        - |     - |     6.32 |        6.81 |    14.82 |      7.97 |         - |       - |     5.92x |
+| c99:debug     | dense_query_update |     1000 |   256 |   3806.7 |      3823.3 |   3889.2 |    3832.4 |     3.823 |   261.6 |    13.38x |
+| c99:debug     | dense_query_update |     1000 |  4096 |   3696.7 |      3716.7 |   3843.3 |    3732.4 |     3.717 |   269.1 |    12.60x |
+| c99:debug     | dense_query_update |   100000 |   256 | 400483.2 |    401904.2 | 406791.6 |  402640.0 |     4.019 |   248.8 |     7.13x |
+| c99:debug     | dense_query_update |   100000 |  4096 | 389375.0 |    390716.6 | 395175.0 |  391410.4 |     3.907 |   255.9 |     7.57x |
+| c99:debug     | command_burst      |        - |     - |    617.5 |       652.1 |    683.1 |     653.2 |         - |       - |     3.51x |
+| c99:debug     | host_api_roundtrip |        - |     - |   1871.9 |      1886.7 |   1928.3 |    1893.8 |         - |       - |     1.53x |
+| cpp17:release | noop               |        - |     - |     3.47 |        3.48 |     3.61 |      3.50 |         - |       - |     3.03x |
+| cpp17:release | dense_query_update |     1000 |   256 |    342.5 |       346.7 |    397.5 |     351.8 |     0.347 |  2884.5 |     1.21x |
+| cpp17:release | dense_query_update |     1000 |  4096 |    290.0 |       291.7 |    293.3 |     291.9 |     0.292 |  3428.4 |     0.99x |
+| cpp17:release | dense_query_update |   100000 |   256 |  60650.0 |     60929.2 |  62233.4 |   61128.8 |     0.609 |  1641.2 |     1.08x |
+| cpp17:release | dense_query_update |   100000 |  4096 |  51633.2 |     51725.0 |  53308.4 |   52013.2 |     0.517 |  1933.3 |     1.00x |
+| cpp17:release | command_burst      |        - |     - |    608.1 |       659.0 |    687.2 |     658.7 |         - |       - |     3.55x |
+| cpp17:release | host_api_roundtrip |        - |     - |   1824.2 |      1825.1 |   1871.1 |    1834.7 |         - |       - |     1.48x |
+| cpp17:debug   | noop               |        - |     - |     6.32 |        7.05 |    15.74 |      8.77 |         - |       - |     6.13x |
+| cpp17:debug   | dense_query_update |     1000 |   256 |   3855.0 |      3885.8 |   3985.0 |    3906.4 |     3.886 |   257.3 |    13.60x |
+| cpp17:debug   | dense_query_update |     1000 |  4096 |   3740.0 |      3763.7 |   3900.0 |    3775.8 |     3.764 |   265.7 |    12.76x |
+| cpp17:debug   | dense_query_update |   100000 |   256 | 404266.8 |    406041.6 | 408608.4 |  406284.7 |     4.060 |   246.3 |     7.21x |
+| cpp17:debug   | dense_query_update |   100000 |  4096 | 390475.0 |    392091.7 | 394991.8 |  392332.6 |     3.921 |   255.0 |     7.60x |
+| cpp17:debug   | command_burst      |        - |     - |   1136.7 |      1155.3 |   1198.3 |    1157.3 |         - |       - |     6.23x |
+| cpp17:debug   | host_api_roundtrip |        - |     - |   2798.1 |      2810.1 |   2858.9 |    2817.2 |         - |       - |     2.28x |
+| zig:release   | noop               |        - |     - |     3.91 |        3.92 |     4.20 |      3.96 |         - |       - |     3.41x |
+| zig:release   | dense_query_update |     1000 |   256 |    517.5 |       520.8 |    540.8 |     522.3 |     0.521 |  1920.0 |     1.82x |
+| zig:release   | dense_query_update |     1000 |  4096 |    418.3 |       419.2 |    424.2 |     421.0 |     0.419 |  2385.7 |     1.42x |
+| zig:release   | dense_query_update |   100000 |   256 |  64291.6 |     64495.8 |  65916.6 |   64777.1 |     0.645 |  1550.5 |     1.14x |
+| zig:release   | dense_query_update |   100000 |  4096 |  54100.0 |     54216.7 |  55758.4 |   54437.2 |     0.542 |  1844.5 |     1.05x |
+| zig:release   | command_burst      |        - |     - |    679.4 |       740.0 |    781.4 |     738.6 |         - |       - |     3.99x |
+| zig:release   | host_api_roundtrip |        - |     - |   1833.1 |      1839.2 |   1868.6 |    1845.3 |         - |       - |     1.49x |
+| zig:debug     | noop               |        - |     - |     4.10 |        4.11 |     4.36 |      4.13 |         - |       - |     3.58x |
+| zig:debug     | dense_query_update |     1000 |   256 |   4039.2 |      4217.9 |   4380.0 |    4222.3 |     4.218 |   237.1 |    14.76x |
+| zig:debug     | dense_query_update |     1000 |  4096 |   3657.5 |      3859.2 |   4109.2 |    3882.2 |     3.859 |   259.1 |    13.08x |
+| zig:debug     | dense_query_update |   100000 |   256 | 384183.4 |    393108.4 | 413616.8 |  395419.7 |     3.931 |   254.4 |     6.98x |
+| zig:debug     | dense_query_update |   100000 |  4096 | 384950.0 |    415654.1 | 426858.2 |  414892.5 |     4.157 |   240.6 |     8.05x |
+| zig:debug     | command_burst      |        - |     - |   1626.1 |      1647.5 |   1691.7 |    1651.3 |         - |       - |     8.88x |
+| zig:debug     | host_api_roundtrip |        - |     - |   3948.3 |      3981.7 |   4032.2 |    3984.5 |         - |       - |     3.23x |
 <!-- BENCHMARKS_RESULTS_END -->

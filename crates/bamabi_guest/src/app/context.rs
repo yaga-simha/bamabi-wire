@@ -3,7 +3,8 @@
 use core::ffi::{CStr, c_void};
 
 use bamabi_guest_sys::{
-    Host, ValidatedIter, ValidatedSystemInvocation, ValidatedSystemRef, resolve_component,
+    Host, LazyCommands, ValidatedCommands, ValidatedIter, ValidatedSystemInvocation,
+    ValidatedSystemRef, resolve_component,
 };
 use bamabi_sys::{
     AbiPod, BamChangeTicks, BamComponent, BamHostApi, BamSystemCtx, ComponentUuid, FfiEntity,
@@ -81,13 +82,116 @@ impl<'a> RunConditionContext<'a> {
 /// `queries_2_mut`, `queries_2_and_commands`), declaration-indexed singleton resources
 /// (`resource`, `resource_mut`), and handle/batched [`GuestCommands`].
 pub struct SystemContext<'a> {
-    host: &'a Host,
     pub(crate) sys_ref: ValidatedSystemRef<'a>,
     user_query_count: usize,
-    queries: [Option<ChunkIter<'a>>; MAX_QUERIES_PER_SYSTEM],
+    query0: Option<ChunkIter<'a>>,
+    extra_queries: Option<[Option<ChunkIter<'a>>; MAX_QUERIES_PER_SYSTEM - 1]>,
     resource_query: Option<ChunkIter<'a>>,
-    empty_iter: ChunkIter<'a>,
-    commands: GuestCommands<'a>,
+    empty_iter: Option<ChunkIter<'a>>,
+    commands: Option<GuestCommands<'a>>,
+    lazy_commands: Option<LazyCommands<'a>>,
+}
+
+/// Lazily resolves `commands` from `lazy_commands` on first access so systems that never touch
+/// deferred commands avoid the `BamHostApi::sys_commands` FFI call.
+#[inline]
+fn resolve_commands_slot<'b, 'a>(
+    commands: &'b mut Option<GuestCommands<'a>>,
+    lazy_commands: &mut Option<LazyCommands<'a>>,
+    base_host: &'a Host,
+) -> &'b mut GuestCommands<'a> {
+    commands.get_or_insert_with(|| {
+        let validated = match lazy_commands.take() {
+            Some(lazy) => lazy.resolve(),
+            None => ValidatedCommands::empty(base_host),
+        };
+        GuestCommands::from_validated(validated)
+    })
+}
+
+/// Splits two distinct mutable query slots (`idx_a != idx_b`) out of `query0` and `extra_queries`.
+#[inline]
+fn split_queries_2_mut<'b, 'a>(
+    query0: &'b mut Option<ChunkIter<'a>>,
+    extra_queries: &'b mut Option<[Option<ChunkIter<'a>>; MAX_QUERIES_PER_SYSTEM - 1]>,
+    user_query_count: usize,
+    idx_a: usize,
+    idx_b: usize,
+) -> Option<(&'b mut ChunkIter<'a>, &'b mut ChunkIter<'a>)> {
+    if idx_a == idx_b || idx_a >= user_query_count || idx_b >= user_query_count {
+        return None;
+    }
+    if idx_a == 0 {
+        let extra = extra_queries.as_mut()?;
+        return Some((query0.as_mut()?, extra.get_mut(idx_b - 1)?.as_mut()?));
+    }
+    if idx_b == 0 {
+        let extra = extra_queries.as_mut()?;
+        return Some((extra.get_mut(idx_a - 1)?.as_mut()?, query0.as_mut()?));
+    }
+    let extra = extra_queries.as_mut()?;
+    let ea = idx_a - 1;
+    let eb = idx_b - 1;
+    if ea < eb {
+        let (left, right) = extra.split_at_mut(eb);
+        Some((left[ea].as_mut()?, right[0].as_mut()?))
+    } else {
+        let (left, right) = extra.split_at_mut(ea);
+        Some((right[0].as_mut()?, left[eb].as_mut()?))
+    }
+}
+
+/// Splits three distinct mutable query slots (`idx_a`, `idx_b`, `idx_c`) out of `query0` and
+/// `extra_queries`.
+#[allow(clippy::type_complexity)]
+fn split_queries_3_mut<'b, 'a>(
+    query0: &'b mut Option<ChunkIter<'a>>,
+    extra_queries: &'b mut Option<[Option<ChunkIter<'a>>; MAX_QUERIES_PER_SYSTEM - 1]>,
+    user_query_count: usize,
+    idx_a: usize,
+    idx_b: usize,
+    idx_c: usize,
+) -> Option<(
+    &'b mut ChunkIter<'a>,
+    &'b mut ChunkIter<'a>,
+    &'b mut ChunkIter<'a>,
+)> {
+    if idx_a == idx_b
+        || idx_b == idx_c
+        || idx_a == idx_c
+        || idx_a >= user_query_count
+        || idx_b >= user_query_count
+        || idx_c >= user_query_count
+    {
+        return None;
+    }
+    let mut order = [(idx_a, 0u8), (idx_b, 1u8), (idx_c, 2u8)];
+    order.sort_unstable_by_key(|&(idx, _)| idx);
+    let (i0, p0) = order[0];
+    let (i1, p1) = order[1];
+    let (i2, p2) = order[2];
+    let extra = extra_queries.as_mut()?;
+    let (r0, r1, r2) = if i0 == 0 {
+        let (s1, s2) = extra.split_at_mut(i2 - 1);
+        (query0.as_mut()?, s1[i1 - 1].as_mut()?, s2[0].as_mut()?)
+    } else {
+        let e0 = i0 - 1;
+        let e1 = i1 - 1;
+        let e2 = i2 - 1;
+        let (s0, rest1) = extra.split_at_mut(e1);
+        let (s1, s2) = rest1.split_at_mut(e2 - e1);
+        (s0[e0].as_mut()?, s1[0].as_mut()?, s2[0].as_mut()?)
+    };
+    let ordered = match (p0, p1, p2) {
+        (0, 1, 2) => (r0, r1, r2),
+        (0, 2, 1) => (r0, r2, r1),
+        (1, 0, 2) => (r1, r0, r2),
+        (1, 2, 0) => (r2, r0, r1),
+        (2, 0, 1) => (r1, r2, r0),
+        (2, 1, 0) => (r2, r1, r0),
+        _ => return None,
+    };
+    Some(ordered)
 }
 
 /// Safe read-only singleton resource guard carrying Bevy change-detection [`BamChangeTicks`].
@@ -184,44 +288,91 @@ impl<R> core::ops::DerefMut for GuestResMut<'_, R> {
 
 impl<'a> SystemContext<'a> {
     /// Constructs a [`SystemContext`] by extracting the validated system reference, declared query
-    /// slots, optional system-level resource query slot, and deferred command buffer from `inv`.
+    /// slots, optional system-level resource query slot, and lazy deferred command token from `inv`.
+    #[inline(always)]
     pub(crate) fn from_invocation(inv: &mut ValidatedSystemInvocation<'a>) -> Self {
-        let host = inv.host();
+        let base_host = inv.base_host();
         let sys_ref = inv
             .take_system_ref()
-            .unwrap_or_else(|| ValidatedSystemRef::empty(host));
+            .unwrap_or_else(|| ValidatedSystemRef::empty(base_host));
         let user_query_count = inv.query_count();
-        let mut queries: [Option<ChunkIter<'a>>; MAX_QUERIES_PER_SYSTEM] =
-            [const { None }; MAX_QUERIES_PER_SYSTEM];
-        for (idx, slot) in queries.iter_mut().enumerate().take(user_query_count) {
-            *slot = inv.take_raw_query_slot(idx).map(ChunkIter::from_validated);
-        }
-        let resource_query = inv
-            .resource_query_index()
-            .and_then(|res_idx| inv.take_raw_query_slot(res_idx))
-            .map(ChunkIter::from_validated);
-        let commands = GuestCommands::from_validated(inv.take_commands());
+        let (query0, extra_queries) = if user_query_count > 0 {
+            let q0 = inv.take_raw_query_slot(0).map(ChunkIter::from_validated);
+            let extra = if user_query_count > 1 {
+                let mut rest: [Option<ChunkIter<'a>>; MAX_QUERIES_PER_SYSTEM - 1] =
+                    [const { None }; MAX_QUERIES_PER_SYSTEM - 1];
+                let mut offset = 0usize;
+                let extra_count = user_query_count - 1;
+                while offset < extra_count {
+                    rest[offset] = inv
+                        .take_raw_query_slot(offset + 1)
+                        .map(ChunkIter::from_validated);
+                    offset += 1;
+                }
+                Some(rest)
+            } else {
+                None
+            };
+            (q0, extra)
+        } else {
+            (None, None)
+        };
+        let resource_query = if let Some(res_idx) = inv.resource_query_index() {
+            inv.take_raw_query_slot(res_idx)
+                .map(ChunkIter::from_validated)
+        } else {
+            None
+        };
+        let lazy_commands = Some(inv.take_lazy_commands());
         Self {
-            host,
             sys_ref,
             user_query_count,
-            queries,
+            query0,
+            extra_queries,
             resource_query,
-            empty_iter: ChunkIter::from_validated(ValidatedIter::empty(host)),
-            commands,
+            empty_iter: None,
+            commands: None,
+            lazy_commands,
         }
     }
 
-    /// Returns the cached [`Host`] table for this mod instance.
+    /// Borrows query slot `index` immutably without touching `extra_queries` for `index == 0`.
     #[inline]
-    pub const fn host(&self) -> &'a Host {
-        self.host
+    fn query_ref(&self, index: usize) -> Option<&ChunkIter<'a>> {
+        if index >= self.user_query_count {
+            return None;
+        }
+        if index == 0 {
+            self.query0.as_ref()
+        } else {
+            self.extra_queries.as_ref()?.get(index - 1)?.as_ref()
+        }
+    }
+
+    /// Borrows query slot `index` mutably without touching `extra_queries` for `index == 0`.
+    #[inline]
+    fn query_slot_mut(&mut self, index: usize) -> Option<&mut ChunkIter<'a>> {
+        if index >= self.user_query_count {
+            return None;
+        }
+        if index == 0 {
+            self.query0.as_mut()
+        } else {
+            self.extra_queries.as_mut()?.get_mut(index - 1)?.as_mut()
+        }
+    }
+
+    /// Returns the active [`Host`] table for this mod instance, lazily resolving
+    /// `BamHostApi::sys_host_ctx` on first access.
+    #[inline]
+    pub fn host(&self) -> &'a Host {
+        self.sys_ref.host()
     }
 
     /// Returns the validated [`BamHostApi`] function table.
     #[inline]
     pub const fn host_api(&self) -> &'a BamHostApi {
-        self.host.api()
+        self.sys_ref.base_host().api()
     }
 
     /// Returns the raw `*mut BamSystemCtx` pointer for low-level FFI helpers.
@@ -233,7 +384,7 @@ impl<'a> SystemContext<'a> {
     /// Reads the most recent human-readable UTF-8 diagnostic recorded on this world's host context.
     #[inline]
     pub fn last_error(&self) -> String {
-        self.host.last_error()
+        self.host().last_error()
     }
 
     /// Returns the number of explicit `.query(...)` clauses declared on this system.
@@ -246,10 +397,14 @@ impl<'a> SystemContext<'a> {
     /// clause was declared).
     #[inline]
     pub fn iter(&mut self) -> &mut ChunkIter<'a> {
-        if self.user_query_count == 0 {
-            return &mut self.empty_iter;
+        if self.user_query_count > 0
+            && let Some(q0) = self.query0.as_mut()
+        {
+            return q0;
         }
-        self.queries[0].as_mut().unwrap_or(&mut self.empty_iter)
+        let base_host = self.sys_ref.base_host();
+        self.empty_iter
+            .get_or_insert_with(|| ChunkIter::from_validated(ValidatedIter::empty(base_host)))
     }
 
     /// Borrows declared query `index` (`0..query_count()`) mutably (`None` if out of range).
@@ -261,10 +416,7 @@ impl<'a> SystemContext<'a> {
     /// Borrows declared query `index` (`0..query_count()`) mutably (`None` if out of range).
     #[inline]
     pub fn query_mut(&mut self, index: usize) -> Option<&mut ChunkIter<'a>> {
-        if index >= self.user_query_count {
-            return None;
-        }
-        self.queries[index].as_mut()
+        self.query_slot_mut(index)
     }
 
     /// Simultaneously borrows two distinct queries `idx_a` and `idx_b` (`None` if `idx_a == idx_b`
@@ -274,16 +426,13 @@ impl<'a> SystemContext<'a> {
         idx_a: usize,
         idx_b: usize,
     ) -> Option<(&mut ChunkIter<'a>, &mut ChunkIter<'a>)> {
-        if idx_a == idx_b || idx_a >= self.user_query_count || idx_b >= self.user_query_count {
-            return None;
-        }
-        if idx_a < idx_b {
-            let (left, right) = self.queries.split_at_mut(idx_b);
-            Some((left[idx_a].as_mut()?, right[0].as_mut()?))
-        } else {
-            let (left, right) = self.queries.split_at_mut(idx_a);
-            Some((right[0].as_mut()?, left[idx_b].as_mut()?))
-        }
+        split_queries_2_mut(
+            &mut self.query0,
+            &mut self.extra_queries,
+            self.user_query_count,
+            idx_a,
+            idx_b,
+        )
     }
 
     /// Simultaneously borrows three distinct queries `idx_a`, `idx_b`, and `idx_c` (`None` if any
@@ -294,24 +443,38 @@ impl<'a> SystemContext<'a> {
         idx_b: usize,
         idx_c: usize,
     ) -> Option<(&mut ChunkIter<'a>, &mut ChunkIter<'a>, &mut ChunkIter<'a>)> {
-        let (a, b, c, _) = self.queries_3_and_commands(idx_a, idx_b, idx_c)?;
-        Some((a, b, c))
+        split_queries_3_mut(
+            &mut self.query0,
+            &mut self.extra_queries,
+            self.user_query_count,
+            idx_a,
+            idx_b,
+            idx_c,
+        )
     }
 
     /// Borrows the deferred [`GuestCommands`] buffer mutably.
     #[inline]
     pub fn commands(&mut self) -> &mut GuestCommands<'a> {
-        &mut self.commands
+        resolve_commands_slot(
+            &mut self.commands,
+            &mut self.lazy_commands,
+            self.sys_ref.base_host(),
+        )
     }
 
     /// Simultaneously borrows primary query `0` and [`GuestCommands`].
     #[inline]
     pub fn iter_and_commands(&mut self) -> (&mut ChunkIter<'a>, &mut GuestCommands<'a>) {
-        let cmds = &mut self.commands;
-        let iter = if self.user_query_count == 0 {
-            &mut self.empty_iter
+        let base_host = self.sys_ref.base_host();
+        let cmds = resolve_commands_slot(&mut self.commands, &mut self.lazy_commands, base_host);
+        let iter = if self.user_query_count > 0
+            && let Some(q0) = self.query0.as_mut()
+        {
+            q0
         } else {
-            self.queries[0].as_mut().unwrap_or(&mut self.empty_iter)
+            self.empty_iter
+                .get_or_insert_with(|| ChunkIter::from_validated(ValidatedIter::empty(base_host)))
         };
         (iter, cmds)
     }
@@ -326,17 +489,19 @@ impl<'a> SystemContext<'a> {
         &mut ChunkIter<'a>,
         &mut GuestCommands<'a>,
     )> {
-        if idx_a == idx_b || idx_a >= self.user_query_count || idx_b >= self.user_query_count {
-            return None;
-        }
-        let cmds = &mut self.commands;
-        if idx_a < idx_b {
-            let (left, right) = self.queries.split_at_mut(idx_b);
-            Some((left[idx_a].as_mut()?, right[0].as_mut()?, cmds))
-        } else {
-            let (left, right) = self.queries.split_at_mut(idx_a);
-            Some((right[0].as_mut()?, left[idx_b].as_mut()?, cmds))
-        }
+        let (a, b) = split_queries_2_mut(
+            &mut self.query0,
+            &mut self.extra_queries,
+            self.user_query_count,
+            idx_a,
+            idx_b,
+        )?;
+        let cmds = resolve_commands_slot(
+            &mut self.commands,
+            &mut self.lazy_commands,
+            self.sys_ref.base_host(),
+        );
+        Some((a, b, cmds))
     }
 
     /// Simultaneously borrows three distinct queries `idx_a`, `idx_b`, and `idx_c` alongside
@@ -353,36 +518,20 @@ impl<'a> SystemContext<'a> {
         &mut ChunkIter<'a>,
         &mut GuestCommands<'a>,
     )> {
-        if idx_a == idx_b
-            || idx_b == idx_c
-            || idx_a == idx_c
-            || idx_a >= self.user_query_count
-            || idx_b >= self.user_query_count
-            || idx_c >= self.user_query_count
-        {
-            return None;
-        }
-        let mut order = [(idx_a, 0u8), (idx_b, 1u8), (idx_c, 2u8)];
-        order.sort_unstable_by_key(|&(idx, _)| idx);
-        let (i0, p0) = order[0];
-        let (i1, p1) = order[1];
-        let (i2, p2) = order[2];
-        let cmds = &mut self.commands;
-        let (s0, rest1) = self.queries.split_at_mut(i1);
-        let (s1, s2) = rest1.split_at_mut(i2 - i1);
-        let r0 = s0[i0].as_mut()?;
-        let r1 = s1[0].as_mut()?;
-        let r2 = s2[0].as_mut()?;
-        let ordered = match (p0, p1, p2) {
-            (0, 1, 2) => (r0, r1, r2),
-            (0, 2, 1) => (r0, r2, r1),
-            (1, 0, 2) => (r1, r0, r2),
-            (1, 2, 0) => (r2, r0, r1),
-            (2, 0, 1) => (r1, r2, r0),
-            (2, 1, 0) => (r2, r1, r0),
-            _ => return None,
-        };
-        Some((ordered.0, ordered.1, ordered.2, cmds))
+        let (a, b, c) = split_queries_3_mut(
+            &mut self.query0,
+            &mut self.extra_queries,
+            self.user_query_count,
+            idx_a,
+            idx_b,
+            idx_c,
+        )?;
+        let cmds = resolve_commands_slot(
+            &mut self.commands,
+            &mut self.lazy_commands,
+            self.sys_ref.base_host(),
+        );
+        Some((a, b, c, cmds))
     }
 
     /// Mutably borrows the dedicated system-level resource query iterator, if one was registered.
@@ -395,17 +544,13 @@ impl<'a> SystemContext<'a> {
     /// `resource_query` slot, or falling back to primary query `0`).
     #[inline]
     fn resource_iter(&self) -> Option<&ChunkIter<'a>> {
-        self.resource_query
-            .as_ref()
-            .or_else(|| self.queries.first().and_then(Option::as_ref))
+        self.resource_query.as_ref().or(self.query0.as_ref())
     }
 
     /// Mutable variant of [`Self::resource_iter`] for exclusive resource and message-writer access.
     #[inline]
     fn resource_iter_mut(&mut self) -> Option<&mut ChunkIter<'a>> {
-        self.resource_query
-            .as_mut()
-            .or_else(|| self.queries.first_mut().and_then(Option::as_mut))
+        self.resource_query.as_mut().or(self.query0.as_mut())
     }
 
     /// Borrows singleton resource `R` (`R: AbiPod`) by declaration index `decl_index`.
@@ -578,11 +723,8 @@ impl<'a> SystemContext<'a> {
         term_index: usize,
         entity: FfiEntity,
     ) -> Option<&T> {
-        if query_index >= self.user_query_count {
-            return None;
-        }
-        let q = self.queries[query_index].as_ref()?;
-        let filter = guest_uuid_filter::<T>(self.host.manifest_name());
+        let q = self.query_ref(query_index)?;
+        let filter = guest_uuid_filter::<T>(self.sys_ref.base_host().manifest_name());
         self.sys_ref.entity_get_checked::<T>(
             &q.inner,
             query_index,
@@ -601,11 +743,17 @@ impl<'a> SystemContext<'a> {
         term_index: usize,
         entity: FfiEntity,
     ) -> Option<&mut T> {
-        if query_index >= self.user_query_count {
+        let filter = guest_uuid_filter::<T>(self.sys_ref.base_host().manifest_name());
+        let q = if query_index >= self.user_query_count {
             return None;
-        }
-        let q = self.queries[query_index].as_mut()?;
-        let filter = guest_uuid_filter::<T>(self.host.manifest_name());
+        } else if query_index == 0 {
+            self.query0.as_mut()?
+        } else {
+            self.extra_queries
+                .as_mut()?
+                .get_mut(query_index - 1)?
+                .as_mut()?
+        };
         self.sys_ref.entity_get_mut_checked::<T>(
             &mut q.inner,
             query_index,
@@ -624,10 +772,7 @@ impl<'a> SystemContext<'a> {
         term_index: usize,
         entity: FfiEntity,
     ) -> Option<&T> {
-        if query_index >= self.user_query_count {
-            return None;
-        }
-        let q = self.queries[query_index].as_ref()?;
+        let q = self.query_ref(query_index)?;
         self.sys_ref
             .entity_get_checked::<T>(&q.inner, query_index, term_index, entity, None)
     }
@@ -641,10 +786,16 @@ impl<'a> SystemContext<'a> {
         term_index: usize,
         entity: FfiEntity,
     ) -> Option<&mut T> {
-        if query_index >= self.user_query_count {
+        let q = if query_index >= self.user_query_count {
             return None;
-        }
-        let q = self.queries[query_index].as_mut()?;
+        } else if query_index == 0 {
+            self.query0.as_mut()?
+        } else {
+            self.extra_queries
+                .as_mut()?
+                .get_mut(query_index - 1)?
+                .as_mut()?
+        };
         self.sys_ref.entity_get_mut_checked::<T>(
             &mut q.inner,
             query_index,
@@ -664,10 +815,7 @@ impl<'a> SystemContext<'a> {
         term_index: usize,
         entity: FfiEntity,
     ) -> Option<&T> {
-        if query_index >= self.user_query_count {
-            return None;
-        }
-        let q = self.queries[query_index].as_ref()?;
+        let q = self.query_ref(query_index)?;
         self.sys_ref
             .entity_get_dynamic_checked::<T>(&q.inner, query_index, term_index, entity)
     }
@@ -681,10 +829,16 @@ impl<'a> SystemContext<'a> {
         term_index: usize,
         entity: FfiEntity,
     ) -> Option<&mut T> {
-        if query_index >= self.user_query_count {
+        let q = if query_index >= self.user_query_count {
             return None;
-        }
-        let q = self.queries[query_index].as_mut()?;
+        } else if query_index == 0 {
+            self.query0.as_mut()?
+        } else {
+            self.extra_queries
+                .as_mut()?
+                .get_mut(query_index - 1)?
+                .as_mut()?
+        };
         self.sys_ref.entity_get_dynamic_mut_checked::<T>(
             &mut q.inner,
             query_index,
