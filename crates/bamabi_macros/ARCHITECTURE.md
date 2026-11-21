@@ -1,6 +1,6 @@
 # `bamabi_macros` Architecture & Implementation Guide
 
-`bamabi_macros` (`v0.3.0`, ABI `0x0003_0000`, `edition = "2024"`, `proc-macro = true`) is the Layer 0 procedural-macro compiler crate of [`bamabi-wire`](../../README.md). It transforms Rust struct and enum definitions into deterministic C-ABI VTables, 128-bit SipHash-2-4 component UUIDs, 64-bit FNV-1a schema fingerprints, reflection descriptors, hot-reload migration witnesses, ISO C99 / C++17 / Zig declarations, and zero-overhead `AbiPod` / `GuestComponent` implementations—with **zero Bevy dependencies** and **`#![forbid(unsafe_code)]`** on the macro crate itself.
+`bamabi_macros` (`v0.3.0`, ABI `0x0003_0000`, `edition = "2024"`, `proc-macro = true`) is the Layer 0 procedural-macro compiler crate of `bamabi-wire`. It transforms Rust struct and enum definitions into deterministic C-ABI VTables, 128-bit SipHash-2-4 component UUIDs, 64-bit FNV-1a schema fingerprints, reflection descriptors, hot-reload migration witnesses, ISO C99 / C++17 / Zig declarations, and zero-overhead `AbiPod` / `GuestComponent` implementations—with **zero Bevy dependencies** and **`#![forbid(unsafe_code)]`** on the macro crate itself.
 
 ---
 
