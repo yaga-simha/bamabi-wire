@@ -629,6 +629,28 @@ pub type BamCmdRemoveRelationFn = unsafe extern "C" fn(
 
 /// Migrates live ECS rows of `component` from `old_fingerprint` to `new_desc` using `migrate_fn`
 /// (`typedef BamResult (*BamMigrateComponentColumnFn)(BamLoadCtx* load_ctx, BamComponent component, uint64_t old_fingerprint, const BamComponentDesc* new_desc, BamRowMigrateFn migrate_fn, void* user_data);`).
+///
+/// # Host Exclusivity Contract (Slot 67)
+/// - **Init-time exclusivity:** Valid strictly during `bamabi_init` ([`BamLoadCtx`]) while the host
+///   holds exclusive `&mut World` access (rejected with [`FfiResult::INVALID_STATE`] outside
+///   `bamabi_init`).
+/// - **Zero-copy retention:** If `old_fingerprint == new_desc.schema_fingerprint` and `(uuid, size,
+///   align, storage_flags)` are unchanged, existing column storage and [`BamColumnInfo`](crate::BamColumnInfo)
+///   metadata are preserved in place for all mods with zero bytes copied.
+/// - **Cross-mod `ACCESS_CONFLICT` rule:** If `migrate_component_column` changes any
+///   [`BamColumnInfo`](crate::BamColumnInfo)-observable property of `component` (`uuid`, `size`,
+///   `align`, or `storage_flags`) while **any other currently loaded mod** (outside the reloading
+///   mod's own teardown/replacement transaction) owns an active registered system
+///   ([`BamSystemDesc`]) or observer ([`BamObserverDesc`]) referencing `component`, the host **MUST**
+///   reject the migration atomically with [`FfiResult::ACCESS_CONFLICT`] (unless a cascading reload
+///   unloads and reloads all dependent mods prior to running schedules) so no live foreign system
+///   ever observes a mutated column layout mid-lifetime under [`BamIterColumnInfoFn`].
+///
+/// # Safety
+/// - `load_ctx` must point to the active [`BamLoadCtx`] during `bamabi_init`.
+/// - `new_desc` must point to a valid [`ComponentDesc`].
+/// - If `migrate_fn` is `Some`, it must be safe to invoke on `(old_row, new_row, user_data)`
+///   without unwinding across `extern "C"`.
 pub type BamMigrateComponentColumnFn = unsafe extern "C" fn(
     load_ctx: *mut BamLoadCtx,
     component: BamComponent,

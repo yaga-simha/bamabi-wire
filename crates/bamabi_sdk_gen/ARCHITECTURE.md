@@ -55,8 +55,8 @@ Before formatting any C99 text, `render_c99_header()` builds `wire_struct_specs(
 | `BamManifest` | `BamManifest` | 48 / 8 | 32 / `Fixed(4)` | 32 / 24 (`v0.2`) |
 | `BamAssetHandle` | `FfiAssetHandle` | 32 / 4 | 32 / `Fixed(4)` | — |
 | `BamTermDesc` | `BamTermDesc` | 12 / 4 | 12 / `Fixed(4)` | — |
-| `BamQueryDesc` | `BamQueryDesc` | 24 / 8 | 16 / `Fixed(4)` | 24 / 16 (`v0.2`) |
-| `BamSystemDesc` | `BamSystemDesc` | 168 / 8 | 92 / `Fixed(4)` | 104 / 60 (`v0.2`) |
+| `BamQueryDesc` | `BamQueryDesc` | 32 / 8 | 24 / `Fixed(4)` | 24 / 16 (`v0.2`) |
+| `BamSystemDesc` | `BamSystemDesc` | 192 / 8 | 104 / `Fixed(4)` | 104 / 60 (`v0.2`) |
 | `BamObserverDesc` | `BamObserverDesc` | 88 / 8 | 64 / `Fixed(4)` | 48 / 36 (`v0.2`) |
 | `BamTriggerDesc` | `BamTriggerDesc` | 64 / 8 | 48 / `Fixed(4)` | 64 / 48 (`v0.2`) |
 | `BamChangeTicks` | `BamChangeTicks` | 16 / 4 | 16 / `Fixed(4)` | — |
@@ -86,7 +86,7 @@ Before formatting any C99 text, `render_c99_header()` builds `wire_struct_specs(
 3. **Primitive Newtypes, Handles, Status Codes, Modes & Flags:**
    - `BamBool`, `BamComponent`, `BamSystem`, `BamSystemSet`, `BamSymbol`, `BamEntity`, `BamResult` (18 status codes including `BAM_RESULT_CYCLE_DETECTED`), `BamAccessMode`, `BamEventKind`, `BamFieldKind`, `BAM_LOG_*`, `BAM_ASSET_HANDLE_KIND_*`, `BamAssetLoadState`, `BamScheduleId`, and all `BAM_*_FLAGS` bitmasks.
 4. **Opaque Context Handles, Wire Descriptors & Function Pointer Typedefs:**
-   - Opaque structs (`BamHostCtx`, `BamLoadCtx`, `BamSystemCtx`, `BamIter`, `BamCommands`, `BamInstance`), wire descriptors (`BamStrView`, `BamByteSlice`, `BamComponentUuid`, `BAM_OPTION_STRUCT`, `BamAssetHandle`, `BamChildOf`, `BamChangeTicks`, `BamManifest`, `BamTermDesc`, `BamQueryDesc`, `BamSystemDesc`, `BamObserverDesc`, `BamTriggerDesc`, `BamFieldDesc`, `BamRequiredComponent`, `BamRelationDesc`, `BamLayoutInfo`, `BamScheduleSetDesc`, `BamComponentDesc`, `BamColumnInfo`, `BamVTableHeader`, `BAM_MAPPED_WIRE_VTABLE_STRUCT`, `BamMappedStringVTable`), guest entry-point typedefs (`BamManifestFn`, `BamInitFn`, `BamShutdownFn`), all 68 slot typedefs, `struct BamHostApi`, `BAM_*_MIN_V0_*_SIZE` macros, and all 68 `BAM_HOST_API_OFFSET_*` macros (`offsetof(BamHostApi, <slot>)`).
+   - Opaque structs (`BamHostCtx`, `BamLoadCtx`, `BamSystemCtx`, `BamIter`, `BamCommands`, `BamInstance`), wire descriptors (`BamStrView`, `BamByteSlice`, `BamComponentUuid`, `BAM_OPTION_STRUCT`, `BamAssetHandle`, `BamChildOf`, `BamChangeTicks`, `BamManifest`, `BamTermDesc`, `BamQueryDesc`, `BamSystemDesc`, `BamObserverDesc`, `BamTriggerDesc`, `BamFieldDesc`, `BamRequiredComponent`, `BamRelationDesc`, `BamLayoutInfo`, `BamScheduleSetDesc`, `BamComponentDesc`, `BamColumnInfo`, `BamVTableHeader`, `BAM_MAPPED_WIRE_VTABLE_STRUCT`, `BamMappedStringVTable`), guest entry-point typedefs (`BamManifestFn`, `BamInitFn`, `BamShutdownFn`), all 73 slot typedefs, `struct BamHostApi`, `BAM_*_MIN_V0_*_SIZE` macros, and all 73 `BAM_HOST_API_OFFSET_*` macros (`offsetof(BamHostApi, <slot>)`).
    - Under C++14+ (`__cplusplus >= 201402L` or `_MSVC_LANG >= 201402L`), extensible tail fields on `BamManifest`, `BamSystemDesc`, `BamObserverDesc`, and `BamComponentDesc` receive safe default member initializers (`= nullptr` / `= 0`).
 5. **ISO C99 Inline Helpers (`bam_*`):**
    - Version helpers (`bam_pack_abi_version`, `bam_version_major`/`minor`/`patch`, `bam_version_is_compatible`).
@@ -97,11 +97,11 @@ Before formatting any C99 text, `render_c99_header()` builds `wire_struct_specs(
    - Pure C99 `SipHash-2-4-128` (`BamSipHasher128`, `bam_siphash128_*`, `bam_uuid_from_parts`, `bam_uuid_from_canonical_name`, `bam_disabled_uuid`, `bam_uuid_equals`), emitting byte-for-byte identical 16-byte digests to `bamabi_sys::ComponentUuid::from_parts`.
 6. **Auto-Generated Layout Assertions:**
    - Unconditional primitive `sizeof` / `BAM_ALIGNOF` checks.
-   - `#if UINTPTR_MAX == 0xffffffffffffffffULL` (64-bit) and `#elif UINTPTR_MAX == 0xffffffffUL` (32-bit) blocks checking `sizeof`, `BAM_ALIGNOF`, `offsetof` for every field of all 20 structs (including all 68 `BamHostApi` slots), and all `BAM_*_MIN_V0_*_SIZE` bounds.
+   - `#if UINTPTR_MAX == 0xffffffffffffffffULL` (64-bit) and `#elif UINTPTR_MAX == 0xffffffffUL` (32-bit) blocks checking `sizeof`, `BAM_ALIGNOF`, `offsetof` for every field of all 20 structs (including all 73 `BamHostApi` slots), and all `BAM_*_MIN_V0_*_SIZE` bounds.
 
-### 3.4 `BamHostApi` 68-Slot Layout & 32/64-Bit Parity (`Align32`)
+### 3.4 `BamHostApi` 73-Slot Layout & 32/64-Bit Parity (`Align32`)
 
-`BamHostApi` begins with `uint32_t struct_size` (offset `0`) and `uint32_t abi_version` (offset `4`), followed by **68 function-pointer slots**:
+`BamHostApi` begins with `uint32_t struct_size` (offset `0`) and `uint32_t abi_version` (offset `4`), followed by **73 function-pointer slots**:
 
 - **Slots 0..=26 (27 slots, ABI 0.2 baseline):** `get_proc_address` through `cmd_remove`. Tail ends at `BAM_HOST_API_MIN_V0_2_SIZE` (`224` B on 64-bit, `116` B on 32-bit).
 - **Slots 27..=49 (23 slots, ABI 0.2.x extensions):** `par_for_each_chunk` through `cmd_spawn_scene`.

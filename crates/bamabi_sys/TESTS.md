@@ -21,9 +21,9 @@ This document inventories **every** unit test, property-based test, doctest, and
 
 ### `src/host_api.rs` (`offset_tests`)
 
-1. **`host_api::offset_tests::host_api_offset_constants_cover_all_68_slots_monotonically`**
+1. **`host_api::offset_tests::host_api_offset_constants_cover_all_73_slots_monotonically`**
    - **Why:** JIT/AOT backends (such as `bql_jit`) and `bamabi_sdk_gen` rely on `bamabi_sys::offsets` (`OFF64_*`, `OFF32_*`, `<FIELD>`) instead of hardcoding magic numbers, and `MIN_V0_2_SIZE` / `MIN_V0_3_SIZE` must match exact slot boundaries.
-   - **Proves (`PO-W6`):** `BAM_HOST_API_SLOT_COUNT == offsets::SLOT_COUNT == 68`, `SIZE_64 == 552`, `SIZE_32 == 280`, header fields sit at offsets `0` and `4`, every slot `k` in `0..68` satisfies `OFF64_k == 8 + 8*k` and `OFF32_k == 8 + 4*k` matching the native target offset, and `MIN_V0_2_SIZE` / `MIN_V0_3_SIZE` terminate immediately after `cmd_remove` (slot 26) and `migrate_component_column` (slot 67) respectively.
+   - **Proves (`PO-W6`):** `BAM_HOST_API_SLOT_COUNT == offsets::SLOT_COUNT == 73`, `SIZE_64 == 592`, `SIZE_32 == 300`, header fields sit at offsets `0` and `4`, every slot `k` in `0..73` satisfies `OFF64_k == 8 + 8*k` and `OFF32_k == 8 + 4*k` matching the native target offset, and `MIN_V0_2_SIZE` (`224` / `116`) / `MIN_V0_3_SIZE` (`552` / `280`) terminate immediately after `cmd_remove` (slot 26) and `migrate_component_column` (slot 67) respectively.
 
 ### `src/tests/layout.rs`
 

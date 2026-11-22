@@ -686,7 +686,7 @@ fn assert_all_41_extended_slots_none(api: &BamHostApi) {
     assert!(host_slot!(api, cmd_remove_resource).is_none());
 }
 
-/// PO-G1: `host_slot!` across all 41 extended/ABI-0.3 slots returns `Some` iff `populated` and
+/// PO-G1: `host_slot!` across all 46 extended/ABI-0.3 slots returns `Some` iff `populated` and
 /// `struct_size >= offset_of!(BamHostApi, slot) + size_of::<usize>()`, with zero overflow.
 #[kani::proof]
 fn po_g1_host_slot_bounds_all_41_extended_slots() {
@@ -764,7 +764,7 @@ fn po_g1_host_slot_bounds_all_41_extended_slots() {
 /// PO-G1: `Host::from_raw` and `Host::from_load_ctx` reject null pointers, misaligned `api_ptr`,
 /// undersized `struct_size`, incompatible `abi_version`, missing mandatory core slots, and null
 /// `load_host_ctx` returns without UB, while proving an exact `BamHostApi::MIN_V0_2_SIZE`
-/// truncated stack buffer triggers zero out-of-bounds reads and leaves all 41 extended slots `None`.
+/// truncated stack buffer triggers zero out-of-bounds reads and leaves all 46 extended slots `None`.
 #[kani::proof]
 fn po_g1_host_from_raw_and_load_ctx_guards() {
     #[repr(C)]

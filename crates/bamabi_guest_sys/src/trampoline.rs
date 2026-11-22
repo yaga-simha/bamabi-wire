@@ -1689,6 +1689,11 @@ impl InvocationHostScratch {
 unsafe impl Sync for InvocationHostScratch {}
 
 /// Heap-pinned per-query-slot scratch storage owned by [`SystemClosureState`].
+///
+/// Bound 1:1 to a single registered system for the lifetime of its [`GuestInstance`] (hot-reload
+/// tears down the old instance and allocates a fresh `SlotScratchesCell`), enabling persistent
+/// cross-tick `BamColumnInfo` / term caching under [`bamabi_sys::BamIterColumnInfoFn`] and
+/// [`bamabi_sys::BamMigrateComponentColumnFn`].
 pub(crate) struct SlotScratchesCell(UnsafeCell<Box<[QuerySlotScratch]>>);
 
 impl SlotScratchesCell {
@@ -1734,6 +1739,10 @@ pub(crate) struct SystemClosureState<F> {
     pub(crate) user_query_count: usize,
     pub(crate) resource_query_index: Option<usize>,
     pub(crate) host_scratch: InvocationHostScratch,
+    /// Per-query-slot persistent metadata cache & per-tick batch pointer scratch. Retained across
+    /// ticks via `reset_per_tick()` per [`bamabi_sys::BamIterColumnInfoFn`] invariance and
+    /// [`bamabi_sys::BamMigrateComponentColumnFn`] cross-mod `ACCESS_CONFLICT` exclusivity;
+    /// hot-reloading allocates a fresh `GuestInstance` and `SlotScratchesCell`.
     pub(crate) slot_scratches: SlotScratchesCell,
     pub(crate) closure: ReentrantCell<F>,
 }
@@ -1780,6 +1789,9 @@ where
                 let Some(scratch) = scratches.get(idx) else {
                     break;
                 };
+                // Retain `col_info_mask`/`term_cache_mask` across ticks under the single-system
+                // `BamIterColumnInfoFn` invariance contract (vs `reset_all()` in
+                // `ValidatedIter::from_raw_with_scratch`).
                 scratch.reset_per_tick();
                 idx += 1;
             }
@@ -1844,6 +1856,9 @@ where
                     let Some(scratch) = scratch_slice.get(idx) else {
                         break;
                     };
+                    // Retain `col_info_mask`/`term_cache_mask` across ticks under the single-system
+                    // `BamIterColumnInfoFn` invariance contract (vs `reset_all()` in
+                    // `ValidatedIter::from_raw_with_scratch`).
                     scratch.reset_per_tick();
                     idx += 1;
                 }

@@ -1,4 +1,4 @@
-//! Soundness regression test suite verifying all 8 audit findings (S1–S8) in `bamabi_guest_sys`.
+//! Soundness regression test suite verifying audit findings (S1–S13) in `bamabi_guest_sys`.
 
 mod common;
 
@@ -2235,5 +2235,395 @@ fn s12_query_slot_scratch_reuse_resets_column_info_mask() {
             iter_c.column_checked::<u32>(0, Some(UuidFilter::exact(read_u32_uuid))),
             Some(&[42u32, 43u32][..])
         );
+    }
+}
+
+// ============================================================================
+// S13: Hot-reload column migration & `from_raw_with_scratch` 16 B -> 8 B shrink
+// ============================================================================
+
+/// Verifies the per-system `BamColumnInfo` invariance and hot-reload cache contract (`S13`):
+/// (a) Simulated hot-reload (`GuestInstance` v1 `[f32; 4]` 16 B shut down -> host migrates the
+///     same `BamComponent` handle to v2 `[f32; 2]` 8 B -> fresh `GuestInstance` v2 initialized)
+///     starts with fresh `SlotScratchesCell` caches (1 `iter_column_info` call on Tick 1, 0 on
+///     Tick 2) and reads `8 B` v2 slices cleanly, while an un-migrated v1 registration against the
+///     migrated `8 B` column fails closed on Tick 1 via `iter_column_info` without over-reading.
+/// (b) Reusing caller-owned `&mut QuerySlotScratch` via `ValidatedIter::from_raw_with_scratch`
+///     across a `16 B -> 8 B` schema shrink (`S12` shrink variant) calls `reset_all()` and rejects
+///     an out-of-date `next_read::<[f32; 4]>` with `TYPE_MISMATCH` before `slice::from_raw_parts`
+///     can over-read the 16-byte v2 allocation under Miri.
+#[test]
+fn s13_hot_reload_column_migration_and_scratch_shrink_soundness() {
+    use std::cell::Cell;
+
+    struct S13HostState {
+        is_v2: Cell<bool>,
+        col_info_calls: AtomicUsize,
+        v1_uuid: ComponentUuid,
+        v2_uuid: ComponentUuid,
+        v1_data: Box<[[f32; 4]; 2]>,
+        v2_data: Box<[[f32; 2]; 2]>,
+        registered_fn: Cell<Option<bamabi_sys::BamSystemFn>>,
+        registered_ud: Cell<*mut c_void>,
+    }
+
+    struct S13IterState {
+        host: *const S13HostState,
+        advanced: Cell<bool>,
+    }
+
+    unsafe extern "C" fn s13_register_system(
+        load_ctx: *mut BamLoadCtx,
+        desc: *const BamSystemDesc,
+    ) -> FfiResult {
+        if load_ctx.is_null() || desc.is_null() {
+            return FfiResult::NULL_POINTER;
+        }
+        // SAFETY: `desc` is a valid `BamSystemDesc` from `ValidatedLoadCtx`.
+        let status = unsafe { (*desc).validate() };
+        if !status.is_ok() {
+            return status;
+        }
+        // SAFETY: `load_ctx` points to `S13HostState` during `init_guest_instance`.
+        let host = unsafe { &*load_ctx.cast::<S13HostState>() };
+        // SAFETY: `desc` is readable.
+        host.registered_fn.set(unsafe { (*desc).callback });
+        // SAFETY: `desc` is readable.
+        host.registered_ud.set(unsafe { (*desc).user_data });
+        FfiResult::OK
+    }
+
+    unsafe extern "C" fn s13_sys_query(
+        sys_ctx: *mut BamSystemCtx,
+        query_index: usize,
+        out_iter: *mut *mut BamIter,
+    ) -> FfiResult {
+        if sys_ctx.is_null() || out_iter.is_null() {
+            return FfiResult::NULL_POINTER;
+        }
+        if query_index != 0 {
+            return FfiResult::OUT_OF_RANGE;
+        }
+        // SAFETY: `sys_ctx` points to `S13IterState` for this tick.
+        let iter_state = unsafe { &*sys_ctx.cast::<S13IterState>() };
+        iter_state.advanced.set(false);
+        // SAFETY: `out_iter` is writable stack storage.
+        unsafe { *out_iter = sys_ctx.cast::<BamIter>() };
+        FfiResult::OK
+    }
+
+    unsafe extern "C" fn s13_next_chunk(iter: *mut BamIter, out_len: *mut usize) -> FfiBool {
+        if iter.is_null() || out_len.is_null() {
+            return FfiBool::FALSE;
+        }
+        // SAFETY: `iter` points to `S13IterState`.
+        let st = unsafe { &*iter.cast::<S13IterState>() };
+        if st.advanced.get() {
+            return FfiBool::FALSE;
+        }
+        st.advanced.set(true);
+        // SAFETY: `out_len` is writable stack storage.
+        unsafe { *out_len = 2 };
+        FfiBool::TRUE
+    }
+
+    unsafe extern "C" fn s13_col_info(
+        iter: *const BamIter,
+        term_index: usize,
+        out: *mut BamColumnInfo,
+    ) -> FfiResult {
+        if iter.is_null() || out.is_null() {
+            return FfiResult::NULL_POINTER;
+        }
+        if term_index != 0 {
+            return FfiResult::OUT_OF_RANGE;
+        }
+        // SAFETY: `iter` points to `S13IterState` and `host` stays immutable during ticks.
+        let host = unsafe { &*(*iter.cast::<S13IterState>()).host };
+        host.col_info_calls.fetch_add(1, Ordering::Relaxed);
+        let info = if host.is_v2.get() {
+            BamColumnInfo {
+                component: BamComponent::from_raw(1),
+                mode: AccessMode::READ,
+                uuid: host.v2_uuid,
+                size: 8,
+                align: 4,
+                storage_flags: 0,
+                reserved0: 0,
+            }
+        } else {
+            BamColumnInfo {
+                component: BamComponent::from_raw(1),
+                mode: AccessMode::READ,
+                uuid: host.v1_uuid,
+                size: 16,
+                align: 4,
+                storage_flags: 0,
+                reserved0: 0,
+            }
+        };
+        // SAFETY: `out` is writable stack storage.
+        unsafe { *out = info };
+        FfiResult::OK
+    }
+
+    unsafe extern "C" fn s13_col_ro(iter: *const BamIter, term_index: usize) -> *const u8 {
+        if iter.is_null() || term_index != 0 {
+            return core::ptr::null();
+        }
+        // SAFETY: `iter` points to `S13IterState` and `host` stays immutable during ticks.
+        let host = unsafe { &*(*iter.cast::<S13IterState>()).host };
+        if host.is_v2.get() {
+            host.v2_data.as_ptr().cast::<u8>()
+        } else {
+            host.v1_data.as_ptr().cast::<u8>()
+        }
+    }
+
+    let v1_uuid = ComponentUuid::from_parts("s13::Position", 16, 4, 1);
+    let v2_uuid = ComponentUuid::from_parts("s13::Position", 8, 4, 2);
+
+    let mut api = make_mock_api();
+    api.register_system = Some(s13_register_system);
+    api.sys_query = Some(s13_sys_query);
+    api.iter_next_chunk = Some(s13_next_chunk);
+    api.iter_column_info = Some(s13_col_info);
+    api.iter_column_readonly = Some(s13_col_ro);
+
+    let mut host_state = S13HostState {
+        is_v2: Cell::new(false),
+        col_info_calls: AtomicUsize::new(0),
+        v1_uuid,
+        v2_uuid,
+        v1_data: Box::new([[1.0, 2.0, 3.0, 4.0], [5.0, 6.0, 7.0, 8.0]]),
+        // Strictly 16-byte heap allocation (2 * 8 B): any accidental 32-byte `[f32; 4]` slice
+        // read triggers immediate UB under Miri.
+        v2_data: Box::new([[10.0, 20.0], [30.0, 40.0]]),
+        registered_fn: Cell::new(None),
+        registered_ud: Cell::new(core::ptr::null_mut()),
+    };
+
+    let manifest_v1 = BamManifest::new(c"s13_mod".as_ptr(), c"0.1.0".as_ptr());
+    let manifest_v2 = BamManifest::new(c"s13_mod".as_ptr(), c"0.2.0".as_ptr());
+
+    // ------------------------------------------------------------------------
+    // Part (a): Simulated hot-reload across `16 B -> 8 B` migration
+    // ------------------------------------------------------------------------
+    let mut inst_v1: *mut BamInstance = core::ptr::null_mut();
+    let v1_terms = [BamTermDesc::read(BamComponent::from_raw(1))];
+    // SAFETY: `api` and `host_state` remain live across `init_guest_instance`.
+    let init_v1_res = unsafe {
+        init_guest_instance(
+            &raw const api,
+            (&raw mut host_state).cast::<BamLoadCtx>(),
+            &raw mut inst_v1,
+            &manifest_v1,
+            move |inst, load| {
+                let queries = [&v1_terms[..]];
+                let cfg = SystemRegistrationConfig {
+                    name: c"s13_v1_read",
+                    user_queries: &queries,
+                    ..Default::default()
+                };
+                load.register_system_slice::<1, _>(inst, &cfg, None, move |inv| {
+                    let mut iter = inv.take_raw_query_slot(0).unwrap();
+                    assert_eq!(iter.next_chunk(), Some(2));
+                    let mut disp = ChunkColumnDispenser::new(&mut iter);
+                    let pos = match disp
+                        .next_read::<[f32; 4]>(AccessMode::READ, Some(UuidFilter::exact(v1_uuid)))
+                    {
+                        Ok(s) => s,
+                        Err(e) => return e,
+                    };
+                    assert_eq!(pos, &[[1.0, 2.0, 3.0, 4.0], [5.0, 6.0, 7.0, 8.0]]);
+                    FfiResult::OK
+                })
+            },
+        )
+    };
+    assert_eq!(init_v1_res, FfiResult::OK);
+    let v1_fn = host_state.registered_fn.take().unwrap();
+    let v1_ud = host_state.registered_ud.get();
+
+    let mut iter_ctx = S13IterState {
+        host: &raw const host_state,
+        advanced: Cell::new(false),
+    };
+    // Tick 1 populates `SlotScratchesCell` (1 `iter_column_info` call); Tick 2 hits cache (still 1).
+    // SAFETY: `inst_v1` and `iter_ctx` are active.
+    let v1_t1 = unsafe { v1_fn((&raw mut iter_ctx).cast::<BamSystemCtx>(), v1_ud) };
+    assert_eq!(v1_t1, FfiResult::OK);
+    assert_eq!(host_state.col_info_calls.load(Ordering::Relaxed), 1);
+    // SAFETY: `inst_v1` and `iter_ctx` are active.
+    let v1_t2 = unsafe { v1_fn((&raw mut iter_ctx).cast::<BamSystemCtx>(), v1_ud) };
+    assert_eq!(v1_t2, FfiResult::OK);
+    assert_eq!(host_state.col_info_calls.load(Ordering::Relaxed), 1);
+
+    // Tear down v1 guest instance and migrate the host's `BamComponent(1)` column from 16 B -> 8 B.
+    // SAFETY: `inst_v1` was initialized by `init_guest_instance` and is shut down once.
+    unsafe { shutdown_guest_instance(inst_v1) };
+    host_state.is_v2.set(true);
+    host_state.col_info_calls.store(0, Ordering::Relaxed);
+    host_state.registered_ud.set(core::ptr::null_mut());
+
+    // Fresh v2 guest instance gets a brand-new `SlotScratchesCell` and reads `[f32; 2]` (8 B).
+    let mut inst_v2: *mut BamInstance = core::ptr::null_mut();
+    let v2_terms = [BamTermDesc::read(BamComponent::from_raw(1))];
+    // SAFETY: `api` and `host_state` remain live across `init_guest_instance`.
+    let init_v2_res = unsafe {
+        init_guest_instance(
+            &raw const api,
+            (&raw mut host_state).cast::<BamLoadCtx>(),
+            &raw mut inst_v2,
+            &manifest_v2,
+            move |inst, load| {
+                let queries = [&v2_terms[..]];
+                let cfg = SystemRegistrationConfig {
+                    name: c"s13_v2_read",
+                    user_queries: &queries,
+                    ..Default::default()
+                };
+                load.register_system_slice::<1, _>(inst, &cfg, None, move |inv| {
+                    let mut iter = inv.take_raw_query_slot(0).unwrap();
+                    assert_eq!(iter.next_chunk(), Some(2));
+                    let mut disp = ChunkColumnDispenser::new(&mut iter);
+                    let pos = match disp
+                        .next_read::<[f32; 2]>(AccessMode::READ, Some(UuidFilter::exact(v2_uuid)))
+                    {
+                        Ok(s) => s,
+                        Err(e) => return e,
+                    };
+                    assert_eq!(pos, &[[10.0, 20.0], [30.0, 40.0]]);
+                    FfiResult::OK
+                })
+            },
+        )
+    };
+    assert_eq!(init_v2_res, FfiResult::OK);
+    let v2_fn = host_state.registered_fn.take().unwrap();
+    let v2_ud = host_state.registered_ud.get();
+
+    // SAFETY: `inst_v2` and `iter_ctx` are active (`host_state` immutable across ticks).
+    let v2_t1 = unsafe { v2_fn((&raw mut iter_ctx).cast::<BamSystemCtx>(), v2_ud) };
+    assert_eq!(v2_t1, FfiResult::OK);
+    assert_eq!(host_state.col_info_calls.load(Ordering::Relaxed), 1);
+    // SAFETY: `inst_v2` and `iter_ctx` are active.
+    let v2_t2 = unsafe { v2_fn((&raw mut iter_ctx).cast::<BamSystemCtx>(), v2_ud) };
+    assert_eq!(v2_t2, FfiResult::OK);
+    assert_eq!(host_state.col_info_calls.load(Ordering::Relaxed), 1);
+    // SAFETY: `inst_v2` was initialized by `init_guest_instance`.
+    unsafe { shutdown_guest_instance(inst_v2) };
+
+    // Un-migrated v1 guest code loaded against the migrated 8 B host fails closed on Tick 1 via
+    // `iter_column_info` (both with `v1_uuid` filter and with `None` UUID filter).
+    host_state.col_info_calls.store(0, Ordering::Relaxed);
+    host_state.registered_ud.set(core::ptr::null_mut());
+    let mut inst_stale: *mut BamInstance = core::ptr::null_mut();
+    let stale_terms = [BamTermDesc::read(BamComponent::from_raw(1))];
+    // SAFETY: `api` and `host_state` remain live across `init_guest_instance`.
+    let init_stale_res = unsafe {
+        init_guest_instance(
+            &raw const api,
+            (&raw mut host_state).cast::<BamLoadCtx>(),
+            &raw mut inst_stale,
+            &manifest_v1,
+            move |inst, load| {
+                let queries = [&stale_terms[..]];
+                let cfg = SystemRegistrationConfig {
+                    name: c"s13_stale_v1",
+                    user_queries: &queries,
+                    ..Default::default()
+                };
+                load.register_system_slice::<1, _>(inst, &cfg, None, move |inv| {
+                    let mut iter = inv.take_raw_query_slot(0).unwrap();
+                    assert_eq!(iter.next_chunk(), Some(2));
+                    assert!(iter.column_checked::<[f32; 4]>(0, None).is_none());
+                    let mut disp = ChunkColumnDispenser::new(&mut iter);
+                    match disp
+                        .next_read::<[f32; 4]>(AccessMode::READ, Some(UuidFilter::exact(v1_uuid)))
+                    {
+                        Ok(_) => FfiResult::OK,
+                        Err(e) => e,
+                    }
+                })
+            },
+        )
+    };
+    assert_eq!(init_stale_res, FfiResult::OK);
+    let stale_fn = host_state.registered_fn.take().unwrap();
+    let stale_ud = host_state.registered_ud.get();
+    // SAFETY: `inst_stale` and `iter_ctx` are active; fails closed with `TYPE_MISMATCH` before
+    // `slice::from_raw_parts` can over-read the 16-byte v2 allocation.
+    let stale_res = unsafe { stale_fn((&raw mut iter_ctx).cast::<BamSystemCtx>(), stale_ud) };
+    assert_eq!(stale_res, FfiResult::TYPE_MISMATCH);
+    assert_eq!(host_state.col_info_calls.load(Ordering::Relaxed), 1);
+    // SAFETY: `inst_stale` was initialized by `init_guest_instance`.
+    unsafe { shutdown_guest_instance(inst_stale) };
+
+    // ------------------------------------------------------------------------
+    // Part (b): Caller-owned `&mut QuerySlotScratch` reuse across 16 B -> 8 B shrink
+    // ------------------------------------------------------------------------
+    // SAFETY: `api` and `host_state` stay valid for `scratch_host`.
+    let scratch_host =
+        unsafe { Host::from_raw(&raw const api, (&raw const host_state).cast()) }.unwrap();
+    let mut scratch = QuerySlotScratch::new();
+
+    // Bind `iter_v1` (`16 B`) into `scratch`, populating both `col_info_mask` and `term_cache_mask`.
+    host_state.is_v2.set(false);
+    host_state.col_info_calls.store(0, Ordering::Relaxed);
+    let mut raw_iter_v1 = S13IterState {
+        host: &raw const host_state,
+        advanced: Cell::new(false),
+    };
+    {
+        // SAFETY: `raw_iter_v1` and `scratch` outlive `iter_v1`.
+        let mut iter_v1 = unsafe {
+            ValidatedIter::from_raw_with_scratch(
+                (&raw mut raw_iter_v1).cast::<BamIter>(),
+                &scratch_host,
+                &mut scratch,
+            )
+        };
+        assert_eq!(iter_v1.next_chunk(), Some(2));
+        let mut disp = ChunkColumnDispenser::new(&mut iter_v1);
+        let pos_v1 = disp
+            .next_read::<[f32; 4]>(AccessMode::READ, None)
+            .expect("v1 16B read must succeed");
+        assert_eq!(pos_v1, &[[1.0, 2.0, 3.0, 4.0], [5.0, 6.0, 7.0, 8.0]]);
+        assert_eq!(host_state.col_info_calls.load(Ordering::Relaxed), 1);
+    }
+
+    // Reuse the exact same `&mut scratch` for `iter_v2` (`8 B`, strictly 16-byte heap buffer).
+    // `ValidatedIter::from_raw_with_scratch` must `reset_all()` so an outdated `next_read::<[f32; 4]>`
+    // fails closed with `TYPE_MISMATCH` rather than reading stale cached metadata or 32 bytes.
+    host_state.is_v2.set(true);
+    host_state.col_info_calls.store(0, Ordering::Relaxed);
+    let mut raw_iter_v2 = S13IterState {
+        host: &raw const host_state,
+        advanced: Cell::new(false),
+    };
+    {
+        // SAFETY: `raw_iter_v2` and `scratch` outlive `iter_v2`.
+        let mut iter_v2 = unsafe {
+            ValidatedIter::from_raw_with_scratch(
+                (&raw mut raw_iter_v2).cast::<BamIter>(),
+                &scratch_host,
+                &mut scratch,
+            )
+        };
+        assert_eq!(iter_v2.next_chunk(), Some(2));
+        let mut disp_bad = ChunkColumnDispenser::new(&mut iter_v2);
+        assert_eq!(
+            disp_bad.next_read::<[f32; 4]>(AccessMode::READ, None),
+            Err(FfiResult::TYPE_MISMATCH)
+        );
+        assert_eq!(host_state.col_info_calls.load(Ordering::Relaxed), 1);
+
+        let mut disp_ok = ChunkColumnDispenser::new(&mut iter_v2);
+        let pos_v2 = disp_ok
+            .next_read::<[f32; 2]>(AccessMode::READ, None)
+            .expect("v2 8B read must succeed on fresh dispenser");
+        assert_eq!(pos_v2, &[[10.0, 20.0], [30.0, 40.0]]);
+        assert_eq!(host_state.col_info_calls.load(Ordering::Relaxed), 1);
     }
 }

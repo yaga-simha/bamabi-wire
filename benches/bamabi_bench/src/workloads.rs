@@ -155,12 +155,24 @@ fn native_noop() -> FfiResult {
     black_box(FfiResult::OK)
 }
 
+#[inline(always)]
+fn integrate_dense_chunk(pos: &mut [Position], vel: &[Velocity], dt: f32) {
+    assert_eq!(pos.len(), vel.len());
+    for (p, v) in pos.iter_mut().zip(vel.iter()) {
+        p.x += v.vx * dt;
+        p.y += v.vy * dt;
+        p.z += v.vz * dt;
+        p.w += v.vw * dt;
+    }
+}
+
 #[inline(never)]
 pub(crate) fn native_dense_update(world: &HostWorld) -> FfiResult {
     let pos_handle = world.pos_handle;
     let vel_handle = world.vel_handle;
     let dt = BENCH_DT;
     for chunk in &world.chunks {
+        chunk.mark_changed(pos_handle);
         // SAFETY: `setup_dense_entities` populates `pos_handle` (`Position`) and `vel_handle`
         // (`Velocity`) with `chunk.entities.len()` elements on every chunk, backing storage is
         // 8-byte word aligned, and native execution borrows these two distinct columns exclusively.
@@ -173,14 +185,7 @@ pub(crate) fn native_dense_update(world: &HostWorld) -> FfiResult {
                 chunk.dense_slice_unchecked::<Velocity>(vel_handle),
             )
         };
-        assert_eq!(pos.len(), vel.len());
-        chunk.mark_changed(pos_handle);
-        for (p, v) in pos.iter_mut().zip(vel.iter()) {
-            p.x += v.vx * dt;
-            p.y += v.vy * dt;
-            p.z += v.vz * dt;
-            p.w += v.vw * dt;
-        }
+        integrate_dense_chunk(pos, vel, dt);
     }
     FfiResult::OK
 }

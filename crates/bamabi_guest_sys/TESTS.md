@@ -6,11 +6,11 @@
 2. **Integration & Soundness Regression Suites (`tests/`):**
    - `tests/host_and_instance_tests.rs` (**7 tests**) — host table handshake, VTable checks, `GuestInstance` multi-World isolation, LIFO teardown, rollback, runtime observer tracking, and dynamic component symbols.
    - `tests/iter_tests.rs` (**1 test**) — non-POD witness message serialization/reconstruction and marker enforcement.
-   - `tests/soundness_regressions.rs` (**8 tests**, covering audit findings **S1–S10**) — adversarial host/pointer/re-entrancy/overlap/Tree-Borrows regressions.
+   - `tests/soundness_regressions.rs` (**11 tests**, covering audit findings **S1–S13**) — adversarial host/pointer/re-entrancy/overlap/hot-reload/Tree-Borrows regressions.
 3. **Property-Based Fuzzing (`tests/proptest_guest_sys.rs`, 3 `proptest!` suites):** Randomized borrow sequences, hostile message counts, and malformed sparse-row pointer arrays.
 4. **Formal Verification (`src/kani_proofs.rs` & `src/kani_bounds_proofs.rs`, 30 `#[kani::proof]` harnesses across `PO-G1`, `PO-G3`..`PO-G9`):** Symbolic CBMC proofs over unbounded/adversarial pointers, sizes, counts, and overlap offsets.
 
-*(Inline `#[test]` unit tests are intentionally kept in `tests/` rather than `src/`—`src/` contains 0 `#[test]` functions—so Miri, doc builds, and `tests/common/mod.rs` mock fixtures remain unified.)*
+*(Integration, property, and soundness suites live in `tests/` alongside `tests/common/mod.rs` mock fixtures, while `src/commands.rs` also carries 1 focused unit test for `SpawnBatchColumn::typed` so Miri and `cargo test` verify its zero-FFI bounds directly.)*
 
 ---
 
@@ -24,7 +24,7 @@
 | `custom_math_fn` | `"bam.v0.math.add10"` mock custom symbol (`x + 10`). |
 | `MockWorldCtx` | Mock context struct backing `BamHostCtx`, `BamLoadCtx`, and `BamCommands` pointers. |
 | `stub_component_layout_info_padded` | Mock `component_layout_info` reporting `PaddedPod`'s `(size, align, uuid)` for handle `1`. |
-| `make_mock_api` & `stub_*` | Zeroed `BamHostApi` populated with all 27 core ABI `0.2` stubs and all 41 extended/ABI-`0.3.0` slots set to `None` for opt-in customization per test. |
+| `make_mock_api` & `stub_*` | Zeroed `BamHostApi` populated with all 27 core ABI `0.2` stubs and all 46 extended/ABI-`0.3.0` slots set to `None` for opt-in customization per test. |
 
 ---
 
@@ -61,7 +61,7 @@
 
 ---
 
-## 5. Soundness Regression Tests (`tests/soundness_regressions.rs`, S1–S10)
+## 5. Soundness Regression Tests (`tests/soundness_regressions.rs`, S1–S13)
 
 | Test Function | Audit Finding(s) | Invariant Proved |
 |---|---|---|
@@ -73,6 +73,9 @@
 | `s8_stride_zero_isize_max_sparse_alignment_and_overlap_guards` | **S8** | (1) `stride == 0` in `ValidatedSlice`/`ValidatedSliceMut` rejects non-ZST casts (`u64`) while allowing ZSTs; (2) `SparseRows`/`SparseRowsMut` reject `len * ptr_size > isize::MAX`; (3) `ChunkColumnDispenser` rejects `isize::MAX` overflows on `entities`/`next_read`/`next_write`; (4) misaligned sparse row pointer arrays return `TYPE_MISMATCH` in `read_mapped_wire_row`; (5) `iter_entities_and_dynamic_slice_mut` rejects overlapping entity and component buffers. |
 | `s9_dispenser_overlapping_write_then_read_and_repeat_entities_are_sound` | **S9** | `ChunkColumnDispenser` rejects an overlapping `next_read` after `next_write` with `ACCESS_CONFLICT` *before* forming `&[u32]`, preserving Tree Borrows soundness of the live `&mut [u32]`, and rejects a second `entities()` call whose host range shifts (`ACCESS_CONFLICT`). |
 | `s10_restore_state_observer_mut_reentrancy_pod_clone_overlap_and_bridged_bounds` | **S10** | Under Miri Tree Borrows + Strict Provenance: (1) `guest_restore_state_trampoline` rejects `len > isize::MAX` (`OUT_OF_RANGE`) and misaligned `instance` (`INVALID_ARGUMENT`); (2) re-entrant `observer_mut_closure_trampoline` with identical live `event_data` and `propagate` pointers rejects with `ACCESS_CONFLICT` *before* forming `&mut E` or clobbering `*propagate`; (3) `pod_clone_trampoline` handles identical and overlapping `(src, dst)` via `ptr::copy`; (4) bridged dense rows reject `current_len * host_size > isize::MAX` (`OUT_OF_RANGE`) and non-power-of-two `host_align` (`TYPE_MISMATCH`). |
+| `s11_batch_col_cache_and_dispenser_epoch_and_scratch_soundness` | **S11** | Verifies batched chunk column pointer caching, `ChunkColumnDispenser` epoch bump invalidation, and `QuerySlotScratch` aliasing/bounds soundness. |
+| `s12_query_slot_scratch_reuse_resets_column_info_mask` | **S12** | Verifies caller-owned `QuerySlotScratch` reuse via `ValidatedIter::from_raw_with_scratch` calls `reset_all()` so stale `col_info_mask` entries from a previous iterator/component never skip revalidation. |
+| `s13_hot_reload_column_migration_and_scratch_shrink_soundness` | **S13** | Verifies (a) simulated `16 B -> 8 B` hot-reload migration starts a fresh `GuestInstance` with clean `SlotScratchesCell` caches while an un-migrated v1 registration fails closed on Tick 1, and (b) reusing a caller-owned `QuerySlotScratch` across a `16 B -> 8 B` schema shrink rejects `next_read::<[f32; 4]>` before `slice::from_raw_parts` can over-read under Miri. |
 
 ---
 
@@ -82,8 +85,8 @@
 
 | Proof Obligation | Harness Function | What It Symbolically Proves |
 |---|---|---|
-| **PO-G1** | `po_g1_host_slot_bounds_all_41_extended_slots` | Across all 41 extended/ABI-`0.3.0` slots, `host_slot!` returns `Some` iff `populated && struct_size >= offset_of!(BamHostApi, slot) + size_of::<usize>()` with zero overflow. |
-| **PO-G1** | `po_g1_host_from_raw_and_load_ctx_guards` | `Host::from_raw` and `Host::from_load_ctx` reject null, misaligned `api_ptr`, undersized `struct_size`, incompatible `abi_version`, missing core slots, and null `load_host_ctx`; an exact `MIN_V0_2_SIZE` truncated buffer triggers zero OOB reads and leaves all 41 extended slots `None`. |
+| **PO-G1** | `po_g1_host_slot_bounds_all_41_extended_slots` | Across all 46 extended/ABI-`0.3.0` slots, `host_slot!` returns `Some` iff `populated && struct_size >= offset_of!(BamHostApi, slot) + size_of::<usize>()` with zero overflow. |
+| **PO-G1** | `po_g1_host_from_raw_and_load_ctx_guards` | `Host::from_raw` and `Host::from_load_ctx` reject null, misaligned `api_ptr`, undersized `struct_size`, incompatible `abi_version`, missing core slots, and null `load_host_ctx`; an exact `MIN_V0_2_SIZE` truncated buffer triggers zero OOB reads and leaves all 46 extended slots `None`. |
 | **PO-G1** | `po_g1_host_resolve_vtable_guards` | `Host::resolve_vtable` rejects undersized target types, null/misaligned pointers, undersized `VTableHeader::struct_size`, incompatible `abi_version`, and mismatched UUIDs strictly before forming `&V`. |
 | **PO-G1 / PO-G6** | `po_g1_mapped_vtables_and_bridged_row_bounds` | `resolve_mapped_wire_vtable` / `resolve_mapped_string_vtable` enforce `"bam.v0."` prefix and non-`None` getters; `ValidatedIter` bridged row accessors reject non-power-of-two `host_align` (`TYPE_MISMATCH`) and `current_len * host_size > isize::MAX` (`OUT_OF_RANGE`) without OOB pointer arithmetic. |
 | **PO-G3** | `po_g3_checked_slice_elem_offset_exact_bounds` | `checked_slice_elem_offset` over 22 stride classes (plus symbolic 8-bit `(len, index, stride)`) returns `Some(index * stride)` iff `valid && index < len && expected_size == Some(stride) && len * stride <= isize::MAX`. |
@@ -110,7 +113,7 @@
 | Proof ID | Harness Function | What It Symbolically Proves |
 |---|---|---|
 | **PO-G9.1** | `po_g9_read_messages_batch_clamps_hostile_count` | Hostile `read_count > max_count` (including `usize::MAX`) is clamped to `max_count` before `scratch.set_len` / `assume_init`; null/`UNSUPPORTED`/`TYPE_MISMATCH`/host errors fail closed. |
-| **PO-G9.2** | `po_g9_spawn_batch_column_validation_bounds` | `validate_spawn_batch_column` and `spawn_batch_columns` fail closed before `cmd_spawn_batch` on `entity_count * expected_size > isize::MAX`, `col.entity_count < entity_count`, layout mismatches, and null non-empty pointers. |
+| **PO-G9.2** | `po_g9_spawn_batch_column_validation_bounds` | `validate_spawn_batch_column` and `spawn_batch_columns` fail closed before `cmd_spawn_batch` on `entity_count * expected_size > isize::MAX`, `col.entity_count < entity_count`, layout mismatches, and null non-empty pointers, and prove `SpawnBatchColumn::typed` skips `component_layout_info` while still enforcing `entity_count`, null-pointer, and `isize::MAX` overflow bounds. |
 | **PO-G9.3a** | `po_g9_init_guest_instance_early_error_paths` | Every pre-builder failure path in `init_guest_instance` leaves `*instance_out == null` cleanly. |
 | **PO-G9.3b** | `po_g9_init_guest_instance_build_fn_rollback_and_ok` | Failing `build_fn` rolls back staged allocations and leaves `*instance_out == null`; succeeding `build_fn` returns a valid instance reclaimed cleanly by `shutdown_guest_instance`. |
 | **PO-G9.4a** | `po_g9_validated_system_ref_entity_and_resource_guards` | `ValidatedSystemRef::entity_get_checked`, `entity_get_mut_checked`, and `res_ptr_by_handle_with_uuid_checked` fail closed on missing `component_layout_info`, mismatched layout/UUID/flags, and null/misaligned pointers. |

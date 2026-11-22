@@ -358,7 +358,7 @@ fn column_uuid_mismatch_returns_none() {
 
 /// Scenario: Compiles a full `SystemBuilder` with read/write/with/without/changed/added/optional
 /// terms, system-level resources, schedule selection, `after`/`before` ordering, `main_thread`,
-/// and `run_if_fn`, plus verifies `CAPACITY_EXCEEDED` (> 8 queries) and `NOT_FOUND` propagation.
+/// and `run_if_fn`, plus verifies `CAPACITY_EXCEEDED` (> 16 queries) and `NOT_FOUND` propagation.
 #[test]
 fn unified_system_builder_compiles_queries_resources_ordering_and_flags() {
     let mut world = MockHostWorld::new();
@@ -443,7 +443,7 @@ fn unified_system_builder_compiles_queries_resources_ordering_and_flags() {
                 });
             assert_eq!(s1, FfiResult::OK);
 
-            // Exceeding `MAX_QUERIES_PER_SYSTEM` (8) returns `CAPACITY_EXCEEDED`:
+            // Exceeding `MAX_QUERIES_PER_SYSTEM` (16) returns `CAPACITY_EXCEEDED`:
             let mut over_q = app.system(c"too_many_queries");
             for _ in 0..=MAX_QUERIES_PER_SYSTEM {
                 over_q = over_q.query(|q| q.read::<Pos>());

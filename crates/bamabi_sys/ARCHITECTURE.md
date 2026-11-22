@@ -17,7 +17,7 @@
 |---|---|---|
 | `bamabi_macros` | Layer 0 | Emits `ModComponent`, `AbiPod`, `RawInsertable`, `VTableHeader`, `BamFieldDesc`, and `BamRequiredComponent` implementations |
 | `bamabi_sdk_gen` | Layer 0 | Reads `offsets`, struct contracts, and constants to generate `include/bamabi.h`, `bamabi.hpp`, and `bamabi.zig` |
-| `bamabi_guest_sys` | Layer 0 | Wraps all 68 `BamHostApi` slots with `covers_slot` checks, `extern "C"` panic guards, and validated slice/descriptor helpers |
+| `bamabi_guest_sys` | Layer 0 | Wraps all 73 `BamHostApi` slots with `covers_slot` checks, `extern "C"` panic guards, and validated slice/descriptor helpers |
 | `bamabi_guest` | Layer 0 | Exposes safe `#![forbid(unsafe_code)]` Rust guest abstractions over `bamabi_sys` primitives and descriptors |
 | `bamabi-tools` (`bamabi_manifest`, `cargo-bam`) | Layer 1 | Reuses `ABI_VERSION` and wire primitives without pulling in Bevy |
 | `bamabi-core` (`bamabi_host_sys`, `bamabi_host`) | Layer 2 | Populates the 73-slot `BamHostApi` table, validates `BamManifest` / descriptors via `read_descriptor`, and resolves `ComponentUuid` |
@@ -88,12 +88,12 @@ Every cross-boundary struct in `bamabi_sys` is either `#[repr(transparent)]` ove
 | `FfiSlice<T>`, `StrView` | 16 B / 8 B | 8 B / 4 B | — | — |
 | `BamTermDesc` | 12 B / 4 B | 12 B / 4 B | — | — |
 | `BamColumnInfo` | 48 B / 8 B | 40 B / 4 B | — | — |
-| `BamQueryDesc` | 24 B / 8 B | 16 B / 4 B | 24 / 16 | — |
+| `BamQueryDesc` | 32 B / 8 B | 24 B / 4 B | 24 / 16 | — |
 | `VTableHeader` | 40 B / 8 B | 32 B / 4 B | 40 / 32 | — |
 | `BamManifest` | 48 B / 8 B | 32 B / 4 B | 32 / 24 | — |
 | `BamTriggerDesc` | 64 B / 8 B | 48 B / 4 B | 64 / 48 | — |
 | `BamObserverDesc` | 88 B / 8 B | 64 B / 4 B | 48 / 36 | — |
-| `BamSystemDesc` | 168 B / 8 B | 92 B / 4 B | 104 / 60 | — |
+| `BamSystemDesc` | 192 B / 8 B | 104 B / 4 B | 104 / 60 | — |
 | `ComponentDesc` | 176 B / 8 B | 104 B / `align_of::<u64>()` | 64 / 44 | 176 / 104 |
 | `BamFieldDesc` | 64 B / 8 B | 36 B / 4 B | `MIN_V0_3_SIZE` | 64 / 36 |
 | `BamRequiredComponent` | 64 B / 8 B | 48 B / 4 B | `MIN_V0_3_SIZE` | 64 / 48 |
@@ -104,7 +104,7 @@ Every cross-boundary struct in `bamabi_sys` is either `#[repr(transparent)]` ove
 
 ---
 
-## 4. `BamHostApi` 68-Slot Freeze & `offsets` Module
+## 4. `BamHostApi` 73-Slot Layout & `offsets` Module
 
 `BamHostApi` in [`src/host_api.rs`](src/host_api.rs) is the single versioned function table passed from host to guest in `bamabi_init(api, load_ctx, instance_out)`.
 

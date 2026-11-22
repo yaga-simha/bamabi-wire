@@ -18,14 +18,14 @@ Crate guide for **`bamabi_sys`** (`v0.3.0`, ABI `0x0003_0000`) — the `#![no_st
 ---
 
 ## 3. Owned Surface & Frozen Wire Contract
-- **Version & Host API (`version.rs`, `host_api.rs`):** `BAM_ABI_VERSION` (`0x0003_0000`), `BamManifest`, all **68/68** `BamHostApi` slots (`Option<unsafe extern "C" fn(...)>`), frozen `MIN_V0_2_SIZE` (`224` B / `116` B) & `MIN_V0_3_SIZE` (`552` B / `280` B), and `offsets` (`<FIELD>`, `OFF64_*`, `OFF32_*`, `SLOT_COUNT = 68`, `SIZE_64 = 552`, `SIZE_32 = 280`).
+- **Version & Host API (`version.rs`, `host_api.rs`):** `BAM_ABI_VERSION` (`0x0003_0000`), `BamManifest`, all **73/73** `BamHostApi` slots (`Option<unsafe extern "C" fn(...)>`), frozen `MIN_V0_2_SIZE` (`224` B / `116` B) & `MIN_V0_3_SIZE` (`552` B / `280` B, first 68 slots), and `offsets` (`<FIELD>`, `OFF64_*`, `OFF32_*`, `SLOT_COUNT = 73`, `SIZE_64 = 592`, `SIZE_32 = 300`).
 - **Primitives (`primitives/`):** `FfiResult` (`CYCLE_DETECTED = 16`, etc.), `FfiBool`, `FfiOption<T>`, `StrView`, `FfiSlice<T>`, `FfiEntity`, `FfiChildOf`, `FfiAssetHandle`, `FfiAssetLoadState`, `BamComponent`, `BamSystem`, `BamSystemSet`, `BamSymbol`, `ComponentUuid` (const keyed SipHash-2-4-128), `ScheduleId`, `AccessMode`, `BamEventKind`, `BAM_LOG_*`.
 - **Descriptors & Traits (`component.rs`, `system.rs`, `commands.rs`, `iter.rs`, `access.rs`, `extensible.rs`, `traits.rs`):** `ComponentDesc`, `BAM_COMPONENT_FLAG_SUMMARY_TICK`, `BAM_STORAGE_FLAG_SUMMARY_TICK`, `BamFieldDesc`, `BamFieldKind`, `BamRequiredComponent`, `BamSystemDesc`, `BamQueryDesc`, `BamTermDesc`, `BamObserverDesc`, `BamTriggerDesc`, `BamRelationDesc` (`BAM_RELATION_FLAG_*`), `BamLayoutInfo`, `BamRowMigrateFn`, `BamScheduleSetDesc` (`BAM_SCHEDULE_SET_FLAG_*`), `BamChangeTicks`, `BamColumnInfo`, `VTableHeader`, `ExtensibleStruct`, `ModComponent`, `AbiPod`, `RawInsertable`.
 
 ---
 
 ## 4. Strict Engineering Rules
-1. **ABI Freeze (`0x0003_0000`):** Do NOT reorder fields, resize frozen prefix structs (`MIN_V0_2_SIZE`, `MIN_V0_3_SIZE`), or change `BamHostApi` slot count/offsets (`68` slots) without a formal minor/major ABI bump.
+1. **ABI Freeze (`0x0003_0000`):** Do NOT reorder fields, resize frozen prefix structs (`MIN_V0_2_SIZE`, `MIN_V0_3_SIZE`), or change `BamHostApi` slot count/offsets (`73` slots) without a formal minor/major ABI bump.
 2. **Wire Purity:** Every wire struct MUST be `#[repr(C)]` or `#[repr(transparent)]` with zero implicit padding bytes; all strings cross FFI via `StrView` or NUL-terminated C pointers. Never expose Rust `Box`, `Vec`, `String`, or fat pointers.
 3. **SemVer & Layout Tests:** Preserve compile-time size/alignment/offset assertions in `src/tests/layout.rs` and `[package.metadata.cargo-semver-checks.lints]` in `Cargo.toml`.
 

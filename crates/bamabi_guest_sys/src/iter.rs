@@ -1232,8 +1232,20 @@ impl<'a> SlotCacheRef<'a> {
 /// Per-query-slot scratch storage for persistent `BamColumnInfo`/term metadata caching and
 /// per-tick slot-68 batch column pointers.
 ///
-/// Kept inside `SystemClosureState` (rather than inline inside [`ValidatedIter`]) so
-/// [`ValidatedIter`] stays `<= 64` bytes on stack frames.
+/// Kept inside `SystemClosureState::slot_scratches` (rather than inline inside [`ValidatedIter`])
+/// so [`ValidatedIter`] stays `<= 64` bytes on stack frames.
+///
+/// # Cache Lifetime Invariant
+/// Under the wire-level [`bamabi_sys::BamIterColumnInfoFn`] invariance contract and
+/// [`bamabi_sys::BamMigrateComponentColumnFn`]'s cross-mod `FfiResult::ACCESS_CONFLICT`
+/// exclusivity rule, a registered system's `(query_index, term_index)` [`BamColumnInfo`] is
+/// immutable across all chunks and ticks for the lifetime of that registered system (and a
+/// hot-reload of the owning mod tears down the old `GuestInstance` and allocates a fresh
+/// `SlotScratchesCell`). Therefore:
+/// - Internal `SystemClosureState` invocations call `Self::reset_per_tick` on tick entry,
+///   retaining `col_info_mask` and `term_cache_mask` across ticks.
+/// - External callers reusing a [`QuerySlotScratch`] via [`ValidatedIter::from_raw_with_scratch`]
+///   have no single-system binding and MUST clear all caches via `Self::reset_all`.
 pub struct QuerySlotScratch {
     col_info_mask: Cell<u8>,
     term_cache_mask: Cell<u8>,
@@ -1261,14 +1273,22 @@ impl QuerySlotScratch {
     }
 
     /// Resets per-tick ephemeral slot state (`batch_col_count`) on system tick entry while
-    /// preserving persistent `BamColumnInfo` and validated term metadata caches across ticks.
+    /// preserving `col_info_mask` (`col_infos`) and `term_cache_mask` (`term_entries`) across ticks.
+    ///
+    /// # Safety Contract Note
+    /// Sound solely because `SystemClosureState` binds each [`QuerySlotScratch`] 1:1 to a single
+    /// registered system whose [`BamColumnInfo`] is invariant for its lifetime per
+    /// [`bamabi_sys::BamIterColumnInfoFn`] and [`bamabi_sys::BamMigrateComponentColumnFn`]. Public
+    /// scratch reuse via [`ValidatedIter::from_raw_with_scratch`] must call [`Self::reset_all`].
     #[inline]
     pub(crate) fn reset_per_tick(&self) {
         self.batch_col_count.set(0);
     }
 
     /// Resets all cached slot state (`col_info_mask`, `term_cache_mask`, and `batch_col_count`)
-    /// when binding a fresh external `BamIter` via [`ValidatedIter::from_raw_with_scratch`].
+    /// when binding a fresh external `BamIter` via [`ValidatedIter::from_raw_with_scratch`],
+    /// preventing stale `BamColumnInfo` or term validation caches from leaking across distinct
+    /// iterators or schema revisions.
     #[inline]
     pub(crate) fn reset_all(&self) {
         self.col_info_mask.set(0);
@@ -1413,6 +1433,12 @@ impl<'a> ValidatedIter<'a> {
 
     /// Wraps a raw [`BamIter`] pointer bound exclusively to caller-owned [`QuerySlotScratch`] for
     /// `BamColumnInfo` caching and slot-68 batch column pointers.
+    ///
+    /// Unlike `SystemClosureState::slot_scratches` (which uses `QuerySlotScratch::reset_per_tick`
+    /// under [`bamabi_sys::BamIterColumnInfoFn`]'s single-system invariance contract), this
+    /// constructor always invokes `QuerySlotScratch::reset_all` so reusing a caller-owned
+    /// `&mut QuerySlotScratch` across distinct iterators or migrated schemas cannot leak stale
+    /// `BamColumnInfo` or term caches.
     ///
     /// # Safety
     /// If `raw` is non-null, it must point to an active [`BamIter`] belonging to the current

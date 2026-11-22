@@ -334,7 +334,7 @@ impl LoadedGuest {
         }
 
         let mut instance: *mut BamInstance = core::ptr::null_mut();
-        // SAFETY: `world.api_ptr()` points to a valid 68-slot `BamHostApi`, `world.load_ctx_ptr()`
+        // SAFETY: `world.api_ptr()` points to a valid 73-slot `BamHostApi`, `world.load_ctx_ptr()`
         // points to `HostWorld` for the duration of `bamabi_init`, and `instance` is writable.
         let init_status = unsafe { init_fn(world.api_ptr(), world.load_ctx_ptr(), &mut instance) };
         if init_status != FfiResult::OK {

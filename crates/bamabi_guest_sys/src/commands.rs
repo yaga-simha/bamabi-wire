@@ -22,8 +22,9 @@ const INLINE_SPAWN_CAP: usize = 16;
 ///
 /// Constructed via [`TypedComponent::validate`] (which verifies the handle and its host-registered
 /// `(size, align)` once against `Host::component_layout_info`) or [`TypedComponent::from_raw_unchecked`],
-/// enabling hot-path commands (`SpawnEntry::typed`, `ValidatedCommands::insert_typed`,
-/// `ValidatedCommands::insert_if_new_typed`) to skip redundant per-command `component_layout_info`
+/// enabling hot-path commands (`SpawnEntry::typed`, `SpawnBatchColumn::typed`,
+/// `ValidatedCommands::insert_typed`, `ValidatedCommands::insert_if_new_typed`,
+/// `ValidatedCommands::insert_resource_typed`) to skip redundant per-command `component_layout_info`
 /// FFI round-trips.
 #[repr(transparent)]
 pub struct TypedComponent<T: AbiPod> {
@@ -255,6 +256,7 @@ pub struct SpawnBatchColumn<'a> {
     entity_count: usize,
     elem_size: Option<usize>,
     elem_align: Option<usize>,
+    validated_typed: bool,
     _marker: PhantomData<&'a ()>,
 }
 
@@ -273,6 +275,29 @@ impl<'a> SpawnBatchColumn<'a> {
             entity_count: values.len(),
             elem_size: Some(core::mem::size_of::<T>()),
             elem_align: Some(core::mem::align_of::<T>()),
+            validated_typed: false,
+            _marker: PhantomData,
+        }
+    }
+
+    /// Binds an init-validated [`TypedComponent<T>`] handle to a contiguous slice of `values`
+    /// (`T: AbiPod`) for multi-entity spawn, skipping the per-call `Host::component_layout_info`
+    /// and `BamHostApi::sys_host_ctx` FFI round-trips while still enforcing local `entity_count`,
+    /// non-null, and `isize::MAX` byte-length bounds.
+    #[inline]
+    pub const fn typed<T: AbiPod>(component: TypedComponent<T>, values: &'a [T]) -> Self {
+        let ptr = if core::mem::size_of::<T>() == 0 || values.is_empty() {
+            core::ptr::NonNull::<u8>::dangling().as_ptr().cast_const()
+        } else {
+            values.as_ptr().cast::<u8>()
+        };
+        Self {
+            component: component.handle(),
+            column_ptr: ptr,
+            entity_count: values.len(),
+            elem_size: Some(core::mem::size_of::<T>()),
+            elem_align: Some(core::mem::align_of::<T>()),
+            validated_typed: true,
             _marker: PhantomData,
         }
     }
@@ -286,6 +311,7 @@ impl<'a> SpawnBatchColumn<'a> {
             entity_count,
             elem_size: Some(0),
             elem_align: None,
+            validated_typed: false,
             _marker: PhantomData,
         }
     }
@@ -307,6 +333,7 @@ impl<'a> SpawnBatchColumn<'a> {
             entity_count,
             elem_size: None,
             elem_align: None,
+            validated_typed: false,
             _marker: PhantomData,
         }
     }
@@ -341,9 +368,9 @@ impl<'a> SpawnBatchColumn<'a> {
         self.elem_align
     }
 
-    /// Constructs a [`SpawnBatchColumn`] from raw parts for Kani bounds harnesses so symbolic
-    /// null pointers and `isize::MAX` byte-length overflows can be exercised directly.
-    #[cfg(kani)]
+    /// Constructs a [`SpawnBatchColumn`] from raw parts for unit tests and Kani bounds harnesses so
+    /// symbolic null pointers and `isize::MAX` byte-length overflows can be exercised directly.
+    #[cfg(any(test, kani))]
     #[inline]
     pub(crate) const unsafe fn from_parts_for_kani(
         component: BamComponent,
@@ -351,6 +378,7 @@ impl<'a> SpawnBatchColumn<'a> {
         entity_count: usize,
         elem_size: Option<usize>,
         elem_align: Option<usize>,
+        validated_typed: bool,
     ) -> Self {
         Self {
             component,
@@ -358,14 +386,16 @@ impl<'a> SpawnBatchColumn<'a> {
             entity_count,
             elem_size,
             elem_align,
+            validated_typed,
             _marker: PhantomData,
         }
     }
 }
 
-/// Validates a [`SpawnBatchColumn`] against `Host::component_layout_info_with_ctx` and checks
-/// buffer bounds before passing columnar pointers to `BamHostApi::cmd_spawn_batch`, invoking
-/// `resolve_ctx` only when `col.elem_size` is `Some`.
+/// Validates a [`SpawnBatchColumn`] against `Host::component_layout_info_with_ctx` (unless
+/// already init-validated via [`SpawnBatchColumn::typed`]) and checks buffer bounds before passing
+/// columnar pointers to `BamHostApi::cmd_spawn_batch`, invoking `resolve_ctx` only when an FFI
+/// `component_layout_info` call is required.
 ///
 /// # Safety
 /// `resolve_ctx` must return a valid active [`BamHostCtx`] matching `api` for the duration of this call.
@@ -382,20 +412,22 @@ pub(crate) unsafe fn validate_spawn_batch_column_with_ctx(
         return FfiResult::INVALID_ARGUMENT;
     }
     if let Some(expected_size) = col.elem_size {
-        // SAFETY: Caller guarantees `resolve_ctx()` returns a valid active `BamHostCtx` matching `api`.
-        let info = match unsafe {
-            Host::component_layout_info_with_ctx(api, resolve_ctx(), col.component)
-        } {
-            Ok(i) => i,
-            Err(err) => return err,
-        };
-        if info.size != expected_size {
-            return FfiResult::TYPE_MISMATCH;
-        }
-        if let Some(expected_align) = col.elem_align
-            && info.align != expected_align
-        {
-            return FfiResult::TYPE_MISMATCH;
+        if !col.validated_typed {
+            // SAFETY: Caller guarantees `resolve_ctx()` returns a valid active `BamHostCtx` matching `api`.
+            let info = match unsafe {
+                Host::component_layout_info_with_ctx(api, resolve_ctx(), col.component)
+            } {
+                Ok(i) => i,
+                Err(err) => return err,
+            };
+            if info.size != expected_size {
+                return FfiResult::TYPE_MISMATCH;
+            }
+            if let Some(expected_align) = col.elem_align
+                && info.align != expected_align
+            {
+                return FfiResult::TYPE_MISMATCH;
+            }
         }
         if entity_count > 0 && expected_size > 0 {
             if col.column_ptr.is_null() {
@@ -1504,5 +1536,412 @@ impl<'a> ValidatedCommands<'a> {
         };
         // SAFETY: `self.raw` is active and `resource` was validated non-zero.
         unsafe { remove_res_fn(self.raw, resource) }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use core::{
+        ffi::{c_char, c_void},
+        mem::{MaybeUninit, align_of, size_of},
+        sync::atomic::{AtomicUsize, Ordering},
+    };
+
+    use bamabi_sys::{
+        ABI_VERSION, BamChangeTicks, BamColumnInfo, BamCommands, BamComponent, BamHostApi,
+        BamHostCtx, BamIter, BamLayoutInfo, BamLoadCtx, BamSystemCtx, BamSystemDesc, ComponentDesc,
+        ComponentUuid, FfiBool, FfiEntity, FfiResult,
+    };
+
+    use super::*;
+    use crate::{GuestInstance, allocate_system_slice_trampoline};
+
+    struct BatchMockCounters {
+        sys_host_ctx_calls: AtomicUsize,
+        layout_info_calls: AtomicUsize,
+        spawn_batch_calls: AtomicUsize,
+        last_entity_count: AtomicUsize,
+        last_comp_count: AtomicUsize,
+    }
+
+    unsafe extern "C" fn mock_get_proc(_: *const BamHostCtx, _: *const c_char) -> *const c_void {
+        core::ptr::null()
+    }
+    unsafe extern "C" fn mock_last_error(_: *const BamHostCtx, _: *mut c_char, _: usize) -> usize {
+        0
+    }
+    unsafe extern "C" fn mock_load_host_ctx(load_ctx: *const BamLoadCtx) -> *const BamHostCtx {
+        load_ctx.cast::<BamHostCtx>()
+    }
+    unsafe extern "C" fn mock_reg_comp(
+        _: *mut BamLoadCtx,
+        _: *const ComponentDesc,
+        _: *mut BamComponent,
+    ) -> FfiResult {
+        FfiResult::OK
+    }
+    unsafe extern "C" fn mock_res_comp(
+        _: *const BamHostCtx,
+        _: *const c_char,
+        _: *const ComponentUuid,
+        _: *mut BamComponent,
+    ) -> FfiResult {
+        FfiResult::OK
+    }
+    unsafe extern "C" fn mock_reg_sys(_: *mut BamLoadCtx, _: *const BamSystemDesc) -> FfiResult {
+        FfiResult::OK
+    }
+    unsafe extern "C" fn mock_sys_host_ctx(sys_ctx: *const BamSystemCtx) -> *const BamHostCtx {
+        // SAFETY: `sys_ctx` points to `BatchMockCounters`.
+        let st = unsafe { &*sys_ctx.cast::<BatchMockCounters>() };
+        st.sys_host_ctx_calls.fetch_add(1, Ordering::Relaxed);
+        sys_ctx.cast::<BamHostCtx>()
+    }
+    unsafe extern "C" fn mock_sys_query(
+        _: *mut BamSystemCtx,
+        _: usize,
+        _: *mut *mut BamIter,
+    ) -> FfiResult {
+        FfiResult::OK
+    }
+    unsafe extern "C" fn mock_sys_commands(
+        sys_ctx: *mut BamSystemCtx,
+        out_cmds: *mut *mut BamCommands,
+    ) -> FfiResult {
+        // SAFETY: `out_cmds` is writable stack storage and `sys_ctx` points to `BatchMockCounters`.
+        unsafe { *out_cmds = sys_ctx.cast::<BamCommands>() };
+        FfiResult::OK
+    }
+    unsafe extern "C" fn mock_next_chunk(_: *mut BamIter, _: *mut usize) -> FfiBool {
+        FfiBool::FALSE
+    }
+    unsafe extern "C" fn mock_iter_reset(_: *mut BamIter) -> FfiResult {
+        FfiResult::OK
+    }
+    unsafe extern "C" fn mock_iter_entities(_: *const BamIter) -> *const FfiEntity {
+        core::ptr::null()
+    }
+    unsafe extern "C" fn mock_col_ro(_: *const BamIter, _: usize) -> *const u8 {
+        core::ptr::null()
+    }
+    unsafe extern "C" fn mock_col_mut(_: *mut BamIter, _: usize) -> *mut u8 {
+        core::ptr::null_mut()
+    }
+    unsafe extern "C" fn mock_mark(_: *mut BamIter, _: usize, _: usize, _: usize) -> FfiResult {
+        FfiResult::OK
+    }
+    unsafe extern "C" fn mock_rows_ro(_: *mut BamIter, _: usize) -> *const *const u8 {
+        core::ptr::null()
+    }
+    unsafe extern "C" fn mock_rows_mut(_: *mut BamIter, _: usize) -> *const *mut u8 {
+        core::ptr::null()
+    }
+    unsafe extern "C" fn mock_col_info(
+        _: *const BamIter,
+        _: usize,
+        _: *mut BamColumnInfo,
+    ) -> FfiResult {
+        FfiResult::NOT_FOUND
+    }
+    unsafe extern "C" fn mock_res_ptr(_: *const BamIter, _: usize) -> *const u8 {
+        core::ptr::null()
+    }
+    unsafe extern "C" fn mock_res_mut(_: *mut BamIter, _: usize) -> *mut u8 {
+        core::ptr::null_mut()
+    }
+    unsafe extern "C" fn mock_spawn_empty(_: *mut BamCommands, _: *mut FfiEntity) -> FfiResult {
+        FfiResult::OK
+    }
+    unsafe extern "C" fn mock_spawn(
+        _: *mut BamCommands,
+        _: *const BamComponent,
+        _: *const *const u8,
+        _: usize,
+        _: *mut FfiEntity,
+    ) -> FfiResult {
+        FfiResult::OK
+    }
+    unsafe extern "C" fn mock_despawn(_: *mut BamCommands, _: FfiEntity) -> FfiResult {
+        FfiResult::OK
+    }
+    unsafe extern "C" fn mock_insert(
+        _: *mut BamCommands,
+        _: FfiEntity,
+        _: BamComponent,
+        _: *const u8,
+        _: usize,
+    ) -> FfiResult {
+        FfiResult::OK
+    }
+    unsafe extern "C" fn mock_insert_default(
+        _: *mut BamCommands,
+        _: FfiEntity,
+        _: BamComponent,
+    ) -> FfiResult {
+        FfiResult::OK
+    }
+    unsafe extern "C" fn mock_remove(
+        _: *mut BamCommands,
+        _: FfiEntity,
+        _: BamComponent,
+    ) -> FfiResult {
+        FfiResult::OK
+    }
+
+    /// Unused helper verifying [`BamChangeTicks`] stays imported cleanly if needed.
+    const _: usize = size_of::<BamChangeTicks>();
+
+    #[test]
+    fn spawn_batch_column_typed_skips_ffi_checks_and_enforces_local_bounds() {
+        unsafe extern "C" fn mock_layout_info(
+            ctx: *const BamHostCtx,
+            comp: BamComponent,
+            out: *mut BamLayoutInfo,
+        ) -> FfiResult {
+            // SAFETY: `ctx` points to `BatchMockCounters`.
+            let st = unsafe { &*ctx.cast::<BatchMockCounters>() };
+            st.layout_info_calls.fetch_add(1, Ordering::Relaxed);
+            let info = if comp == BamComponent::from_raw(2) {
+                BamLayoutInfo {
+                    size: 0,
+                    align: 1,
+                    uuid: ComponentUuid::from_bytes([2; 16]),
+                    ..BamLayoutInfo::empty()
+                }
+            } else {
+                BamLayoutInfo {
+                    size: size_of::<u64>(),
+                    align: align_of::<u64>(),
+                    uuid: ComponentUuid::from_bytes([1; 16]),
+                    ..BamLayoutInfo::empty()
+                }
+            };
+            // SAFETY: `out` is writable stack storage.
+            unsafe { *out = info };
+            FfiResult::OK
+        }
+
+        unsafe extern "C" fn mock_spawn_batch(
+            cmds: *mut BamCommands,
+            _comps: *const BamComponent,
+            _col_ptrs: *const *const u8,
+            comp_count: usize,
+            entity_count: usize,
+            out_entities: *mut FfiEntity,
+        ) -> FfiResult {
+            // SAFETY: `cmds` points to `BatchMockCounters`.
+            let st = unsafe { &*cmds.cast::<BatchMockCounters>() };
+            st.spawn_batch_calls.fetch_add(1, Ordering::Relaxed);
+            st.last_comp_count.store(comp_count, Ordering::Relaxed);
+            st.last_entity_count.store(entity_count, Ordering::Relaxed);
+            if !out_entities.is_null() {
+                for i in 0..entity_count {
+                    // SAFETY: Caller supplies `out_entities` with at least `entity_count` slots.
+                    unsafe { *out_entities.add(i) = FfiEntity::from_bits((i + 100) as u64) };
+                }
+            }
+            FfiResult::OK
+        }
+
+        // SAFETY: `BamHostApi` is `#[repr(C)]` of `u32` and `Option<fn>` slots.
+        let mut api: BamHostApi = unsafe { MaybeUninit::zeroed().assume_init() };
+        api.struct_size = size_of::<BamHostApi>() as u32;
+        api.abi_version = ABI_VERSION;
+        api.get_proc_address = Some(mock_get_proc);
+        api.last_error = Some(mock_last_error);
+        api.load_host_ctx = Some(mock_load_host_ctx);
+        api.register_component = Some(mock_reg_comp);
+        api.resolve_component = Some(mock_res_comp);
+        api.register_system = Some(mock_reg_sys);
+        api.sys_host_ctx = Some(mock_sys_host_ctx);
+        api.sys_query = Some(mock_sys_query);
+        api.sys_commands = Some(mock_sys_commands);
+        api.iter_next_chunk = Some(mock_next_chunk);
+        api.iter_reset = Some(mock_iter_reset);
+        api.iter_entities = Some(mock_iter_entities);
+        api.iter_column_readonly = Some(mock_col_ro);
+        api.iter_column_mutable = Some(mock_col_mut);
+        api.iter_column_mutable_untracked = Some(mock_col_mut);
+        api.iter_mark_changed_range = Some(mock_mark);
+        api.iter_column_rows_readonly = Some(mock_rows_ro);
+        api.iter_column_rows_mutable = Some(mock_rows_mut);
+        api.iter_column_info = Some(mock_col_info);
+        api.res_ptr = Some(mock_res_ptr);
+        api.res_mut_ptr = Some(mock_res_mut);
+        api.cmd_spawn_empty = Some(mock_spawn_empty);
+        api.cmd_spawn = Some(mock_spawn);
+        api.cmd_despawn = Some(mock_despawn);
+        api.cmd_insert = Some(mock_insert);
+        api.cmd_insert_default = Some(mock_insert_default);
+        api.cmd_remove = Some(mock_remove);
+        api.component_layout_info = Some(mock_layout_info);
+        api.cmd_spawn_batch = Some(mock_spawn_batch);
+
+        let counters = BatchMockCounters {
+            sys_host_ctx_calls: AtomicUsize::new(0),
+            layout_info_calls: AtomicUsize::new(0),
+            spawn_batch_calls: AtomicUsize::new(0),
+            last_entity_count: AtomicUsize::new(0),
+            last_comp_count: AtomicUsize::new(0),
+        };
+
+        // SAFETY: `api` and `&counters` stay alive for the test.
+        let init_host = unsafe {
+            Host::from_raw(
+                &raw const api,
+                core::ptr::from_ref(&counters).cast::<BamHostCtx>(),
+            )
+        }
+        .unwrap();
+        let mut instance = GuestInstance::new(init_host, "typed_batch_mod");
+
+        // Init-time TypedComponent validation (2 layout_info calls).
+        let typed_u64 =
+            TypedComponent::<u64>::validate(instance.host(), BamComponent::from_raw(1)).unwrap();
+        let typed_zst =
+            TypedComponent::<[u8; 0]>::validate(instance.host(), BamComponent::from_raw(2))
+                .unwrap();
+        assert_eq!(counters.layout_info_calls.load(Ordering::Relaxed), 2);
+        counters.layout_info_calls.store(0, Ordering::Relaxed);
+
+        let (sys_fn, sys_ud) =
+            allocate_system_slice_trampoline::<0, _>(&mut instance, 0, 0, None, move |inv| {
+                let mut cmds = inv.take_lazy_commands().resolve();
+                let vals = [11u64, 22u64, 33u64];
+                let zsts: [[u8; 0]; 3] = [[], [], []];
+                let mut out = [FfiEntity::NULL; 3];
+
+                // 1. Valid POD + ZST typed batch spawns 3 entities with 0 layout/sys_host_ctx calls.
+                let st = cmds.spawn_batch_columns(
+                    &[
+                        SpawnBatchColumn::typed(typed_u64, &vals),
+                        SpawnBatchColumn::typed(typed_zst, &zsts),
+                    ],
+                    3,
+                    Some(&mut out),
+                );
+                assert_eq!(st, FfiResult::OK);
+                assert_eq!(
+                    out,
+                    [
+                        FfiEntity::from_bits(100),
+                        FfiEntity::from_bits(101),
+                        FfiEntity::from_bits(102),
+                    ]
+                );
+
+                // 2. Empty slice (`entity_count == 0`) with `SpawnBatchColumn::typed` succeeds.
+                let empty_u64: [u64; 0] = [];
+                assert_eq!(
+                    cmds.spawn_batch_columns(
+                        &[SpawnBatchColumn::typed(typed_u64, &empty_u64)],
+                        0,
+                        None,
+                    ),
+                    FfiResult::OK
+                );
+
+                // 3. Under-sized column slice (`col.entity_count < entity_count`) -> INVALID_ARGUMENT.
+                assert_eq!(
+                    cmds.spawn_batch_columns(
+                        &[SpawnBatchColumn::typed(typed_u64, &vals)],
+                        4,
+                        None,
+                    ),
+                    FfiResult::INVALID_ARGUMENT
+                );
+
+                // 4. Invalid component handle wrapped unchecked -> INVALID_COMPONENT.
+                // SAFETY: Intentionally testing invalid-handle fail-closed guard.
+                let bad_typed =
+                    unsafe { TypedComponent::<u64>::from_raw_unchecked(BamComponent::INVALID) };
+                assert_eq!(
+                    cmds.spawn_batch_columns(&[SpawnBatchColumn::typed(bad_typed, &vals)], 3, None),
+                    FfiResult::INVALID_COMPONENT
+                );
+
+                // 5. Synthetic null non-empty typed column -> NULL_POINTER with 0 FFI calls.
+                // SAFETY: Synthetic null pointer is rejected before dereferencing.
+                let null_typed = unsafe {
+                    SpawnBatchColumn::from_parts_for_kani(
+                        typed_u64.handle(),
+                        core::ptr::null(),
+                        2,
+                        Some(size_of::<u64>()),
+                        Some(align_of::<u64>()),
+                        true,
+                    )
+                };
+                assert_eq!(
+                    cmds.spawn_batch_columns(&[null_typed], 2, None),
+                    FfiResult::NULL_POINTER
+                );
+
+                // 6. Synthetic `isize::MAX` byte-length overflow on typed column -> OUT_OF_RANGE.
+                let over_half = (isize::MAX as usize / size_of::<u64>()) + 1;
+                // SAFETY: Overflow check rejects before `cmd_spawn_batch` or dereference.
+                let overflow_typed = unsafe {
+                    SpawnBatchColumn::from_parts_for_kani(
+                        typed_u64.handle(),
+                        vals.as_ptr().cast::<u8>(),
+                        over_half,
+                        Some(size_of::<u64>()),
+                        Some(align_of::<u64>()),
+                        true,
+                    )
+                };
+                assert_eq!(
+                    cmds.spawn_batch_columns(&[overflow_typed], over_half, None),
+                    FfiResult::OUT_OF_RANGE
+                );
+
+                // 7. Synthetic `checked_mul` wrap on typed column -> OUT_OF_RANGE.
+                let wrap_count = usize::MAX / 2;
+                // SAFETY: Overflow check rejects before `cmd_spawn_batch` or dereference.
+                let wrap_typed = unsafe {
+                    SpawnBatchColumn::from_parts_for_kani(
+                        typed_u64.handle(),
+                        vals.as_ptr().cast::<u8>(),
+                        wrap_count,
+                        Some(size_of::<u64>()),
+                        Some(align_of::<u64>()),
+                        true,
+                    )
+                };
+                assert_eq!(
+                    cmds.spawn_batch_columns(&[wrap_typed], wrap_count, None),
+                    FfiResult::OUT_OF_RANGE
+                );
+
+                FfiResult::OK
+            });
+
+        let sys_ctx = core::ptr::from_ref(&counters)
+            .cast_mut()
+            .cast::<BamSystemCtx>();
+        // SAFETY: `sys_ctx` and `sys_ud` remain valid for this synchronous call.
+        assert_eq!(unsafe { sys_fn(sys_ctx, sys_ud) }, FfiResult::OK);
+        assert_eq!(counters.layout_info_calls.load(Ordering::Relaxed), 0);
+        assert_eq!(counters.sys_host_ctx_calls.load(Ordering::Relaxed), 0);
+        assert_eq!(counters.spawn_batch_calls.load(Ordering::Relaxed), 2);
+        assert_eq!(counters.last_comp_count.load(Ordering::Relaxed), 1);
+        assert_eq!(counters.last_entity_count.load(Ordering::Relaxed), 0);
+
+        // Contrast: `SpawnBatchColumn::new` DOES invoke `sys_host_ctx` and `component_layout_info`.
+        let (untyped_fn, untyped_ud) =
+            allocate_system_slice_trampoline::<0, _>(&mut instance, 0, 0, None, move |inv| {
+                let mut cmds = inv.take_lazy_commands().resolve();
+                let vals = [1u64, 2u64];
+                cmds.spawn_batch_columns(
+                    &[SpawnBatchColumn::new(BamComponent::from_raw(1), &vals)],
+                    2,
+                    None,
+                )
+            });
+        // SAFETY: `sys_ctx` and `untyped_ud` remain valid for this synchronous call.
+        assert_eq!(unsafe { untyped_fn(sys_ctx, untyped_ud) }, FfiResult::OK);
+        assert_eq!(counters.layout_info_calls.load(Ordering::Relaxed), 1);
+        assert_eq!(counters.sys_host_ctx_calls.load(Ordering::Relaxed), 1);
+        assert_eq!(counters.spawn_batch_calls.load(Ordering::Relaxed), 3);
     }
 }

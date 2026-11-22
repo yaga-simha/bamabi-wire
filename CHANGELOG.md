@@ -6,6 +6,21 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ---
 
+## [Unreleased]
+
+### Added
+- **`SpawnBatchColumn::typed<T: AbiPod>` (`bamabi_guest_sys` & `bamabi_guest`):** Skips per-command `component_layout_info` and `sys_host_ctx` FFI calls for init-validated `TypedComponent<T>` handles while preserving `component.is_valid()`, `entity_count` length, null non-empty pointer, and `isize::MAX` byte-length overflow guards (covered by `commands::tests`, `v03_guest_sdk_tests::spawn_batch_column_typed_skips_layout_info_and_enforces_bounds`, and Kani `PO-G9.2` `po_g9_spawn_batch_column_validation_bounds`).
+- **Soundness Regression Test S13 (`bamabi_guest_sys`):** Added `s13_hot_reload_column_migration_and_scratch_shrink_soundness` verifying simulated `16 B -> 8 B` hot-reload column migration with clean `SlotScratchesCell` initialization, un-migrated v1 fail-closed Tick 1 rejection, and caller-owned `&mut QuerySlotScratch` shrink reuse (`reset_all()`) under dual-model Miri (Tree Borrows + Stacked Borrows with Strict Provenance).
+
+### Changed / Documented
+- **Per-System `BamColumnInfo` Invariance & Cross-Mod Migration Exclusivity Contract:** Codified the single-system `BamIterColumnInfoFn` invariance contract and Slot 67 `BamMigrateComponentColumnFn` (`bamabi_init`-only, zero-copy fingerprint retention, and cross-mod `FfiResult::ACCESS_CONFLICT` rejection) across `bamabi_sys`, generated ISO C99 comments in `bamabi_sdk_gen` / `include/bamabi.h`, `bamabi_guest_sys` (`QuerySlotScratch` / `SystemClosureState::slot_scratches`), and `spec.md` (§3.6 & §4.7.2).
+- **73-Slot / 16-Query ABI `0.3.0` Documentation Parity:** Reconciled `spec.md`, `README.md`, `ARCHITECTURE.md`, `TESTING.md`, crate docs (`bamabi_docs`, `bamabi_sys`, `bamabi_guest_sys`, `bamabi_sdk_gen`, `bamabi_guest`), and test/harness comments (`standalone_c_test.c`, `benches/bamabi_bench/src/loader.rs`) to full 73-slot `BamHostApi` (`592` B 64-bit / `300` B 32-bit; `MIN_V0_2_SIZE = 224` / `116`, `MIN_V0_3_SIZE = 552` / `280` for slots `0..68`, slots `68..=72`) and `MAX_QUERIES_PER_SYSTEM = 16` parity.
+
+### Fixed
+- **Native Benchmark LLVM `noalias` Parity (`bamabi_bench`):** Extracted `#[inline(always)] fn integrate_dense_chunk(pos: &mut [Position], vel: &[Velocity], dt: f32)` and moved `chunk.mark_changed(pos_handle)` outside the slice borrows in `native_dense_update` (`benches/bamabi_bench/src/workloads.rs`) so `native` receives the same LLVM `noalias` parameter optimization as polyglot guests.
+
+---
+
 ## [0.3.0] - 2026-11-19
 
 ### Added

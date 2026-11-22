@@ -160,7 +160,7 @@
 //! 6. `src/system.rs` & `src/commands.rs` — [`BamQueryDesc`], [`BamSystemDesc`], [`BamObserverDesc`],
 //!    [`BamTriggerDesc`], and deferred command prototypes.
 //! 7. `src/iter.rs` — [`BamIter`], [`BamChangeTicks`], [`BamColumnInfo`], and iteration callbacks.
-//! 8. `src/host_api.rs` — [`BamManifest`], 68-slot [`BamHostApi`], and [`offsets`].
+//! 8. `src/host_api.rs` — [`BamManifest`], 73-slot [`BamHostApi`], and [`offsets`].
 //! 9. `src/traits.rs` — [`RawInsertable`], [`AbiPod`], [`SymbolEntry`], and [`ModComponent`].
 //!
 //! For deep architectural notes and a complete test/proof inventory, see `ARCHITECTURE.md` and

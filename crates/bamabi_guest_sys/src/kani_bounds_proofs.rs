@@ -32,8 +32,8 @@ use bamabi_sys::{
 };
 
 use crate::{
-    GuestInstance, Host, SpawnBatchColumn, UuidFilter, ValidatedCommands, ValidatedIter,
-    ValidatedLoadCtx, ValidatedSystemInvocation, ValidatedSystemRef,
+    GuestInstance, Host, SpawnBatchColumn, TypedComponent, UuidFilter, ValidatedCommands,
+    ValidatedIter, ValidatedLoadCtx, ValidatedSystemInvocation, ValidatedSystemRef,
     commands::validate_spawn_batch_column, init_guest_instance,
 };
 
@@ -476,7 +476,8 @@ fn po_g9_read_messages_batch_clamps_hostile_count() {
 /// PO-G9.2: Proves `validate_spawn_batch_column` and `ValidatedCommands::spawn_batch_columns`
 /// fail closed before reaching `cmd_spawn_batch` on `entity_count * expected_size > isize::MAX`
 /// overflow, `col.entity_count < entity_count`, layout `(size, align)` mismatches, and null
-/// non-empty column pointers.
+/// non-empty column pointers, and proves `SpawnBatchColumn::typed` skips `component_layout_info`
+/// while preserving local `entity_count`, null-pointer, and `isize::MAX` overflow guards.
 #[kani::proof]
 #[kani::unwind(4)]
 fn po_g9_spawn_batch_column_validation_bounds() {
@@ -485,6 +486,7 @@ fn po_g9_spawn_batch_column_validation_bounds() {
         layout_size: usize,
         layout_align: usize,
         layout_status: FfiResult,
+        layout_called: core::cell::Cell<bool>,
         batch_called: bool,
         last_entity_count: usize,
     }
@@ -496,6 +498,7 @@ fn po_g9_spawn_batch_column_validation_bounds() {
     ) -> FfiResult {
         // SAFETY: Test binds `ctx` to `BatchSpy`.
         let spy = unsafe { &*ctx.cast::<BatchSpy>() };
+        spy.layout_called.set(true);
         if !spy.layout_status.is_ok() {
             return spy.layout_status;
         }
@@ -546,6 +549,7 @@ fn po_g9_spawn_batch_column_validation_bounds() {
         layout_size: size_of::<u64>(),
         layout_align: align_of::<u64>(),
         layout_status: FfiResult::OK,
+        layout_called: core::cell::Cell::new(false),
         batch_called: false,
         last_entity_count: 0,
     };
@@ -592,9 +596,9 @@ fn po_g9_spawn_batch_column_validation_bounds() {
     assert!(!spy.batch_called);
 
     // 4. Symbolic failure and success scenarios on `validate_spawn_batch_column` and
-    //    `spawn_batch_columns`.
+    //    `spawn_batch_columns` (including `validated_typed` fast-path cases 9..=12).
     let case_idx: u8 = kani::any();
-    kani::assume(case_idx < 9);
+    kani::assume(case_idx < 13);
 
     let dummy_non_null = (&raw const data).cast::<u8>();
     let (col, entity_count, host_size, host_align) = match case_idx {
@@ -636,6 +640,7 @@ fn po_g9_spawn_batch_column_validation_bounds() {
                     2,
                     Some(size_of::<u64>()),
                     Some(align_of::<u64>()),
+                    false,
                 )
             },
             2usize,
@@ -654,6 +659,7 @@ fn po_g9_spawn_batch_column_validation_bounds() {
                         over_half,
                         Some(size_of::<u64>()),
                         Some(align_of::<u64>()),
+                        false,
                     )
                 },
                 over_half,
@@ -673,6 +679,7 @@ fn po_g9_spawn_batch_column_validation_bounds() {
                         wrap_count,
                         Some(size_of::<u64>()),
                         Some(align_of::<u64>()),
+                        false,
                     )
                 },
                 wrap_count,
@@ -688,16 +695,76 @@ fn po_g9_spawn_batch_column_validation_bounds() {
             align_of::<u64>(),
         ),
         // Valid `entity_count == 0` with `SpawnBatchColumn::new`.
-        _ => (
+        8 => (
             SpawnBatchColumn::new(BamComponent::from_raw(1), &data),
             0usize,
             size_of::<u64>(),
             align_of::<u64>(),
         ),
+        // Valid `SpawnBatchColumn::typed` skips `component_layout_info` (ignores host mismatch).
+        9 => (
+            // SAFETY: Kani probes the pre-validated `TypedComponent` fast path skipping `component_layout_info`.
+            SpawnBatchColumn::typed(
+                unsafe { TypedComponent::<u64>::from_raw_unchecked(BamComponent::from_raw(1)) },
+                &data,
+            ),
+            2usize,
+            999usize,
+            64usize,
+        ),
+        // `SpawnBatchColumn::typed` still rejects `col.entity_count < entity_count`.
+        10 => (
+            // SAFETY: Kani probes local bounds enforcement on the `TypedComponent` fast path.
+            SpawnBatchColumn::typed(
+                unsafe { TypedComponent::<u64>::from_raw_unchecked(BamComponent::from_raw(1)) },
+                &data,
+            ),
+            3usize,
+            999usize,
+            64usize,
+        ),
+        // `validated_typed` still rejects null non-empty `column_ptr`.
+        11 => (
+            // SAFETY: Kani probes null non-empty pointer rejection on the `validated_typed` fast path.
+            unsafe {
+                SpawnBatchColumn::from_parts_for_kani(
+                    BamComponent::from_raw(1),
+                    core::ptr::null(),
+                    2,
+                    Some(size_of::<u64>()),
+                    Some(align_of::<u64>()),
+                    true,
+                )
+            },
+            2usize,
+            999usize,
+            64usize,
+        ),
+        // `validated_typed` still rejects `entity_count * expected_size > isize::MAX`.
+        _ => {
+            let over_half = (isize::MAX as usize / size_of::<u64>()) + 1;
+            (
+                // SAFETY: Kani probes `isize::MAX` byte-length overflow rejection on the `validated_typed` fast path.
+                unsafe {
+                    SpawnBatchColumn::from_parts_for_kani(
+                        BamComponent::from_raw(1),
+                        dummy_non_null,
+                        over_half,
+                        Some(size_of::<u64>()),
+                        Some(align_of::<u64>()),
+                        true,
+                    )
+                },
+                over_half,
+                999usize,
+                64usize,
+            )
+        }
     };
 
     spy.layout_size = host_size;
     spy.layout_align = host_align;
+    spy.layout_called.set(false);
     spy.batch_called = false;
 
     let col_status = validate_spawn_batch_column(&host, &col, entity_count);
@@ -705,6 +772,8 @@ fn po_g9_spawn_batch_column_validation_bounds() {
     let marker_col = SpawnBatchColumn::marker(BamComponent::from_raw(2), entity_count);
     let batch_status = if case_idx == 7 {
         cmds.spawn_batch_columns(&[col, marker_col], entity_count, Some(&mut out_entities))
+    } else if case_idx == 9 {
+        cmds.spawn_batch_columns(&[col], entity_count, Some(&mut out_entities))
     } else {
         cmds.spawn_batch_columns(&[col], entity_count, None)
     };
@@ -724,10 +793,30 @@ fn po_g9_spawn_batch_column_validation_bounds() {
             assert_eq!(out_entities[0], FfiEntity::from_bits(1));
             assert_eq!(out_entities[1], FfiEntity::from_bits(2));
         }
-        _ => {
+        8 => {
             assert_eq!(batch_status, FfiResult::OK);
             assert!(spy.batch_called);
             assert_eq!(spy.last_entity_count, 0);
+        }
+        9 => {
+            assert_eq!(batch_status, FfiResult::OK);
+            assert!(!spy.layout_called.get());
+            assert!(spy.batch_called);
+            assert_eq!(spy.last_entity_count, 2);
+            assert_eq!(out_entities[0], FfiEntity::from_bits(1));
+            assert_eq!(out_entities[1], FfiEntity::from_bits(2));
+        }
+        10 => {
+            assert_eq!(batch_status, FfiResult::INVALID_ARGUMENT);
+            assert!(!spy.layout_called.get());
+        }
+        11 => {
+            assert_eq!(batch_status, FfiResult::NULL_POINTER);
+            assert!(!spy.layout_called.get());
+        }
+        _ => {
+            assert_eq!(batch_status, FfiResult::OUT_OF_RANGE);
+            assert!(!spy.layout_called.get());
         }
     }
 
@@ -740,8 +829,16 @@ fn po_g9_spawn_batch_column_validation_bounds() {
         "spawn_batch_columns Ok reachable"
     );
     kani::cover!(
+        case_idx == 9 && batch_status == FfiResult::OK && !spy.layout_called.get(),
+        "spawn_batch_columns typed fast-path Ok without layout_info reachable"
+    );
+    kani::cover!(
         batch_status == FfiResult::OUT_OF_RANGE,
         "spawn_batch_columns OUT_OF_RANGE overflow rejection reachable"
+    );
+    kani::cover!(
+        case_idx == 12 && batch_status == FfiResult::OUT_OF_RANGE && !spy.layout_called.get(),
+        "spawn_batch_columns typed OUT_OF_RANGE overflow rejection reachable"
     );
     kani::cover!(
         batch_status == FfiResult::INVALID_ARGUMENT,

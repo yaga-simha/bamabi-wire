@@ -96,9 +96,10 @@
 //!    primitives (`FfiResult`, `FfiBool`, `FfiEntity`, `StrView`, `FfiSlice`, `FfiOption`), const
 //!    SipHash-2-4-128 `ComponentUuid`, prefix-extensible descriptors (`ExtensibleStruct`,
 //!    `BamManifest`, `VTableHeader`, `BamQueryDesc`, `BamSystemDesc`, `BamObserverDesc`,
-//!    `BamRelationDesc`, `BamScheduleSetDesc`), the frozen **68-slot** `BamHostApi` table plus
-//!    byte-offset constants (`offsets::OFF64_*` / `OFF32_*`), and `AbiPod` / `ModComponent` /
-//!    `RawInsertable` traits.
+//!    `BamRelationDesc`, `BamScheduleSetDesc`), the **73-slot** `BamHostApi` table (`MIN_V0_3_SIZE`
+//!    covering the first 68 slots; full `592` B / `300` B covering `68..=72`) plus byte-offset
+//!    constants (`offsets::OFF64_*` / `OFF32_*`), and `AbiPod` / `ModComponent` / `RawInsertable`
+//!    traits.
 //! 2. **[`bamabi_macros`](../bamabi_macros/index.html)** (`#![forbid(unsafe_code)]`): Proc-macro
 //!    compiler plugin generating `#[derive(AbiPod)]` (compile-time zero-padding and field checks),
 //!    `#[derive(GuestComponent)]`, and `#[derive(ModComponent)]`, emitting `ComponentUuid`, 64-bit
@@ -107,12 +108,12 @@
 //!    constants.
 //! 3. **[`bamabi_sdk_gen`](../bamabi_sdk_gen/index.html)** (`#![forbid(unsafe_code)]`): Reads
 //!    `bamabi_sys` constants and `offsets` to render the checked-in ISO C99 header
-//!    (`include/bamabi.h`), the polyglot SDK bundle (`bamabi.h`, C++17 `bamabi.hpp` with 68/68
+//!    (`include/bamabi.h`), the polyglot SDK bundle (`bamabi.h`, C++17 `bamabi.hpp` with 73/73
 //!    slot views and RAII `ScopedTransaction`, and Zig `bamabi.zig` with `addTranslateC` views and
 //!    lossless `BamError`), and `ModComponent::C_DECL` component headers
 //!    (`include/generated/testbed_components.h`).
 //! 4. **[`bamabi_guest_sys`](../bamabi_guest_sys/index.html)** (guest `unsafe` boundary): Wraps
-//!    `*const BamHostApi` (`Host` + `host_slot!` bounds checking across all 68 slots), per-World
+//!    `*const BamHostApi` (`Host` + `host_slot!` bounds checking across all 73 slots), per-World
 //!    heap-owned `GuestInstance` with LIFO teardown, `catch_unwind` `extern "C"` panic barriers
 //!    (`panic`), lock-free `ReentrantCell`, validated slices/iterators (`ChunkColumnDispenser`,
 //!    `SparseRows`), checked `ValidatedCommands`, schema migrations, and unconditional Bevy `0.20`
@@ -137,10 +138,10 @@
 //! all 6 functional crates interlock with zero `bevy_*` dependencies:
 //!
 //! 1. **Contract (`bamabi_sys`):** `abi-lock.toml` pins `ABI 0.3.0` (`0x0003_0000`). `bamabi_sys`
-//!    freezes the `68`-slot `BamHostApi` (`MIN_V0_2_SIZE = 224` B / `116` B; `MIN_V0_3_SIZE = 552` B
-//!    / `280` B), computes `OFF64_*` / `OFF32_*` offsets via `offset_of!`, defines `FfiResult` (18
-//!    status codes), and provides `const` SipHash-2-4-128 `ComponentUuid::from_parts` plus `AbiPod`
-//!    / `ModComponent` / `RawInsertable`.
+//!    freezes the `73`-slot `BamHostApi` (`MIN_V0_2_SIZE = 224` B / `116` B; `MIN_V0_3_SIZE = 552` B
+//!    / `280` B for the first 68 slots; full `592` B / `300` B), computes `OFF64_*` / `OFF32_*`
+//!    offsets via `offset_of!`, defines `FfiResult` (18 status codes), and provides `const`
+//!    SipHash-2-4-128 `ComponentUuid::from_parts` plus `AbiPod` / `ModComponent` / `RawInsertable`.
 //! 2. **Compile-Time Derivation (`bamabi_macros`):** A component annotated with
 //!    `#[derive(ModComponent, GuestComponent)]` (or `#[derive(AbiPod, GuestComponent)]`) is
 //!    verified for `#[repr(C)]`, zero implicit padding, and POD field bounds at compile time,

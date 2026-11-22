@@ -116,6 +116,10 @@ enum RecordedCmd {
     RemoveResource {
         resource: BamComponent,
     },
+    SpawnBatch {
+        components: Vec<BamComponent>,
+        entity_count: usize,
+    },
 }
 
 /// Simulated dense archetype chunk inside [`MockV03World`].
@@ -194,7 +198,7 @@ struct MockSystemFrame {
     iters: Vec<Box<MockIterState>>,
 }
 
-/// Full ABI `0.3.0` (68-slot) mock host world exercising all v0.3 guest SDK APIs.
+/// Full ABI `0.3.0` (73-slot) mock host world exercising all v0.3 guest SDK APIs.
 struct MockV03World {
     api: BamHostApi,
     components: Vec<RegisteredComp>,
@@ -215,6 +219,7 @@ struct MockV03World {
     rollback_calls: usize,
     sys_host_ctx_calls: AtomicUsize,
     sys_commands_calls: AtomicUsize,
+    layout_info_calls: AtomicUsize,
     iter_column_info_calls: AtomicUsize,
     res_ticks_calls: AtomicUsize,
     iter_column_ro_calls: AtomicUsize,
@@ -262,7 +267,7 @@ impl core::ops::DerefMut for V03TestHost {
 }
 
 impl V03TestHost {
-    /// Creates a [`V03TestHost`] wired with a complete 68-slot ABI `0.3.0` [`BamHostApi`].
+    /// Creates a [`V03TestHost`] wired with a complete 73-slot ABI `0.3.0` [`BamHostApi`].
     fn new() -> Self {
         Self::with_api(make_v03_host_api())
     }
@@ -287,6 +292,7 @@ impl V03TestHost {
                 rollback_calls: 0,
                 sys_host_ctx_calls: AtomicUsize::new(0),
                 sys_commands_calls: AtomicUsize::new(0),
+                layout_info_calls: AtomicUsize::new(0),
                 iter_column_info_calls: AtomicUsize::new(0),
                 res_ticks_calls: AtomicUsize::new(0),
                 iter_column_ro_calls: AtomicUsize::new(0),
@@ -1195,7 +1201,42 @@ unsafe extern "C" fn host_cmd_remove(
     FfiResult::OK
 }
 
-// --- All 18 ABI 0.3.0 Host Slots (50..=67) ---
+/// Mock `BamHostApi::cmd_spawn_batch` allocating `entity_count` entities and recording `RecordedCmd::SpawnBatch`.
+unsafe extern "C" fn host_cmd_spawn_batch(
+    cmds: *mut BamCommands,
+    comps: *const BamComponent,
+    col_ptrs: *const *const u8,
+    comp_count: usize,
+    entity_count: usize,
+    out_entities: *mut FfiEntity,
+) -> FfiResult {
+    if cmds.is_null() || (comp_count > 0 && (comps.is_null() || col_ptrs.is_null())) {
+        return FfiResult::NULL_POINTER;
+    }
+    // SAFETY: Non-null `cmds` points to `MockV03World` in this test harness.
+    let world = unsafe { &mut *cmds.cast::<MockV03World>() };
+    let components = if comp_count == 0 {
+        Vec::new()
+    } else {
+        // SAFETY: `comps` is non-null and valid for `comp_count` `BamComponent` elements.
+        unsafe { core::slice::from_raw_parts(comps, comp_count) }.to_vec()
+    };
+    for i in 0..entity_count {
+        world.next_entity_bits += 1;
+        let ent = FfiEntity::from_bits(world.next_entity_bits);
+        if !out_entities.is_null() {
+            // SAFETY: Caller verified `out_entities` has at least `entity_count` writable slots.
+            unsafe { *out_entities.add(i) = ent };
+        }
+    }
+    world.commands.push(RecordedCmd::SpawnBatch {
+        components,
+        entity_count,
+    });
+    FfiResult::OK
+}
+
+// --- Extended & ABI 0.3.0 Host Slots ---
 
 /// Mock `BamHostApi::log_diagnostic` (slot 50) recording `(level, message)` diagnostics.
 unsafe extern "C" fn host_log_diagnostic(
@@ -1272,6 +1313,7 @@ unsafe extern "C" fn host_component_layout_info(
         return FfiResult::INVALID_ARGUMENT;
     }
     let world = unsafe { &*ctx.cast::<MockV03World>() };
+    world.layout_info_calls.fetch_add(1, Ordering::Relaxed);
     let Some(meta) = world.comp_meta(component) else {
         return FfiResult::NOT_FOUND;
     };
@@ -1915,9 +1957,10 @@ fn make_v03_host_api_with_batch() -> BamHostApi {
     api
 }
 
-/// Constructs a complete 68-slot ABI `0.3.0` `BamHostApi` wired to all `host_*` callbacks.
+/// Constructs an ABI `0.3.0` (73-slot) `BamHostApi` wired to `host_*` callbacks.
 fn make_v03_host_api() -> BamHostApi {
     let mut api = make_v02_only_host_api(false);
+    api.cmd_spawn_batch = Some(host_cmd_spawn_batch);
     api.log_diagnostic = Some(host_log_diagnostic);
     api.report_guest_fault = Some(host_report_guest_fault);
     api.resolve_component_by_uuid = Some(host_resolve_component_by_uuid);
@@ -4398,6 +4441,124 @@ fn res_with_ticks_64_call_loop_makes_zero_steady_state_iter_column_info_calls() 
     assert_eq!(host.run_system(0), FfiResult::OK);
     assert_eq!(host.iter_column_info_calls.load(Ordering::Relaxed), 1);
     assert_eq!(host.res_ticks_calls.load(Ordering::Relaxed), 193);
+
+    host.unload(inst);
+}
+
+#[test]
+fn spawn_batch_column_typed_skips_layout_info_and_enforces_bounds() {
+    use bamabi_guest::commands::SpawnBatchColumn;
+
+    define_pod_component!(struct BatchPos { x: f32, y: f32 } => c"wave3::BatchPos");
+    define_pod_component!(struct BatchVel { vx: f32, vy: f32 } => c"wave3::BatchVel");
+
+    let mut host = V03TestHost::new();
+    let h_pos = host.expose_component::<BatchPos>("wave3::BatchPos", BatchPos::UUID, 0, &[]);
+    let h_vel = host.expose_component::<BatchVel>("wave3::BatchVel", BatchVel::UUID, 0, &[]);
+
+    let inst = host
+        .load_fn(c"wave3_typed_batch_mod", move |app| {
+            let pos_typed = TypedComponent::<BatchPos>::validate(app.host(), h_pos)
+                .expect("valid typed BatchPos handle");
+            let vel_typed = TypedComponent::<BatchVel>::validate(app.host(), h_vel)
+                .expect("valid typed BatchVel handle");
+
+            let st = app.system(c"typed_batch_sys").build(move |ctx| {
+                let cmds = ctx.commands();
+                let short_pos = [BatchPos { x: 1.0, y: 2.0 }];
+                let positions = [
+                    BatchPos { x: 1.0, y: 2.0 },
+                    BatchPos { x: 3.0, y: 4.0 },
+                    BatchPos { x: 5.0, y: 6.0 },
+                ];
+                let vels = [
+                    BatchVel { vx: 0.1, vy: 0.2 },
+                    BatchVel { vx: 0.3, vy: 0.4 },
+                    BatchVel { vx: 0.5, vy: 0.6 },
+                ];
+
+                assert_eq!(
+                    cmds.spawn_batch(
+                        &[
+                            SpawnBatchColumn::typed(pos_typed, &short_pos),
+                            SpawnBatchColumn::typed(vel_typed, &vels),
+                        ],
+                        3,
+                    ),
+                    Err(FfiResult::INVALID_ARGUMENT)
+                );
+
+                let entities = match cmds.spawn_batch(
+                    &[
+                        SpawnBatchColumn::typed(pos_typed, &positions),
+                        SpawnBatchColumn::typed(vel_typed, &vels),
+                    ],
+                    3,
+                ) {
+                    Ok(v) => v,
+                    Err(err) => return err,
+                };
+                assert_eq!(entities.len(), 3);
+                assert!(entities.iter().all(|e| e.is_valid()));
+                assert_ne!(entities[0], entities[1]);
+                assert_ne!(entities[1], entities[2]);
+
+                let empty =
+                    match cmds.spawn_batch(&[SpawnBatchColumn::typed(pos_typed, &positions)], 0) {
+                        Ok(v) => v,
+                        Err(err) => return err,
+                    };
+                assert!(empty.is_empty());
+                FfiResult::OK
+            });
+            if !st.is_ok() {
+                return st;
+            }
+
+            app.system(c"untyped_batch_sys").build(move |ctx| {
+                let cmds = ctx.commands();
+                let positions = [
+                    BatchPos { x: 7.0, y: 8.0 },
+                    BatchPos { x: 9.0, y: 10.0 },
+                    BatchPos { x: 11.0, y: 12.0 },
+                ];
+                let entities =
+                    match cmds.spawn_batch(&[SpawnBatchColumn::new(h_pos, &positions)], 3) {
+                        Ok(v) => v,
+                        Err(err) => return err,
+                    };
+                assert_eq!(entities.len(), 3);
+                FfiResult::OK
+            })
+        })
+        .unwrap();
+
+    // Init-time TypedComponent::validate already ran `component_layout_info` for both components.
+    assert!(host.layout_info_calls.load(Ordering::Relaxed) >= 2);
+    host.layout_info_calls.store(0, Ordering::Relaxed);
+    host.sys_host_ctx_calls.store(0, Ordering::Relaxed);
+
+    // Typed batch path makes 0 `component_layout_info` and 0 `sys_host_ctx` FFI calls on tick.
+    assert_eq!(host.run_system(0), FfiResult::OK);
+    assert_eq!(host.layout_info_calls.load(Ordering::Relaxed), 0);
+    assert_eq!(host.sys_host_ctx_calls.load(Ordering::Relaxed), 0);
+    assert_eq!(
+        host.commands,
+        vec![
+            RecordedCmd::SpawnBatch {
+                components: vec![h_pos, h_vel],
+                entity_count: 3,
+            },
+            RecordedCmd::SpawnBatch {
+                components: vec![h_pos],
+                entity_count: 0,
+            },
+        ]
+    );
+
+    // Untyped batch path contrasts by invoking `component_layout_info` once per column.
+    assert_eq!(host.run_system(1), FfiResult::OK);
+    assert_eq!(host.layout_info_calls.load(Ordering::Relaxed), 1);
 
     host.unload(inst);
 }

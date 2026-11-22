@@ -30,7 +30,7 @@ Because `bamabi-wire` is Layer 0 (zero Bevy dependencies), integration tests run
 | Harness | Location | Scope |
 |---|---|---|
 | `MockHostWorld` / `TestHost` | [`tests/common/mod.rs`](tests/common/mod.rs) | Shared ABI `0.2.0` mock world implementing `BamHostApi` slots for component registration/resolution, chunk iteration, dense & sparse-set columns, untracked mutation + `mark_changed_range`, singleton resources, POD messages, random `sys_entity_get*`, parallel chunk dispatch, and `component_layout_info`. |
-| `MockV03World` / `V03TestHost` | [`tests/v03_guest_sdk_tests.rs`](tests/v03_guest_sdk_tests.rs) | Full 68-slot ABI `0.3.0` mock world implementing diagnostics (`log_diagnostic`, `report_guest_fault`), UUID resolution, schema/field layout info, typed relationships with cycle/degree enforcement, symbol interning, named objects, `iter_count`, `iter_up_cascade`, `par_for_each_chunk_readonly`, `register_system_handle`, `configure_schedule_set`, `mount_system_in_schedule`, `cmd_checkpoint` / `cmd_rollback`, and `migrate_component_column`. |
+| `MockV03World` / `V03TestHost` | [`tests/v03_guest_sdk_tests.rs`](tests/v03_guest_sdk_tests.rs) | Full 73-slot ABI `0.3.0` mock world implementing diagnostics (`log_diagnostic`, `report_guest_fault`), UUID resolution, schema/field layout info, typed relationships with cycle/degree enforcement, symbol interning, named objects, `iter_count`, `iter_up_cascade`, `par_for_each_chunk_readonly`, `register_system_handle`, `configure_schedule_set`, `mount_system_in_schedule`, `cmd_checkpoint` / `cmd_rollback`, `migrate_component_column`, `iter_next_chunk_batch`, `iter_column_ticks`, `cmd_clone_entity`, `cmd_insert_resource`, and `cmd_remove_resource`. |
 | `MockHost` / `MockSysCtxState` | [`tests/bevy_020_parity_tests.rs`](tests/bevy_020_parity_tests.rs) | Full-featured ABI `0.3.0` mock world emulating `StdTypesBridgePlugin` (including `DisabledBridge` denying raw `cmd_insert`), `ModUiBridgePlugin` string/wire VTables, `ModStateSlab`, POD and witness-backed non-POD message streams, `Children` / `RelationshipTarget` adjacency lists, `RemovedComponents` cursors, and observers. |
 
 ---
@@ -45,7 +45,7 @@ Verifies core `ABI 0.2.0` guest runtime invariants, typed queries, panic contain
 |---|---|
 | `reentrant_trampoline_conflict` | Proves lock-free `ReentrantCell` returns `FfiResult::ACCESS_CONFLICT` on re-entrant system invocation and `FfiBool::FALSE` on re-entrant `run_if`, and that an RAII guard clears active state after a panicking system (`PANIC_CAUGHT`) so subsequent ticks still execute. |
 | `column_uuid_mismatch_returns_none` | Proves `Chunk` and `SystemContext::component_resource*` reject layout-identical imposters (`ImposterPos` vs `Pos`), wrong element sizes/alignments, mutable borrows of `READ`-only columns, and mutable borrows of `BAM_COMPONENT_FLAG_IMMUTABLE` components. |
-| `unified_system_builder_compiles_queries_resources_ordering_and_flags` | Proves `SystemBuilder` compiles dense/filter/tick/optional query terms, system-level resources, schedule selection, `after`/`before` ordering, `main_thread`, and `run_if_fn` into a valid `BamSystemDesc`, and latches `CAPACITY_EXCEEDED` (> 8 queries) and `NOT_FOUND` cleanly. |
+| `unified_system_builder_compiles_queries_resources_ordering_and_flags` | Proves `SystemBuilder` compiles dense/filter/tick/optional query terms, system-level resources, schedule selection, `after`/`before` ordering, `main_thread`, and `run_if_fn` into a valid `BamSystemDesc`, and latches `CAPACITY_EXCEEDED` (> 16 queries) and `NOT_FOUND` cleanly. |
 | `sparse_rows_and_untracked_change_marking_work_end_to_end` | Proves `SparseSet` columns reject contiguous dense casts (`column`/`column_mut` return `None`) while `component_rows`/`component_rows_mut` succeed, and proves `component_mut_untracked` + `mark_changed` leaves whole-chunk change flags unset while rejecting out-of-range `mark_changed_range`. |
 | `host_handshake_custom_symbols_and_vtable_validation` | Proves `init_guest_instance` rejects under-sized `BamHostApi` (`struct_size < MIN_V0_2_SIZE`) with `INVALID_VERSION` and nulls `*instance_out`, retrieves `last_error`, resolves `"bam.v0.*"` symbols, and rejects unprefixed (`INVALID_ARGUMENT`) or missing (`NOT_FOUND`) symbols. |
 | `derive_mod_component_vtable_header_roundtrip` *(derive)* | Proves `#[derive(ModComponent)]` exports a valid `VTableHeader`-prefixed VTable whose slots round-trip via `Host::resolve_vtable` and fail with `TYPE_MISMATCH` on wrong UUID. |
@@ -69,7 +69,7 @@ Verifies core `ABI 0.2.0` guest runtime invariants, typed queries, panic contain
 
 ### [`tests/v03_guest_sdk_tests.rs`](tests/v03_guest_sdk_tests.rs)
 
-Exercises all 18 ABI `0.3.0` host slots (`50..=67`) plus graceful `0.2.0` degradation and max-arity typed queries:
+Exercises all ABI `0.3.0` host slots (`50..=72`) plus graceful `0.2.0` / `MIN_V0_3_SIZE` degradation and max-arity typed queries:
 
 | Test | Why It Exists & What It Proves |
 |---|---|

@@ -7,10 +7,10 @@
 //! ## Workspace & Crate Documentation
 //!
 //! - **This Crate (`bamabi_guest_sys`):**
-//!   - [`docs::architecture`] — Guest-side `unsafe` boundary architecture, 68-slot `host_slot!`
+//!   - [`docs::architecture`] — Guest-side `unsafe` boundary architecture, 73-slot `host_slot!`
 //!     negotiation, move-safe `GuestInstance` provenance, `ChunkColumnDispenser`, and Bevy `0.20`
 //!     `wire_types`.
-//!   - [`docs::tests`] — Integration tests, soundness regressions (`S1`–`S10`), `proptest` fuzzing,
+//!   - [`docs::tests`] — Integration tests, soundness regressions (`S1`–`S13`), `proptest` fuzzing,
 //!     and Kani formal proofs (`PO-G1`, `PO-G3`..`PO-G9`).
 //! - **Workspace-Wide Guides:**
 //!   - [`bamabi_docs`](../bamabi_docs/index.html) — Workspace landing hub across all crates
@@ -44,7 +44,7 @@
 //!
 //! ---
 //!
-//! ## Step 2: Loading & Host Table (`Host`, `ValidatedLoadCtx`, 68 Slots & `"bam.v0.*"`)
+//! ## Step 2: Loading & Host Table (`Host`, `ValidatedLoadCtx`, 73 Slots & `"bam.v0.*"`)
 //!
 //! When a host loads a guest `.cdylib` and invokes `bamabi_init`, it passes a `*const BamHostApi`
 //! function table and `*mut BamLoadCtx`:
@@ -55,12 +55,13 @@
 //!    `min(struct_size, size_of::<BamHostApi>())`, checks [`ABI_VERSION`](../bamabi_sys/constant.ABI_VERSION.html)
 //!    SemVer compatibility, and verifies all 27 mandatory core ABI `0.2` slots
 //!    (`BamHostApi::MIN_V0_2_SIZE` = `224` B on 64-bit, `116` B on 32-bit).
-//! 2. **68-Slot `covers_slot` + `UNSUPPORTED` Fallback:** The full ABI `0.3.0`
-//!    [`BamHostApi`](../bamabi_sys/host_api/struct.BamHostApi.html) contains **68** slots (`MIN_V0_3_SIZE` = `552` B on
-//!    64-bit, `280` B on 32-bit). All **41** optional/extended slots beyond the 27 core slots
-//!    (23 extended `0.2` slots + 18 `0.3.0` slots) are resolved through `host_slot!`, which checks
+//! 2. **73-Slot `covers_slot` + `UNSUPPORTED` Fallback:** The full ABI `0.3.0`
+//!    [`BamHostApi`](../bamabi_sys/host_api/struct.BamHostApi.html) contains **73** slots
+//!    (`MIN_V0_3_SIZE` = `552` B / `280` B for the first 68 slots; full `size_of` = `592` B on
+//!    64-bit, `300` B on 32-bit). All **46** optional/extended slots beyond the 27 core slots
+//!    (23 extended `0.2` slots + 23 `0.3.0` slots) are resolved through `host_slot!`, which checks
 //!    `api.covers_slot(offset_of!(..), size_of_val(..))` and `Option::is_some()`, returning
-//!    [`FfiResult::UNSUPPORTED`] cleanly when running against an older host.
+//!    [`FfiResult::UNSUPPORTED`] cleanly when running against an older or truncated host.
 //! 3. **Custom Symbols & VTables:** [`Host::resolve_custom_symbol`] and [`Host::resolve_custom_fn`]
 //!    enforce the [`CUSTOM_SYMBOL_PREFIX`] (`"bam.v0."`) namespace. [`Host::resolve_vtable`],
 //!    [`Host::resolve_mapped_wire_vtable`], and [`Host::resolve_mapped_string_vtable`] validate

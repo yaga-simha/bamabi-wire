@@ -49,10 +49,10 @@ Inside `bamabi-wire`, the 5 functional library crates and `xtask` form a strictl
 | Crate | `#![no_std]` | `#![forbid(unsafe_code)]` | External Deps | Role |
 |---|---|---|---|---|
 | `bamabi_docs` | Yes | **Yes** | **Zero** | Non-published (`publish = false`) workspace `rustdoc` landing hub (`target/doc/bamabi_docs/index.html`) embedding `README.md`, `ARCHITECTURE.md`, `DEVELOPMENT.md`, `TESTING.md`, `spec.md`, and the curated crate index |
-| `bamabi_sys` | Yes | No (`unsafe` traits/slice views) | **Zero** | ABI `0.3.0` (`0x0003_0000`) `#[repr(C)]`/`#[repr(transparent)]` primitives, 68-slot `BamHostApi`, `offsets`, `ComponentUuid` (SipHash-2-4-128), `ExtensibleStruct`, descriptors, `ModComponent`/`AbiPod`/`RawInsertable` |
+| `bamabi_sys` | Yes | No (`unsafe` traits/slice views) | **Zero** | ABI `0.3.0` (`0x0003_0000`) `#[repr(C)]`/`#[repr(transparent)]` primitives, 73-slot `BamHostApi`, `offsets`, `ComponentUuid` (SipHash-2-4-128), `ExtensibleStruct`, descriptors, `ModComponent`/`AbiPod`/`RawInsertable` |
 | `bamabi_macros` | Proc-macro | **Yes** | `syn`, `quote`, `proc-macro2`, `proc-macro-crate` | `#[derive(ModComponent, AbiPod, GuestComponent)]`, compile-time zero-padding checks, hygienic VTables, `SCHEMA_FINGERPRINT`, `BAM_FIELDS`, `REQUIRED_COMPONENTS`, `C_DECL`/`ZIG_DECL` |
 | `bamabi_sdk_gen` | `std` | **Yes** | None (`bamabi_sys` only) | Renders `include/bamabi.h` (C99), `bamabi.hpp` (C++17), `bamabi.zig` (Zig), and C99 component headers from `bamabi_sys` metadata |
-| `bamabi_guest_sys` | `std` | No (guest `unsafe` boundary) | None (`bamabi_sys` only) | `GuestInstance`, `extern "C"` panic guards (`ReentrantCell`), checked 68/68 `Host` wrappers, Bevy `0.20` `wire_types` POD mirrors, validated iterators, commands, migrations |
+| `bamabi_guest_sys` | `std` | No (guest `unsafe` boundary) | None (`bamabi_sys` only) | `GuestInstance`, `extern "C"` panic guards (`ReentrantCell`), checked 73/73 `Host` wrappers, Bevy `0.20` `wire_types` POD mirrors, validated iterators, commands, migrations |
 | `bamabi_guest` | `std` | **Yes** | None (`bamabi_sys`, `bamabi_guest_sys`, opt. `bamabi_macros`) | Ergonomic safe Rust `.cdylib` SDK (`GuestPlugin`, `GuestApp`, `BevySchedules`, `conditions::*`, `1..=16`-term `QueryTuple`, `Or<(T0..T7)>`, `GuestTransaction`, `ObserverBuilder`, `bridges`, `export_mod!`) |
 | `xtask` | `std` | **Yes** | None (`bamabi_sys`, `bamabi_macros`, `bamabi_sdk_gen`) | Local & CI runner (`fmt`, `lint`, `test`, `c-test`, `header`, `gen-component-headers`, `audit`, `miri`, `kani`, `nightly`, `ci`) |
 
@@ -67,7 +67,7 @@ Inside `bamabi-wire`, the 5 functional library crates and `xtask` form a strictl
    - All foreign function pointers use `Option<unsafe extern "C" fn(...)>` so all-bits-zero is guaranteed `None`.
 4. **Prefix Extensibility (`ExtensibleStruct`) & `BamHostApi` Slot Negotiation:**
    - Every extensible descriptor (`BamManifest`, `BamHostApi`, `BamQueryDesc`, `BamSystemDesc`, `BamObserverDesc`, `BamTriggerDesc`, `ComponentDesc`, `BamFieldDesc`, `BamRequiredComponent`, `BamRelationDesc`, `BamLayoutInfo`, `BamScheduleSetDesc`, `VTableHeader`) places `pub struct_size: u32` at byte offset `0` and defines frozen `MIN_V0_2_SIZE` / `MIN_V0_3_SIZE` constants via `offset_of!`.
-   - `BamHostApi` freezes `MIN_V0_2_SIZE = 224` B (64-bit) / `116` B (32-bit) for the 27 core slots, `224..408` / `116..208` for the 23 extended `0.2.x` slots, and `MIN_V0_3_SIZE = 552` B (64-bit) / `280` B (32-bit) for all **68/68** live slots (`SLOT_COUNT = 68`).
+   - `BamHostApi` freezes `MIN_V0_2_SIZE = 224` B (64-bit) / `116` B (32-bit) for the 27 core slots, `224..408` / `116..208` for the 23 extended `0.2.x` slots, `MIN_V0_3_SIZE = 552` B (64-bit) / `280` B (32-bit) for the first 68 slots (`migrate_component_column` at slot 67), and `size_of = 592` B (64-bit) / `300` B (32-bit) for all **73/73** live slots (`SLOT_COUNT = 73`).
    - Guests check `api.struct_size >= BamHostApi::MIN_V0_2_SIZE` and probe extended slots with `BamHostApi::covers_slot(offset, slot_size)` (mirroring `bamabi_sys::offsets::{OFF64_*, OFF32_*}`), returning `FfiResult::UNSUPPORTED` if an older host table omits an optional slot.
 
 ## 3. ABI `0.3.0` (`0x0003_0000`) Host-Guest Lifecycle
@@ -82,7 +82,7 @@ Inside `bamabi-wire`, the 5 functional library crates and `xtask` form a strictl
      Validate struct_size, ABI version, flags
   3. Open LoadTransaction
   4. Call bamabi_init(api, load_ctx, &mut inst)► GuestInstance::init(...)
-       - resolve/register components & relations   - validates BamHostApi & copies 68 slots
+       - resolve/register components & relations   - validates BamHostApi & copies 73 slots
        - intern symbols, bind named objects        - registers components, systems, observers,
        - register systems, schedule sets, mounts     schedule sets, relations
        - if Err: rollback LoadTransaction          - if Err: drops partial GuestInstance, no shutdown
@@ -126,8 +126,8 @@ Every opaque handle issued by the host is strictly scoped and must never be cach
 
 `bamabi_sys` is the single source of truth for wire types, `ComponentUuid` SipHash-2-4-128 constants, and `BamHostApi` offsets (`bamabi_sys::offsets`):
 
-1. **`bamabi_sdk_gen::header_gen`** reads `bamabi_sys::offsets` and ABI constants to render ISO C99 [`include/bamabi.h`](include/bamabi.h) (`BAM_EXPORT`, `BAM_RESTRICT`, all 68 `BAM_HOST_API_OFFSET_*`, `bam_uuid_from_parts`, and 64-bit/32-bit `BAM_STATIC_ASSERT` checks). Parity is enforced by `cargo xtask header --check` and `crates/bamabi_sdk_gen/tests/header_parity.rs`.
-2. **`bamabi_sdk_gen::sdk`** embeds and exports the polyglot bundle (`export_sdk`): `bamabi.h` (C99), `bamabi.hpp` (C++17 68/68 slot view wrappers + RAII `ScopedTransaction`), and `bamabi.zig` (Zig `b.addTranslateC` `"bam_c"` 68/68 slot views + lossless 18-code `BamError`).
+1. **`bamabi_sdk_gen::header_gen`** reads `bamabi_sys::offsets` and ABI constants to render ISO C99 [`include/bamabi.h`](include/bamabi.h) (`BAM_EXPORT`, `BAM_RESTRICT`, all 73 `BAM_HOST_API_OFFSET_*`, `bam_uuid_from_parts`, and 64-bit/32-bit `BAM_STATIC_ASSERT` checks). Parity is enforced by `cargo xtask header --check` and `crates/bamabi_sdk_gen/tests/header_parity.rs`.
+2. **`bamabi_sdk_gen::sdk`** embeds and exports the polyglot bundle (`export_sdk`): `bamabi.h` (C99), `bamabi.hpp` (C++17 73/73 slot view wrappers + RAII `ScopedTransaction`), and `bamabi.zig` (Zig `b.addTranslateC` `"bam_c"` 73/73 slot views + lossless 18-code `BamError`).
 3. **`bamabi_macros` + `bamabi_sdk_gen::component_header` + `xtask/src/component_headers.rs`**: `#[derive(ModComponent)]` emits compile-time `ModComponent::C_DECL` and `ZIG_DECL` constants; `cargo xtask gen-component-headers` collects `section_for::<T>()` into [`include/generated/testbed_components.h`](include/generated/testbed_components.h).
 
 ## 6. How Everything Ties Together: End-to-End Walkthrough
@@ -135,14 +135,14 @@ Every opaque handle issued by the host is strictly scoped and must never be cach
 To see how all 6 workspace crates interlock without a single `bevy_*` dependency, trace one concrete feature end-to-end: defining a `#[derive(ModComponent, GuestComponent)]` component (`Health`), running a system that queries and updates it via deferred commands (`GuestCommands`), exporting polyglot C99/C++17/Zig headers, and passing `cargo xtask ci`:
 
 ```text
-  1. bamabi_sys        ──► Wire types, offsets (68 slots), ComponentUuid, AbiPod & ModComponent traits
+  1. bamabi_sys        ──► Wire types, offsets (73 slots), ComponentUuid, AbiPod & ModComponent traits
          │
          ▼
   2. bamabi_macros     ──► #[derive(ModComponent, GuestComponent)]: zero-pad checks, VTableHeader + C_DECL/ZIG_DECL
          │
          ├──► 3. bamabi_sdk_gen  ──► include/bamabi.h, bamabi.hpp, bamabi.zig, include/generated/testbed_components.h
          │
-         ├──► 4. bamabi_guest_sys ──► Host (68-slot covers_slot), GuestInstance, ReentrantCell, catch_guest_result
+         ├──► 4. bamabi_guest_sys ──► Host (73-slot covers_slot), GuestInstance, ReentrantCell, catch_guest_result
          │          │
          │          ▼
          └──► 5. bamabi_guest    ──► #![forbid(unsafe_code)] GuestPlugin, GuestApp, QueryTuple, GuestCommands
@@ -151,12 +151,12 @@ To see how all 6 workspace crates interlock without a single `bevy_*` dependency
              6. xtask            ──► header --check, gen-component-headers --check, lint, test, c-test (ASan/UBSan)
 ```
 
-### Step 1 (`bamabi_sys`): Wire Primitives, 68-Slot `offsets`, and Identity Hashing
+### Step 1 (`bamabi_sys`): Wire Primitives, 73-Slot `offsets`, and Identity Hashing
 
 Everything begins in [`bamabi_sys`](crates/bamabi_sys/README.md) (`#![no_std]`, zero dependencies):
 
 - **Deterministic wire primitives:** Components, queries, and commands cross `extern "C"` using `#[repr(C)]` / `#[repr(transparent)]` types with no Rust-ABI assumptions: `FfiEntity`, `BamComponent` (1-based `u32` handle), `FfiResult` (18-code `u32` status), `FfiBool` (`u8`), `FfiOption<T>`, and `FfiSlice<T>` / `StrView`.
-- **Single-source-of-truth offsets (`bamabi_sys::offsets`):** `BamHostApi` declares `struct_size`, `abi_version`, and all **68** host function-pointer slots (`MIN_V0_2_SIZE = 224` B / `116` B; `MIN_V0_3_SIZE = 552` B / `280` B). `bamabi_sys::offsets` computes `OFF64_*`, `OFF32_*`, `SIZE_64 = 552`, `SIZE_32 = 280`, and `SLOT_COUNT = 68` via `core::mem::offset_of!`.
+- **Single-source-of-truth offsets (`bamabi_sys::offsets`):** `BamHostApi` declares `struct_size`, `abi_version`, and all **73** host function-pointer slots (`MIN_V0_2_SIZE = 224` B / `116` B; `MIN_V0_3_SIZE = 552` B / `280` B; full `size_of = 592` B / `300` B). `bamabi_sys::offsets` computes `OFF64_*`, `OFF32_*`, `SIZE_64 = 592`, `SIZE_32 = 300`, and `SLOT_COUNT = 73` via `core::mem::offset_of!`.
 - **Const UUID & Schema Fingerprint:** `ComponentUuid::from_parts(name, size, align, field_schema_hash)` hashes component identity in `const` using keyed SipHash-2-4-128 (`SIPHASH_KEY_0`, `SIPHASH_KEY_1`), while `ModComponent::SCHEMA_FINGERPRINT` carries a 64-bit FNV-1a structural hash (`FNV1A_64_OFFSET_BASIS`, `FNV1A_64_PRIME`).
 - **Safety contracts:** `RawInsertable`, `AbiPod`, and `ModComponent` define the trait contract enforced at compile time (`assert_abi_pod::<T>()`).
 
@@ -186,15 +186,15 @@ pub struct Health {
 
 [`bamabi_sdk_gen`](crates/bamabi_sdk_gen/README.md) (`#![forbid(unsafe_code)]`, depends only on `bamabi_sys`) turns Rust wire metadata into polyglot headers without duplicating constants:
 
-- **Core ABI header (`header_gen::render_c99_header`):** Reads `bamabi_sys::offsets` and a 20-struct layout specification table (`wire_struct_specs`), verifies `verify_host_rust_layouts()` and `BAM_HOST_API_SLOT_COUNT == 68` before emitting a single byte, and renders [`include/bamabi.h`](include/bamabi.h) with all 68 `BAM_HOST_API_OFFSET_*` macros, `bam_uuid_from_parts`, `bam_host_api_covers_slot`, `bam_host_api_copy_bounded`, and 64-bit/32-bit `BAM_STATIC_ASSERT` checks.
-- **Polyglot bundle (`sdk::export_sdk`):** Emits `bamabi.h` (C99), `bamabi.hpp` (C++17 68/68 slot view wrappers + RAII `ScopedTransaction`), and `bamabi.zig` (Zig `0.16` `b.addTranslateC` `"bam_c"` bindings + lossless 18-code `BamError`) so C/C++/Zig mods see the exact same `BamHostApi` table as Rust mods.
+- **Core ABI header (`header_gen::render_c99_header`):** Reads `bamabi_sys::offsets` and a 20-struct layout specification table (`wire_struct_specs`), verifies `verify_host_rust_layouts()` and `BAM_HOST_API_SLOT_COUNT == 73` before emitting a single byte, and renders [`include/bamabi.h`](include/bamabi.h) with all 73 `BAM_HOST_API_OFFSET_*` macros, `bam_uuid_from_parts`, `bam_host_api_covers_slot`, `bam_host_api_copy_bounded`, and 64-bit/32-bit `BAM_STATIC_ASSERT` checks.
+- **Polyglot bundle (`sdk::export_sdk`):** Emits `bamabi.h` (C99), `bamabi.hpp` (C++17 73/73 slot view wrappers + RAII `ScopedTransaction`), and `bamabi.zig` (Zig `0.16` `b.addTranslateC` `"bam_c"` bindings + lossless 18-code `BamError`) so C/C++/Zig mods see the exact same `BamHostApi` table as Rust mods.
 - **Component declarations (`component_header`):** `section_for::<Health>()` reads `(Health::CANONICAL_NAME, Health::IS_ABI_POD, Health::C_DECL)` and `render_component_header` wraps it in `#ifndef` guards, `#include "../bamabi.h"`, and `extern "C"` blocks (used to generate [`include/generated/testbed_components.h`](include/generated/testbed_components.h)).
 
 ### Step 4 (`bamabi_guest_sys`): Host Table Validation, Panic Boundary & Data Plane
 
 [`bamabi_guest_sys`](crates/bamabi_guest_sys/README.md) isolates every guest-side `unsafe` operation behind fail-closed runtime checks:
 
-- **Instance & table handshake (`bamabi_init`):** `init_guest_instance` allocates a heap-owned per-World `GuestInstance` (zero process-global mutable state). `Host::from_load_ctx` copies `min(struct_size, size_of::<BamHostApi>())` bytes via `read_descriptor::<BamHostApi>`, enforces `abi_version_is_compatible` and the 27 core `0.2` slots, and probes all 41 extended/v0.3 slots via `BamHostApi::covers_slot` (returning `FfiResult::UNSUPPORTED` if absent).
+- **Instance & table handshake (`bamabi_init`):** `init_guest_instance` allocates a heap-owned per-World `GuestInstance` (zero process-global mutable state). `Host::from_load_ctx` copies `min(struct_size, size_of::<BamHostApi>())` bytes via `read_descriptor::<BamHostApi>`, enforces `abi_version_is_compatible` and the 27 core `0.2` slots, and probes all 46 extended/v0.3 slots via `BamHostApi::covers_slot` (returning `FfiResult::UNSUPPORTED` if absent).
 - **Registration & VTables:** `ValidatedLoadCtx::register_pod_component` populates `ComponentDesc` (with `schema_fingerprint`, `fields`, and `required_init_descs`) and invokes `BamHostApi::register_component` to obtain a 1-based `BamComponent` handle. Host-exported VTables can also be resolved and verified (`VTableHeader` size/version/UUID) via `Host::resolve_vtable`.
 - **Lock-free re-entrancy & panic containment:** `register_system_closure` wraps each `FnMut` system closure in `ReentrantCell<F>` (`UnsafeCell` + `AtomicBool` `Acquire`/`Release` + `ReleaseGuard`), rejecting re-entrant execution with `FfiResult::ACCESS_CONFLICT`. Its `extern "C"` trampoline (`BamSystemFn`) executes inside `panic::catch_guest_result` (`catch_unwind`), dropping any panic payload on the guest heap and returning `FfiResult::PANIC_CAUGHT` (`3`) instead of unwinding across `extern "C"`.
 - **Validated iteration & deferred commands:** Inside the system tick, `ValidatedIter` checks `BamColumnInfo` (`mode`, `size`, `align`, `uuid`, storage flags) and `ChunkColumnDispenser` prevents mutable aliasing across query terms; `ValidatedCommands::insert` validates `BamLayoutInfo` (and `SpawnEntry::new::<T>` checks `(size, align)` on batched spawns) before calling `BamHostApi::cmd_insert` on `*mut BamCommands`.

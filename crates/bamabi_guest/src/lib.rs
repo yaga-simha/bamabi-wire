@@ -97,7 +97,7 @@
 //!   over `&T`, `&mut T`, `Option<&T>`, `Option<&mut T>`, [`With<T>`], [`Without<T>`],
 //!   [`Changed<T>`], [`Added<T>`], [`Allow<T>`], [`Has<T>`], [`Or<(T0, T1, ...)>`] (2..=8
 //!   branches, plus [`Or2`] / [`Or3`] aliases), and [`FfiEntity`]. Up to [`MAX_QUERIES_PER_SYSTEM`]
-//!   (8) queries per system are supported (`ctx.single_query`, `ctx.query_typed`,
+//!   (16) queries per system are supported (`ctx.single_query`, `ctx.query_typed`,
 //!   `ctx.queries_2_typed`, `ctx.queries_3_typed`).
 //! - **Dynamic Queries & `RemovedComponents`:** [`SystemBuilder::query`] + [`QueryBuilder`]
 //!   support handle-based, dynamic, and entity-disabling terms (`allow_disabled`, `with_disabled`,

@@ -37,7 +37,7 @@
 //!
 //! Rather than duplicating wire constants by hand, [`header_gen`] reads ABI constants, flags,
 //! error discriminants, and the [`bamabi_sys::offsets`] table (`OFF64_*`, `OFF32_*`,
-//! `SIZE_64 = 552`, `SIZE_32 = 280`, `SLOT_COUNT = 68`) directly from [`bamabi_sys`].
+//! `SIZE_64 = 592`, `SIZE_32 = 300`, `SLOT_COUNT = 73`) directly from [`bamabi_sys`].
 //!
 //! Before emitting C99 source text, [`render_c99_header`] constructs a unified 20-struct layout
 //! specification table (`wire_struct_specs`) and runs two pre-emission checks:
@@ -46,7 +46,7 @@
 //!    and `offset_of!` of every primitive newtype and all 20 wire structs on the current host
 //!    (`64`-bit or `32`-bit) against the frozen ABI `0.3.0` layout table.
 //! 2. **VTable slot count check:** Asserts that `BamHostApi` declares exactly
-//!    `BAM_HOST_API_SLOT_COUNT` (`68`) function-pointer slots after `(struct_size, abi_version)`.
+//!    `BAM_HOST_API_SLOT_COUNT` (`73`) function-pointer slots after `(struct_size, abi_version)`.
 //!
 //! The generated C99 header then emits `BAM_STATIC_ASSERT` guards for both `64`-bit
 //! (`UINTPTR_MAX == 0xffffffffffffffffULL`) and `32`-bit (`UINTPTR_MAX == 0xffffffffUL`) targets,
@@ -56,7 +56,7 @@
 //! ## Step 3: Generating Core Headers & Language SDKs
 //!
 //! - [`render_c99_header`] synthesizes the 6-section ISO C99 header (`BAM_EXPORT`, `BAM_UNUSED`,
-//!   `BAM_RESTRICT`, `BAM_ALIGNOF`, `BAM_STATIC_ASSERT`, all 68 `BAM_HOST_API_OFFSET_*` macros,
+//!   `BAM_RESTRICT`, `BAM_ALIGNOF`, `BAM_STATIC_ASSERT`, all 73 `BAM_HOST_API_OFFSET_*` macros,
 //!   prefix-extensibility `BAM_*_MIN_V0_2_SIZE` / `BAM_*_MIN_V0_3_SIZE` bounds, and `bam_*`
 //!   inline helpers including `SipHash-2-4-128` `bam_uuid_from_parts`, `bam_host_api_covers_slot`,
 //!   and `bam_host_api_copy_bounded`).
@@ -65,12 +65,12 @@
 //! - [`export_sdk`] writes `bamabi.h`, `bamabi.hpp` ([`CPP17_HEADER`]), and `bamabi.zig`
 //!   ([`ZIG_SDK`]) into an output directory for `cargo bam export-sdk` and polyglot consumers:
 //!   - [`CPP17_HEADER`] adds `bam::offsets::*` compile-time constants, `copy_column_restricted`
-//!     using `BAM_RESTRICT`, `guard_boundary`, 68-slot views (`HostContextView`, `LoadContextView`,
+//!     using `BAM_RESTRICT`, `guard_boundary`, 73-slot views (`HostContextView`, `LoadContextView`,
 //!     `ChunkView`, `CommandsView`, `SystemContextView`), and RAII [`ScopedTransaction`][cpp_tx].
 //!   - [`ZIG_SDK`] targets Zig `0.16` `b.addTranslateC` (`@import("bam_c")`), providing
 //!     `BAM_RESTRICT_QUALIFIER = "noalias"`, `copyColumnNoAlias`, `offsets.*` /
 //!     `BAM_HOST_API_OFFSET_*`, lossless 18-code `BamError` (`checkResult` / `mapError`), and
-//!     68-slot view structs.
+//!     73-slot view structs.
 //!
 //! [cpp_tx]: sdk::CPP17_HEADER
 //!

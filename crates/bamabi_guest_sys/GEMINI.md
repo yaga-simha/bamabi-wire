@@ -17,15 +17,15 @@ Crate guide for **`bamabi_guest_sys`** (`v0.3.0`, ABI `0x0003_0000`) — low-lev
 ---
 
 ## 3. Owned Surface
-- **`Host` & `ValidatedLoadCtx` (`host.rs`, `lib.rs`):** Bounded `BamHostApi` copy, `ABI 0.3.0` SemVer verification, `covers_slot` + `Option` guards on all **68/68** host slots (`host_slot!` macro), `"bam.v0.*"` lookup, and `VTableHeader` checks.
+- **`Host` & `ValidatedLoadCtx` (`host.rs`, `lib.rs`):** Bounded `BamHostApi` copy, `ABI 0.3.0` SemVer verification, `covers_slot` + `Option` guards on all **73/73** host slots (`host_slot!` macro), `"bam.v0.*"` lookup, and `VTableHeader` checks.
 - **`GuestInstance` (`instance.rs`):** Per-World heap state owner with raw-owned runtime allocations (`into_raw`/`from_raw` — move-safe under Stacked & Tree Borrows), deterministic LIFO closure teardown, and zero process-global mutable state.
 - **Panic & Re-entrancy Guards (`panic.rs`):** `catch_guest_result`, `catch_guest_bool`, `catch_guest_unit` across all `extern "C"` entry points (including `forward_field` and `append_field` in `iter.rs`) + lock-free `ReentrantCell`.
-- **Validated Wrappers (`trampoline.rs`, `iter.rs`, `commands.rs`, `component.rs`):** Fail-closed `component_layout_info` validation on handle-based resource/wire/moved-component APIs (`insert_moved`, `spawn_moved`, `SpawnEntry`, `SpawnBatchColumn`), non-`Copy` `ValidatedSystemRef`, exact `M::UUID` checks on non-POD messages, `stride != 0` / `isize::MAX` / alignment / byte-overlap guards across dense slices & sparse rows.
+- **Validated Wrappers (`trampoline.rs`, `iter.rs`, `commands.rs`, `component.rs`):** Fail-closed `component_layout_info` validation on handle-based resource/wire/moved-component APIs (`insert_moved`, `spawn_moved`, `SpawnEntry`, `SpawnBatchColumn`), `TypedComponent<T>` (`SpawnEntry::typed`, `SpawnBatchColumn::typed`, `insert_typed`, `insert_if_new_typed`, `insert_resource_typed`), non-`Copy` `ValidatedSystemRef`, persistent `QuerySlotScratch` per-system cache, exact `M::UUID` checks on non-POD messages, `stride != 0` / `isize::MAX` / alignment / byte-overlap guards across dense slices & sparse rows.
 
 ---
 
 ## 4. Strict Engineering Rules
-1. **Zero Soundness Regressions (S1–S8):** Never allow unchecked handle sizes/UUIDs/alignments, `Copy` mutable system handles, unguarded `extern "C"` callbacks that can unwind, or `Box`-move pointer retagging UB.
+1. **Zero Soundness Regressions (S1–S13):** Never allow unchecked handle sizes/UUIDs/alignments, `Copy` mutable system handles, unguarded `extern "C"` callbacks that can unwind, or `Box`-move pointer retagging UB.
 2. **Allocator Isolation:** Unwind payloads, closures, and guest buffers MUST be allocated and dropped strictly on the guest heap.
 3. **Miri Dual-Model Gate:** Changes to `instance.rs`, `trampoline.rs`, `iter.rs`, or `commands.rs` MUST pass Miri under both Tree Borrows and Stacked Borrows (`tests/soundness_regressions.rs`).
 4. **Preserve MSRV `1.87`:** Keep `rust-version = "1.87"` in `Cargo.toml` so guests targeting older Rust compilers than the host (`1.95`) continue building cleanly across mismatched toolchains.

@@ -1132,7 +1132,7 @@ static void test_extended_wire_descriptors(void) {
     assert(trig_desc.struct_size == (uint32_t)sizeof(BamTriggerDesc));
     assert(trig_desc.entity_lo == 99u && trig_desc.reserved0 == 0u);
 
-    /* 6. Extended BamSystemDesc & 68-slot BamHostApi */
+    /* 6. Extended BamSystemDesc & 73-slot BamHostApi */
     assert(strcmp(BAM_CHILDREN_NAME, "bevy_ecs::hierarchy::Children") == 0);
     assert(strcmp(BAM_DISABLED_NAME, "bevy_ecs::entity_disabling::Disabled") == 0);
     assert(bam_uuid_equals(

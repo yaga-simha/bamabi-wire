@@ -114,6 +114,15 @@ const _: () = {
 
 /// Metadata returned by [`BamIterColumnInfoFn`] (`iter_column_info`) for guest type-confusion checks.
 ///
+/// # Per-System Invariance Contract
+/// For any registered system ([`BamSystemDesc`](crate::BamSystemDesc)), the [`BamColumnInfo`]
+/// (`component`, `mode`, `uuid`, `size`, `align`, `storage_flags`) written by `iter_column_info`
+/// for a given `(query_index, term_index)` is **invariant across all chunks and across all
+/// [`BamSystemFn`](crate::BamSystemFn) ticks** for the entire lifetime of that registered system
+/// (upheld across multi-mod reloads by [`BamMigrateComponentColumnFn`](crate::BamMigrateComponentColumnFn)'s
+/// cross-mod `FfiResult::ACCESS_CONFLICT` exclusivity guard). Guests may therefore validate and
+/// cache `BamColumnInfo` once per registered query slot.
+///
 /// Layout:
 /// - 64-bit: `48` bytes, `8`-byte alignment, zero implicit padding.
 /// - 32-bit: `40` bytes, `4`-byte alignment, zero implicit padding.
@@ -321,6 +330,18 @@ pub type BamIterColumnRowsMutableFn =
 
 /// Writes type, layout, and storage metadata for `term_index` (entity column or resource term)
 /// into `*out_info`.
+///
+/// # Per-System Invariance Contract
+/// For any registered system ([`BamSystemDesc`](crate::BamSystemDesc)), the [`BamColumnInfo`]
+/// (`component`, `mode`, `uuid`, `size`, `align`, `storage_flags`) returned by `iter_column_info`
+/// for a given `(query_index, term_index)` is **invariant across all chunks and across all
+/// [`BamSystemFn`](crate::BamSystemFn) ticks** for the lifetime of that registered system.
+///
+/// Consequently, guests (including `bamabi_guest_sys::QuerySlotScratch` and raw pointer casts in
+/// C99/C++17/Zig guests) may validate and cache `BamColumnInfo` once per registered query slot.
+/// Hosts **MUST NOT** mutate any observable `BamColumnInfo` property mid-lifetime; see
+/// [`BamMigrateComponentColumnFn`](crate::BamMigrateComponentColumnFn) for the cross-mod
+/// `FfiResult::ACCESS_CONFLICT` exclusivity rule during schema migrations.
 ///
 /// # Safety
 /// - `iter` must point to an active [`BamIter`].

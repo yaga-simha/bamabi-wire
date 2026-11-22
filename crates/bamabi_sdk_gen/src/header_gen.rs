@@ -81,7 +81,7 @@ struct StructLayoutSpec {
 /// Builds the complete layout specification table for all C-ABI `0.3.0` wire structs.
 ///
 /// Intended purpose: centralizes every wire struct's 64-bit and 32-bit sizes, alignments, and
-/// field offsets (including all 68 `BamHostApi` vtable slots from `bamabi_sys::offsets`) so
+/// field offsets (including all 73 `BamHostApi` vtable slots from `bamabi_sys::offsets`) so
 /// `render_c99_header` validates Rust layouts and emits matching C99 static assertions from one table.
 ///
 /// What it does: constructs and returns a `Vec<StructLayoutSpec>` covering `BamComponentUuid`,
@@ -1848,7 +1848,7 @@ fn verify_host_rust_layouts(specs: &[StructLayoutSpec]) -> Result<(), String> {
 /// bindings so `include/bamabi.h` is always byte-for-byte consistent with `bamabi_sys`.
 ///
 /// What it does: validates host Rust layouts via `verify_host_rust_layouts`, verifies that
-/// `BamHostApi` contains exactly `BAM_HOST_API_SLOT_COUNT` (68) function-pointer slots, and
+/// `BamHostApi` contains exactly `BAM_HOST_API_SLOT_COUNT` (73) function-pointer slots, and
 /// emits six ordered sections: portability macros (`BAM_EXPORT`, `BAM_RESTRICT`, `BAM_STATIC_ASSERT`),
 /// ABI version/limits, primitive/flag constants, wire structs and function-pointer typedefs,
 /// inline C99 helpers (`bam_*` including SipHash-2-4-128 UUID computation), and 64-bit/32-bit
@@ -2515,7 +2515,7 @@ pub fn render_c99_header() -> Result<String, String> {
          }} BamMappedStringVTable;\n"
     );
 
-    // BamHostApi function pointer typedefs + 68-slot struct + MIN_SIZE + OFFSET macros
+    // BamHostApi function pointer typedefs + 73-slot struct + MIN_SIZE + OFFSET macros
     out.push_str(
         "/* --- Mandatory Guest Entry-Point Typedefs --- */\n\
          typedef const BamManifest* (*BamManifestFn)(void);\n\
@@ -2543,6 +2543,10 @@ pub fn render_c99_header() -> Result<String, String> {
          typedef BamResult          (*BamIterMarkChangedRangeFn)(BamIter* iter, size_t term_index, size_t start_row, size_t row_count);\n\
          typedef const uint8_t* const* (*BamIterColumnRowsReadonlyFn)(BamIter* iter, size_t term_index);\n\
          typedef uint8_t* const*    (*BamIterColumnRowsMutableFn)(BamIter* iter, size_t term_index);\n\
+         /* Per-system invariance: for any registered BamSystemDesc, BamColumnInfo\n\
+          * (component, mode, uuid, size, align, storage_flags) at (query_index, term_index)\n\
+          * is invariant across all chunks and BamSystemFn ticks for that system's lifetime,\n\
+          * permitting guests to validate and cache BamColumnInfo once per query slot. */\n\
          typedef BamResult          (*BamIterColumnInfoFn)(const BamIter* iter, size_t term_index, BamColumnInfo* out_info);\n\n\
          /* --- 5. Declaration-Indexed Singleton Resource Access --- */\n\
          typedef const uint8_t* (*BamResPtrFn)(const BamIter* iter, size_t term_index);\n\
@@ -2594,6 +2598,12 @@ pub fn render_c99_header() -> Result<String, String> {
          typedef BamResult (*BamCmdRollbackFn)(BamCommands* commands, size_t checkpoint);\n\
          typedef BamResult (*BamCmdInsertRelationFn)(BamCommands* commands, BamEntity entity, BamComponent relation, BamEntity target, const void* data, size_t data_size);\n\
          typedef BamResult (*BamCmdRemoveRelationFn)(BamCommands* commands, BamEntity entity, BamComponent relation, BamEntity target);\n\
+         /* Host exclusivity contract (slot 67): valid strictly in bamabi_init (exclusive\n\
+          * &mut World). Zero-copy retention preserves BamColumnInfo when old_fingerprint matches.\n\
+          * If changing any BamColumnInfo-observable property (uuid, size, align, storage_flags)\n\
+          * while another loaded mod owns an active system or observer referencing component,\n\
+          * the host MUST reject atomically with BAM_RESULT_ACCESS_CONFLICT unless cascading\n\
+          * reload unloads/reloads dependent mods before running schedules. */\n\
          typedef BamResult (*BamMigrateComponentColumnFn)(BamLoadCtx* load_ctx, BamComponent component, uint64_t old_fingerprint, const BamComponentDesc* new_desc, BamRowMigrateFn migrate_fn, void* user_data);\n\
          typedef BamBool   (*BamIterNextChunkBatchFn)(BamIter* iter, size_t* out_len, const BamEntity** out_entities, uint8_t** out_col_ptrs, size_t col_count, uint32_t mark_changed_mask);\n\
          typedef BamResult (*BamIterColumnTicksFn)(const BamIter* iter, size_t term_index, const uint32_t** out_added, const uint32_t** out_changed, uint32_t* out_last_run, uint32_t* out_this_run);\n\
@@ -3353,9 +3363,9 @@ mod tests {
     use super::*;
 
     /// Test scenario: verifies that `render_c99_header()` is byte-for-byte deterministic across
-    /// repeated calls, emits `ABI_VERSION = 0x00030000u`, 68 `BAM_HOST_API_OFFSET_*` macros,
+    /// repeated calls, emits `ABI_VERSION = 0x00030000u`, 73 `BAM_HOST_API_OFFSET_*` macros,
     /// `BAM_EXPORT`/`BAM_RESTRICT` portability definitions, 64-bit/32-bit `BAM_STATIC_ASSERT`
-    /// checks (552 B / 280 B for `BamHostApi`, 176 B / 104 B for `BamComponentDesc`), excludes
+    /// checks (592 B / 300 B for `BamHostApi`, 176 B / 104 B for `BamComponentDesc`), excludes
     /// removed v0.1 unprefixed typedefs, and matches the golden SipHash-2-4-128 UUID vectors
     /// tested identically in `tests/standalone_c_test.c`.
     #[test]

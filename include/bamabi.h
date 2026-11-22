@@ -624,6 +624,10 @@ typedef uint8_t*           (*BamIterColumnMutableUntrackedFn)(BamIter* iter, siz
 typedef BamResult          (*BamIterMarkChangedRangeFn)(BamIter* iter, size_t term_index, size_t start_row, size_t row_count);
 typedef const uint8_t* const* (*BamIterColumnRowsReadonlyFn)(BamIter* iter, size_t term_index);
 typedef uint8_t* const*    (*BamIterColumnRowsMutableFn)(BamIter* iter, size_t term_index);
+/* Per-system invariance: for any registered BamSystemDesc, BamColumnInfo
+* (component, mode, uuid, size, align, storage_flags) at (query_index, term_index)
+* is invariant across all chunks and BamSystemFn ticks for that system's lifetime,
+* permitting guests to validate and cache BamColumnInfo once per query slot. */
 typedef BamResult          (*BamIterColumnInfoFn)(const BamIter* iter, size_t term_index, BamColumnInfo* out_info);
 
 /* --- 5. Declaration-Indexed Singleton Resource Access --- */
@@ -679,6 +683,12 @@ typedef BamResult (*BamCmdCheckpointFn)(BamCommands* commands, size_t* out_check
 typedef BamResult (*BamCmdRollbackFn)(BamCommands* commands, size_t checkpoint);
 typedef BamResult (*BamCmdInsertRelationFn)(BamCommands* commands, BamEntity entity, BamComponent relation, BamEntity target, const void* data, size_t data_size);
 typedef BamResult (*BamCmdRemoveRelationFn)(BamCommands* commands, BamEntity entity, BamComponent relation, BamEntity target);
+/* Host exclusivity contract (slot 67): valid strictly in bamabi_init (exclusive
+* &mut World). Zero-copy retention preserves BamColumnInfo when old_fingerprint matches.
+* If changing any BamColumnInfo-observable property (uuid, size, align, storage_flags)
+* while another loaded mod owns an active system or observer referencing component,
+* the host MUST reject atomically with BAM_RESULT_ACCESS_CONFLICT unless cascading
+* reload unloads/reloads dependent mods before running schedules. */
 typedef BamResult (*BamMigrateComponentColumnFn)(BamLoadCtx* load_ctx, BamComponent component, uint64_t old_fingerprint, const BamComponentDesc* new_desc, BamRowMigrateFn migrate_fn, void* user_data);
 typedef BamBool   (*BamIterNextChunkBatchFn)(BamIter* iter, size_t* out_len, const BamEntity** out_entities, uint8_t** out_col_ptrs, size_t col_count, uint32_t mark_changed_mask);
 typedef BamResult (*BamIterColumnTicksFn)(const BamIter* iter, size_t term_index, const uint32_t** out_added, const uint32_t** out_changed, uint32_t* out_last_run, uint32_t* out_this_run);
