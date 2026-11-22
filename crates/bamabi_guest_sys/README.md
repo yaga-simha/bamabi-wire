@@ -48,7 +48,7 @@ cargo test --doc -p bamabi_guest_sys --all-features
 MIRIFLAGS="-Zmiri-tree-borrows -Zmiri-strict-provenance" cargo +nightly miri test -p bamabi_guest_sys
 MIRIFLAGS="-Zmiri-strict-provenance" cargo +nightly miri test -p bamabi_guest_sys --test soundness_regressions
 
-# Kani formal verification (PO-G1, PO-G3..PO-G10)
+# Kani formal verification (PO-G1, PO-G3..PO-G10; see TESTS.md for the CI two-step memory split)
 cargo kani -p bamabi_guest_sys
 ```
 

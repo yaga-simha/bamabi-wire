@@ -140,4 +140,9 @@ MIRIFLAGS="-Zmiri-strict-provenance" cargo +nightly miri test -p bamabi_guest_sy
 
 # Kani formal verification
 cargo kani -p bamabi_guest_sys
+
+# CI two-step split (runs 58 lightweight harnesses in parallel, then the ~7.5 GB / ~9.4 GB
+# RSS PO-G10 drain harnesses serially to fit within 16 GB runner memory)
+cargo kani -p bamabi_sys -p bamabi_guest_sys -Z unstable-options --harness-timeout 15m --output-format terse -j --harness po_ --harness kani_proof_raw_msg_stack_scratch_alignment_and_bounds --harness kani_proof_drain_messages_conservation_and_ramp
+cargo kani -p bamabi_guest_sys -Z unstable-options --harness-timeout 15m --output-format terse --harness kani_proof_drain_messages_small_batch_ramp --harness kani_proof_drain_messages_pre_reserved_exact_fit
 ```
