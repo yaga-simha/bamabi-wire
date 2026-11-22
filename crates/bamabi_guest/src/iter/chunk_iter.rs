@@ -2,7 +2,7 @@
 
 use core::marker::PhantomData;
 
-use bamabi_guest_sys::{Host, SparseRows, SparseRowsMut, UuidFilter, ValidatedIter};
+use bamabi_guest_sys::{BatchColCache, Host, SparseRows, SparseRowsMut, UuidFilter, ValidatedIter};
 use bamabi_sys::{
     AbiPod, BamChangeTicks, BamColumnInfo, BamComponent, BamIter, FfiEntity, FfiResult,
     ModComponent,
@@ -376,6 +376,7 @@ impl<'a> ChunkIter<'a> {
     pub fn typed<Q: QueryTuple>(&mut self) -> TypedChunkIter<'_, 'a, Q> {
         TypedChunkIter {
             iter: self,
+            batch_cache: BatchColCache::new(),
             _marker: PhantomData,
         }
     }

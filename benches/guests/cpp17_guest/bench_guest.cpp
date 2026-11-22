@@ -77,6 +77,9 @@ struct BamInstance {
     BamQueryDesc      dense_query{};
     BamTermDesc       roundtrip_terms[1]{};
     BamQueryDesc      roundtrip_query{};
+    bool              has_iter_next_chunk_batch = false;
+    bool              has_checkpoint_rollback = false;
+    bool              has_roundtrip_slots = false;
     volatile uint64_t sink = 0u;
 };
 
@@ -117,17 +120,35 @@ extern "C" BamResult sys_dense_update(BamSystemCtx* sys_ctx, void* user_data) {
         if (!bam::is_ok(rc)) {
             return rc;
         }
+        if (!cview.valid()) {
+            return BAM_RESULT_NULL_POINTER;
+        }
         std::size_t chunk_len = 0u;
-        while (cview.next_chunk(chunk_len)) {
-            if (chunk_len == 0u) {
-                continue;
+        if (inst->has_iter_next_chunk_batch) {
+            uint8_t* col_ptrs[2] = { nullptr, nullptr };
+            while (cview.next_chunk_batch_unchecked(chunk_len, nullptr, col_ptrs, 2u, 1u)) {
+                if (chunk_len == 0u) {
+                    continue;
+                }
+                if (col_ptrs[0] == nullptr || col_ptrs[1] == nullptr) {
+                    return BAM_RESULT_NULL_POINTER;
+                }
+                auto* pos = reinterpret_cast<BenchPosition*>(col_ptrs[0]);
+                const auto* vel = reinterpret_cast<const BenchVelocity*>(col_ptrs[1]);
+                integrate_chunk(pos, vel, chunk_len);
             }
-            auto* pos = cview.column_mutable<BenchPosition>(0u);
-            const auto* vel = cview.column_readonly<BenchVelocity>(1u);
-            if (pos == nullptr || vel == nullptr) {
-                return BAM_RESULT_NULL_POINTER;
+        } else {
+            while (cview.next_chunk(chunk_len)) {
+                if (chunk_len == 0u) {
+                    continue;
+                }
+                auto* pos = cview.column_mutable<BenchPosition>(0u);
+                const auto* vel = cview.column_readonly<BenchVelocity>(1u);
+                if (pos == nullptr || vel == nullptr) {
+                    return BAM_RESULT_NULL_POINTER;
+                }
+                integrate_chunk(pos, vel, chunk_len);
             }
-            integrate_chunk(pos, vel, chunk_len);
         }
         return BAM_RESULT_OK;
     });
@@ -139,6 +160,9 @@ extern "C" BamResult sys_command_burst(BamSystemCtx* sys_ctx, void* user_data) {
         if (inst == nullptr || sys_ctx == nullptr) {
             return BAM_RESULT_NULL_POINTER;
         }
+        if (!inst->has_checkpoint_rollback) {
+            return BAM_RESULT_UNSUPPORTED;
+        }
         bam::SystemContextView sview(inst->api, sys_ctx);
         bam::CommandsView cmds;
         BamResult rc = sview.commands_view(cmds);
@@ -149,7 +173,7 @@ extern "C" BamResult sys_command_burst(BamSystemCtx* sys_ctx, void* user_data) {
         constexpr BenchPosition sample_pos{1.0f, 2.0f, 3.0f, 4.0f};
         for (std::size_t i = 0u; i < 64u; ++i) {
             BamEntity ent = BAM_ENTITY_NULL;
-            rc = cmds.spawn(nullptr, nullptr, 0u, ent);
+            rc = cmds.spawn_empty(ent);
             if (!bam::is_ok(rc)) {
                 return rc;
             }
@@ -159,16 +183,18 @@ extern "C" BamResult sys_command_burst(BamSystemCtx* sys_ctx, void* user_data) {
             }
         }
 
-        bam::ScopedTransaction tx(cmds);
-        if (!tx.active()) {
-            return tx.status();
-        }
-        BamEntity rolled_entity = BAM_ENTITY_NULL;
-        rc = cmds.spawn(nullptr, nullptr, 0u, rolled_entity);
+        std::size_t checkpoint = 0u;
+        rc = inst->api.cmd_checkpoint(cmds.raw(), &checkpoint);
         if (!bam::is_ok(rc)) {
             return rc;
         }
-        return tx.rollback_now();
+        BamEntity rolled_entity = BAM_ENTITY_NULL;
+        rc = cmds.spawn_empty(rolled_entity);
+        if (!bam::is_ok(rc)) {
+            (void)inst->api.cmd_rollback(cmds.raw(), checkpoint);
+            return rc;
+        }
+        return inst->api.cmd_rollback(cmds.raw(), checkpoint);
     });
 }
 
@@ -178,6 +204,9 @@ extern "C" BamResult sys_host_api_roundtrip(BamSystemCtx* sys_ctx, void* user_da
         if (inst == nullptr || sys_ctx == nullptr) {
             return BAM_RESULT_NULL_POINTER;
         }
+        if (!inst->has_roundtrip_slots) {
+            return BAM_RESULT_UNSUPPORTED;
+        }
         bam::SystemContextView sview(inst->api, sys_ctx);
         bam::ChunkView cview;
         BamResult rc = sview.query_view(0u, cview);
@@ -186,21 +215,25 @@ extern "C" BamResult sys_host_api_roundtrip(BamSystemCtx* sys_ctx, void* user_da
         }
         bam::HostContextView sys_hview = sview.host_ctx();
         bam::HostContextView hview(inst->api, sys_hview.valid() ? sys_hview.raw() : inst->host_ctx);
+        if (!cview.valid() || !hview.valid() || inst->api.res_ptr == nullptr) {
+            return BAM_RESULT_NULL_POINTER;
+        }
 
         const BamStrView sym_name = bam_str_view_len(reinterpret_cast<const uint8_t*>("bench.sym"), 9u);
         uint64_t acc = 0u;
         for (std::size_t i = 0u; i < 64u; ++i) {
-            const auto* params = cview.res_ptr<BenchSimParams>(0u);
+            const auto* params =
+                reinterpret_cast<const BenchSimParams*>(inst->api.res_ptr(cview.raw(), 0u));
             if (params == nullptr) {
                 return BAM_RESULT_NOT_FOUND;
             }
             BamChangeTicks ticks{};
-            rc = cview.res_ticks(0u, ticks);
+            rc = inst->api.res_ticks(cview.raw(), 0u, &ticks);
             if (!bam::is_ok(rc)) {
                 return rc;
             }
             BamSymbol sym = BAM_SYMBOL_INVALID;
-            rc = hview.intern_symbol(sym_name, sym);
+            rc = inst->api.intern_symbol(hview.raw(), sym_name, &sym);
             if (!bam::is_ok(rc)) {
                 return rc;
             }
@@ -267,6 +300,44 @@ BAM_EXPORT BamResult bamabi_init(
             delete inst;
             return rc;
         }
+        if (inst->api.cmd_spawn_empty == nullptr || inst->api.res_ptr == nullptr) {
+            delete inst;
+            return BAM_RESULT_NULL_POINTER;
+        }
+
+        inst->has_iter_next_chunk_batch =
+            bam::host_api_covers_slot(
+                inst->api,
+                bam::offsets::ITER_NEXT_CHUNK_BATCH,
+                sizeof(BamIterNextChunkBatchFn)
+            ) &&
+            (inst->api.iter_next_chunk_batch != nullptr);
+        inst->has_checkpoint_rollback =
+            bam::host_api_covers_slot(
+                inst->api,
+                bam::offsets::CMD_CHECKPOINT,
+                sizeof(BamCmdCheckpointFn)
+            ) &&
+            (inst->api.cmd_checkpoint != nullptr) &&
+            bam::host_api_covers_slot(
+                inst->api,
+                bam::offsets::CMD_ROLLBACK,
+                sizeof(BamCmdRollbackFn)
+            ) &&
+            (inst->api.cmd_rollback != nullptr);
+        inst->has_roundtrip_slots =
+            bam::host_api_covers_slot(
+                inst->api,
+                bam::offsets::RES_TICKS,
+                sizeof(BamResTicksFn)
+            ) &&
+            (inst->api.res_ticks != nullptr) &&
+            bam::host_api_covers_slot(
+                inst->api,
+                bam::offsets::INTERN_SYMBOL,
+                sizeof(BamInternSymbolFn)
+            ) &&
+            (inst->api.intern_symbol != nullptr);
 
         bam::LoadContextView lview(inst->api, load_ctx);
         bam::HostContextView hview = lview.host_ctx();

@@ -4,8 +4,8 @@ use core::ffi::{CStr, c_void};
 
 use bamabi_guest_sys::{
     GuestInstance, Host, PreparedRunIf, SystemRegistrationConfig, TypedComponent, ValidatedLoadCtx,
-    ValidatedSystemInvocation, allocate_run_if_ctx_query, allocate_run_if_ctx_trampoline,
-    resolve_component, resolve_mod_component,
+    ValidatedSystemInvocation, ValidatedSystemSlice, allocate_run_if_ctx_query,
+    allocate_run_if_ctx_trampoline, resolve_component, resolve_mod_component,
 };
 use bamabi_sys::{
     AbiPod, AccessMode, BAM_COMPONENT_FLAG_IMMUTABLE, BAM_COMPONENT_FLAG_SPARSE_SET,
@@ -25,7 +25,7 @@ use crate::{
     component::{
         GuestComponent, GuestComponentHooks, qualify_component_identity, resolve_guest_component,
     },
-    iter::typed_query::QueryTuple,
+    iter::{ChunkIter, typed_query::QueryTuple},
 };
 
 /// Boxed ECS-aware run-condition predicate paired with its base term offset in `run_if_query`.
@@ -878,6 +878,67 @@ pub struct SystemBuilder<'b, 'a> {
     first_error: Option<FfiResult>,
 }
 
+/// Shared non-`N`-generic system callback wrapper so user closures `F` are not monomorphized 4×
+/// across bucketed trampolines (`N ∈ {0, 1, 4, 16}`).
+fn invoke_system_callback<F, R>(callback: &mut F, ctx: &mut SystemContext<'_>) -> FfiResult
+where
+    F: FnMut(&mut SystemContext<'_>) -> R,
+    R: IntoSystemResult,
+{
+    callback(ctx).into_ffi_result()
+}
+
+/// Abstracts `build` (`FfiResult`) vs `register_handle` (`Result<BamSystem, FfiResult>`) submission
+/// over const-bucketed `N ∈ {0, 1, 4, 16}` slice trampolines.
+trait SliceSystemSubmitter<Out> {
+    fn submit<const N: usize, S>(
+        self,
+        load_ctx: &mut ValidatedLoadCtx<'_>,
+        instance: &mut GuestInstance,
+        config: &SystemRegistrationConfig<'_>,
+        run_if: Option<PreparedRunIf>,
+        closure: S,
+    ) -> Out
+    where
+        S: FnMut(&mut ValidatedSystemSlice<'_>) -> FfiResult + Send + 'static;
+}
+
+struct BuildSubmitter;
+
+impl SliceSystemSubmitter<FfiResult> for BuildSubmitter {
+    fn submit<const N: usize, S>(
+        self,
+        load_ctx: &mut ValidatedLoadCtx<'_>,
+        instance: &mut GuestInstance,
+        config: &SystemRegistrationConfig<'_>,
+        run_if: Option<PreparedRunIf>,
+        closure: S,
+    ) -> FfiResult
+    where
+        S: FnMut(&mut ValidatedSystemSlice<'_>) -> FfiResult + Send + 'static,
+    {
+        load_ctx.register_system_slice::<N, S>(instance, config, run_if, closure)
+    }
+}
+
+struct HandleSubmitter;
+
+impl SliceSystemSubmitter<Result<BamSystem, FfiResult>> for HandleSubmitter {
+    fn submit<const N: usize, S>(
+        self,
+        load_ctx: &mut ValidatedLoadCtx<'_>,
+        instance: &mut GuestInstance,
+        config: &SystemRegistrationConfig<'_>,
+        run_if: Option<PreparedRunIf>,
+        closure: S,
+    ) -> Result<BamSystem, FfiResult>
+    where
+        S: FnMut(&mut ValidatedSystemSlice<'_>) -> FfiResult + Send + 'static,
+    {
+        load_ctx.register_system_handle_slice::<N, S>(instance, config, run_if, closure)
+    }
+}
+
 impl<'b, 'a> SystemBuilder<'b, 'a> {
     /// Latches the first resolution or capacity error encountered during fluent system building.
     #[inline]
@@ -1314,19 +1375,20 @@ impl<'b, 'a> SystemBuilder<'b, 'a> {
         }
     }
 
-    /// Shared finalization pipeline for [`Self::build`] and [`Self::register_handle`]: checks for
-    /// latched builder errors, assembles [`SystemRegistrationConfig`] and [`PreparedRunIf`], and
-    /// delegates submission to `submit`.
-    fn finalize<Out>(
+    /// Shared bucketed finalization pipeline for [`Self::build`] and [`Self::register_handle`]:
+    /// checks latched builder errors, assembles [`SystemRegistrationConfig`] and [`PreparedRunIf`],
+    /// and dispatches across `N ∈ {0, 1, 4, 16}` slice trampolines without duplicating `callback`.
+    fn finalize_bucketed<Out, Sub, F, R>(
         self,
-        submit: impl FnOnce(
-            &mut ValidatedLoadCtx<'a>,
-            &mut GuestInstance,
-            &SystemRegistrationConfig<'_>,
-            Option<PreparedRunIf>,
-        ) -> Out,
+        submitter: Sub,
+        mut callback: F,
         on_err: impl FnOnce(FfiResult) -> Out,
-    ) -> Out {
+    ) -> Out
+    where
+        Sub: SliceSystemSubmitter<Out>,
+        F: FnMut(&mut SystemContext<'_>) -> R + Send + 'static,
+        R: IntoSystemResult,
+    {
         if let Some(err) = self.first_error {
             return on_err(err);
         }
@@ -1371,30 +1433,65 @@ impl<'b, 'a> SystemBuilder<'b, 'a> {
             run_if_ctx_user_data,
         };
         let run_if = Self::prepare_run_if(self.app.instance, self.run_if_preds);
-        submit(&mut self.app.load_ctx, self.app.instance, &config, run_if)
+        let total_query_count =
+            config.user_queries.len() + usize::from(!config.system_resources.is_empty());
+        match total_query_count {
+            0 => submitter.submit::<0, _>(
+                &mut self.app.load_ctx,
+                self.app.instance,
+                &config,
+                run_if,
+                move |inv: &mut ValidatedSystemSlice<'_>| {
+                    let mut slots: [Option<ChunkIter<'_>>; 0] = [];
+                    let mut ctx = SystemContext::from_slice_invocation(inv, &mut slots);
+                    invoke_system_callback(&mut callback, &mut ctx)
+                },
+            ),
+            1 => submitter.submit::<1, _>(
+                &mut self.app.load_ctx,
+                self.app.instance,
+                &config,
+                run_if,
+                move |inv: &mut ValidatedSystemSlice<'_>| {
+                    let mut slots: [Option<ChunkIter<'_>>; 1] = [None];
+                    let mut ctx = SystemContext::from_slice_invocation(inv, &mut slots);
+                    invoke_system_callback(&mut callback, &mut ctx)
+                },
+            ),
+            2..=4 => submitter.submit::<4, _>(
+                &mut self.app.load_ctx,
+                self.app.instance,
+                &config,
+                run_if,
+                move |inv: &mut ValidatedSystemSlice<'_>| {
+                    let mut slots: [Option<ChunkIter<'_>>; 4] = [const { None }; 4];
+                    let mut ctx = SystemContext::from_slice_invocation(inv, &mut slots);
+                    invoke_system_callback(&mut callback, &mut ctx)
+                },
+            ),
+            _ => submitter.submit::<MAX_QUERIES_PER_SYSTEM, _>(
+                &mut self.app.load_ctx,
+                self.app.instance,
+                &config,
+                run_if,
+                move |inv: &mut ValidatedSystemSlice<'_>| {
+                    let mut slots: [Option<ChunkIter<'_>>; MAX_QUERIES_PER_SYSTEM] =
+                        [const { None }; MAX_QUERIES_PER_SYSTEM];
+                    let mut ctx = SystemContext::from_slice_invocation(inv, &mut slots);
+                    invoke_system_callback(&mut callback, &mut ctx)
+                },
+            ),
+        }
     }
 
     /// Finalizes and registers the system on the host `World`, returning [`FfiResult::OK`] on
     /// success or the first registration/resolution error encountered.
-    pub fn build<F, R>(self, mut callback: F) -> FfiResult
+    pub fn build<F, R>(self, callback: F) -> FfiResult
     where
         F: FnMut(&mut SystemContext<'_>) -> R + Send + 'static,
         R: IntoSystemResult,
     {
-        self.finalize(
-            |load_ctx, instance, config, run_if| {
-                load_ctx.register_system(
-                    instance,
-                    config,
-                    run_if,
-                    move |inv: &mut ValidatedSystemInvocation<'_>| {
-                        let mut ctx = SystemContext::from_invocation(inv);
-                        callback(&mut ctx).into_ffi_result()
-                    },
-                )
-            },
-            |err| err,
-        )
+        self.finalize_bucketed(BuildSubmitter, callback, |err| err)
     }
 
     /// Finalizes and registers the system with persistent per-system local state `local: L`
@@ -1412,25 +1509,12 @@ impl<'b, 'a> SystemBuilder<'b, 'a> {
     /// Finalizes and registers the system via `BamHostApi::register_system_handle` (slot 60),
     /// returning its assigned [`BamSystem`] handle for decoupled scheduling with
     /// [`GuestApp::mount_system`].
-    pub fn register_handle<F, R>(self, mut callback: F) -> Result<BamSystem, FfiResult>
+    pub fn register_handle<F, R>(self, callback: F) -> Result<BamSystem, FfiResult>
     where
         F: FnMut(&mut SystemContext<'_>) -> R + Send + 'static,
         R: IntoSystemResult,
     {
-        self.finalize(
-            |load_ctx, instance, config, run_if| {
-                load_ctx.register_system_handle(
-                    instance,
-                    config,
-                    run_if,
-                    move |inv: &mut ValidatedSystemInvocation<'_>| {
-                        let mut ctx = SystemContext::from_invocation(inv);
-                        callback(&mut ctx).into_ffi_result()
-                    },
-                )
-            },
-            Err,
-        )
+        self.finalize_bucketed(HandleSubmitter, callback, Err)
     }
 
     /// Registers a decoupled [`BamSystem`] handle carrying persistent per-system local state

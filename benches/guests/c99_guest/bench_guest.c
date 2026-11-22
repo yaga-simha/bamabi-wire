@@ -46,6 +46,9 @@ struct BamInstance {
     BamQueryDesc      dense_query;
     BamTermDesc       roundtrip_terms[1];
     BamQueryDesc      roundtrip_query;
+    int               has_iter_next_chunk_batch;
+    int               has_checkpoint_rollback;
+    int               has_roundtrip_slots;
     volatile uint64_t sink;
 };
 
@@ -119,18 +122,35 @@ static BamResult sys_dense_update(BamSystemCtx* sys_ctx, void* user_data) {
         return BAM_RESULT_NULL_POINTER;
     }
 
-    while (inst->api.iter_next_chunk(iter, &chunk_len) != BAM_FALSE) {
-        BenchPosition* pos;
-        const BenchVelocity* vel;
-        if (chunk_len == 0u) {
-            continue;
+    if (inst->has_iter_next_chunk_batch) {
+        uint8_t* col_ptrs[2] = { NULL, NULL };
+        while (inst->api.iter_next_chunk_batch(iter, &chunk_len, NULL, col_ptrs, 2u, 1u) != BAM_FALSE) {
+            BenchPosition* pos;
+            const BenchVelocity* vel;
+            if (chunk_len == 0u) {
+                continue;
+            }
+            if (col_ptrs[0] == NULL || col_ptrs[1] == NULL) {
+                return BAM_RESULT_NULL_POINTER;
+            }
+            pos = (BenchPosition*)(void*)col_ptrs[0];
+            vel = (const BenchVelocity*)(const void*)col_ptrs[1];
+            bench_integrate_chunk(pos, vel, chunk_len);
         }
-        pos = (BenchPosition*)(void*)inst->api.iter_column_mutable(iter, 0u);
-        vel = (const BenchVelocity*)(const void*)inst->api.iter_column_readonly(iter, 1u);
-        if (pos == NULL || vel == NULL) {
-            return BAM_RESULT_NULL_POINTER;
+    } else {
+        while (inst->api.iter_next_chunk(iter, &chunk_len) != BAM_FALSE) {
+            BenchPosition* pos;
+            const BenchVelocity* vel;
+            if (chunk_len == 0u) {
+                continue;
+            }
+            pos = (BenchPosition*)(void*)inst->api.iter_column_mutable(iter, 0u);
+            vel = (const BenchVelocity*)(const void*)inst->api.iter_column_readonly(iter, 1u);
+            if (pos == NULL || vel == NULL) {
+                return BAM_RESULT_NULL_POINTER;
+            }
+            bench_integrate_chunk(pos, vel, chunk_len);
         }
-        bench_integrate_chunk(pos, vel, chunk_len);
     }
     return BAM_RESULT_OK;
 }
@@ -147,10 +167,7 @@ static BamResult sys_command_burst(BamSystemCtx* sys_ctx, void* user_data) {
     if (inst == NULL || sys_ctx == NULL) {
         return BAM_RESULT_NULL_POINTER;
     }
-    if (!bam_host_api_covers_slot(&inst->api, BAM_HOST_API_OFFSET_CMD_CHECKPOINT, sizeof(BamCmdCheckpointFn)) ||
-        inst->api.cmd_checkpoint == NULL ||
-        !bam_host_api_covers_slot(&inst->api, BAM_HOST_API_OFFSET_CMD_ROLLBACK, sizeof(BamCmdRollbackFn)) ||
-        inst->api.cmd_rollback == NULL) {
+    if (!inst->has_checkpoint_rollback) {
         return BAM_RESULT_UNSUPPORTED;
     }
 
@@ -164,7 +181,7 @@ static BamResult sys_command_burst(BamSystemCtx* sys_ctx, void* user_data) {
 
     for (i = 0u; i < 64u; ++i) {
         BamEntity ent = BAM_ENTITY_NULL;
-        rc = inst->api.cmd_spawn(cmds, NULL, NULL, 0u, &ent);
+        rc = inst->api.cmd_spawn_empty(cmds, &ent);
         if (rc != BAM_RESULT_OK) {
             return rc;
         }
@@ -184,7 +201,7 @@ static BamResult sys_command_burst(BamSystemCtx* sys_ctx, void* user_data) {
     if (rc != BAM_RESULT_OK) {
         return rc;
     }
-    rc = inst->api.cmd_spawn(cmds, NULL, NULL, 0u, &rolled_entity);
+    rc = inst->api.cmd_spawn_empty(cmds, &rolled_entity);
     if (rc != BAM_RESULT_OK) {
         (void)inst->api.cmd_rollback(cmds, checkpoint);
         return rc;
@@ -204,10 +221,7 @@ static BamResult sys_host_api_roundtrip(BamSystemCtx* sys_ctx, void* user_data) 
     if (inst == NULL || sys_ctx == NULL) {
         return BAM_RESULT_NULL_POINTER;
     }
-    if (!bam_host_api_covers_slot(&inst->api, BAM_HOST_API_OFFSET_RES_TICKS, sizeof(BamResTicksFn)) ||
-        inst->api.res_ticks == NULL ||
-        !bam_host_api_covers_slot(&inst->api, BAM_HOST_API_OFFSET_INTERN_SYMBOL, sizeof(BamInternSymbolFn)) ||
-        inst->api.intern_symbol == NULL) {
+    if (!inst->has_roundtrip_slots) {
         return BAM_RESULT_UNSUPPORTED;
     }
 
@@ -308,11 +322,46 @@ BAM_EXPORT BamResult bamabi_init(
         inst->api.iter_column_readonly == NULL ||
         inst->api.iter_column_mutable == NULL ||
         inst->api.res_ptr == NULL ||
+        inst->api.cmd_spawn_empty == NULL ||
         inst->api.cmd_spawn == NULL ||
         inst->api.cmd_insert == NULL) {
         free(inst);
         return BAM_RESULT_NULL_POINTER;
     }
+
+    inst->has_iter_next_chunk_batch =
+        (bam_host_api_covers_slot(
+             &inst->api,
+             BAM_HOST_API_OFFSET_ITER_NEXT_CHUNK_BATCH,
+             sizeof(BamIterNextChunkBatchFn)
+         ) != BAM_FALSE) &&
+        (inst->api.iter_next_chunk_batch != NULL);
+    inst->has_checkpoint_rollback =
+        (bam_host_api_covers_slot(
+             &inst->api,
+             BAM_HOST_API_OFFSET_CMD_CHECKPOINT,
+             sizeof(BamCmdCheckpointFn)
+         ) != BAM_FALSE) &&
+        (inst->api.cmd_checkpoint != NULL) &&
+        (bam_host_api_covers_slot(
+             &inst->api,
+             BAM_HOST_API_OFFSET_CMD_ROLLBACK,
+             sizeof(BamCmdRollbackFn)
+         ) != BAM_FALSE) &&
+        (inst->api.cmd_rollback != NULL);
+    inst->has_roundtrip_slots =
+        (bam_host_api_covers_slot(
+             &inst->api,
+             BAM_HOST_API_OFFSET_RES_TICKS,
+             sizeof(BamResTicksFn)
+         ) != BAM_FALSE) &&
+        (inst->api.res_ticks != NULL) &&
+        (bam_host_api_covers_slot(
+             &inst->api,
+             BAM_HOST_API_OFFSET_INTERN_SYMBOL,
+             sizeof(BamInternSymbolFn)
+         ) != BAM_FALSE) &&
+        (inst->api.intern_symbol != NULL);
 
     inst->host_ctx = inst->api.load_host_ctx(load_ctx);
     if (inst->host_ctx == NULL) {

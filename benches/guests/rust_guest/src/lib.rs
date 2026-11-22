@@ -128,7 +128,7 @@ impl GuestPlugin for BenchGuestRust {
                     w: 4.0,
                 };
                 for _ in 0..64 {
-                    let entity = match cmds.spawn(&[]) {
+                    let entity = match cmds.spawn_empty() {
                         Ok(e) => e,
                         Err(err) => return err,
                     };
@@ -142,7 +142,7 @@ impl GuestPlugin for BenchGuestRust {
                     Ok(cp) => cp,
                     Err(err) => return err,
                 };
-                if let Err(err) = cmds.spawn(&[]) {
+                if let Err(err) = cmds.spawn_empty() {
                     let _ = cmds.rollback(checkpoint);
                     return err;
                 }

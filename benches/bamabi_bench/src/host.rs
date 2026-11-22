@@ -10,7 +10,11 @@ use core::{
     mem::MaybeUninit,
     sync::atomic::{AtomicPtr, AtomicU64, Ordering},
 };
-use std::{collections::HashMap, sync::Mutex};
+use std::{
+    collections::HashMap,
+    hash::{BuildHasher, Hasher},
+    sync::{Mutex, RwLock},
+};
 
 use bamabi_sys::{
     ABI_VERSION, AbiPod, AccessMode, BAM_COMPONENT_FLAG_IMMUTABLE, BAM_COMPONENT_FLAG_SPARSE_SET,
@@ -21,8 +25,7 @@ use bamabi_sys::{
     BamRowMigrateFn, BamRunIfFn, BamScheduleSetDesc, BamSymbol, BamSystem, BamSystemCtx,
     BamSystemDesc, BamSystemFn, BamSystemSet, BamTermDesc, BamTriggerDesc, ComponentDesc,
     ComponentDropFn, ComponentHookFn, ComponentUuid, FfiAssetHandle, FfiAssetLoadState, FfiBool,
-    FfiEntity, FfiResult, MAX_QUERIES_PER_SYSTEM, RawInsertable, ScheduleId, StrView,
-    read_descriptor,
+    FfiEntity, FfiResult, RawInsertable, ScheduleId, StrView, read_descriptor,
 };
 
 /// Canonical component name for entity positions.
@@ -153,64 +156,49 @@ pub(crate) struct CommandStats {
     pub(crate) last_insert_len: usize,
 }
 
-/// Deferred command entry queued on [`CommandQueue`].
-#[derive(Clone)]
-pub(crate) enum RecordedCmd {
-    SpawnEmpty {
-        _entity: FfiEntity,
-    },
-    Spawn {
-        _entity: FfiEntity,
-        inline_inserts: usize,
-    },
-    SpawnBatch {
-        entity_count: usize,
-        component_count: usize,
-    },
-    Despawn {
-        _entity: FfiEntity,
-    },
-    DespawnAll,
-    Insert {
-        _entity: FfiEntity,
-        component: BamComponent,
-        byte_len: usize,
-        _inline_bytes: [u8; 32],
-    },
-    InsertIfNew {
-        _entity: FfiEntity,
-        component: BamComponent,
-        byte_len: usize,
-        _inline_bytes: [u8; 32],
-    },
-    InsertDefault {
-        _entity: FfiEntity,
-        _component: BamComponent,
-    },
-    Remove {
-        _entity: FfiEntity,
-        _component: BamComponent,
-    },
-    Trigger,
-    Observe,
-    InsertRelation,
-    RemoveRelation,
-    CloneEntity {
-        _src: FfiEntity,
-        _dst: FfiEntity,
-    },
-    InsertResource {
-        _resource: BamComponent,
-        _byte_len: usize,
-    },
-    RemoveResource {
-        _resource: BamComponent,
-    },
+/// Discriminant for compact [`CmdHeader`] entries queued on [`CommandQueue`].
+#[repr(u8)]
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+pub(crate) enum CmdKind {
+    SpawnEmpty = 0,
+    Spawn = 1,
+    SpawnBatch = 2,
+    Despawn = 3,
+    DespawnAll = 4,
+    Insert = 5,
+    InsertIfNew = 6,
+    InsertDefault = 7,
+    Remove = 8,
+    Trigger = 9,
+    Observe = 10,
+    InsertRelation = 11,
+    RemoveRelation = 12,
+    CloneEntity = 13,
+    InsertResource = 14,
+    RemoveResource = 15,
 }
+
+/// Compact 16-byte deferred command header queued on [`CommandQueue`].
+#[repr(C)]
+#[derive(Copy, Clone)]
+pub(crate) struct CmdHeader {
+    pub(crate) kind: CmdKind,
+    pub(crate) _flags: u8,
+    pub(crate) _reserved: u16,
+    pub(crate) component_or_count: u32,
+    pub(crate) aux_len: u32,
+    pub(crate) payload_offset: u32,
+}
+
+const _: () = {
+    assert!(core::mem::size_of::<CmdHeader>() == 16);
+    assert!(core::mem::align_of::<CmdHeader>() == 4);
+};
 
 /// Deferred command queue backing `*mut BamCommands`.
 pub(crate) struct CommandQueue {
-    pub(crate) ops: Vec<RecordedCmd>,
+    pub(crate) ops: Vec<CmdHeader>,
+    pub(crate) payload_bytes: Vec<u8>,
     pub(crate) comp_meta: Vec<CompCommandMeta>,
     pub(crate) checkpoints: u64,
     pub(crate) rollbacks: u64,
@@ -222,6 +210,7 @@ impl CommandQueue {
     fn new() -> Self {
         Self {
             ops: Vec::with_capacity(256),
+            payload_bytes: Vec::with_capacity(4096),
             comp_meta: Vec::new(),
             checkpoints: 0,
             rollbacks: 0,
@@ -237,6 +226,7 @@ impl CommandQueue {
 
     pub(crate) fn clear(&mut self) {
         self.ops.clear();
+        self.payload_bytes.clear();
         self.checkpoints = 0;
         self.rollbacks = 0;
         self.rolled_back_ops = 0;
@@ -244,25 +234,41 @@ impl CommandQueue {
 
     pub(crate) fn reserve_ops(&mut self, min_additional: usize) {
         if self.ops.capacity() < min_additional {
-            self.ops.reserve(min_additional - self.ops.len());
+            self.ops
+                .reserve(min_additional.saturating_sub(self.ops.len()));
         }
+        let min_payload = min_additional.saturating_mul(16);
+        if self.payload_bytes.capacity() < min_payload {
+            self.payload_bytes
+                .reserve(min_payload.saturating_sub(self.payload_bytes.len()));
+        }
+    }
+
+    #[inline]
+    fn push_op(&mut self, kind: CmdKind, component_or_count: u32, aux_len: u32) {
+        let payload_offset = self.payload_bytes.len() as u32;
+        self.ops.push(CmdHeader {
+            kind,
+            _flags: 0,
+            _reserved: 0,
+            component_or_count,
+            aux_len,
+            payload_offset,
+        });
     }
 
     /// Directly pushes a spawn operation (used by the native Rust baseline).
     pub(crate) fn push_native_spawn(&mut self) -> FfiEntity {
         let e = FfiEntity::from_bits(self.next_entity_bits);
         self.next_entity_bits += 1;
-        self.ops.push(RecordedCmd::Spawn {
-            _entity: e,
-            inline_inserts: 0,
-        });
+        self.push_op(CmdKind::Spawn, 0, 0);
         e
     }
 
     /// Directly pushes a POD component insertion (used by the native Rust baseline).
     pub(crate) fn push_native_insert_pod<T: AbiPod>(
         &mut self,
-        entity: FfiEntity,
+        _entity: FfiEntity,
         component: BamComponent,
         value: &T,
     ) -> FfiResult {
@@ -273,23 +279,33 @@ impl CommandQueue {
         if meta.size != len {
             return FfiResult::TYPE_MISMATCH;
         }
-        let mut inline_bytes = [0u8; 32];
-        if len > 0 && len <= inline_bytes.len() {
-            // SAFETY: `value` is a live `&T` (`T: AbiPod`) valid for `len` readable bytes and
-            // `inline_bytes` has capacity `>= len`.
-            unsafe {
-                core::ptr::copy_nonoverlapping(
-                    core::ptr::from_ref(value).cast::<u8>(),
-                    inline_bytes.as_mut_ptr(),
-                    len,
-                );
-            }
+        let Ok(len_u32) = u32::try_from(len) else {
+            return FfiResult::OUT_OF_RANGE;
+        };
+        if self
+            .payload_bytes
+            .len()
+            .checked_add(len)
+            .and_then(|end| u32::try_from(end).ok())
+            .is_none()
+        {
+            return FfiResult::OUT_OF_RANGE;
         }
-        self.ops.push(RecordedCmd::Insert {
-            _entity: entity,
-            component,
-            byte_len: len,
-            _inline_bytes: inline_bytes,
+        let payload_offset = self.payload_bytes.len() as u32;
+        if len > 0 {
+            // SAFETY: `value` is a live `&T` (`T: AbiPod`) valid for `len` readable bytes.
+            let bytes = unsafe {
+                core::slice::from_raw_parts(core::ptr::from_ref(value).cast::<u8>(), len)
+            };
+            self.payload_bytes.extend_from_slice(bytes);
+        }
+        self.ops.push(CmdHeader {
+            kind: CmdKind::Insert,
+            _flags: 0,
+            _reserved: 0,
+            component_or_count: component.to_raw(),
+            aux_len: len_u32,
+            payload_offset,
         });
         FfiResult::OK
     }
@@ -306,8 +322,12 @@ impl CommandQueue {
             return FfiResult::OUT_OF_RANGE;
         }
         self.rollbacks += 1;
-        self.rolled_back_ops += (self.ops.len() - token) as u64;
-        self.ops.truncate(token);
+        if let Some(first_rolled_back) = self.ops.get(token) {
+            let truncate_bytes = first_rolled_back.payload_offset as usize;
+            self.rolled_back_ops += (self.ops.len() - token) as u64;
+            self.payload_bytes.truncate(truncate_bytes);
+            self.ops.truncate(token);
+        }
         FfiResult::OK
     }
 
@@ -319,32 +339,22 @@ impl CommandQueue {
             ..CommandStats::default()
         };
         for op in &self.ops {
-            match *op {
-                RecordedCmd::SpawnEmpty { .. } => stats.committed_spawns += 1,
-                RecordedCmd::Spawn { inline_inserts, .. } => {
+            match op.kind {
+                CmdKind::SpawnEmpty => stats.committed_spawns += 1,
+                CmdKind::Spawn => {
                     stats.committed_spawns += 1;
-                    stats.committed_inserts += inline_inserts;
+                    stats.committed_inserts += op.aux_len as usize;
                 }
-                RecordedCmd::SpawnBatch {
-                    entity_count,
-                    component_count,
-                } => {
+                CmdKind::SpawnBatch => {
+                    let entity_count = op.aux_len as usize;
+                    let component_count = op.component_or_count as usize;
                     stats.committed_spawns += entity_count;
                     stats.committed_inserts += entity_count * component_count;
                 }
-                RecordedCmd::Insert {
-                    component,
-                    byte_len,
-                    ..
-                }
-                | RecordedCmd::InsertIfNew {
-                    component,
-                    byte_len,
-                    ..
-                } => {
+                CmdKind::Insert | CmdKind::InsertIfNew => {
                     stats.committed_inserts += 1;
-                    stats.last_insert_component = component;
-                    stats.last_insert_len = byte_len;
+                    stats.last_insert_component = BamComponent::from_raw(op.component_or_count);
+                    stats.last_insert_len = op.aux_len as usize;
                 }
                 _ => {}
             }
@@ -542,14 +552,19 @@ pub(crate) struct IterState {
 
 /// Stack-allocated per-system execution frame backing `*mut BamSystemCtx`.
 #[repr(C)]
-struct SystemFrame {
+pub(crate) struct SystemFrame {
     world: *const HostWorld,
     shared: *const HostSharedState,
     commands: *mut CommandQueue,
     sys_idx: usize,
-    iter_ptrs: [*mut IterState; MAX_QUERIES_PER_SYSTEM],
+    iters: *const UnsafeCell<IterState>,
     query_count: usize,
 }
+
+const _: () = {
+    assert!(core::mem::size_of::<SystemFrame>() == 6 * core::mem::size_of::<usize>());
+    assert!(core::mem::align_of::<SystemFrame>() == core::mem::align_of::<usize>());
+};
 
 /// Registered guest system descriptor and pre-allocated query iterators.
 pub(crate) struct RegisteredSystem {
@@ -564,17 +579,94 @@ pub(crate) struct RegisteredSystem {
     pub(crate) run_if_user_data: *mut c_void,
 }
 
-/// Symbol interner state protected by a mutex inside [`HostSharedState`].
+const FX_SEED: u64 = 0x517c_c1b7_2722_0a95;
+
+#[derive(Clone, Copy, Default)]
+struct FastBuildHasher;
+
+impl BuildHasher for FastBuildHasher {
+    type Hasher = FastHasher;
+
+    #[inline]
+    fn build_hasher(&self) -> Self::Hasher {
+        FastHasher { hash: 0 }
+    }
+}
+
+struct FastHasher {
+    hash: u64,
+}
+
+impl FastHasher {
+    #[inline]
+    fn add_u64(&mut self, v: u64) {
+        self.hash = (self.hash.rotate_left(5) ^ v).wrapping_mul(FX_SEED);
+    }
+}
+
+impl Hasher for FastHasher {
+    #[inline]
+    fn finish(&self) -> u64 {
+        let h = self.hash;
+        h ^ (h >> 32)
+    }
+
+    #[inline]
+    fn write(&mut self, mut bytes: &[u8]) {
+        while let Some((chunk, rest)) = bytes.split_first_chunk::<8>() {
+            self.add_u64(u64::from_le_bytes(*chunk));
+            bytes = rest;
+        }
+        if let Some((chunk, rest)) = bytes.split_first_chunk::<4>() {
+            self.add_u64(u64::from(u32::from_le_bytes(*chunk)));
+            bytes = rest;
+        }
+        if let Some((chunk, rest)) = bytes.split_first_chunk::<2>() {
+            self.add_u64(u64::from(u16::from_le_bytes(*chunk)));
+            bytes = rest;
+        }
+        if let Some(&b) = bytes.first() {
+            self.add_u64(u64::from(b));
+        }
+    }
+
+    #[inline]
+    fn write_u8(&mut self, i: u8) {
+        self.add_u64(u64::from(i));
+    }
+
+    #[inline]
+    fn write_u16(&mut self, i: u16) {
+        self.add_u64(u64::from(i));
+    }
+
+    #[inline]
+    fn write_u32(&mut self, i: u32) {
+        self.add_u64(u64::from(i));
+    }
+
+    #[inline]
+    fn write_u64(&mut self, i: u64) {
+        self.add_u64(i);
+    }
+
+    #[inline]
+    fn write_usize(&mut self, i: usize) {
+        self.add_u64(i as u64);
+    }
+}
+
+/// Symbol interner state protected by an [`RwLock`] inside [`HostSharedState`].
 struct SymbolTable {
-    map: HashMap<Box<str>, BamSymbol>,
-    list: Vec<Box<str>>,
+    map: HashMap<Box<str>, BamSymbol, FastBuildHasher>,
+    next_id: u32,
 }
 
 impl SymbolTable {
     fn new() -> Self {
         Self {
-            map: HashMap::new(),
-            list: Vec::new(),
+            map: HashMap::with_hasher(FastBuildHasher),
+            next_id: 0,
         }
     }
 
@@ -582,9 +674,9 @@ impl SymbolTable {
         if let Some(&sym) = self.map.get(s) {
             return sym;
         }
-        let sym = BamSymbol::from_raw(self.list.len() as u32);
+        let sym = BamSymbol::from_raw(self.next_id);
+        self.next_id = self.next_id.saturating_add(1);
         let owned: Box<str> = s.into();
-        self.list.push(owned.clone());
         self.map.insert(owned, sym);
         sym
     }
@@ -596,7 +688,7 @@ pub(crate) struct HostSharedState {
     last_error: Mutex<String>,
     faults: Mutex<Vec<String>>,
     proc_symbols: Mutex<HashMap<String, usize>>,
-    symbol_table: Mutex<SymbolTable>,
+    symbol_table: RwLock<SymbolTable>,
     named_objects: Mutex<HashMap<String, FfiEntity>>,
     intern_symbol_calls: AtomicU64,
     res_ticks_calls: AtomicU64,
@@ -611,7 +703,7 @@ impl HostSharedState {
             last_error: Mutex::new(String::new()),
             faults: Mutex::new(Vec::new()),
             proc_symbols: Mutex::new(HashMap::new()),
-            symbol_table: Mutex::new(SymbolTable::new()),
+            symbol_table: RwLock::new(SymbolTable::new()),
             named_objects: Mutex::new(HashMap::new()),
             intern_symbol_calls: AtomicU64::new(0),
             res_ticks_calls: AtomicU64::new(0),
@@ -622,9 +714,18 @@ impl HostSharedState {
 
     pub(crate) fn intern_symbol_str(&self, sym: &str) -> BamSymbol {
         self.intern_symbol_calls.fetch_add(1, Ordering::Relaxed);
+        {
+            let guard = self
+                .symbol_table
+                .read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if let Some(&id) = guard.map.get(sym) {
+                return id;
+            }
+        }
         let mut guard = self
             .symbol_table
-            .lock()
+            .write()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         guard.intern(sym)
     }
@@ -704,33 +805,21 @@ impl OwnedHostWorld {
 
     /// Runs registered system `sys_idx` using a stack-allocated [`SystemFrame`] and pre-allocated
     /// per-query [`IterState`] slots (zero heap allocations per tick).
+    #[inline]
     pub(crate) fn run_system(&self, sys_idx: usize) -> FfiResult {
         let world_ptr = self.raw;
-        // SAFETY: No guest callback is active yet; we inspect `systems[sys_idx]` and reset its
-        // pre-allocated `IterState` cursors before invoking the `extern "C"` callback.
-        let (run_if, run_if_data, callback, user_data, query_count, iter_ptrs) = unsafe {
+        // SAFETY: No guest callback is active yet; extract metadata and drop `&HostWorld` before
+        // invoking `run_if` or `callback` so reentrant calls do not alias `&HostWorld`.
+        let (run_if, run_if_data, callback, user_data, iters_ptr, query_count) = unsafe {
             let world_ref = &*world_ptr;
             let sys = &world_ref.systems[sys_idx];
-            let mut ptrs = [core::ptr::null_mut::<IterState>(); MAX_QUERIES_PER_SYSTEM];
-            for (q_idx, iter_cell) in sys.iters.iter().enumerate() {
-                let iter_ptr = iter_cell.get();
-                (*iter_ptr).world = world_ptr;
-                (*iter_ptr).sys_idx = sys_idx;
-                (*iter_ptr).query_idx = q_idx;
-                (*iter_ptr).start_chunk_idx = 0;
-                (*iter_ptr).next_chunk_idx = 0;
-                (*iter_ptr).end_chunk_idx = None;
-                (*iter_ptr).active_chunk_idx = None;
-                (*iter_ptr).in_par_iter = false;
-                ptrs[q_idx] = iter_ptr;
-            }
             (
                 sys.run_if,
                 sys.run_if_user_data,
                 sys.callback,
                 sys.user_data,
+                sys.iters.as_ptr(),
                 sys.iters.len(),
-                ptrs,
             )
         };
 
@@ -739,6 +828,18 @@ impl OwnedHostWorld {
             let should_run = unsafe { pred(run_if_data) };
             if !should_run.get() {
                 return FfiResult::OK;
+            }
+        }
+
+        if query_count > 0 {
+            for q_idx in 0..query_count {
+                // SAFETY: `iters_ptr` points to `query_count` pre-initialized `UnsafeCell<IterState>`
+                // entries in `systems[sys_idx].iters` and no guest callback is active yet.
+                unsafe {
+                    let iter_ptr = UnsafeCell::raw_get(iters_ptr.add(q_idx));
+                    (*iter_ptr).next_chunk_idx = 0;
+                    (*iter_ptr).active_chunk_idx = None;
+                }
             }
         }
 
@@ -754,7 +855,7 @@ impl OwnedHostWorld {
             shared: shared_ptr,
             commands: commands_ptr,
             sys_idx,
-            iter_ptrs,
+            iters: iters_ptr,
             query_count,
         };
         let sys_ctx = (&raw mut frame).cast::<BamSystemCtx>();
@@ -1406,6 +1507,8 @@ unsafe fn register_system_impl(
         }
     }
 
+    // Capture root `HostWorld` pointer provenance before creating `&mut HostWorld`.
+    let world_ptr = load_ctx.cast::<HostWorld>().cast_const();
     // SAFETY: `load_ctx` points to an exclusively held `HostWorld` during `bamabi_init`.
     let world = unsafe { &mut *load_ctx.cast::<HostWorld>() };
     let sys_idx = world.systems.len();
@@ -1414,7 +1517,7 @@ unsafe fn register_system_impl(
         .enumerate()
         .map(|(q_idx, terms)| {
             UnsafeCell::new(IterState {
-                world: core::ptr::null(),
+                world: world_ptr,
                 sys_idx,
                 query_idx: q_idx,
                 terms: terms.clone(),
@@ -1482,9 +1585,9 @@ unsafe extern "C" fn host_sys_query(
     if query_index >= frame.query_count {
         return FfiResult::OUT_OF_RANGE;
     }
-    // SAFETY: `out_iter` is non-null writable `*mut BamIter` storage.
+    // SAFETY: `out_iter` is non-null writable `*mut BamIter` storage and `query_index < frame.query_count`.
     unsafe {
-        *out_iter = frame.iter_ptrs[query_index].cast::<BamIter>();
+        *out_iter = UnsafeCell::raw_get(frame.iters.add(query_index)).cast::<BamIter>();
     }
     FfiResult::OK
 }
@@ -2018,7 +2121,7 @@ unsafe extern "C" fn host_cmd_spawn_empty(
     let queue = unsafe { &mut *cmds.cast::<CommandQueue>() };
     let entity = FfiEntity::from_bits(queue.next_entity_bits);
     queue.next_entity_bits += 1;
-    queue.ops.push(RecordedCmd::SpawnEmpty { _entity: entity });
+    queue.push_op(CmdKind::SpawnEmpty, 0, 0);
     // SAFETY: `out_entity` is writable `FfiEntity` storage.
     unsafe {
         *out_entity = entity;
@@ -2040,6 +2143,9 @@ unsafe extern "C" fn host_cmd_spawn(
     if count > 0 && (comps.is_null() || data_ptrs.is_null()) {
         return FfiResult::NULL_POINTER;
     }
+    let Ok(inline_inserts) = u32::try_from(count) else {
+        return FfiResult::OUT_OF_RANGE;
+    };
     // SAFETY: `cmds` points to the system's active `CommandQueue`.
     let queue = unsafe { &mut *cmds.cast::<CommandQueue>() };
     for i in 0..count {
@@ -2054,10 +2160,7 @@ unsafe extern "C" fn host_cmd_spawn(
     }
     let entity = FfiEntity::from_bits(queue.next_entity_bits);
     queue.next_entity_bits += 1;
-    queue.ops.push(RecordedCmd::Spawn {
-        _entity: entity,
-        inline_inserts: count,
-    });
+    queue.push_op(CmdKind::Spawn, 0, inline_inserts);
     // SAFETY: `out_entity` is writable `FfiEntity` storage.
     unsafe {
         *out_entity = entity;
@@ -2075,7 +2178,7 @@ unsafe extern "C" fn host_cmd_despawn(cmds: *mut BamCommands, entity: FfiEntity)
     }
     // SAFETY: `cmds` points to the system's active `CommandQueue`.
     let queue = unsafe { &mut *cmds.cast::<CommandQueue>() };
-    queue.ops.push(RecordedCmd::Despawn { _entity: entity });
+    queue.push_op(CmdKind::Despawn, 0, 0);
     FfiResult::OK
 }
 
@@ -2102,33 +2205,39 @@ unsafe fn cmd_insert_impl(
     if meta.size != data_len {
         return FfiResult::TYPE_MISMATCH;
     }
-    let mut inline_bytes = [0u8; 32];
-    if data_len > 0 {
-        if data_ptr.is_null() {
-            return FfiResult::NULL_POINTER;
-        }
-        let copy_n = data_len.min(inline_bytes.len());
-        // SAFETY: Caller guarantees `data_ptr` is readable for `data_len >= copy_n` bytes.
-        unsafe {
-            core::ptr::copy_nonoverlapping(data_ptr, inline_bytes.as_mut_ptr(), copy_n);
-        }
+    if data_len > 0 && data_ptr.is_null() {
+        return FfiResult::NULL_POINTER;
     }
-    let op = if if_new {
-        RecordedCmd::InsertIfNew {
-            _entity: entity,
-            component: comp,
-            byte_len: data_len,
-            _inline_bytes: inline_bytes,
-        }
-    } else {
-        RecordedCmd::Insert {
-            _entity: entity,
-            component: comp,
-            byte_len: data_len,
-            _inline_bytes: inline_bytes,
-        }
+    let Ok(len_u32) = u32::try_from(data_len) else {
+        return FfiResult::OUT_OF_RANGE;
     };
-    queue.ops.push(op);
+    if queue
+        .payload_bytes
+        .len()
+        .checked_add(data_len)
+        .and_then(|end| u32::try_from(end).ok())
+        .is_none()
+    {
+        return FfiResult::OUT_OF_RANGE;
+    }
+    let payload_offset = queue.payload_bytes.len() as u32;
+    if data_len > 0 {
+        // SAFETY: Caller guarantees `data_ptr` is non-null and readable for `data_len` bytes.
+        let bytes = unsafe { core::slice::from_raw_parts(data_ptr, data_len) };
+        queue.payload_bytes.extend_from_slice(bytes);
+    }
+    queue.ops.push(CmdHeader {
+        kind: if if_new {
+            CmdKind::InsertIfNew
+        } else {
+            CmdKind::Insert
+        },
+        _flags: 0,
+        _reserved: 0,
+        component_or_count: comp.to_raw(),
+        aux_len: len_u32,
+        payload_offset,
+    });
     FfiResult::OK
 }
 
@@ -2164,10 +2273,7 @@ unsafe extern "C" fn host_cmd_insert_default(
     if !meta.has_default {
         return FfiResult::PERMISSION_DENIED;
     }
-    queue.ops.push(RecordedCmd::InsertDefault {
-        _entity: entity,
-        _component: comp,
-    });
+    queue.push_op(CmdKind::InsertDefault, comp.to_raw(), 0);
     FfiResult::OK
 }
 
@@ -2188,10 +2294,7 @@ unsafe extern "C" fn host_cmd_remove(
     if queue.meta_for(comp).is_none() {
         return FfiResult::INVALID_COMPONENT;
     }
-    queue.ops.push(RecordedCmd::Remove {
-        _entity: entity,
-        _component: comp,
-    });
+    queue.push_op(CmdKind::Remove, comp.to_raw(), 0);
     FfiResult::OK
 }
 
@@ -2269,8 +2372,8 @@ unsafe extern "C" fn host_sys_entity_get(
     if query_index >= frame.query_count {
         return core::ptr::null();
     }
-    // SAFETY: `iter_ptrs[query_index]` points to a valid `IterState`.
-    let iter_state = unsafe { &*frame.iter_ptrs[query_index] };
+    // SAFETY: `frame.iters` has `frame.query_count` initialized `UnsafeCell<IterState>` entries.
+    let iter_state = unsafe { &*UnsafeCell::raw_get(frame.iters.add(query_index)) };
     let Some(term) = iter_state.terms.get(term_index) else {
         return core::ptr::null();
     };
@@ -2318,8 +2421,8 @@ unsafe extern "C" fn host_sys_entity_get_mut(
     if query_index >= frame.query_count {
         return core::ptr::null_mut();
     }
-    // SAFETY: `iter_ptrs[query_index]` points to a valid `IterState`.
-    let iter_state = unsafe { &*frame.iter_ptrs[query_index] };
+    // SAFETY: `frame.iters` has `frame.query_count` initialized `UnsafeCell<IterState>` entries.
+    let iter_state = unsafe { &*UnsafeCell::raw_get(frame.iters.add(query_index)) };
     let Some(term) = iter_state.terms.get(term_index) else {
         return core::ptr::null_mut();
     };
@@ -2672,7 +2775,7 @@ unsafe extern "C" fn host_cmd_trigger(
     if data_len > 0 && data_ptr.is_null() {
         return FfiResult::NULL_POINTER;
     }
-    queue.ops.push(RecordedCmd::Trigger);
+    queue.push_op(CmdKind::Trigger, 0, 0);
     FfiResult::OK
 }
 
@@ -2691,6 +2794,9 @@ unsafe extern "C" fn host_cmd_spawn_batch(
     if component_count > 0 && (components.is_null() || column_ptrs.is_null()) {
         return FfiResult::NULL_POINTER;
     }
+    let (Ok(cc), Ok(ec)) = (u32::try_from(component_count), u32::try_from(entity_count)) else {
+        return FfiResult::OUT_OF_RANGE;
+    };
     // SAFETY: `cmds` points to the system's active `CommandQueue`.
     let queue = unsafe { &mut *cmds.cast::<CommandQueue>() };
     for i in 0..component_count {
@@ -2715,10 +2821,7 @@ unsafe extern "C" fn host_cmd_spawn_batch(
     } else {
         queue.next_entity_bits += entity_count as u64;
     }
-    queue.ops.push(RecordedCmd::SpawnBatch {
-        entity_count,
-        component_count,
-    });
+    queue.push_op(CmdKind::SpawnBatch, cc, ec);
     FfiResult::OK
 }
 
@@ -2747,7 +2850,7 @@ unsafe extern "C" fn host_cmd_despawn_all(
     }
     // SAFETY: `cmds` points to the system's active `CommandQueue`.
     let queue = unsafe { &mut *cmds.cast::<CommandQueue>() };
-    queue.ops.push(RecordedCmd::DespawnAll);
+    queue.push_op(CmdKind::DespawnAll, 0, 0);
     FfiResult::OK
 }
 
@@ -2782,7 +2885,7 @@ unsafe extern "C" fn host_cmd_trigger_ex(
     }
     // SAFETY: `cmds` points to the system's active `CommandQueue`.
     let queue = unsafe { &mut *cmds.cast::<CommandQueue>() };
-    queue.ops.push(RecordedCmd::Trigger);
+    queue.push_op(CmdKind::Trigger, 0, 0);
     FfiResult::OK
 }
 
@@ -2808,7 +2911,7 @@ unsafe extern "C" fn host_cmd_observe(
     let queue = unsafe { &mut *cmds.cast::<CommandQueue>() };
     let e = FfiEntity::from_bits(queue.next_entity_bits);
     queue.next_entity_bits += 1;
-    queue.ops.push(RecordedCmd::Observe);
+    queue.push_op(CmdKind::Observe, 0, 0);
     if !out_entity.is_null() {
         // SAFETY: Non-null `out_entity` is writable `FfiEntity` storage.
         unsafe {
@@ -3100,14 +3203,14 @@ unsafe extern "C" fn host_intern_symbol(
     if ctx.is_null() || out_symbol.is_null() {
         return FfiResult::NULL_POINTER;
     }
+    if symbol.len == 0 {
+        return FfiResult::INVALID_ARGUMENT;
+    }
     // SAFETY: `symbol` points to valid bytes for the duration of this synchronous call.
     let sym_str = match unsafe { symbol.try_as_str() } {
         Ok(s) => s,
         Err(err) => return err,
     };
-    if sym_str.is_empty() {
-        return FfiResult::INVALID_ARGUMENT;
-    }
     // SAFETY: `ctx` points to an active `HostSharedState`.
     let shared = unsafe { &*ctx.cast::<HostSharedState>() };
     let sym = shared.intern_symbol_str(sym_str);
@@ -3351,7 +3454,7 @@ unsafe extern "C" fn host_cmd_insert_relation(
     if data_size > 0 && data.is_null() {
         return FfiResult::NULL_POINTER;
     }
-    queue.ops.push(RecordedCmd::InsertRelation);
+    queue.push_op(CmdKind::InsertRelation, 0, 0);
     FfiResult::OK
 }
 
@@ -3373,7 +3476,7 @@ unsafe extern "C" fn host_cmd_remove_relation(
     if queue.meta_for(relation).is_none() {
         return FfiResult::INVALID_COMPONENT;
     }
-    queue.ops.push(RecordedCmd::RemoveRelation);
+    queue.push_op(CmdKind::RemoveRelation, 0, 0);
     FfiResult::OK
 }
 
@@ -3466,10 +3569,7 @@ unsafe extern "C" fn host_cmd_clone_entity(
     }
     // SAFETY: `cmds` points to the system's active `CommandQueue`.
     let queue = unsafe { &mut *cmds.cast::<CommandQueue>() };
-    queue.ops.push(RecordedCmd::CloneEntity {
-        _src: src_entity,
-        _dst: dst_entity,
-    });
+    queue.push_op(CmdKind::CloneEntity, 0, 0);
     FfiResult::OK
 }
 
@@ -3494,10 +3594,10 @@ unsafe extern "C" fn host_cmd_insert_resource(
     if meta.size != data_len {
         return FfiResult::TYPE_MISMATCH;
     }
-    queue.ops.push(RecordedCmd::InsertResource {
-        _resource: resource,
-        _byte_len: data_len,
-    });
+    let Ok(len_u32) = u32::try_from(data_len) else {
+        return FfiResult::OUT_OF_RANGE;
+    };
+    queue.push_op(CmdKind::InsertResource, resource.to_raw(), len_u32);
     FfiResult::OK
 }
 
@@ -3514,9 +3614,7 @@ unsafe extern "C" fn host_cmd_remove_resource(
     if queue.meta_for(resource).is_none() {
         return FfiResult::INVALID_COMPONENT;
     }
-    queue.ops.push(RecordedCmd::RemoveResource {
-        _resource: resource,
-    });
+    queue.push_op(CmdKind::RemoveResource, resource.to_raw(), 0);
     FfiResult::OK
 }
 

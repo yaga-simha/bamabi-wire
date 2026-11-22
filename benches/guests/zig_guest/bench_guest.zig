@@ -45,6 +45,9 @@ const BenchInstance = struct {
     dense_query: [1]c.BamQueryDesc,
     roundtrip_terms: [1]c.BamTermDesc,
     roundtrip_query: [1]c.BamQueryDesc,
+    has_next_chunk_batch: bool,
+    has_checkpoint_rollback: bool,
+    has_roundtrip_slots: bool,
     sink: u64,
 };
 
@@ -227,45 +230,64 @@ fn sysDenseUpdate(sys_ctx_opt: ?*c.BamSystemCtx, user_data: ?*anyopaque) callcon
     const sview = bam.SystemContextView{ .api = &inst.api, .ctx = sctx };
     var cview = sview.query(0) catch |err| return bam.mapError(err);
 
-    while (cview.nextChunk()) |chunk_len| {
-        if (chunk_len == 0) continue;
-        const pos = cview.columnMutable(BenchPosition, 0) orelse return c.BAM_RESULT_NULL_POINTER;
-        const vel = cview.columnReadonly(BenchVelocity, 1) orelse return c.BAM_RESULT_NULL_POINTER;
-        integrateChunk(pos, vel, chunk_len);
+    if (inst.has_next_chunk_batch) {
+        var col_ptrs = [_]?[*]u8{ null, null };
+        while (cview.nextChunkBatchUnchecked(null, &col_ptrs, 1)) |chunk_len| {
+            if (chunk_len == 0) continue;
+            const pos_raw = col_ptrs[0] orelse return c.BAM_RESULT_NULL_POINTER;
+            const vel_raw = col_ptrs[1] orelse return c.BAM_RESULT_NULL_POINTER;
+            const pos: [*]BenchPosition = @ptrCast(@alignCast(pos_raw));
+            const vel: [*]const BenchVelocity = @ptrCast(@alignCast(vel_raw));
+            integrateChunk(pos, vel, chunk_len);
+        }
+    } else {
+        while (cview.nextChunk()) |chunk_len| {
+            if (chunk_len == 0) continue;
+            const pos = cview.columnMutable(BenchPosition, 0) orelse return c.BAM_RESULT_NULL_POINTER;
+            const vel = cview.columnReadonly(BenchVelocity, 1) orelse return c.BAM_RESULT_NULL_POINTER;
+            integrateChunk(pos, vel, chunk_len);
+        }
     }
     return c.BAM_RESULT_OK;
 }
 
 fn sysCommandBurst(sys_ctx_opt: ?*c.BamSystemCtx, user_data: ?*anyopaque) callconv(.c) c.BamResult {
     const inst: *BenchInstance = @ptrCast(@alignCast(user_data orelse return c.BAM_RESULT_NULL_POINTER));
+    if (!inst.has_checkpoint_rollback) return c.BAM_RESULT_UNSUPPORTED;
+    const checkpoint_fn = inst.api.cmd_checkpoint orelse return c.BAM_RESULT_UNSUPPORTED;
+    const rollback_fn = inst.api.cmd_rollback orelse return c.BAM_RESULT_UNSUPPORTED;
+
     const sctx = sys_ctx_opt orelse return c.BAM_RESULT_NULL_POINTER;
     const sview = bam.SystemContextView{ .api = &inst.api, .ctx = sctx };
     const cmds = sview.commands() catch |err| return bam.mapError(err);
 
     const sample_pos = BenchPosition{ .x = 1.0, .y = 2.0, .z = 3.0, .w = 4.0 };
-    var dummy_comp: c.BamComponent = c.BAM_COMPONENT_INVALID;
-    var dummy_ptr: ?[*]const u8 = null;
-    const empty_comps: [*]const c.BamComponent = @ptrCast(&dummy_comp);
-    const empty_ptrs: [*]const ?[*]const u8 = @ptrCast(&dummy_ptr);
-
     for (0..64) |_| {
-        const ent = cmds.spawn(empty_comps, empty_ptrs, 0) catch |err| return bam.mapError(err);
+        const ent = cmds.spawnEmpty() catch |err| return bam.mapError(err);
         cmds.insert(ent, inst.pos_comp, std.mem.asBytes(&sample_pos)) catch |err| {
             return bam.mapError(err);
         };
     }
 
-    const token = cmds.checkpoint() catch |err| return bam.mapError(err);
-    _ = cmds.spawn(empty_comps, empty_ptrs, 0) catch |err| {
-        cmds.rollback(token) catch {};
+    var token: usize = 0;
+    const cp_rc = checkpoint_fn(cmds.cmds, &token);
+    if (cp_rc != c.BAM_RESULT_OK) {
+        return cp_rc;
+    }
+    _ = cmds.spawnEmpty() catch |err| {
+        _ = rollback_fn(cmds.cmds, token);
         return bam.mapError(err);
     };
-    cmds.rollback(token) catch |err| return bam.mapError(err);
-    return c.BAM_RESULT_OK;
+    return rollback_fn(cmds.cmds, token);
 }
 
 fn sysHostApiRoundtrip(sys_ctx_opt: ?*c.BamSystemCtx, user_data: ?*anyopaque) callconv(.c) c.BamResult {
     const inst: *BenchInstance = @ptrCast(@alignCast(user_data orelse return c.BAM_RESULT_NULL_POINTER));
+    if (!inst.has_roundtrip_slots) return c.BAM_RESULT_UNSUPPORTED;
+    const res_ptr_fn = inst.api.res_ptr orelse return c.BAM_RESULT_NULL_POINTER;
+    const res_ticks_fn = inst.api.res_ticks orelse return c.BAM_RESULT_UNSUPPORTED;
+    const intern_fn = inst.api.intern_symbol orelse return c.BAM_RESULT_UNSUPPORTED;
+
     const sctx = sys_ctx_opt orelse return c.BAM_RESULT_NULL_POINTER;
     const sview = bam.SystemContextView{ .api = &inst.api, .ctx = sctx };
     const cview = sview.query(0) catch |err| return bam.mapError(err);
@@ -274,11 +296,21 @@ fn sysHostApiRoundtrip(sys_ctx_opt: ?*c.BamSystemCtx, user_data: ?*anyopaque) ca
         .ctx = inst.host_ctx orelse return c.BAM_RESULT_NULL_POINTER,
     };
 
+    const sym_name: c.BamStrView = .{ .ptr = "bench.sym", .len = 9 };
     var acc: u64 = 0;
     for (0..64) |_| {
-        const params = cview.resPtr(BenchSimParams, 0) orelse return c.BAM_RESULT_NOT_FOUND;
-        const ticks = cview.resTicks(0) catch |err| return bam.mapError(err);
-        const sym = hview.internSymbol("bench.sym") catch |err| return bam.mapError(err);
+        const raw_ptr = res_ptr_fn(cview.iter, 0) orelse return c.BAM_RESULT_NOT_FOUND;
+        const params: *const BenchSimParams = @ptrCast(@alignCast(raw_ptr));
+        var ticks: c.BamChangeTicks = undefined;
+        const ticks_rc = res_ticks_fn(cview.iter, 0, &ticks);
+        if (ticks_rc != c.BAM_RESULT_OK) {
+            return ticks_rc;
+        }
+        var sym: c.BamSymbol = c.BAM_SYMBOL_INVALID;
+        const sym_rc = intern_fn(hview.ctx, sym_name, &sym);
+        if (sym_rc != c.BAM_RESULT_OK) {
+            return sym_rc;
+        }
         const dt_bits: u32 = @bitCast(params.dt);
         acc +%= @as(u64, ticks.this_run) +% @as(u64, params.tick) +% @as(u64, dt_bits) +% @as(u64, sym);
     }
@@ -336,6 +368,9 @@ export fn bamabi_init(
         .dense_query = std.mem.zeroes([1]c.BamQueryDesc),
         .roundtrip_terms = std.mem.zeroes([1]c.BamTermDesc),
         .roundtrip_query = std.mem.zeroes([1]c.BamQueryDesc),
+        .has_next_chunk_batch = false,
+        .has_checkpoint_rollback = false,
+        .has_roundtrip_slots = false,
         .sink = 0,
     };
 
@@ -343,6 +378,37 @@ export fn bamabi_init(
     if (copy_rc != c.BAM_RESULT_OK) {
         return copy_rc;
     }
+    if (inst.api.cmd_spawn_empty == null or inst.api.res_ptr == null) {
+        return c.BAM_RESULT_NULL_POINTER;
+    }
+    inst.has_next_chunk_batch =
+        bam.coversHostApiSlot(
+            &inst.api,
+            bam.offsets.ITER_NEXT_CHUNK_BATCH,
+            @sizeOf(c.BamIterNextChunkBatchFn),
+        ) and inst.api.iter_next_chunk_batch != null;
+    inst.has_checkpoint_rollback =
+        bam.coversHostApiSlot(
+            &inst.api,
+            bam.offsets.CMD_CHECKPOINT,
+            @sizeOf(c.BamCmdCheckpointFn),
+        ) and inst.api.cmd_checkpoint != null and
+        bam.coversHostApiSlot(
+            &inst.api,
+            bam.offsets.CMD_ROLLBACK,
+            @sizeOf(c.BamCmdRollbackFn),
+        ) and inst.api.cmd_rollback != null;
+    inst.has_roundtrip_slots =
+        bam.coversHostApiSlot(
+            &inst.api,
+            bam.offsets.RES_TICKS,
+            @sizeOf(c.BamResTicksFn),
+        ) and inst.api.res_ticks != null and
+        bam.coversHostApiSlot(
+            &inst.api,
+            bam.offsets.INTERN_SYMBOL,
+            @sizeOf(c.BamInternSymbolFn),
+        ) and inst.api.intern_symbol != null;
 
     const lview = bam.LoadContextView{ .api = &inst.api, .ctx = load_ctx };
     const hview = lview.hostCtx() catch |err| return bam.mapError(err);

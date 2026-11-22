@@ -635,7 +635,57 @@ macro_rules! impl_v03_host_forwarders {
     };
 }
 
-impl_v03_host_forwarders!(SystemContext<'a>, RunConditionContext<'a>);
+impl_v03_host_forwarders!(RunConditionContext<'a>);
+
+impl<'a> SystemContext<'a> {
+    /// Binds a canonical UTF-8 lookup `name` to `entity` in the host symbol registry via
+    /// `BamHostApi::bind_named_object` (slot 56) without materializing a full [`Host`] copy.
+    #[inline]
+    pub fn bind_named_object(&self, name: &str, entity: FfiEntity) -> FfiResult {
+        self.sys_ref.bind_named_object(name, entity)
+    }
+
+    /// Interns a UTF-8 symbol string into an `O(1)` comparable [`BamSymbol`] handle via
+    /// `BamHostApi::intern_symbol` (slot 55) without materializing a full [`Host`] copy.
+    #[inline]
+    pub fn intern_symbol(&self, symbol: &str) -> Result<BamSymbol, FfiResult> {
+        self.sys_ref.intern_symbol(symbol)
+    }
+
+    /// Resolves a registered component or resource strictly by its 128-bit [`ComponentUuid`] via
+    /// `BamHostApi::resolve_component_by_uuid` (slot 52) without materializing a full [`Host`] copy.
+    #[inline]
+    pub fn resolve_component_by_uuid(
+        &self,
+        uuid: ComponentUuid,
+    ) -> Result<BamComponent, FfiResult> {
+        self.sys_ref.resolve_component_by_uuid(uuid)
+    }
+
+    /// Queries ABI `0.3.0` [`BamLayoutInfo`] metadata for `component` via
+    /// `BamHostApi::component_layout_info` (slot 53) without materializing a full [`Host`] copy.
+    #[inline]
+    pub fn component_layout_info(
+        &self,
+        component: BamComponent,
+    ) -> Result<BamLayoutInfo, FfiResult> {
+        self.sys_ref.component_layout_info(component)
+    }
+
+    /// Emits a structured guest diagnostic message via `BamHostApi::log_diagnostic` (slot 50)
+    /// without materializing a full [`Host`] copy.
+    #[inline]
+    pub fn log_diagnostic(&self, level: u32, message: &str) -> FfiResult {
+        self.sys_ref.log_diagnostic(level, message)
+    }
+
+    /// Records a guest-side fault message on this world's host context via
+    /// `BamHostApi::report_guest_fault` (slot 51) without materializing a full [`Host`] copy.
+    #[inline]
+    pub fn report_fault(&self, message: &str) -> FfiResult {
+        self.sys_ref.report_guest_fault(message)
+    }
+}
 
 impl<'a> SystemContext<'a> {
     /// Resolves `T: ModComponent` and verifies its registered `size`, `align`, and

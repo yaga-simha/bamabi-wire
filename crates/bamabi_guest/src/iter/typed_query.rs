@@ -10,7 +10,7 @@ use core::{
     ops::{Deref, DerefMut},
 };
 
-use bamabi_guest_sys::{ChunkColumnDispenser, Host};
+use bamabi_guest_sys::{BatchColCache, ChunkColumnDispenser, Host};
 use bamabi_sys::{
     AccessMode, BamChangeTicks, BamComponent, BamTermDesc, FfiEntity, FfiResult,
     MAX_TERMS_PER_QUERY,
@@ -301,6 +301,9 @@ pub type Or3<A, B, C> = Or<(A, B, C)>;
 /// Sealed trait implemented by filter terms permitted inside [`Or`] ([`Or2`] / [`Or3`]):
 /// [`With<T>`], [`Without<T>`], [`Changed<T>`], and [`Added<T>`].
 pub trait OrFilterTerm: private::OrFilterSealed {
+    /// `'static` canonical type key distinguishing filter term types and access modes.
+    type StaticKey: 'static;
+
     /// Resolves and appends the filter term with `or_group` assigned.
     fn push_filter_desc(
         host: &Host,
@@ -317,6 +320,9 @@ pub trait OrFilterTerm: private::OrFilterSealed {
 
 /// Sealed trait implemented by 2..=8 tuples of [`OrFilterTerm`] items accepted by [`Or`].
 pub trait OrFilterTuple: private::OrFilterTupleSealed {
+    /// `'static` canonical type key distinguishing filter tuple shapes and branch access modes.
+    type StaticKey: 'static;
+
     /// Number of disjunctive branches in this `Or<(...)>` group (`2..=8`).
     const BRANCH_COUNT: usize;
 
@@ -386,6 +392,10 @@ pub trait QueryTerm: private::TermSealed {
     /// Zero-copy slice or unit marker yielded for each chunk of this term.
     type Slice<'chunk>;
 
+    /// `'static` canonical type key distinguishing component types and access modes (`&'static T`
+    /// vs `&'static mut T`, `Option<&'static T>` vs `Option<&'static mut T>`, etc.).
+    type StaticKey: 'static;
+
     /// `true` if this term never requests mutable column access (`WRITE` / `OPTIONAL_WRITE`).
     const IS_READ_ONLY: bool = true;
 
@@ -416,6 +426,7 @@ pub trait QueryTerm: private::TermSealed {
 impl private::TermSealed for FfiEntity {}
 impl QueryTerm for FfiEntity {
     type Slice<'chunk> = &'chunk [FfiEntity];
+    type StaticKey = FfiEntity;
     const TERM_COUNT: usize = 0;
     const NEEDS_ENTITIES: bool = true;
 
@@ -441,6 +452,7 @@ impl QueryTerm for FfiEntity {
 impl<T: GuestComponent> private::TermSealed for &T {}
 impl<T: GuestComponent> QueryTerm for &T {
     type Slice<'chunk> = &'chunk [T];
+    type StaticKey = &'static T;
 
     /// Appends an [`AccessMode::READ`] descriptor for `T`.
     #[inline]
@@ -465,6 +477,7 @@ impl<T: GuestComponent> QueryTerm for &T {
 impl<T: GuestComponent> private::TermSealed for &mut T {}
 impl<T: GuestComponent> QueryTerm for &mut T {
     type Slice<'chunk> = &'chunk mut [T];
+    type StaticKey = &'static mut T;
     const IS_READ_ONLY: bool = false;
     const MARK_CHANGED_MASK: u32 = 1;
 
@@ -491,6 +504,7 @@ impl<T: GuestComponent> QueryTerm for &mut T {
 impl<T: GuestComponent> private::TermSealed for Option<&T> {}
 impl<T: GuestComponent> QueryTerm for Option<&T> {
     type Slice<'chunk> = Option<&'chunk [T]>;
+    type StaticKey = Option<&'static T>;
 
     /// Appends an [`AccessMode::OPTIONAL_READ`] descriptor for `T`.
     #[inline]
@@ -515,6 +529,7 @@ impl<T: GuestComponent> QueryTerm for Option<&T> {
 impl<T: GuestComponent> private::TermSealed for Option<&mut T> {}
 impl<T: GuestComponent> QueryTerm for Option<&mut T> {
     type Slice<'chunk> = Option<&'chunk mut [T]>;
+    type StaticKey = Option<&'static mut T>;
     const IS_READ_ONLY: bool = false;
     const MARK_CHANGED_MASK: u32 = 1;
 
@@ -541,6 +556,7 @@ impl<T: GuestComponent> QueryTerm for Option<&mut T> {
 impl<T: GuestComponent> private::TermSealed for With<T> {}
 impl<T: GuestComponent> QueryTerm for With<T> {
     type Slice<'chunk> = ();
+    type StaticKey = Self;
 
     /// Appends an [`AccessMode::FILTER_ONLY`] (`With<T>`) descriptor.
     #[inline]
@@ -565,6 +581,7 @@ impl<T: GuestComponent> QueryTerm for With<T> {
 impl<T: GuestComponent> private::TermSealed for Without<T> {}
 impl<T: GuestComponent> QueryTerm for Without<T> {
     type Slice<'chunk> = ();
+    type StaticKey = Self;
 
     /// Appends an [`AccessMode::WITHOUT`] (`Without<T>`) descriptor.
     #[inline]
@@ -589,6 +606,7 @@ impl<T: GuestComponent> QueryTerm for Without<T> {
 impl<T: GuestComponent> private::TermSealed for Changed<T> {}
 impl<T: GuestComponent> QueryTerm for Changed<T> {
     type Slice<'chunk> = &'chunk [T];
+    type StaticKey = Self;
 
     /// Appends an [`AccessMode::CHANGED`] descriptor for `T`.
     #[inline]
@@ -613,6 +631,7 @@ impl<T: GuestComponent> QueryTerm for Changed<T> {
 impl<T: GuestComponent> private::TermSealed for Added<T> {}
 impl<T: GuestComponent> QueryTerm for Added<T> {
     type Slice<'chunk> = &'chunk [T];
+    type StaticKey = Self;
 
     /// Appends an [`AccessMode::ADDED`] descriptor for `T`.
     #[inline]
@@ -637,6 +656,7 @@ impl<T: GuestComponent> QueryTerm for Added<T> {
 impl<T: GuestComponent> private::TermSealed for ChangedMut<T> {}
 impl<T: GuestComponent> QueryTerm for ChangedMut<T> {
     type Slice<'chunk> = &'chunk mut [T];
+    type StaticKey = Self;
     const IS_READ_ONLY: bool = false;
     const MARK_CHANGED_MASK: u32 = 1;
 
@@ -668,6 +688,7 @@ impl<T: GuestComponent> QueryTerm for ChangedMut<T> {
 impl<T: GuestComponent> private::TermSealed for AddedMut<T> {}
 impl<T: GuestComponent> QueryTerm for AddedMut<T> {
     type Slice<'chunk> = &'chunk mut [T];
+    type StaticKey = Self;
     const IS_READ_ONLY: bool = false;
     const MARK_CHANGED_MASK: u32 = 1;
 
@@ -699,6 +720,7 @@ impl<T: GuestComponent> QueryTerm for AddedMut<T> {
 impl<T: GuestComponent> private::TermSealed for WithChanged<T> {}
 impl<T: GuestComponent> QueryTerm for WithChanged<T> {
     type Slice<'chunk> = ();
+    type StaticKey = Self;
 
     /// Appends an [`AccessMode::FILTER_ONLY`] descriptor tagged with `BAM_TERM_FLAG_CHANGED`.
     #[inline]
@@ -728,6 +750,7 @@ impl<T: GuestComponent> QueryTerm for WithChanged<T> {
 impl<T: GuestComponent> private::TermSealed for WithAdded<T> {}
 impl<T: GuestComponent> QueryTerm for WithAdded<T> {
     type Slice<'chunk> = ();
+    type StaticKey = Self;
 
     /// Appends an [`AccessMode::FILTER_ONLY`] descriptor tagged with `BAM_TERM_FLAG_ADDED`.
     #[inline]
@@ -757,6 +780,7 @@ impl<T: GuestComponent> QueryTerm for WithAdded<T> {
 impl<T: GuestComponent> private::TermSealed for Ref<T> {}
 impl<T: GuestComponent> QueryTerm for Ref<T> {
     type Slice<'chunk> = RefSlice<'chunk, T>;
+    type StaticKey = Self;
 
     /// Appends an [`AccessMode::READ`] descriptor for `T`.
     #[inline]
@@ -789,6 +813,7 @@ impl<T: GuestComponent> QueryTerm for Ref<T> {
 impl<T: GuestComponent> private::TermSealed for Mut<T> {}
 impl<T: GuestComponent> QueryTerm for Mut<T> {
     type Slice<'chunk> = MutSlice<'chunk, T>;
+    type StaticKey = Self;
     const IS_READ_ONLY: bool = false;
     const MARK_CHANGED_MASK: u32 = 1;
 
@@ -823,6 +848,7 @@ impl<T: GuestComponent> QueryTerm for Mut<T> {
 impl<T: GuestComponent> private::TermSealed for Allow<T> {}
 impl<T: GuestComponent> QueryTerm for Allow<T> {
     type Slice<'chunk> = ();
+    type StaticKey = Self;
 
     /// Appends an [`AccessMode::ALLOW`] (`Allow<T>`) descriptor.
     #[inline]
@@ -847,6 +873,7 @@ impl<T: GuestComponent> QueryTerm for Allow<T> {
 impl<T: GuestComponent> private::TermSealed for Has<T> {}
 impl<T: GuestComponent> QueryTerm for Has<T> {
     type Slice<'chunk> = bool;
+    type StaticKey = Self;
 
     /// Appends an [`AccessMode::HAS`] (`Has<T>`) descriptor.
     #[inline]
@@ -873,6 +900,8 @@ macro_rules! impl_or_filter_term {
     ($target:ty, $mode:expr) => {
         impl<T: GuestComponent> private::OrFilterSealed for $target {}
         impl<T: GuestComponent> OrFilterTerm for $target {
+            type StaticKey = Self;
+
             /// Appends the filter term descriptor tagged with `or_group`.
             #[inline]
             fn push_filter_desc(
@@ -903,6 +932,8 @@ impl_or_filter_term!(Added<T>, AccessMode::ADDED);
 
 impl<T: GuestComponent> private::OrFilterSealed for WithChanged<T> {}
 impl<T: GuestComponent> OrFilterTerm for WithChanged<T> {
+    type StaticKey = Self;
+
     /// Appends a `FILTER_ONLY` + `BAM_TERM_FLAG_CHANGED` descriptor tagged with `or_group`.
     #[inline]
     fn push_filter_desc(
@@ -935,6 +966,8 @@ impl<T: GuestComponent> OrFilterTerm for WithChanged<T> {
 
 impl<T: GuestComponent> private::OrFilterSealed for WithAdded<T> {}
 impl<T: GuestComponent> OrFilterTerm for WithAdded<T> {
+    type StaticKey = Self;
+
     /// Appends a `FILTER_ONLY` + `BAM_TERM_FLAG_ADDED` descriptor tagged with `or_group`.
     #[inline]
     fn push_filter_desc(
@@ -971,6 +1004,7 @@ macro_rules! impl_or_filter_tuple {
         impl<$($term: OrFilterTerm),+> private::OrFilterTupleSealed for ($($term,)+) {}
 
         impl<$($term: OrFilterTerm),+> OrFilterTuple for ($($term,)+) {
+            type StaticKey = ($($term::StaticKey,)+);
             const BRANCH_COUNT: usize = $count;
 
             /// Appends all branch filter descriptors sharing `or_group`.
@@ -1012,6 +1046,7 @@ impl_or_filter_tuple!(8 => T0, T1, T2, T3, T4, T5, T6, T7);
 impl<T: OrFilterTuple> private::TermSealed for Or<T> {}
 impl<T: OrFilterTuple> QueryTerm for Or<T> {
     type Slice<'chunk> = ();
+    type StaticKey = Or<T::StaticKey>;
     const TERM_COUNT: usize = T::BRANCH_COUNT;
 
     /// Allocates a fresh non-zero `or_group` ID and appends every branch descriptor in `T`.
@@ -1039,6 +1074,9 @@ pub trait QueryTuple: private::TupleSealed {
     /// Tuple (or single item) of chunk slices yielded per chunk.
     type Slices<'chunk>;
 
+    /// `'static` canonical type key distinguishing tuple shapes, component types, and access modes.
+    type StaticKey: 'static;
+
     /// `true` if no term in this tuple requests mutable column access (`WRITE` / `OPTIONAL_WRITE`).
     const IS_READ_ONLY: bool;
 
@@ -1059,6 +1097,13 @@ pub trait QueryTuple: private::TupleSealed {
     fn fetch_slices<'chunk>(
         dispenser: &mut ChunkColumnDispenser<'chunk, '_>,
     ) -> Result<Self::Slices<'chunk>, FfiResult>;
+
+    /// Invokes `f` with tuple slice fields unpacked into separate top-level arguments behind an
+    /// `#[inline(never)]` boundary so LLVM preserves per-slice `noalias`/`readonly` attributes.
+    fn invoke_unpacked<F, R>(f: &mut F, slices: Self::Slices<'_>) -> FfiResult
+    where
+        F: FnMut(Self::Slices<'_>) -> R,
+        R: IntoSystemResult;
 }
 
 /// Implements [`QueryTuple`] directly on a single [`QueryTerm`] type as a 1-item shorthand.
@@ -1067,6 +1112,7 @@ macro_rules! impl_single_query_tuple {
         impl<$($lifetime,)? $ty_param: $bound> private::TupleSealed for $target {}
         impl<$($lifetime,)? $ty_param: $bound> QueryTuple for $target {
             type Slices<'chunk> = <Self as QueryTerm>::Slice<'chunk>;
+            type StaticKey = <Self as QueryTerm>::StaticKey;
             const IS_READ_ONLY: bool = <Self as QueryTerm>::IS_READ_ONLY;
             const TERM_COUNT: usize = <Self as QueryTerm>::TERM_COUNT;
             const NEEDS_ENTITIES: bool = <Self as QueryTerm>::NEEDS_ENTITIES;
@@ -1090,6 +1136,24 @@ macro_rules! impl_single_query_tuple {
             ) -> Result<Self::Slices<'chunk>, FfiResult> {
                 <Self as QueryTerm>::fetch_slice(dispenser)
             }
+
+            /// Invokes `f` with the single slice across an `#[inline(never)]` `noalias` boundary.
+            #[inline]
+            fn invoke_unpacked<F, R>(f: &mut F, slices: Self::Slices<'_>) -> FfiResult
+            where
+                F: FnMut(Self::Slices<'_>) -> R,
+                R: IntoSystemResult,
+            {
+                #[inline(never)]
+                fn call_unpacked<S, F, R>(f: &mut F, s: S) -> FfiResult
+                where
+                    F: FnMut(S) -> R,
+                    R: IntoSystemResult,
+                {
+                    f(s).into_ffi_result()
+                }
+                call_unpacked(f, slices)
+            }
         }
     };
 }
@@ -1097,6 +1161,7 @@ macro_rules! impl_single_query_tuple {
 impl private::TupleSealed for FfiEntity {}
 impl QueryTuple for FfiEntity {
     type Slices<'chunk> = &'chunk [FfiEntity];
+    type StaticKey = FfiEntity;
     const IS_READ_ONLY: bool = true;
     const TERM_COUNT: usize = 0;
     const NEEDS_ENTITIES: bool = true;
@@ -1114,6 +1179,24 @@ impl QueryTuple for FfiEntity {
         dispenser: &mut ChunkColumnDispenser<'chunk, '_>,
     ) -> Result<Self::Slices<'chunk>, FfiResult> {
         dispenser.entities()
+    }
+
+    /// Invokes `f` with the entity slice across an `#[inline(never)]` `noalias` boundary.
+    #[inline]
+    fn invoke_unpacked<F, R>(f: &mut F, slices: Self::Slices<'_>) -> FfiResult
+    where
+        F: FnMut(Self::Slices<'_>) -> R,
+        R: IntoSystemResult,
+    {
+        #[inline(never)]
+        fn call_unpacked<S, F, R>(f: &mut F, s: S) -> FfiResult
+        where
+            F: FnMut(S) -> R,
+            R: IntoSystemResult,
+        {
+            f(s).into_ffi_result()
+        }
+        call_unpacked(f, slices)
     }
 }
 
@@ -1137,6 +1220,7 @@ impl_single_query_tuple!(T: GuestComponent => Has<T>);
 impl<T: OrFilterTuple> private::TupleSealed for Or<T> {}
 impl<T: OrFilterTuple> QueryTuple for Or<T> {
     type Slices<'chunk> = ();
+    type StaticKey = Or<T::StaticKey>;
     const IS_READ_ONLY: bool = true;
     const TERM_COUNT: usize = T::BRANCH_COUNT;
     const NEEDS_ENTITIES: bool = false;
@@ -1157,15 +1241,34 @@ impl<T: OrFilterTuple> QueryTuple for Or<T> {
     ) -> Result<Self::Slices<'chunk>, FfiResult> {
         <Self as QueryTerm>::fetch_slice(dispenser)
     }
+
+    /// Invokes `f` across an `#[inline(never)]` boundary for consistency with data tuples.
+    #[inline]
+    fn invoke_unpacked<F, R>(f: &mut F, slices: Self::Slices<'_>) -> FfiResult
+    where
+        F: FnMut(Self::Slices<'_>) -> R,
+        R: IntoSystemResult,
+    {
+        #[inline(never)]
+        fn call_unpacked<S, F, R>(f: &mut F, s: S) -> FfiResult
+        where
+            F: FnMut(S) -> R,
+            R: IntoSystemResult,
+        {
+            f(s).into_ffi_result()
+        }
+        call_unpacked(f, slices)
+    }
 }
 
 /// Implements [`QueryTuple`] for fixed-arity tuples of 1..=16 [`QueryTerm`] elements.
 macro_rules! impl_query_tuple {
-    ($cap:expr => $($term:ident),+ $(,)?) => {
+    ($cap:expr => $($slice:ident : $term:ident : $var:ident),+ $(,)?) => {
         impl<$($term: QueryTerm),+> private::TupleSealed for ($($term,)+) {}
 
         impl<$($term: QueryTerm),+> QueryTuple for ($($term,)+) {
             type Slices<'chunk> = ($($term::Slice<'chunk>,)+);
+            type StaticKey = ($($term::StaticKey,)+);
             const IS_READ_ONLY: bool = true $(&& $term::IS_READ_ONLY)+;
             const TERM_COUNT: usize = 0 $(+ $term::TERM_COUNT)+;
             const NEEDS_ENTITIES: bool = false $(|| $term::NEEDS_ENTITIES)+;
@@ -1204,26 +1307,47 @@ macro_rules! impl_query_tuple {
                     $term::fetch_slice(dispenser)?,
                 )+))
             }
+
+            /// Unpacks tuple slice fields into separate top-level arguments behind an
+            /// `#[inline(never)]` boundary so LLVM preserves per-slice `noalias`/`readonly`.
+            #[inline]
+            fn invoke_unpacked<F, R>(f: &mut F, slices: Self::Slices<'_>) -> FfiResult
+            where
+                F: FnMut(Self::Slices<'_>) -> R,
+                R: IntoSystemResult,
+            {
+                #[inline(never)]
+                #[allow(clippy::too_many_arguments)]
+                fn call_unpacked<$($slice,)+ F, R>(f: &mut F, $($var: $slice,)+) -> FfiResult
+                where
+                    F: FnMut(($($slice,)+)) -> R,
+                    R: IntoSystemResult,
+                {
+                    f(($($var,)+)).into_ffi_result()
+                }
+                let ($($var,)+) = slices;
+                call_unpacked(f, $($var,)+)
+            }
         }
     };
 }
 
-impl_query_tuple!(1 => T0);
-impl_query_tuple!(2 => T0, T1);
-impl_query_tuple!(3 => T0, T1, T2);
-impl_query_tuple!(4 => T0, T1, T2, T3);
-impl_query_tuple!(5 => T0, T1, T2, T3, T4);
-impl_query_tuple!(6 => T0, T1, T2, T3, T4, T5);
-impl_query_tuple!(7 => T0, T1, T2, T3, T4, T5, T6);
-impl_query_tuple!(8 => T0, T1, T2, T3, T4, T5, T6, T7);
-impl_query_tuple!(9 => T0, T1, T2, T3, T4, T5, T6, T7, T8);
-impl_query_tuple!(10 => T0, T1, T2, T3, T4, T5, T6, T7, T8, T9);
-impl_query_tuple!(11 => T0, T1, T2, T3, T4, T5, T6, T7, T8, T9, T10);
-impl_query_tuple!(12 => T0, T1, T2, T3, T4, T5, T6, T7, T8, T9, T10, T11);
-impl_query_tuple!(13 => T0, T1, T2, T3, T4, T5, T6, T7, T8, T9, T10, T11, T12);
-impl_query_tuple!(14 => T0, T1, T2, T3, T4, T5, T6, T7, T8, T9, T10, T11, T12, T13);
-impl_query_tuple!(15 => T0, T1, T2, T3, T4, T5, T6, T7, T8, T9, T10, T11, T12, T13, T14);
-impl_query_tuple!(16 => T0, T1, T2, T3, T4, T5, T6, T7, T8, T9, T10, T11, T12, T13, T14, T15);
+impl_query_tuple!(1 => S0: T0: s0);
+impl_query_tuple!(2 => S0: T0: s0, S1: T1: s1);
+impl_query_tuple!(3 => S0: T0: s0, S1: T1: s1, S2: T2: s2);
+impl_query_tuple!(4 => S0: T0: s0, S1: T1: s1, S2: T2: s2, S3: T3: s3);
+impl_query_tuple!(5 => S0: T0: s0, S1: T1: s1, S2: T2: s2, S3: T3: s3, S4: T4: s4);
+impl_query_tuple!(6 => S0: T0: s0, S1: T1: s1, S2: T2: s2, S3: T3: s3, S4: T4: s4, S5: T5: s5);
+impl_query_tuple!(7 => S0: T0: s0, S1: T1: s1, S2: T2: s2, S3: T3: s3, S4: T4: s4, S5: T5: s5, S6: T6: s6);
+impl_query_tuple!(8 => S0: T0: s0, S1: T1: s1, S2: T2: s2, S3: T3: s3, S4: T4: s4, S5: T5: s5, S6: T6: s6, S7: T7: s7);
+impl_query_tuple!(9 => S0: T0: s0, S1: T1: s1, S2: T2: s2, S3: T3: s3, S4: T4: s4, S5: T5: s5, S6: T6: s6, S7: T7: s7, S8: T8: s8);
+impl_query_tuple!(10 => S0: T0: s0, S1: T1: s1, S2: T2: s2, S3: T3: s3, S4: T4: s4, S5: T5: s5, S6: T6: s6, S7: T7: s7, S8: T8: s8, S9: T9: s9);
+impl_query_tuple!(11 => S0: T0: s0, S1: T1: s1, S2: T2: s2, S3: T3: s3, S4: T4: s4, S5: T5: s5, S6: T6: s6, S7: T7: s7, S8: T8: s8, S9: T9: s9, S10: T10: s10);
+impl_query_tuple!(12 => S0: T0: s0, S1: T1: s1, S2: T2: s2, S3: T3: s3, S4: T4: s4, S5: T5: s5, S6: T6: s6, S7: T7: s7, S8: T8: s8, S9: T9: s9, S10: T10: s10, S11: T11: s11);
+impl_query_tuple!(13 => S0: T0: s0, S1: T1: s1, S2: T2: s2, S3: T3: s3, S4: T4: s4, S5: T5: s5, S6: T6: s6, S7: T7: s7, S8: T8: s8, S9: T9: s9, S10: T10: s10, S11: T11: s11, S12: T12: s12);
+impl_query_tuple!(14 => S0: T0: s0, S1: T1: s1, S2: T2: s2, S3: T3: s3, S4: T4: s4, S5: T5: s5, S6: T6: s6, S7: T7: s7, S8: T8: s8, S9: T9: s9, S10: T10: s10, S11: T11: s11, S12: T12: s12, S13: T13: s13);
+impl_query_tuple!(15 => S0: T0: s0, S1: T1: s1, S2: T2: s2, S3: T3: s3, S4: T4: s4, S5: T5: s5, S6: T6: s6, S7: T7: s7, S8: T8: s8, S9: T9: s9, S10: T10: s10, S11: T11: s11, S12: T12: s12, S13: T13: s13, S14: T14: s14);
+impl_query_tuple!(16 => S0: T0: s0, S1: T1: s1, S2: T2: s2, S3: T3: s3, S4: T4: s4, S5: T5: s5, S6: T6: s6, S7: T7: s7, S8: T8: s8, S9: T9: s9, S10: T10: s10, S11: T11: s11, S12: T12: s12, S13: T13: s13, S14: T14: s14, S15: T15: s15);
 
 /// Error returned by [`TypedChunkIter::single_chunk`] (mirroring Bevy's `QuerySingleError`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1253,6 +1377,7 @@ impl std::error::Error for QuerySingleError {}
 /// UUID-verified column slices without magic column index literals.
 pub struct TypedChunkIter<'iter, 'ctx, Q: QueryTuple> {
     pub(crate) iter: &'iter mut ChunkIter<'ctx>,
+    pub(crate) batch_cache: BatchColCache<'ctx>,
     pub(crate) _marker: PhantomData<fn() -> Q>,
 }
 
@@ -1261,10 +1386,14 @@ impl<'iter, 'ctx, Q: QueryTuple> TypedChunkIter<'iter, 'ctx, Q> {
     /// layout/UUID/access mismatch, or `None` when exhausted.
     #[inline]
     pub fn try_next_chunk(&mut self) -> Option<Result<Q::Slices<'_>, FfiResult>> {
-        self.iter
-            .inner
-            .advance_batch(Q::TERM_COUNT, Q::NEEDS_ENTITIES, Q::MARK_CHANGED_MASK)?;
-        let mut dispenser = ChunkColumnDispenser::new(&mut self.iter.inner);
+        self.iter.inner.advance_batch_into(
+            &mut self.batch_cache,
+            Q::TERM_COUNT,
+            Q::NEEDS_ENTITIES,
+            Q::MARK_CHANGED_MASK,
+        )?;
+        let mut dispenser =
+            ChunkColumnDispenser::new_with_batch(&mut self.iter.inner, &self.batch_cache);
         Some(Q::fetch_slices(&mut dispenser))
     }
 
@@ -1383,24 +1512,12 @@ impl<'iter, 'ctx, Q: QueryTuple> TypedChunkIter<'iter, 'ctx, Q> {
         F: FnMut(Q::Slices<'_>) -> R,
         R: IntoSystemResult,
     {
-        // Keep the per-chunk callback behind a `noalias`-preserving call boundary so LLVM
-        // retains `&mut [T]` / `&[U]` disjointness metadata for SIMD auto-vectorization even
-        // when `Q::fetch_slices` is fully inlined into this loop.
-        #[inline(never)]
-        fn invoke_chunk<S, F, R>(f: &mut F, slices: S) -> FfiResult
-        where
-            F: FnMut(S) -> R,
-            R: IntoSystemResult,
-        {
-            f(slices).into_ffi_result()
-        }
-
         while let Some(chunk_res) = self.try_next_chunk() {
             let slices = match chunk_res {
                 Ok(s) => s,
                 Err(err) => return err,
             };
-            let status = invoke_chunk(&mut f, slices);
+            let status = Q::invoke_unpacked(&mut f, slices);
             if !status.is_ok() {
                 return status;
             }
@@ -1421,7 +1538,8 @@ impl<'iter, 'ctx, Q: QueryTuple> TypedChunkIter<'iter, 'ctx, Q> {
                 Ok(s) => s,
                 Err(err) => return err,
             };
-            f(slices).into_ffi_result()
+            let mut adapter = &f;
+            Q::invoke_unpacked(&mut adapter, slices)
         })
     }
 
@@ -1446,7 +1564,8 @@ impl<'iter, 'ctx, Q: QueryTuple> TypedChunkIter<'iter, 'ctx, Q> {
                 Ok(s) => s,
                 Err(err) => return err,
             };
-            f(slices).into_ffi_result()
+            let mut adapter = &f;
+            Q::invoke_unpacked(&mut adapter, slices)
         })
     }
 
@@ -1467,15 +1586,17 @@ impl<'iter, 'ctx, Q: QueryTuple> TypedChunkIter<'iter, 'ctx, Q> {
             return FfiResult::OK;
         }
         let mut items: Vec<Q::OwnedItem> = Vec::new();
-        while let Some(chunk_len) =
-            self.iter
-                .inner
-                .advance_batch(Q::TERM_COUNT, Q::NEEDS_ENTITIES, Q::MARK_CHANGED_MASK)
-        {
+        while let Some(chunk_len) = self.iter.inner.advance_batch_into(
+            &mut self.batch_cache,
+            Q::TERM_COUNT,
+            Q::NEEDS_ENTITIES,
+            Q::MARK_CHANGED_MASK,
+        ) {
             if chunk_len == 0 {
                 continue;
             }
-            let mut dispenser = ChunkColumnDispenser::new(&mut self.iter.inner);
+            let mut dispenser =
+                ChunkColumnDispenser::new_with_batch(&mut self.iter.inner, &self.batch_cache);
             let slices = match Q::fetch_slices(&mut dispenser) {
                 Ok(s) => s,
                 Err(err) => return err,
@@ -1523,15 +1644,17 @@ impl<'iter, 'ctx, Q: QueryTuple> TypedChunkIter<'iter, 'ctx, Q> {
         F: FnMut(Q::PairItem<'_>, Q::PairItem<'_>) -> R,
         R: IntoSystemResult,
     {
-        while let Some(chunk_len) =
-            self.iter
-                .inner
-                .advance_batch(Q::TERM_COUNT, Q::NEEDS_ENTITIES, Q::MARK_CHANGED_MASK)
-        {
+        while let Some(chunk_len) = self.iter.inner.advance_batch_into(
+            &mut self.batch_cache,
+            Q::TERM_COUNT,
+            Q::NEEDS_ENTITIES,
+            Q::MARK_CHANGED_MASK,
+        ) {
             if chunk_len < 2 {
                 continue;
             }
-            let mut dispenser = ChunkColumnDispenser::new(&mut self.iter.inner);
+            let mut dispenser =
+                ChunkColumnDispenser::new_with_batch(&mut self.iter.inner, &self.batch_cache);
             let slices = match Q::fetch_slices(&mut dispenser) {
                 Ok(s) => s,
                 Err(err) => return err,

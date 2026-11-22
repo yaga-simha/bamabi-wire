@@ -40,7 +40,7 @@ type ZstPod = [u8; 0];
 use crate::{
     ChunkColumnDispenser, GuestInstance, Host, ReentrantCell, SparseRows, SparseRowsMut,
     UuidFilter, ValidatedCommands, ValidatedIter, ValidatedSlice, ValidatedSliceMut,
-    ValidatedSystemInvocation,
+    ValidatedSystemInvocation, ValidatedSystemSlice,
     component::{
         HookTrampolineState, RowMigrateCtx, generic_drop_trampoline, pod_clone_trampoline,
         pod_on_add_trampoline, pod_on_remove_trampoline, row_migrate_trampoline,
@@ -52,9 +52,10 @@ use crate::{
         raw_dense_slice, raw_dense_slice_mut,
     },
     trampoline::{
-        ObserverTrampolineState, PinnedHostPtr, RunIfClosureState, SystemClosureState,
-        lifecycle_observer_closure_trampoline, observer_closure_trampoline,
-        observer_mut_closure_trampoline, run_if_closure_trampoline, system_closure_trampoline,
+        InvocationHostScratch, ObserverTrampolineState, PinnedHostPtr, RunIfClosureState,
+        SlotScratchesCell, SystemClosureState, lifecycle_observer_closure_trampoline,
+        observer_closure_trampoline, observer_mut_closure_trampoline, run_if_closure_trampoline,
+        system_closure_slice_trampoline, system_closure_trampoline,
     },
 };
 
@@ -2634,6 +2635,8 @@ fn po_g8_system_and_run_if_trampolines() {
         total_query_count: 1,
         user_query_count: 1,
         resource_query_index: None,
+        host_scratch: InvocationHostScratch::new(),
+        slot_scratches: SlotScratchesCell::empty(),
         closure: ReentrantCell::new(sys_fn),
     };
     let sys_ud = core::ptr::from_mut(&mut sys_state).cast::<c_void>();
@@ -2730,6 +2733,148 @@ fn po_g8_system_and_run_if_trampolines() {
     kani::cover!(run_res.get());
     kani::cover!(!run_res.get());
     kani::cover!(!reent_run_res.get());
+}
+
+/// PO-G8 (`ValidatedSystemSlice` & `system_closure_slice_trampoline::<N, F>`): Proves query count
+/// clamping, single-take exclusivity, null/misaligned pointer rejection, lazy `sys_host_ctx`
+/// refresh via `host_scratch`, re-entrancy rejection (`ACCESS_CONFLICT`), and panic-freedom for
+/// `N = 0` and `N = 1`.
+#[kani::proof]
+fn po_g8_system_slice_trampoline_and_clamping() {
+    #[repr(C)]
+    struct SliceSysHostProbe {
+        refreshed_ctx: u64,
+        return_refreshed: bool,
+    }
+
+    unsafe extern "C" fn probe_slice_sys_host_ctx(
+        sys_ctx: *const BamSystemCtx,
+    ) -> *const BamHostCtx {
+        // SAFETY: Proof binds `sys_ctx` to `SliceSysHostProbe`.
+        let st = unsafe { &*sys_ctx.cast::<SliceSysHostProbe>() };
+        if st.return_refreshed {
+            (&raw const st.refreshed_ctx).cast::<BamHostCtx>()
+        } else {
+            core::ptr::null()
+        }
+    }
+
+    let orig_ctx_token = 1u64;
+    let orig_host_ctx = (&raw const orig_ctx_token).cast::<BamHostCtx>();
+    let mut api = make_core_api(size_of::<BamHostApi>() as u32, ABI_VERSION);
+    api.sys_host_ctx = Some(probe_slice_sys_host_ctx);
+    let host = make_valid_host(api, orig_host_ctx);
+
+    let total: usize = kani::any();
+    let user: usize = kani::any();
+    let res_idx: Option<usize> = if kani::any() { Some(kani::any()) } else { None };
+    let mut dummy_sys = 7u8;
+    // SAFETY: Non-null dummy `BamSystemCtx` for metadata clamping & single-take checks.
+    let mut slice = unsafe {
+        ValidatedSystemSlice::from_raw_for_kani(
+            (&raw mut dummy_sys).cast::<BamSystemCtx>(),
+            &host,
+            total,
+            user,
+            res_idx,
+        )
+    };
+    let clamped_total = total.min(bamabi_sys::MAX_QUERIES_PER_SYSTEM);
+    assert!(slice.query_count() <= clamped_total);
+    if let Some(r) = slice.resource_query_index() {
+        assert!(r < clamped_total);
+    }
+    assert!(slice.take_system_ref().is_some());
+    assert!(slice.take_system_ref().is_none());
+    let _ = slice.take_lazy_commands();
+    assert!(!slice.take_lazy_commands().resolve().is_valid());
+    let probe_idx: usize = kani::any();
+    let first = slice.take_raw_query_slot(probe_idx);
+    assert_eq!(first.is_some(), probe_idx < clamped_total);
+    assert!(slice.take_raw_query_slot(probe_idx).is_none());
+
+    let return_refreshed: bool = kani::any();
+    let mut probe = SliceSysHostProbe {
+        refreshed_ctx: 2u64,
+        return_refreshed,
+    };
+    let sys_ctx = (&raw mut probe).cast::<BamSystemCtx>();
+    let expected_ctx_addr = if return_refreshed {
+        (&raw const probe.refreshed_ctx).cast::<BamHostCtx>() as usize
+    } else {
+        orig_host_ctx as usize
+    };
+
+    // Bucket N = 0 trampoline.
+    let mut state_0 = SystemClosureState {
+        host: PinnedHostPtr::new(&raw const host),
+        total_query_count: 0,
+        user_query_count: 0,
+        resource_query_index: None,
+        host_scratch: InvocationHostScratch::new(),
+        slot_scratches: SlotScratchesCell::empty(),
+        closure: ReentrantCell::new(move |inv: &mut ValidatedSystemSlice<'_>| -> FfiResult {
+            assert_eq!(inv.query_count(), 0);
+            assert_eq!(inv.host().host_ctx() as usize, expected_ctx_addr);
+            FfiResult::OK
+        }),
+    };
+    let ud_0 = core::ptr::from_mut(&mut state_0).cast::<c_void>();
+    fn slice_trampoline_for<const N: usize, F>(_: &SystemClosureState<F>) -> bamabi_sys::BamSystemFn
+    where
+        F: FnMut(&mut ValidatedSystemSlice<'_>) -> FfiResult + Send + 'static,
+    {
+        system_closure_slice_trampoline::<N, F>
+    }
+    let tramp_0 = slice_trampoline_for::<0, _>(&state_0);
+    // SAFETY: Null pointers are rejected before dereferencing.
+    assert_eq!(
+        unsafe { tramp_0(core::ptr::null_mut(), ud_0) },
+        FfiResult::NULL_POINTER
+    );
+    // SAFETY: Null pointers are rejected before dereferencing.
+    assert_eq!(
+        unsafe { tramp_0(sys_ctx, core::ptr::null_mut()) },
+        FfiResult::NULL_POINTER
+    );
+    // SAFETY: `sys_ctx` and `ud_0` are valid for this invocation.
+    assert_eq!(unsafe { tramp_0(sys_ctx, ud_0) }, FfiResult::OK);
+
+    // Bucket N = 1 trampoline + misaligned + re-entrancy rejection.
+    let mut state_1 = SystemClosureState {
+        host: PinnedHostPtr::new(&raw const host),
+        total_query_count: 1,
+        user_query_count: 1,
+        resource_query_index: None,
+        host_scratch: InvocationHostScratch::new(),
+        slot_scratches: SlotScratchesCell::empty(),
+        closure: ReentrantCell::new(move |inv: &mut ValidatedSystemSlice<'_>| -> FfiResult {
+            assert_eq!(inv.query_count(), 1);
+            assert_eq!(inv.host().host_ctx() as usize, expected_ctx_addr);
+            FfiResult::OK
+        }),
+    };
+    let ud_1 = core::ptr::from_mut(&mut state_1).cast::<c_void>();
+    let tramp_1 = slice_trampoline_for::<1, _>(&state_1);
+    let mut align_buf = [0u64; 2];
+    let bad_ud = core::ptr::from_mut(&mut align_buf)
+        .cast::<u8>()
+        .wrapping_add(1)
+        .cast::<c_void>();
+    // SAFETY: Alignment guard rejects `bad_ud` before dereferencing.
+    assert_eq!(
+        unsafe { tramp_1(sys_ctx, bad_ud) },
+        FfiResult::INVALID_ARGUMENT
+    );
+    // SAFETY: `sys_ctx` and `ud_1` are valid for this invocation.
+    assert_eq!(unsafe { tramp_1(sys_ctx, ud_1) }, FfiResult::OK);
+    let mut reent_res = FfiResult::OK;
+    let locked = state_1.closure.try_with_mut(|_| {
+        // SAFETY: `state_1.closure` is locked; trampoline must return `ACCESS_CONFLICT`.
+        reent_res = unsafe { tramp_1(sys_ctx, ud_1) };
+    });
+    assert!(locked.is_some());
+    assert_eq!(reent_res, FfiResult::ACCESS_CONFLICT);
 }
 
 /// PO-G8 (`lifecycle_observer_closure_trampoline`): Proves null/misaligned `user_data` rejection,

@@ -7,6 +7,7 @@ use core::{
     marker::PhantomData,
     mem::MaybeUninit,
     ops::Index,
+    sync::atomic::{AtomicU64, Ordering},
 };
 use std::ffi::CString;
 
@@ -202,6 +203,63 @@ fn validate_resource_write_info<R: AbiPod>(
     true
 }
 
+/// Reinterprets a pre-validated dense column pointer `(ptr, len)` as `&'a [T]` without repeating
+/// null, alignment, or `isize::MAX` byte-length checks.
+///
+/// # Safety
+/// - If `size_of::<T>() == 0`, `ptr` must be non-null when `len > 0` (the returned slice uses
+///   `NonNull::dangling()`).
+/// - If `size_of::<T>() > 0` and `len > 0`, `ptr` must be non-null, aligned to `align_of::<T>()`,
+///   `len * size_of::<T>() <= isize::MAX`, and `ptr` must point to `len` contiguous initialized
+///   elements of `T` valid for shared reads during `'a`.
+#[inline(always)]
+pub(crate) unsafe fn raw_dense_slice_unchecked<'a, T: AbiPod>(
+    ptr: *const u8,
+    len: usize,
+) -> &'a [T] {
+    if core::mem::size_of::<T>() == 0 {
+        // SAFETY: `T: AbiPod` is a zero-sized type; `NonNull::dangling()` is aligned and valid for
+        // any `len` without dereferencing memory.
+        return unsafe {
+            core::slice::from_raw_parts(core::ptr::NonNull::<T>::dangling().as_ptr(), len)
+        };
+    }
+    if len == 0 {
+        return &[];
+    }
+    // SAFETY: Caller guarantees `ptr` is non-null, aligned for `T`, `len * size_of::<T>() <= isize::MAX`,
+    // and points to `len` contiguous initialized `T` elements valid for `'a`.
+    unsafe { core::slice::from_raw_parts(ptr.cast::<T>(), len) }
+}
+
+/// Reinterprets a pre-validated writable dense column pointer `(ptr, len)` as `&'a mut [T]`
+/// without repeating null, alignment, or `isize::MAX` byte-length checks.
+///
+/// # Safety
+/// - If `size_of::<T>() == 0`, `ptr` must be non-null when `len > 0` (the returned slice uses
+///   `NonNull::dangling()`).
+/// - If `size_of::<T>() > 0` and `len > 0`, `ptr` must be non-null, aligned to `align_of::<T>()`,
+///   `len * size_of::<T>() <= isize::MAX`, and `ptr` must point to `len` contiguous exclusively
+///   accessible, initialized elements of `T` valid for `'a`.
+#[inline(always)]
+pub(crate) unsafe fn raw_dense_slice_mut_unchecked<'a, T: AbiPod>(
+    ptr: *mut u8,
+    len: usize,
+) -> &'a mut [T] {
+    if core::mem::size_of::<T>() == 0 {
+        // SAFETY: `T: AbiPod` is zero-sized; `NonNull::dangling()` forms a sound mutable ZST slice.
+        return unsafe {
+            core::slice::from_raw_parts_mut(core::ptr::NonNull::<T>::dangling().as_ptr(), len)
+        };
+    }
+    if len == 0 {
+        return &mut [];
+    }
+    // SAFETY: Caller guarantees `ptr` is non-null, aligned for `T`, `len * size_of::<T>() <= isize::MAX`,
+    // and points to `len` contiguous exclusively accessible `T` elements valid for `'a`.
+    unsafe { core::slice::from_raw_parts_mut(ptr.cast::<T>(), len) }
+}
+
 /// Reinterprets a host-supplied dense column pointer `(ptr, len)` as `&'a [T]` after verifying
 /// alignment, non-nullness (for non-empty slices), ZST rules, and `isize::MAX` byte-length bounds.
 ///
@@ -214,11 +272,8 @@ pub(crate) unsafe fn raw_dense_slice<'a, T: AbiPod>(ptr: *const u8, len: usize) 
         if ptr.is_null() && len > 0 {
             return None;
         }
-        // SAFETY: `T: AbiPod` is a zero-sized type; `NonNull::dangling()` is aligned and valid for
-        // any `len` without dereferencing memory.
-        return Some(unsafe {
-            core::slice::from_raw_parts(core::ptr::NonNull::<T>::dangling().as_ptr(), len)
-        });
+        // SAFETY: `T: AbiPod` is a zero-sized type and `ptr` is non-null when `len > 0`.
+        return Some(unsafe { raw_dense_slice_unchecked::<T>(ptr, len) });
     }
     if ptr.is_null() {
         return None;
@@ -235,7 +290,7 @@ pub(crate) unsafe fn raw_dense_slice<'a, T: AbiPod>(ptr: *const u8, len: usize) 
     }
     // SAFETY: Verified non-null, aligned for `T`, `byte_len <= isize::MAX`, and caller guarantees
     // `ptr` points to `len` contiguous initialized `T` elements valid for `'a`.
-    Some(unsafe { core::slice::from_raw_parts(ptr.cast::<T>(), len) })
+    Some(unsafe { raw_dense_slice_unchecked::<T>(ptr, len) })
 }
 
 /// Reinterprets a host-supplied writable dense column pointer `(ptr, len)` as `&'a mut [T]` after
@@ -253,10 +308,8 @@ pub(crate) unsafe fn raw_dense_slice_mut<'a, T: AbiPod>(
         if ptr.is_null() && len > 0 {
             return None;
         }
-        // SAFETY: `T: AbiPod` is zero-sized; `NonNull::dangling()` forms a sound mutable ZST slice.
-        return Some(unsafe {
-            core::slice::from_raw_parts_mut(core::ptr::NonNull::<T>::dangling().as_ptr(), len)
-        });
+        // SAFETY: `T: AbiPod` is zero-sized and `ptr` is non-null when `len > 0`.
+        return Some(unsafe { raw_dense_slice_mut_unchecked::<T>(ptr, len) });
     }
     if ptr.is_null() {
         return None;
@@ -273,7 +326,7 @@ pub(crate) unsafe fn raw_dense_slice_mut<'a, T: AbiPod>(
     }
     // SAFETY: Verified non-null, aligned for `T`, `byte_len <= isize::MAX`, and caller guarantees
     // exclusive mutable access to `len` contiguous `T` elements valid for `'a`.
-    Some(unsafe { core::slice::from_raw_parts_mut(ptr.cast::<T>(), len) })
+    Some(unsafe { raw_dense_slice_mut_unchecked::<T>(ptr, len) })
 }
 
 /// Validates strided/dense slice metadata (`valid`, element size/alignment, stride compatibility,
@@ -1019,13 +1072,13 @@ impl<'a, T: AbiPod> SparseRowsMut<'a, T> {
     }
 }
 
-/// Number of leading query term indices whose [`BamColumnInfo`] metadata is cached inline inside
-/// [`ValidatedIter`].
+/// Number of leading query term indices whose [`BamColumnInfo`] and validated term metadata are
+/// cached inline inside [`QuerySlotScratch`].
 ///
-/// Covers 1–4 term queries (including dense physics/transform updates and singleton resource
-/// lookups) without inflating per-tick stack frames past 4 KB, eliminating redundant per-chunk and
-/// per-resource `BamHostApi::iter_column_info` FFI calls.
-const INLINE_COL_INFO_CAP: usize = 4;
+/// Covers 0..8 terms (matching [`INLINE_BATCH_COL_CAP`]) without inflating per-tick stack frames,
+/// eliminating steady-state `BamHostApi::iter_column_info` FFI calls and redundant per-chunk /
+/// per-resource layout + UUID validation across ticks.
+const INLINE_COL_INFO_CAP: usize = 8;
 
 /// Maximum number of column pointers cached inline per chunk inside [`ValidatedIter`] when
 /// advancing via `BamHostApi::iter_next_chunk_batch` (slot 68).
@@ -1036,20 +1089,306 @@ const _: () = {
     assert!(INLINE_BATCH_COL_CAP <= 32);
 };
 
+static NEXT_ITER_ID: AtomicU64 = AtomicU64::new(1);
+
+#[inline]
+fn alloc_iter_id() -> u64 {
+    let id = NEXT_ITER_ID.fetch_add(1, Ordering::Relaxed);
+    if id == 0 {
+        NEXT_ITER_ID.fetch_add(1, Ordering::Relaxed)
+    } else {
+        id
+    }
+}
+
+struct BatchColPtrBuf([MaybeUninit<*mut u8>; INLINE_BATCH_COL_CAP]);
+
+// SAFETY: Pointers written into `BatchColPtrBuf` during `advance_batch` are only read during the
+// same active tick while `SystemClosureState::closure.try_with_mut` holds exclusive access, and a
+// fresh `ValidatedIter` with `scratch_batch_epoch = 0` (`!= batch_epoch`) is created on each tick.
+unsafe impl Send for BatchColPtrBuf {}
+
+/// Classification of a cached term validation entry inside [`QuerySlotScratch`].
+#[derive(Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+enum CachedTermKind {
+    DenseRead = 0,
+    DenseReadAny = 1,
+    DenseWrite = 2,
+    DenseWriteAny = 3,
+    OptionalRead = 4,
+    OptionalWrite = 5,
+    Filter = 6,
+    FilterUntyped = 7,
+    Has = 8,
+    HasUntyped = 9,
+    ResourceRead = 10,
+    ResourceWrite = 11,
+}
+
+/// Cached metadata produced after validating a term descriptor `(term_index, kind, TypeId,
+/// expected_mode, expected_uuid)` against host [`BamColumnInfo`].
+#[derive(Clone, Copy)]
+struct CachedTermEntry {
+    type_id: core::any::TypeId,
+    expected_uuid: Option<UuidFilter>,
+    expected_mode: AccessMode,
+    info_mode: AccessMode,
+    component: BamComponent,
+    kind: CachedTermKind,
+}
+
+impl CachedTermEntry {
+    #[inline(always)]
+    fn matches<T: 'static>(
+        &self,
+        kind: CachedTermKind,
+        expected_mode: AccessMode,
+        expected_uuid: Option<UuidFilter>,
+    ) -> bool {
+        self.kind == kind
+            && self.expected_mode == expected_mode
+            && self.type_id == core::any::TypeId::of::<T>()
+            && self.expected_uuid == expected_uuid
+    }
+}
+
+/// Read-only `Sync` snapshot of initialized `BamColumnInfo` and [`CachedTermEntry`] slots from
+/// [`QuerySlotScratch`], shared across parallel worker threads in `par_for_each_chunk*`.
+#[derive(Clone, Copy)]
+pub(crate) struct FrozenSlotCache {
+    col_info_mask: u8,
+    term_cache_mask: u8,
+    col_infos: [MaybeUninit<BamColumnInfo>; INLINE_COL_INFO_CAP],
+    term_entries: [MaybeUninit<CachedTermEntry>; INLINE_COL_INFO_CAP],
+}
+
+/// 8-byte tagged pointer referencing either a per-slot mutable [`QuerySlotScratch`] (low bit `0`)
+/// or a frozen read-only [`FrozenSlotCache`] snapshot (low bit `1`).
+#[derive(Clone, Copy)]
+struct SlotCacheRef<'a> {
+    tagged_ptr: core::ptr::NonNull<u8>,
+    _marker: PhantomData<&'a ()>,
+}
+
+impl<'a> SlotCacheRef<'a> {
+    #[inline(always)]
+    fn mutable(scratch: &'a QuerySlotScratch) -> Self {
+        let ptr = core::ptr::from_ref(scratch).cast::<u8>().cast_mut();
+        // SAFETY: `scratch` is a live `&'a QuerySlotScratch` (non-null, aligned >= 2), so bit 0 is `0`.
+        let tagged_ptr = unsafe { core::ptr::NonNull::new_unchecked(ptr) };
+        Self {
+            tagged_ptr,
+            _marker: PhantomData,
+        }
+    }
+
+    #[inline(always)]
+    fn frozen(cache: &'a FrozenSlotCache) -> Self {
+        let ptr = core::ptr::from_ref(cache)
+            .cast::<u8>()
+            .cast_mut()
+            .map_addr(|addr| addr | 1);
+        // SAFETY: `cache` is a live `&'a FrozenSlotCache` (non-null, aligned >= 2), and `map_addr`
+        // preserves strict provenance while setting tag bit `0` to `1`.
+        let tagged_ptr = unsafe { core::ptr::NonNull::new_unchecked(ptr) };
+        Self {
+            tagged_ptr,
+            _marker: PhantomData,
+        }
+    }
+
+    #[inline(always)]
+    #[allow(clippy::cast_ptr_alignment)]
+    fn as_mutable(self) -> Option<&'a QuerySlotScratch> {
+        let ptr = self.tagged_ptr.as_ptr();
+        if (ptr.addr() & 1) == 0 {
+            // SAFETY: Tag bit `0 == 0` is only produced by `Self::mutable` from `&'a QuerySlotScratch`,
+            // which already satisfies `align_of::<QuerySlotScratch>()`.
+            Some(unsafe { &*ptr.cast_const().cast::<QuerySlotScratch>() })
+        } else {
+            None
+        }
+    }
+
+    #[inline(always)]
+    #[allow(clippy::cast_ptr_alignment)]
+    fn as_frozen(self) -> Option<&'a FrozenSlotCache> {
+        let ptr = self.tagged_ptr.as_ptr();
+        if (ptr.addr() & 1) == 1 {
+            let unmasked = ptr
+                .map_addr(|addr| addr & !1)
+                .cast_const()
+                .cast::<FrozenSlotCache>();
+            // SAFETY: Tag bit `0 == 1` is only produced by `Self::frozen` from `&'a FrozenSlotCache`,
+            // and clearing bit `0` via `map_addr` restores the exact aligned pointer and provenance.
+            Some(unsafe { &*unmasked })
+        } else {
+            None
+        }
+    }
+}
+
+/// Per-query-slot scratch storage for persistent `BamColumnInfo`/term metadata caching and
+/// per-tick slot-68 batch column pointers.
+///
+/// Kept inside `SystemClosureState` (rather than inline inside [`ValidatedIter`]) so
+/// [`ValidatedIter`] stays `<= 64` bytes on stack frames.
+pub struct QuerySlotScratch {
+    col_info_mask: Cell<u8>,
+    term_cache_mask: Cell<u8>,
+    batch_col_count: Cell<u8>,
+    col_infos: UnsafeCell<[MaybeUninit<BamColumnInfo>; INLINE_COL_INFO_CAP]>,
+    term_entries: UnsafeCell<[MaybeUninit<CachedTermEntry>; INLINE_COL_INFO_CAP]>,
+    batch_col_ptrs: UnsafeCell<BatchColPtrBuf>,
+}
+
+impl QuerySlotScratch {
+    /// Creates an empty, uninitialized per-query-slot scratch buffer without zeroing the
+    /// `BamColumnInfo`, term entry, or pointer arrays.
+    #[inline]
+    pub const fn new() -> Self {
+        Self {
+            col_info_mask: Cell::new(0),
+            term_cache_mask: Cell::new(0),
+            batch_col_count: Cell::new(0),
+            col_infos: UnsafeCell::new([const { MaybeUninit::uninit() }; INLINE_COL_INFO_CAP]),
+            term_entries: UnsafeCell::new([const { MaybeUninit::uninit() }; INLINE_COL_INFO_CAP]),
+            batch_col_ptrs: UnsafeCell::new(BatchColPtrBuf(
+                [const { MaybeUninit::uninit() }; INLINE_BATCH_COL_CAP],
+            )),
+        }
+    }
+
+    /// Resets per-tick ephemeral slot state (`batch_col_count`) on system tick entry while
+    /// preserving persistent `BamColumnInfo` and validated term metadata caches across ticks.
+    #[inline]
+    pub(crate) fn reset_per_tick(&self) {
+        self.batch_col_count.set(0);
+    }
+
+    /// Resets all cached slot state (`col_info_mask`, `term_cache_mask`, and `batch_col_count`)
+    /// when binding a fresh external `BamIter` via [`ValidatedIter::from_raw_with_scratch`].
+    #[inline]
+    pub(crate) fn reset_all(&self) {
+        self.col_info_mask.set(0);
+        self.term_cache_mask.set(0);
+        self.batch_col_count.set(0);
+    }
+
+    /// Snapshots initialized `BamColumnInfo` and [`CachedTermEntry`] slots into a `Sync`
+    /// [`FrozenSlotCache`] for lock-free worker reads in `par_for_each_chunk*`.
+    fn snapshot_frozen(&self) -> Option<FrozenSlotCache> {
+        let col_mask = self.col_info_mask.get();
+        let term_mask = self.term_cache_mask.get();
+        if col_mask == 0 && term_mask == 0 {
+            return None;
+        }
+        let mut col_infos = [const { MaybeUninit::uninit() }; INLINE_COL_INFO_CAP];
+        let mut term_entries = [const { MaybeUninit::uninit() }; INLINE_COL_INFO_CAP];
+        let mut idx = 0usize;
+        while idx < INLINE_COL_INFO_CAP {
+            let bit = 1u8 << idx;
+            if (col_mask & bit) != 0 {
+                // SAFETY: `col_mask & bit != 0` proves `col_infos[idx]` was initialized; reading
+                // via `UnsafeCell::get()` avoids aliasing references under Miri.
+                let info = unsafe { self.col_infos.get().cast::<BamColumnInfo>().add(idx).read() };
+                col_infos[idx].write(info);
+            }
+            if (term_mask & bit) != 0 {
+                // SAFETY: `term_mask & bit != 0` proves `term_entries[idx]` was initialized.
+                let entry = unsafe {
+                    self.term_entries
+                        .get()
+                        .cast::<CachedTermEntry>()
+                        .add(idx)
+                        .read()
+                };
+                term_entries[idx].write(entry);
+            }
+            idx += 1;
+        }
+        Some(FrozenSlotCache {
+            col_info_mask: col_mask,
+            term_cache_mask: term_mask,
+            col_infos,
+            term_entries,
+        })
+    }
+}
+
+impl Default for QuerySlotScratch {
+    #[inline]
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Safe stack-friendly buffer for slot-68 (`iter_next_chunk_batch`) column pointers, bound to
+/// the active tick lifetime `'ctx` and tagged with `(iter_id, batch_epoch)` so stale or
+/// cross-iterator caches never expose dangling pointers in safe code.
+pub struct BatchColCache<'ctx> {
+    ptrs: [MaybeUninit<*mut u8>; INLINE_BATCH_COL_CAP],
+    len: u8,
+    iter_id: u64,
+    batch_epoch: u64,
+    _marker: PhantomData<&'ctx ()>,
+}
+
+impl<'ctx> BatchColCache<'ctx> {
+    /// Creates an empty batch column pointer cache without zero-initializing `ptrs`.
+    #[inline]
+    pub const fn new() -> Self {
+        Self {
+            ptrs: [const { MaybeUninit::uninit() }; INLINE_BATCH_COL_CAP],
+            len: 0,
+            iter_id: 0,
+            batch_epoch: 0,
+            _marker: PhantomData,
+        }
+    }
+}
+
+impl Default for BatchColCache<'_> {
+    #[inline]
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 /// Validated query chunk and singleton resource accessor wrapping `*mut BamIter`.
 pub struct ValidatedIter<'a> {
     raw: *mut BamIter,
     host: &'a Host,
     lazy_host: Option<&'a LazyInvocationHost<'a>>,
     current_len: usize,
-    col_info_mask: Cell<u8>,
-    batch_col_count: u8,
-    batch_entities: Option<*const FfiEntity>,
-    batch_col_ptrs: [MaybeUninit<*mut u8>; INLINE_BATCH_COL_CAP],
-    col_infos: UnsafeCell<[MaybeUninit<BamColumnInfo>; INLINE_COL_INFO_CAP]>,
+    batch_entities: *const FfiEntity,
+    slot_cache: Option<SlotCacheRef<'a>>,
+    iter_id: u64,
+    batch_epoch: u32,
+    scratch_batch_epoch: u32,
 }
 
+const _: () = {
+    assert!(core::mem::size_of::<ValidatedIter<'static>>() <= 64);
+    assert!(core::mem::size_of::<Option<ValidatedIter<'static>>>() <= 64);
+    assert!(!core::mem::needs_drop::<ValidatedIter<'static>>());
+    assert!(!core::mem::needs_drop::<QuerySlotScratch>());
+    assert!(!core::mem::needs_drop::<FrozenSlotCache>());
+    assert!(core::mem::align_of::<QuerySlotScratch>() >= 2);
+    assert!(core::mem::align_of::<FrozenSlotCache>() >= 2);
+};
+
 impl<'a> ValidatedIter<'a> {
+    /// Advances `batch_epoch` monotonically on any chunk transition or reset (`0` marks
+    /// uncacheable overflow saturation).
+    #[inline]
+    fn bump_batch_epoch(&mut self) {
+        if self.batch_epoch != 0 {
+            self.batch_epoch = self.batch_epoch.checked_add(1).unwrap_or(0);
+        }
+    }
+
     /// Wraps a raw [`BamIter`] pointer obtained from `BamHostApi::sys_query`.
     ///
     /// A null `raw` pointer constructs an exhausted iterator yielding zero chunks.
@@ -1058,41 +1397,96 @@ impl<'a> ValidatedIter<'a> {
     /// If `raw` is non-null, it must point to an active [`BamIter`] belonging to the current
     /// system invocation on `host` and must not outlive `'a`.
     #[inline]
-    pub const unsafe fn from_raw(raw: *mut BamIter, host: &'a Host) -> Self {
+    pub unsafe fn from_raw(raw: *mut BamIter, host: &'a Host) -> Self {
         Self {
             raw,
             host,
             lazy_host: None,
             current_len: 0,
-            col_info_mask: Cell::new(0),
-            batch_col_count: 0,
-            batch_entities: None,
-            batch_col_ptrs: [const { MaybeUninit::uninit() }; INLINE_BATCH_COL_CAP],
-            col_infos: UnsafeCell::new([const { MaybeUninit::uninit() }; INLINE_COL_INFO_CAP]),
+            batch_entities: core::ptr::null(),
+            slot_cache: None,
+            iter_id: alloc_iter_id(),
+            batch_epoch: 1,
+            scratch_batch_epoch: 0,
         }
     }
 
-    /// Wraps a raw [`BamIter`] pointer paired with an optional lazy per-tick host resolver.
+    /// Wraps a raw [`BamIter`] pointer bound exclusively to caller-owned [`QuerySlotScratch`] for
+    /// `BamColumnInfo` caching and slot-68 batch column pointers.
     ///
     /// # Safety
     /// If `raw` is non-null, it must point to an active [`BamIter`] belonging to the current
     /// system invocation on `host` and must not outlive `'a`.
     #[inline]
-    pub(crate) const unsafe fn from_raw_with_lazy_host(
+    pub unsafe fn from_raw_with_scratch(
+        raw: *mut BamIter,
+        host: &'a Host,
+        scratch: &'a mut QuerySlotScratch,
+    ) -> Self {
+        scratch.reset_all();
+        Self {
+            raw,
+            host,
+            lazy_host: None,
+            current_len: 0,
+            batch_entities: core::ptr::null(),
+            slot_cache: Some(SlotCacheRef::mutable(&*scratch)),
+            iter_id: alloc_iter_id(),
+            batch_epoch: 1,
+            scratch_batch_epoch: 0,
+        }
+    }
+
+    /// Wraps a raw [`BamIter`] pointer paired with an optional lazy per-tick host resolver and
+    /// optional per-slot scratch storage.
+    ///
+    /// # Safety
+    /// - If `raw` is non-null, it must point to an active [`BamIter`] belonging to the current
+    ///   system invocation on `host` and must not outlive `'a`.
+    /// - If `slot_scratch` is `Some`, it must not be shared with any other active [`ValidatedIter`]
+    ///   for the duration of `'a`.
+    #[inline(always)]
+    pub(crate) unsafe fn from_raw_with_parts(
         raw: *mut BamIter,
         host: &'a Host,
         lazy_host: Option<&'a LazyInvocationHost<'a>>,
+        slot_scratch: Option<&'a QuerySlotScratch>,
     ) -> Self {
         Self {
             raw,
             host,
             lazy_host,
             current_len: 0,
-            col_info_mask: Cell::new(0),
-            batch_col_count: 0,
-            batch_entities: None,
-            batch_col_ptrs: [const { MaybeUninit::uninit() }; INLINE_BATCH_COL_CAP],
-            col_infos: UnsafeCell::new([const { MaybeUninit::uninit() }; INLINE_COL_INFO_CAP]),
+            batch_entities: core::ptr::null(),
+            slot_cache: slot_scratch.map(SlotCacheRef::mutable),
+            iter_id: alloc_iter_id(),
+            batch_epoch: 1,
+            scratch_batch_epoch: 0,
+        }
+    }
+
+    /// Wraps a sub-iterator [`BamIter`] pointer for a `par_for_each_chunk*` worker task with an
+    /// optional frozen read-only metadata cache snapshot.
+    ///
+    /// # Safety
+    /// - `raw` must point to an active worker sub-range [`BamIter`] on `host` valid for `'a`.
+    /// - If `frozen_cache` is `Some`, it must outlive `'a`.
+    #[inline]
+    pub(crate) unsafe fn from_raw_with_frozen_cache(
+        raw: *mut BamIter,
+        host: &'a Host,
+        frozen_cache: Option<&'a FrozenSlotCache>,
+    ) -> Self {
+        Self {
+            raw,
+            host,
+            lazy_host: None,
+            current_len: 0,
+            batch_entities: core::ptr::null(),
+            slot_cache: frozen_cache.map(SlotCacheRef::frozen),
+            iter_id: alloc_iter_id(),
+            batch_epoch: 1,
+            scratch_batch_epoch: 0,
         }
     }
 
@@ -1104,11 +1498,11 @@ impl<'a> ValidatedIter<'a> {
             host,
             lazy_host: None,
             current_len: 0,
-            col_info_mask: Cell::new(0),
-            batch_col_count: 0,
-            batch_entities: None,
-            batch_col_ptrs: [const { MaybeUninit::uninit() }; INLINE_BATCH_COL_CAP],
-            col_infos: UnsafeCell::new([const { MaybeUninit::uninit() }; INLINE_COL_INFO_CAP]),
+            batch_entities: core::ptr::null(),
+            slot_cache: None,
+            iter_id: 0,
+            batch_epoch: 1,
+            scratch_batch_epoch: 0,
         }
     }
 
@@ -1153,8 +1547,8 @@ impl<'a> ValidatedIter<'a> {
     /// `None` when exhausted.
     #[inline]
     pub fn next_chunk(&mut self) -> Option<usize> {
-        self.batch_col_count = 0;
-        self.batch_entities = None;
+        self.bump_batch_epoch();
+        self.batch_entities = core::ptr::null();
         if self.raw.is_null() {
             self.current_len = 0;
             return None;
@@ -1176,9 +1570,9 @@ impl<'a> ValidatedIter<'a> {
     }
 
     /// Advances to the next non-empty chunk via `BamHostApi::iter_next_chunk_batch` (slot 68) when
-    /// available and `col_count <= INLINE_BATCH_COL_CAP`, populating `self`'s inline column pointer
-    /// cache for subsequent [`ChunkColumnDispenser`] reads; otherwise falls back to
-    /// [`Self::next_chunk`].
+    /// available, `slot_scratch` is bound, and `col_count <= INLINE_BATCH_COL_CAP`, populating the
+    /// slot scratch batch pointer cache for subsequent [`ChunkColumnDispenser`] reads; otherwise
+    /// falls back to [`Self::next_chunk`].
     #[inline]
     pub fn advance_batch(
         &mut self,
@@ -1186,59 +1580,133 @@ impl<'a> ValidatedIter<'a> {
         needs_entities: bool,
         mark_changed_mask: u32,
     ) -> Option<usize> {
-        if col_count <= INLINE_BATCH_COL_CAP
-            && let Some(batch_fn) = host_slot!(self.host.api(), iter_next_chunk_batch)
-        {
-            if self.raw.is_null() {
+        self.bump_batch_epoch();
+        self.batch_entities = core::ptr::null();
+        if col_count <= INLINE_BATCH_COL_CAP {
+            if let Some(scratch) = self.slot_cache.and_then(SlotCacheRef::as_mutable) {
+                if let Some(batch_fn) = host_slot!(self.host.api(), iter_next_chunk_batch) {
+                    if self.raw.is_null() {
+                        self.current_len = 0;
+                        return None;
+                    }
+                    // SAFETY: `self.slot_scratch` belongs exclusively to this `ValidatedIter<'a>`
+                    // (derived from `&'a mut QuerySlotScratch` or exclusive `query_taken_mask` slot),
+                    // and `&mut self` grants exclusive access for this call.
+                    let ptrs = unsafe { &mut (*scratch.batch_col_ptrs.get()).0 };
+                    for slot in &mut ptrs[..col_count] {
+                        slot.write(core::ptr::null_mut());
+                    }
+                    let mut len: usize = 0;
+                    let mut entities_ptr: *const FfiEntity = core::ptr::null();
+                    let ent_out = if needs_entities {
+                        core::ptr::from_mut(&mut entities_ptr)
+                    } else {
+                        core::ptr::null_mut()
+                    };
+                    let col_out = if col_count > 0 {
+                        ptrs.as_mut_ptr().cast::<*mut u8>()
+                    } else {
+                        core::ptr::null_mut()
+                    };
+                    // SAFETY: `self.raw` is a valid active `BamIter` for `'a`, `len` is writable stack
+                    // storage, `ent_out` is either null or points to `entities_ptr`, and `col_out`
+                    // points to `col_count` initialized writable `*mut u8` slots when `col_count > 0`.
+                    let has_more = unsafe {
+                        batch_fn(
+                            self.raw,
+                            &mut len,
+                            ent_out,
+                            col_out,
+                            col_count,
+                            mark_changed_mask,
+                        )
+                    };
+                    if has_more.get() {
+                        self.current_len = len;
+                        scratch.batch_col_count.set(col_count as u8);
+                        self.scratch_batch_epoch = self.batch_epoch;
+                        self.batch_entities = if needs_entities {
+                            entities_ptr
+                        } else {
+                            core::ptr::null()
+                        };
+                        return Some(len);
+                    }
+                    self.current_len = 0;
+                    return None;
+                }
+            }
+        }
+        self.next_chunk()
+    }
+
+    /// Advances to the next non-empty chunk via `BamHostApi::iter_next_chunk_batch` (slot 68)
+    /// into caller-provided `cache`, falling back to [`Self::next_chunk`] when slot 68 is
+    /// unavailable or `col_count > INLINE_BATCH_COL_CAP`.
+    #[inline]
+    pub fn advance_batch_into(
+        &mut self,
+        cache: &mut BatchColCache<'a>,
+        col_count: usize,
+        needs_entities: bool,
+        mark_changed_mask: u32,
+    ) -> Option<usize> {
+        self.bump_batch_epoch();
+        self.batch_entities = core::ptr::null();
+        cache.len = 0;
+        cache.iter_id = 0;
+        cache.batch_epoch = 0;
+        if col_count <= INLINE_BATCH_COL_CAP {
+            if let Some(batch_fn) = host_slot!(self.host.api(), iter_next_chunk_batch) {
+                if self.raw.is_null() {
+                    self.current_len = 0;
+                    return None;
+                }
+                for slot in &mut cache.ptrs[..col_count] {
+                    slot.write(core::ptr::null_mut());
+                }
+                let mut len: usize = 0;
+                let mut entities_ptr: *const FfiEntity = core::ptr::null();
+                let ent_out = if needs_entities {
+                    core::ptr::from_mut(&mut entities_ptr)
+                } else {
+                    core::ptr::null_mut()
+                };
+                let col_out = if col_count > 0 {
+                    cache.ptrs.as_mut_ptr().cast::<*mut u8>()
+                } else {
+                    core::ptr::null_mut()
+                };
+                // SAFETY: `self.raw` is a valid active `BamIter` for `'a`, `len` is writable stack
+                // storage, `ent_out` is either null or points to `entities_ptr`, and `col_out`
+                // points to `col_count` initialized writable `*mut u8` slots when `col_count > 0`.
+                let has_more = unsafe {
+                    batch_fn(
+                        self.raw,
+                        &mut len,
+                        ent_out,
+                        col_out,
+                        col_count,
+                        mark_changed_mask,
+                    )
+                };
+                if has_more.get() {
+                    self.current_len = len;
+                    self.batch_entities = if needs_entities {
+                        entities_ptr
+                    } else {
+                        core::ptr::null()
+                    };
+                    if self.iter_id != 0 && self.batch_epoch != 0 {
+                        cache.len = col_count as u8;
+                        cache.iter_id = self.iter_id;
+                        cache.batch_epoch = u64::from(self.batch_epoch);
+                    }
+                    return Some(len);
+                }
                 self.current_len = 0;
-                self.batch_col_count = 0;
-                self.batch_entities = None;
                 return None;
             }
-            // Pre-zero only the active `0..col_count` entries so a buggy/hostile host that omits
-            // an entry cannot leave uninitialized bytes in `batch_col_ptrs[0..col_count]`.
-            for slot in &mut self.batch_col_ptrs[..col_count] {
-                slot.write(core::ptr::null_mut());
-            }
-            let mut len: usize = 0;
-            let mut entities_ptr: *const FfiEntity = core::ptr::null();
-            let ent_out = if needs_entities {
-                core::ptr::from_mut(&mut entities_ptr)
-            } else {
-                core::ptr::null_mut()
-            };
-            let col_out = if col_count > 0 {
-                self.batch_col_ptrs.as_mut_ptr().cast::<*mut u8>()
-            } else {
-                core::ptr::null_mut()
-            };
-            // SAFETY: `self.raw` is a valid active `BamIter` for `'a`, `len` is writable stack
-            // storage, `ent_out` is either null or points to `entities_ptr`, and `col_out` points
-            // to `col_count` initialized writable `*mut u8` slots when `col_count > 0`.
-            let has_more = unsafe {
-                batch_fn(
-                    self.raw,
-                    &mut len,
-                    ent_out,
-                    col_out,
-                    col_count,
-                    mark_changed_mask,
-                )
-            };
-            if has_more.get() {
-                self.current_len = len;
-                self.batch_col_count = col_count as u8;
-                self.batch_entities = if needs_entities {
-                    Some(entities_ptr)
-                } else {
-                    None
-                };
-                return Some(len);
-            }
-            self.current_len = 0;
-            self.batch_col_count = 0;
-            self.batch_entities = None;
-            return None;
         }
         self.next_chunk()
     }
@@ -1257,8 +1725,8 @@ impl<'a> ValidatedIter<'a> {
         out_col_ptrs: &mut [*mut u8],
         mark_changed_mask: u32,
     ) -> Result<Option<usize>, FfiResult> {
-        self.batch_col_count = 0;
-        self.batch_entities = None;
+        self.bump_batch_epoch();
+        self.batch_entities = core::ptr::null();
         let batch_fn =
             host_slot!(self.host.api(), iter_next_chunk_batch).ok_or(FfiResult::UNSUPPORTED)?;
         if self.raw.is_null() {
@@ -1301,9 +1769,9 @@ impl<'a> ValidatedIter<'a> {
     /// Resets the iterator back to its initial chunk so nested query loops can re-traverse.
     #[inline]
     pub fn reset(&mut self) -> FfiResult {
+        self.bump_batch_epoch();
         self.current_len = 0;
-        self.batch_col_count = 0;
-        self.batch_entities = None;
+        self.batch_entities = core::ptr::null();
         if self.raw.is_null() {
             return FfiResult::NULL_POINTER;
         }
@@ -1316,33 +1784,47 @@ impl<'a> ValidatedIter<'a> {
 
     /// Queries layout, UUID, access mode, and storage flags for `term_index`.
     ///
-    /// Caches successful results for `term_index < INLINE_COL_INFO_CAP` inside `self` because
-    /// [`BamColumnInfo`] metadata is invariant across all chunks and resource lookups of an active
-    /// `BamIter`.
+    /// Caches successful results for `term_index < INLINE_COL_INFO_CAP` inside `slot_cache` when
+    /// bound mutably, and reads cached results lock-free from frozen snapshots during parallel
+    /// chunk execution.
     #[inline]
     pub fn column_info(&self, term_index: usize) -> Result<BamColumnInfo, FfiResult> {
+        if self.raw.is_null() {
+            return Err(FfiResult::NULL_POINTER);
+        }
         if term_index < INLINE_COL_INFO_CAP {
-            let bit = 1u8 << term_index;
-            if (self.col_info_mask.get() & bit) != 0 {
-                // SAFETY: `col_info_mask & bit != 0` proves slot `term_index` was initialized by
-                // `column_info_uncached`, `term_index < INLINE_COL_INFO_CAP`, and `BamColumnInfo`
-                // is `Copy`. Reading via raw pointer through `UnsafeCell::get()` avoids forming
-                // aliasing references under Miri Stacked/Tree Borrows.
-                let info = unsafe {
-                    self.col_infos
-                        .get()
-                        .cast::<BamColumnInfo>()
-                        .add(term_index)
-                        .read()
-                };
-                return Ok(info);
+            if let Some(cache) = self.slot_cache {
+                let bit = 1u8 << term_index;
+                if let Some(scratch) = cache.as_mutable() {
+                    if (scratch.col_info_mask.get() & bit) != 0 {
+                        // SAFETY: `col_info_mask & bit != 0` proves slot `term_index` in `scratch`
+                        // was initialized by `column_info_uncached`, `term_index < INLINE_COL_INFO_CAP`,
+                        // and `BamColumnInfo` is `Copy`. Reading via raw pointer through
+                        // `UnsafeCell::get()` avoids forming aliasing references under Miri.
+                        let info = unsafe {
+                            scratch
+                                .col_infos
+                                .get()
+                                .cast::<BamColumnInfo>()
+                                .add(term_index)
+                                .read()
+                        };
+                        return Ok(info);
+                    }
+                } else if let Some(frozen) = cache.as_frozen() {
+                    if (frozen.col_info_mask & bit) != 0 {
+                        // SAFETY: `col_info_mask & bit != 0` proves `frozen.col_infos[term_index]`
+                        // was initialized by `snapshot_frozen`.
+                        return Ok(unsafe { frozen.col_infos[term_index].assume_init_read() });
+                    }
+                }
             }
         }
         self.column_info_uncached(term_index)
     }
 
-    /// Cold FFI path invoking `BamHostApi::iter_column_info` and populating the inline cache for
-    /// `term_index < INLINE_COL_INFO_CAP` on [`FfiResult::OK`].
+    /// Cold FFI path invoking `BamHostApi::iter_column_info` and populating `slot_cache`'s
+    /// inline cache (when mutable) for `term_index < INLINE_COL_INFO_CAP` on [`FfiResult::OK`].
     #[cold]
     #[inline(never)]
     fn column_info_uncached(&self, term_index: usize) -> Result<BamColumnInfo, FfiResult> {
@@ -1359,23 +1841,408 @@ impl<'a> ValidatedIter<'a> {
             // SAFETY: Host reported `FfiResult::OK`, confirming `*out` was initialized.
             let info = unsafe { out.assume_init() };
             if term_index < INLINE_COL_INFO_CAP {
-                // SAFETY: `ValidatedIter` is `!Sync`, `term_index < INLINE_COL_INFO_CAP`, and
-                // writing directly via `ptr::write` through `UnsafeCell::get()` preserves
-                // `SharedReadWrite` provenance under Miri Stacked/Tree Borrows.
-                unsafe {
-                    self.col_infos
-                        .get()
-                        .cast::<BamColumnInfo>()
-                        .add(term_index)
-                        .write(info);
+                if let Some(scratch) = self.slot_cache.and_then(SlotCacheRef::as_mutable) {
+                    // SAFETY: `scratch` belongs exclusively to this `ValidatedIter<'a>`,
+                    // `term_index < INLINE_COL_INFO_CAP`, and writing directly via `ptr::write`
+                    // through `UnsafeCell::get()` preserves `SharedReadWrite` provenance under Miri
+                    // Stacked/Tree Borrows.
+                    unsafe {
+                        scratch
+                            .col_infos
+                            .get()
+                            .cast::<BamColumnInfo>()
+                            .add(term_index)
+                            .write(info);
+                    }
+                    scratch
+                        .col_info_mask
+                        .set(scratch.col_info_mask.get() | (1u8 << term_index));
                 }
-                self.col_info_mask
-                    .set(self.col_info_mask.get() | (1u8 << term_index));
             }
             Ok(info)
         } else {
             Err(status)
         }
+    }
+
+    /// Looks up a persistent validated term entry matching `(term_index, kind, TypeId::of::<T>(),
+    /// expected_mode, expected_uuid)`.
+    #[inline]
+    fn cached_term_entry<T: 'static>(
+        &self,
+        term_index: usize,
+        kind: CachedTermKind,
+        expected_mode: AccessMode,
+        expected_uuid: Option<UuidFilter>,
+    ) -> Option<CachedTermEntry> {
+        if self.raw.is_null() || term_index >= INLINE_COL_INFO_CAP {
+            return None;
+        }
+        let cache = self.slot_cache?;
+        let bit = 1u8 << term_index;
+        if let Some(scratch) = cache.as_mutable() {
+            if (scratch.term_cache_mask.get() & bit) != 0 {
+                // SAFETY: `term_cache_mask & bit != 0` proves slot `term_index` was initialized
+                // by `store_cached_term` and `CachedTermEntry` is `Copy`.
+                let entry = unsafe {
+                    scratch
+                        .term_entries
+                        .get()
+                        .cast::<CachedTermEntry>()
+                        .add(term_index)
+                        .read()
+                };
+                if entry.matches::<T>(kind, expected_mode, expected_uuid) {
+                    return Some(entry);
+                }
+            }
+        } else if let Some(frozen) = cache.as_frozen() {
+            if (frozen.term_cache_mask & bit) != 0 {
+                // SAFETY: `term_cache_mask & bit != 0` proves `frozen.term_entries[term_index]`
+                // was initialized by `snapshot_frozen`.
+                let entry = unsafe { frozen.term_entries[term_index].assume_init_read() };
+                if entry.matches::<T>(kind, expected_mode, expected_uuid) {
+                    return Some(entry);
+                }
+            }
+        }
+        None
+    }
+
+    /// Stores a validated term entry into `slot_cache` when mutable and `term_index < INLINE_COL_INFO_CAP`.
+    #[inline]
+    fn store_cached_term(&self, term_index: usize, entry: CachedTermEntry) {
+        if term_index >= INLINE_COL_INFO_CAP {
+            return;
+        }
+        let Some(scratch) = self.slot_cache.and_then(SlotCacheRef::as_mutable) else {
+            return;
+        };
+        // SAFETY: `scratch` belongs exclusively to this `ValidatedIter<'a>`,
+        // `term_index < INLINE_COL_INFO_CAP`, and writing via `ptr::write` through
+        // `UnsafeCell::get()` preserves `SharedReadWrite` provenance under Miri.
+        unsafe {
+            scratch
+                .term_entries
+                .get()
+                .cast::<CachedTermEntry>()
+                .add(term_index)
+                .write(entry);
+        }
+        scratch
+            .term_cache_mask
+            .set(scratch.term_cache_mask.get() | (1u8 << term_index));
+    }
+
+    /// Validates a dense read term (`READ` / `CHANGED` / `ADDED`) via the persistent term cache,
+    /// falling back to `column_info` + `validate_dense_read_info` on miss or key mismatch.
+    #[inline]
+    fn validate_dense_read_term<T: AbiPod>(
+        &self,
+        term_index: usize,
+        expected_mode: AccessMode,
+        expected_uuid: Option<UuidFilter>,
+    ) -> Result<BamComponent, FfiResult> {
+        if let Some(entry) = self.cached_term_entry::<T>(
+            term_index,
+            CachedTermKind::DenseRead,
+            expected_mode,
+            expected_uuid,
+        ) {
+            return Ok(entry.component);
+        }
+        let info = self.column_info(term_index)?;
+        if info.mode != expected_mode || !validate_dense_read_info::<T>(&info, expected_uuid) {
+            return Err(FfiResult::TYPE_MISMATCH);
+        }
+        self.store_cached_term(
+            term_index,
+            CachedTermEntry {
+                type_id: core::any::TypeId::of::<T>(),
+                expected_uuid,
+                expected_mode,
+                info_mode: info.mode,
+                component: info.component,
+                kind: CachedTermKind::DenseRead,
+            },
+        );
+        Ok(info.component)
+    }
+
+    /// Validates a dense writable term (`WRITE`) via the persistent term cache.
+    #[inline]
+    fn validate_dense_write_term<T: AbiPod>(
+        &self,
+        term_index: usize,
+        expected_uuid: Option<UuidFilter>,
+    ) -> Result<BamComponent, FfiResult> {
+        if let Some(entry) = self.cached_term_entry::<T>(
+            term_index,
+            CachedTermKind::DenseWrite,
+            AccessMode::WRITE,
+            expected_uuid,
+        ) {
+            return Ok(entry.component);
+        }
+        let info = self.column_info(term_index)?;
+        if info.mode != AccessMode::WRITE || !validate_dense_write_info::<T>(&info, expected_uuid) {
+            return Err(FfiResult::TYPE_MISMATCH);
+        }
+        self.store_cached_term(
+            term_index,
+            CachedTermEntry {
+                type_id: core::any::TypeId::of::<T>(),
+                expected_uuid,
+                expected_mode: AccessMode::WRITE,
+                info_mode: info.mode,
+                component: info.component,
+                kind: CachedTermKind::DenseWrite,
+            },
+        );
+        Ok(info.component)
+    }
+
+    /// Validates an optional dense read term (`OPTIONAL_READ`) via the persistent term cache.
+    #[inline]
+    fn validate_optional_read_term<T: AbiPod>(
+        &self,
+        term_index: usize,
+        expected_uuid: Option<UuidFilter>,
+    ) -> Result<BamComponent, FfiResult> {
+        if let Some(entry) = self.cached_term_entry::<T>(
+            term_index,
+            CachedTermKind::OptionalRead,
+            AccessMode::OPTIONAL_READ,
+            expected_uuid,
+        ) {
+            return Ok(entry.component);
+        }
+        let info = self.column_info(term_index)?;
+        if info.mode != AccessMode::OPTIONAL_READ
+            || !validate_dense_read_info::<T>(&info, expected_uuid)
+        {
+            return Err(FfiResult::TYPE_MISMATCH);
+        }
+        self.store_cached_term(
+            term_index,
+            CachedTermEntry {
+                type_id: core::any::TypeId::of::<T>(),
+                expected_uuid,
+                expected_mode: AccessMode::OPTIONAL_READ,
+                info_mode: info.mode,
+                component: info.component,
+                kind: CachedTermKind::OptionalRead,
+            },
+        );
+        Ok(info.component)
+    }
+
+    /// Validates an optional dense write term (`OPTIONAL_WRITE`) via the persistent term cache.
+    #[inline]
+    fn validate_optional_write_term<T: AbiPod>(
+        &self,
+        term_index: usize,
+        expected_uuid: Option<UuidFilter>,
+    ) -> Result<BamComponent, FfiResult> {
+        if let Some(entry) = self.cached_term_entry::<T>(
+            term_index,
+            CachedTermKind::OptionalWrite,
+            AccessMode::OPTIONAL_WRITE,
+            expected_uuid,
+        ) {
+            return Ok(entry.component);
+        }
+        let info = self.column_info(term_index)?;
+        if info.mode != AccessMode::OPTIONAL_WRITE
+            || !validate_dense_write_info::<T>(&info, expected_uuid)
+        {
+            return Err(FfiResult::TYPE_MISMATCH);
+        }
+        self.store_cached_term(
+            term_index,
+            CachedTermEntry {
+                type_id: core::any::TypeId::of::<T>(),
+                expected_uuid,
+                expected_mode: AccessMode::OPTIONAL_WRITE,
+                info_mode: info.mode,
+                component: info.component,
+                kind: CachedTermKind::OptionalWrite,
+            },
+        );
+        Ok(info.component)
+    }
+
+    /// Validates a typed filter term (`FILTER_ONLY` / `WITHOUT` / `ALLOW`) via the persistent cache.
+    #[inline]
+    fn validate_filter_term<T: AbiPod>(
+        &self,
+        term_index: usize,
+        expected_mode: AccessMode,
+        expected_uuid: Option<UuidFilter>,
+    ) -> Result<(), FfiResult> {
+        if self
+            .cached_term_entry::<T>(
+                term_index,
+                CachedTermKind::Filter,
+                expected_mode,
+                expected_uuid,
+            )
+            .is_some()
+        {
+            return Ok(());
+        }
+        let info = self.column_info(term_index)?;
+        if info.mode != expected_mode || info.is_resource() || info.is_message() {
+            return Err(FfiResult::TYPE_MISMATCH);
+        }
+        if info.size != core::mem::size_of::<T>() || info.align != core::mem::align_of::<T>() {
+            return Err(FfiResult::TYPE_MISMATCH);
+        }
+        if let Some(filter) = expected_uuid
+            && !filter.matches(info.uuid)
+        {
+            return Err(FfiResult::TYPE_MISMATCH);
+        }
+        self.store_cached_term(
+            term_index,
+            CachedTermEntry {
+                type_id: core::any::TypeId::of::<T>(),
+                expected_uuid,
+                expected_mode,
+                info_mode: info.mode,
+                component: info.component,
+                kind: CachedTermKind::Filter,
+            },
+        );
+        Ok(())
+    }
+
+    /// Validates an untyped/bridged filter term (`FILTER_ONLY` / `WITHOUT` / `ALLOW`) via the
+    /// persistent cache.
+    #[inline]
+    fn validate_filter_untyped_term(
+        &self,
+        term_index: usize,
+        expected_mode: AccessMode,
+        expected_uuid: Option<UuidFilter>,
+    ) -> Result<(), FfiResult> {
+        if self
+            .cached_term_entry::<()>(
+                term_index,
+                CachedTermKind::FilterUntyped,
+                expected_mode,
+                expected_uuid,
+            )
+            .is_some()
+        {
+            return Ok(());
+        }
+        let info = self.column_info(term_index)?;
+        if info.mode != expected_mode || info.is_resource() || info.is_message() {
+            return Err(FfiResult::TYPE_MISMATCH);
+        }
+        if let Some(filter) = expected_uuid
+            && !filter.matches(info.uuid)
+        {
+            return Err(FfiResult::TYPE_MISMATCH);
+        }
+        self.store_cached_term(
+            term_index,
+            CachedTermEntry {
+                type_id: core::any::TypeId::of::<()>(),
+                expected_uuid,
+                expected_mode,
+                info_mode: info.mode,
+                component: info.component,
+                kind: CachedTermKind::FilterUntyped,
+            },
+        );
+        Ok(())
+    }
+
+    /// Validates a typed `AccessMode::HAS` term via the persistent cache.
+    #[inline]
+    fn validate_has_term<T: AbiPod>(
+        &self,
+        term_index: usize,
+        expected_uuid: Option<UuidFilter>,
+    ) -> Result<(), FfiResult> {
+        if self
+            .cached_term_entry::<T>(
+                term_index,
+                CachedTermKind::Has,
+                AccessMode::HAS,
+                expected_uuid,
+            )
+            .is_some()
+        {
+            return Ok(());
+        }
+        let info = self.column_info(term_index)?;
+        if info.mode != AccessMode::HAS || info.is_resource() || info.is_message() {
+            return Err(FfiResult::TYPE_MISMATCH);
+        }
+        if info.size != core::mem::size_of::<T>() || info.align != core::mem::align_of::<T>() {
+            return Err(FfiResult::TYPE_MISMATCH);
+        }
+        if let Some(filter) = expected_uuid
+            && !filter.matches(info.uuid)
+        {
+            return Err(FfiResult::TYPE_MISMATCH);
+        }
+        self.store_cached_term(
+            term_index,
+            CachedTermEntry {
+                type_id: core::any::TypeId::of::<T>(),
+                expected_uuid,
+                expected_mode: AccessMode::HAS,
+                info_mode: info.mode,
+                component: info.component,
+                kind: CachedTermKind::Has,
+            },
+        );
+        Ok(())
+    }
+
+    /// Validates an untyped `AccessMode::HAS` term via the persistent cache.
+    #[inline]
+    fn validate_has_untyped_term(
+        &self,
+        term_index: usize,
+        expected_uuid: Option<UuidFilter>,
+    ) -> Result<(), FfiResult> {
+        if self
+            .cached_term_entry::<()>(
+                term_index,
+                CachedTermKind::HasUntyped,
+                AccessMode::HAS,
+                expected_uuid,
+            )
+            .is_some()
+        {
+            return Ok(());
+        }
+        let info = self.column_info(term_index)?;
+        if info.mode != AccessMode::HAS || info.is_resource() || info.is_message() {
+            return Err(FfiResult::TYPE_MISMATCH);
+        }
+        if let Some(filter) = expected_uuid
+            && !filter.matches(info.uuid)
+        {
+            return Err(FfiResult::TYPE_MISMATCH);
+        }
+        self.store_cached_term(
+            term_index,
+            CachedTermEntry {
+                type_id: core::any::TypeId::of::<()>(),
+                expected_uuid,
+                expected_mode: AccessMode::HAS,
+                info_mode: info.mode,
+                component: info.component,
+                kind: CachedTermKind::HasUntyped,
+            },
+        );
+        Ok(())
     }
 
     /// Borrows the `[FfiEntity; current_len]` slice for the active chunk (`&[]` if empty or unavailable).
@@ -1604,12 +2471,33 @@ impl<'a> ValidatedIter<'a> {
         term_index: usize,
         expected_uuid: Option<UuidFilter>,
     ) -> Option<&[T]> {
-        let info = self.column_info(term_index).ok()?;
-        if !validate_dense_read_info::<T>(&info, expected_uuid) {
-            return None;
-        }
+        let info_mode = if let Some(entry) = self.cached_term_entry::<T>(
+            term_index,
+            CachedTermKind::DenseReadAny,
+            AccessMode::READ,
+            expected_uuid,
+        ) {
+            entry.info_mode
+        } else {
+            let info = self.column_info(term_index).ok()?;
+            if !validate_dense_read_info::<T>(&info, expected_uuid) {
+                return None;
+            }
+            self.store_cached_term(
+                term_index,
+                CachedTermEntry {
+                    type_id: core::any::TypeId::of::<T>(),
+                    expected_uuid,
+                    expected_mode: AccessMode::READ,
+                    info_mode: info.mode,
+                    component: info.component,
+                    kind: CachedTermKind::DenseReadAny,
+                },
+            );
+            info.mode
+        };
         if self.current_len == 0 {
-            if info.mode.is_optional() {
+            if info_mode.is_optional() {
                 return None;
             }
             return Some(&[]);
@@ -1627,13 +2515,34 @@ impl<'a> ValidatedIter<'a> {
         term_index: usize,
         expected_uuid: Option<UuidFilter>,
     ) -> Option<&mut [T]> {
-        let info = self.column_info(term_index).ok()?;
-        if !validate_dense_write_info::<T>(&info, expected_uuid) {
-            return None;
-        }
+        let info_mode = if let Some(entry) = self.cached_term_entry::<T>(
+            term_index,
+            CachedTermKind::DenseWriteAny,
+            AccessMode::WRITE,
+            expected_uuid,
+        ) {
+            entry.info_mode
+        } else {
+            let info = self.column_info(term_index).ok()?;
+            if !validate_dense_write_info::<T>(&info, expected_uuid) {
+                return None;
+            }
+            self.store_cached_term(
+                term_index,
+                CachedTermEntry {
+                    type_id: core::any::TypeId::of::<T>(),
+                    expected_uuid,
+                    expected_mode: AccessMode::WRITE,
+                    info_mode: info.mode,
+                    component: info.component,
+                    kind: CachedTermKind::DenseWriteAny,
+                },
+            );
+            info.mode
+        };
         let len = self.current_len;
         if len == 0 {
-            if info.mode.is_optional() {
+            if info_mode.is_optional() {
                 return None;
             }
             return Some(&mut []);
@@ -1651,13 +2560,34 @@ impl<'a> ValidatedIter<'a> {
         term_index: usize,
         expected_uuid: Option<UuidFilter>,
     ) -> Option<&mut [T]> {
-        let info = self.column_info(term_index).ok()?;
-        if !validate_dense_write_info::<T>(&info, expected_uuid) {
-            return None;
-        }
+        let info_mode = if let Some(entry) = self.cached_term_entry::<T>(
+            term_index,
+            CachedTermKind::DenseWriteAny,
+            AccessMode::WRITE,
+            expected_uuid,
+        ) {
+            entry.info_mode
+        } else {
+            let info = self.column_info(term_index).ok()?;
+            if !validate_dense_write_info::<T>(&info, expected_uuid) {
+                return None;
+            }
+            self.store_cached_term(
+                term_index,
+                CachedTermEntry {
+                    type_id: core::any::TypeId::of::<T>(),
+                    expected_uuid,
+                    expected_mode: AccessMode::WRITE,
+                    info_mode: info.mode,
+                    component: info.component,
+                    kind: CachedTermKind::DenseWriteAny,
+                },
+            );
+            info.mode
+        };
         let len = self.current_len;
         if len == 0 {
-            if info.mode.is_optional() {
+            if info_mode.is_optional() {
                 return None;
             }
             return Some(&mut []);
@@ -1990,16 +2920,37 @@ impl<'a> ValidatedIter<'a> {
     }
 
     /// Borrows singleton resource `R` declared at `term_index` after validating [`BamColumnInfo`]
-    /// and optional `expected_uuid`.
+    /// and optional `expected_uuid` (using the persistent per-system term cache on steady-state calls).
     #[inline]
     pub fn resource_checked<R: AbiPod>(
         &self,
         term_index: usize,
         expected_uuid: Option<UuidFilter>,
     ) -> Option<&R> {
-        let info = self.column_info(term_index).ok()?;
-        if !validate_resource_read_info::<R>(&info, expected_uuid) {
-            return None;
+        if self
+            .cached_term_entry::<R>(
+                term_index,
+                CachedTermKind::ResourceRead,
+                AccessMode::RESOURCE_READ,
+                expected_uuid,
+            )
+            .is_none()
+        {
+            let info = self.column_info(term_index).ok()?;
+            if !validate_resource_read_info::<R>(&info, expected_uuid) {
+                return None;
+            }
+            self.store_cached_term(
+                term_index,
+                CachedTermEntry {
+                    type_id: core::any::TypeId::of::<R>(),
+                    expected_uuid,
+                    expected_mode: AccessMode::RESOURCE_READ,
+                    info_mode: info.mode,
+                    component: info.component,
+                    kind: CachedTermKind::ResourceRead,
+                },
+            );
         }
         let ptr = self.res_ptr(term_index);
         if ptr.is_null() {
@@ -2018,16 +2969,38 @@ impl<'a> ValidatedIter<'a> {
     }
 
     /// Mutably borrows singleton resource `R` declared with `RESOURCE_WRITE` at `term_index` after
-    /// validating [`BamColumnInfo`] and optional `expected_uuid`.
+    /// validating [`BamColumnInfo`] and optional `expected_uuid` (using the persistent per-system
+    /// term cache on steady-state calls).
     #[inline]
     pub fn resource_mut_checked<R: AbiPod>(
         &mut self,
         term_index: usize,
         expected_uuid: Option<UuidFilter>,
     ) -> Option<&mut R> {
-        let info = self.column_info(term_index).ok()?;
-        if !validate_resource_write_info::<R>(&info, expected_uuid) {
-            return None;
+        if self
+            .cached_term_entry::<R>(
+                term_index,
+                CachedTermKind::ResourceWrite,
+                AccessMode::RESOURCE_WRITE,
+                expected_uuid,
+            )
+            .is_none()
+        {
+            let info = self.column_info(term_index).ok()?;
+            if !validate_resource_write_info::<R>(&info, expected_uuid) {
+                return None;
+            }
+            self.store_cached_term(
+                term_index,
+                CachedTermEntry {
+                    type_id: core::any::TypeId::of::<R>(),
+                    expected_uuid,
+                    expected_mode: AccessMode::RESOURCE_WRITE,
+                    info_mode: info.mode,
+                    component: info.component,
+                    kind: CachedTermKind::ResourceWrite,
+                },
+            );
         }
         let ptr = self.res_mut_ptr(term_index);
         if ptr.is_null() {
@@ -2094,9 +3067,16 @@ impl<'a> ValidatedIter<'a> {
         let Some(par_fn) = host_slot!(self.host.api(), par_for_each_chunk) else {
             return FfiResult::UNSUPPORTED;
         };
+        self.bump_batch_epoch();
+        self.batch_entities = core::ptr::null();
         self.current_len = 0;
+        let frozen_cache = self.slot_cache.and_then(|c| match c.as_mutable() {
+            Some(s) => s.snapshot_frozen(),
+            None => c.as_frozen().copied(),
+        });
         let task_ctx = ParChunkTaskContext {
             host: self.host(),
+            frozen_cache: frozen_cache.as_ref(),
             func: f,
         };
         // SAFETY: `self.raw` is an active top-level `BamIter`, `task_ctx` stays live on the stack
@@ -2126,9 +3106,16 @@ impl<'a> ValidatedIter<'a> {
         let Some(par_fn) = host_slot!(self.host.api(), par_for_each_chunk_readonly) else {
             return FfiResult::UNSUPPORTED;
         };
+        self.bump_batch_epoch();
+        self.batch_entities = core::ptr::null();
         self.current_len = 0;
+        let frozen_cache = self.slot_cache.and_then(|c| match c.as_mutable() {
+            Some(s) => s.snapshot_frozen(),
+            None => c.as_frozen().copied(),
+        });
         let task_ctx = ParChunkTaskContext {
             host: self.host(),
+            frozen_cache: frozen_cache.as_ref(),
             func: f,
         };
         // SAFETY: `self.raw` is an active top-level `BamIter`, `task_ctx` lives on the stack across
@@ -2642,17 +3629,9 @@ impl<'a> ValidatedIter<'a> {
     }
 
     /// Reads the synthesized per-chunk [`AccessMode::HAS`] boolean presence indicator for
-    /// `term_index` (`Some(true)` if present in the active chunk's archetype, `Some(false)` if
-    /// absent, or `None` if `term_index` was not declared with `AccessMode::HAS` or no chunk is active).
+    /// `term_index` without re-validating `BamColumnInfo` (caller must have validated `HAS`).
     #[inline]
-    pub fn has_column(&self, term_index: usize) -> Option<bool> {
-        if self.raw.is_null() || self.current_len == 0 {
-            return None;
-        }
-        let info = self.column_info(term_index).ok()?;
-        if info.mode != AccessMode::HAS || info.is_resource() || info.is_message() {
-            return None;
-        }
+    fn has_column_raw(&self, term_index: usize) -> Option<bool> {
         let ptr = self.column_readonly_ptr(term_index);
         if ptr.is_null() {
             return None;
@@ -2660,6 +3639,18 @@ impl<'a> ValidatedIter<'a> {
         // SAFETY: For `AccessMode::HAS` on an active chunk, `iter_column_readonly` returns a
         // non-null pointer to a 1-byte `FfiBool` (`0` or `1`).
         Some(unsafe { (*ptr.cast::<FfiBool>()).get() })
+    }
+
+    /// Reads the synthesized per-chunk [`AccessMode::HAS`] boolean presence indicator for
+    /// `term_index` (`Some(true)` if present in the active chunk's archetype, `Some(false)` if
+    /// absent, or `None` if `term_index` was not declared with `AccessMode::HAS` or no chunk is active).
+    #[inline]
+    pub fn has_column(&self, term_index: usize) -> Option<bool> {
+        if self.raw.is_null() || self.current_len == 0 {
+            return None;
+        }
+        self.validate_has_untyped_term(term_index, None).ok()?;
+        self.has_column_raw(term_index)
     }
 
     /// Reads up to `out_entities.len()` entity IDs from a `RemovedComponents<T>` stream declared
@@ -3289,6 +4280,7 @@ pub(crate) unsafe extern "C" fn append_field(
 /// Context passed through `user_data` to [`par_chunk_task_trampoline`] during parallel chunk dispatch.
 struct ParChunkTaskContext<'h, F> {
     host: &'h Host,
+    frozen_cache: Option<&'h FrozenSlotCache>,
     func: F,
 }
 
@@ -3313,8 +4305,10 @@ where
         // on the caller's stack throughout `par_for_each_chunk`, and `F: Sync` allows concurrent shared reads.
         let ctx = unsafe { &*user_data.cast::<ParChunkTaskContext<'_, F>>() };
         // SAFETY: `sub_iter` is an isolated sub-range `BamIter` valid on this worker thread for
-        // the duration of this task callback.
-        let mut task_iter = unsafe { ValidatedIter::from_raw(sub_iter, ctx.host) };
+        // the duration of this task callback, and `ctx.frozen_cache` outlives this call.
+        let mut task_iter = unsafe {
+            ValidatedIter::from_raw_with_frozen_cache(sub_iter, ctx.host, ctx.frozen_cache)
+        };
         while task_iter.next_chunk().is_some() {
             let status = (ctx.func)(&mut task_iter);
             if !status.is_ok() {
@@ -3450,18 +4444,91 @@ pub struct ChunkColumnDispenser<'chunk, 'ctx> {
     borrowed: [MaybeUninit<DispensedBorrow>; MAX_TERMS_PER_QUERY],
     borrowed_count: usize,
     entities_range: Option<(usize, usize)>,
+    batch_ptrs: *const MaybeUninit<*mut u8>,
+    batch_col_count: usize,
 }
 
 impl<'chunk, 'ctx> ChunkColumnDispenser<'chunk, 'ctx> {
     /// Creates a column dispenser over the currently active chunk of `iter`.
     #[inline]
     pub fn new(iter: &'chunk mut ValidatedIter<'ctx>) -> Self {
+        let (batch_ptrs, batch_col_count) = match iter.slot_cache.and_then(SlotCacheRef::as_mutable)
+        {
+            Some(scratch)
+                if iter.iter_id != 0
+                    && iter.batch_epoch != 0
+                    && iter.scratch_batch_epoch == iter.batch_epoch =>
+            {
+                let count = (scratch.batch_col_count.get() as usize).min(INLINE_BATCH_COL_CAP);
+                if count > 0 {
+                    // SAFETY: `scratch.batch_col_ptrs` holds `INLINE_BATCH_COL_CAP` elements and
+                    // `count` leading entries were initialized by `advance_batch` for the exact
+                    // active `(iter_id, batch_epoch)`. `iter` is borrowed `&'chunk mut`, preventing
+                    // mutation while `self` is alive.
+                    (unsafe { (*scratch.batch_col_ptrs.get()).0.as_ptr() }, count)
+                } else {
+                    (core::ptr::null(), 0)
+                }
+            }
+            _ => (core::ptr::null(), 0),
+        };
         Self {
             iter,
             next_term_index: 0,
             borrowed: [const { MaybeUninit::uninit() }; MAX_TERMS_PER_QUERY],
             borrowed_count: 0,
             entities_range: None,
+            batch_ptrs,
+            batch_col_count,
+        }
+    }
+
+    /// Creates a column dispenser over the currently active chunk of `iter` backed by an explicit
+    /// caller-owned [`BatchColCache`] populated via [`ValidatedIter::advance_batch_into`].
+    ///
+    /// If `cache` does not match `iter`'s current `(iter_id, batch_epoch)` (e.g. from an earlier
+    /// chunk, another iterator, or an unpopulated cache), falls back cleanly to legacy per-column
+    /// FFI lookups (`batch_ptrs = null`, `batch_col_count = 0`).
+    #[inline]
+    pub fn new_with_batch(
+        iter: &'chunk mut ValidatedIter<'ctx>,
+        cache: &'chunk BatchColCache<'ctx>,
+    ) -> Self {
+        let valid = iter.iter_id != 0
+            && iter.batch_epoch != 0
+            && cache.iter_id == iter.iter_id
+            && cache.batch_epoch == u64::from(iter.batch_epoch);
+        let count = if valid {
+            (cache.len as usize).min(INLINE_BATCH_COL_CAP)
+        } else {
+            0
+        };
+        let batch_ptrs = if count > 0 {
+            cache.ptrs.as_ptr()
+        } else {
+            core::ptr::null()
+        };
+        Self {
+            iter,
+            next_term_index: 0,
+            borrowed: [const { MaybeUninit::uninit() }; MAX_TERMS_PER_QUERY],
+            borrowed_count: 0,
+            entities_range: None,
+            batch_ptrs,
+            batch_col_count: count,
+        }
+    }
+
+    /// Reads cached slot-68 column pointer `term_index` if `term_index < self.batch_col_count`.
+    #[inline]
+    fn batch_col_ptr(&self, term_index: usize) -> Option<*mut u8> {
+        if term_index < self.batch_col_count && !self.batch_ptrs.is_null() {
+            // SAFETY: `self.batch_ptrs` points to at least `self.batch_col_count` initialized
+            // `MaybeUninit<*mut u8>` elements populated by `advance_batch` / `advance_batch_into`,
+            // and `self.batch_col_count <= INLINE_BATCH_COL_CAP`.
+            Some(unsafe { (*self.batch_ptrs.add(term_index)).assume_init() })
+        } else {
+            None
         }
     }
 
@@ -3641,8 +4708,8 @@ impl<'chunk, 'ctx> ChunkColumnDispenser<'chunk, 'ctx> {
         if len == 0 {
             return Ok(&[]);
         }
-        let ptr = if let Some(ptr) = self.iter.batch_entities {
-            ptr
+        let ptr = if !self.iter.batch_entities.is_null() {
+            self.iter.batch_entities
         } else {
             let ent_fn = self
                 .iter
@@ -3683,7 +4750,7 @@ impl<'chunk, 'ctx> ChunkColumnDispenser<'chunk, 'ctx> {
     }
 
     /// Validates pointer alignment/bounds, records a shared borrow in `self`, and dispenses
-    /// `&'chunk [T]` for a dense column.
+    /// `&'chunk [T]` for a dense column without repeating bounds/alignment checks.
     ///
     /// # Safety
     /// `ptr` must be valid for `len` initialized `T` elements for lifetime `'chunk`.
@@ -3700,8 +4767,8 @@ impl<'chunk, 'ctx> ChunkColumnDispenser<'chunk, 'ctx> {
                 return Err(FfiResult::TYPE_MISMATCH);
             }
             self.check_and_record_borrow(component, 0, 0, false)?;
-            // SAFETY: `len == 0` or ZST `T: AbiPod`; `raw_dense_slice` uses `NonNull::dangling()`.
-            return unsafe { raw_dense_slice::<T>(ptr, len) }.ok_or(FfiResult::TYPE_MISMATCH);
+            // SAFETY: `len == 0` or ZST `T: AbiPod`, and `ptr` is non-null when `len > 0`.
+            return Ok(unsafe { raw_dense_slice_unchecked::<T>(ptr, len) });
         }
         let byte_len = len.checked_mul(elem_size).ok_or(FfiResult::OUT_OF_RANGE)?;
         if byte_len > isize::MAX as usize {
@@ -3715,11 +4782,11 @@ impl<'chunk, 'ctx> ChunkColumnDispenser<'chunk, 'ctx> {
         self.check_and_record_borrow(component, ptr.addr(), byte_len, false)?;
         // SAFETY: Verified non-null, aligned, `byte_len <= isize::MAX`, and strict disjointness
         // from all active mutable borrows for `'chunk`.
-        unsafe { raw_dense_slice::<T>(ptr, len) }.ok_or(FfiResult::TYPE_MISMATCH)
+        Ok(unsafe { raw_dense_slice_unchecked::<T>(ptr, len) })
     }
 
     /// Validates pointer alignment/bounds, records an exclusive borrow in `self`, and dispenses
-    /// `&'chunk mut [T]` for a writable dense column.
+    /// `&'chunk mut [T]` for a writable dense column without repeating bounds/alignment checks.
     ///
     /// # Safety
     /// `ptr` must be exclusively valid for `len` initialized `T` elements for lifetime `'chunk`.
@@ -3737,7 +4804,7 @@ impl<'chunk, 'ctx> ChunkColumnDispenser<'chunk, 'ctx> {
             }
             self.check_and_record_borrow(component, 0, 0, true)?;
             // SAFETY: `len == 0` or ZST `T: AbiPod`; `check_and_record_borrow` verified unique component.
-            return unsafe { raw_dense_slice_mut::<T>(ptr, len) }.ok_or(FfiResult::TYPE_MISMATCH);
+            return Ok(unsafe { raw_dense_slice_mut_unchecked::<T>(ptr, len) });
         }
         let byte_len = len.checked_mul(elem_size).ok_or(FfiResult::OUT_OF_RANGE)?;
         if byte_len > isize::MAX as usize {
@@ -3748,7 +4815,7 @@ impl<'chunk, 'ctx> ChunkColumnDispenser<'chunk, 'ctx> {
         }
         self.check_and_record_borrow(component, ptr.addr(), byte_len, true)?;
         // SAFETY: Verified non-null, aligned, `byte_len <= isize::MAX`, and strict disjointness for `'chunk`.
-        unsafe { raw_dense_slice_mut::<T>(ptr, len) }.ok_or(FfiResult::TYPE_MISMATCH)
+        Ok(unsafe { raw_dense_slice_mut_unchecked::<T>(ptr, len) })
     }
 
     /// Dispenses the next dense read-only `&'chunk [T]` column (`READ`, `CHANGED`, or `ADDED`).
@@ -3760,20 +4827,14 @@ impl<'chunk, 'ctx> ChunkColumnDispenser<'chunk, 'ctx> {
     ) -> Result<&'chunk [T], FfiResult> {
         let term_index = self.next_term_index;
         self.next_term_index += 1;
-        let info = self.iter.column_info(term_index)?;
-        if info.mode != expected_mode || !validate_dense_read_info::<T>(&info, expected_uuid) {
-            return Err(FfiResult::TYPE_MISMATCH);
-        }
+        let component =
+            self.iter
+                .validate_dense_read_term::<T>(term_index, expected_mode, expected_uuid)?;
         let len = self.iter.current_len();
         let ptr = if len == 0 || core::mem::size_of::<T>() == 0 {
             core::ptr::NonNull::<u8>::dangling().as_ptr().cast_const()
-        } else if term_index < self.iter.batch_col_count as usize {
-            // SAFETY: `advance_batch` initialized `iter.batch_col_ptrs[0..batch_col_count]`.
-            unsafe {
-                self.iter.batch_col_ptrs[term_index]
-                    .assume_init()
-                    .cast_const()
-            }
+        } else if let Some(batch_ptr) = self.batch_col_ptr(term_index) {
+            batch_ptr.cast_const()
         } else {
             let col_fn = self
                 .iter
@@ -3784,8 +4845,8 @@ impl<'chunk, 'ctx> ChunkColumnDispenser<'chunk, 'ctx> {
             // SAFETY: `self.iter.raw` is active at a chunk of `len` rows for `'chunk`.
             unsafe { col_fn(self.iter.raw.cast_const(), term_index) }
         };
-        // SAFETY: `validate_dense_read_info` verified `T`'s layout and UUID for `'chunk`.
-        unsafe { self.dispense_dense_read::<T>(info.component, ptr, len) }
+        // SAFETY: `validate_dense_read_term` verified `T`'s layout, mode, and UUID for `'chunk`.
+        unsafe { self.dispense_dense_read::<T>(component, ptr, len) }
     }
 
     /// Dispenses the next dense mutable `&'chunk mut [T]` column (`WRITE`).
@@ -3796,25 +4857,22 @@ impl<'chunk, 'ctx> ChunkColumnDispenser<'chunk, 'ctx> {
     ) -> Result<&'chunk mut [T], FfiResult> {
         let term_index = self.next_term_index;
         self.next_term_index += 1;
-        let info = self.iter.column_info(term_index)?;
-        if info.mode != AccessMode::WRITE || !validate_dense_write_info::<T>(&info, expected_uuid) {
-            return Err(FfiResult::TYPE_MISMATCH);
-        }
+        let component = self
+            .iter
+            .validate_dense_write_term::<T>(term_index, expected_uuid)?;
         let len = self.iter.current_len();
         let ptr = if len == 0 || core::mem::size_of::<T>() == 0 {
-            if len > 0
-                && term_index >= self.iter.batch_col_count as usize
-                && let Some(col_fn) = self.iter.host.api().iter_column_mutable
-            {
-                // Mark ZST change ticks via host `iter_column_mutable` when not already marked by
-                // `iter_next_chunk_batch`.
-                // SAFETY: `self.iter.raw` is active at a valid chunk.
-                let _ = unsafe { col_fn(self.iter.raw, term_index) };
+            if len > 0 && term_index >= self.batch_col_count {
+                if let Some(col_fn) = self.iter.host.api().iter_column_mutable {
+                    // Mark ZST change ticks via host `iter_column_mutable` when not already marked by
+                    // `iter_next_chunk_batch`.
+                    // SAFETY: `self.iter.raw` is active at a valid chunk.
+                    let _ = unsafe { col_fn(self.iter.raw, term_index) };
+                }
             }
             core::ptr::NonNull::<u8>::dangling().as_ptr()
-        } else if term_index < self.iter.batch_col_count as usize {
-            // SAFETY: `advance_batch` initialized `iter.batch_col_ptrs[0..batch_col_count]`.
-            unsafe { self.iter.batch_col_ptrs[term_index].assume_init() }
+        } else if let Some(batch_ptr) = self.batch_col_ptr(term_index) {
+            batch_ptr
         } else {
             let col_fn = self
                 .iter
@@ -3825,8 +4883,8 @@ impl<'chunk, 'ctx> ChunkColumnDispenser<'chunk, 'ctx> {
             // SAFETY: `self.iter.raw` is active at a chunk of `len` rows for `'chunk`.
             unsafe { col_fn(self.iter.raw, term_index) }
         };
-        // SAFETY: `validate_dense_write_info` verified `WRITE`, non-immutable, layout, and UUID.
-        unsafe { self.dispense_dense_write::<T>(info.component, ptr, len) }
+        // SAFETY: `validate_dense_write_term` verified `WRITE`, non-immutable, layout, and UUID.
+        unsafe { self.dispense_dense_write::<T>(component, ptr, len) }
     }
 
     /// Dispenses the next optional dense read-only `Option<&'chunk [T]>` column (`OPTIONAL_READ`).
@@ -3837,20 +4895,12 @@ impl<'chunk, 'ctx> ChunkColumnDispenser<'chunk, 'ctx> {
     ) -> Result<Option<&'chunk [T]>, FfiResult> {
         let term_index = self.next_term_index;
         self.next_term_index += 1;
-        let info = self.iter.column_info(term_index)?;
-        if info.mode != AccessMode::OPTIONAL_READ
-            || !validate_dense_read_info::<T>(&info, expected_uuid)
-        {
-            return Err(FfiResult::TYPE_MISMATCH);
-        }
+        let component = self
+            .iter
+            .validate_optional_read_term::<T>(term_index, expected_uuid)?;
         let len = self.iter.current_len();
-        let ptr = if term_index < self.iter.batch_col_count as usize {
-            // SAFETY: `advance_batch` initialized `iter.batch_col_ptrs[0..batch_col_count]`.
-            unsafe {
-                self.iter.batch_col_ptrs[term_index]
-                    .assume_init()
-                    .cast_const()
-            }
+        let ptr = if let Some(batch_ptr) = self.batch_col_ptr(term_index) {
+            batch_ptr.cast_const()
         } else {
             let col_fn = self
                 .iter
@@ -3865,7 +4915,7 @@ impl<'chunk, 'ctx> ChunkColumnDispenser<'chunk, 'ctx> {
             return Ok(None);
         }
         // SAFETY: Present optional dense column verified for layout, UUID, alignment, and non-aliasing.
-        unsafe { self.dispense_dense_read::<T>(info.component, ptr, len) }.map(Some)
+        unsafe { self.dispense_dense_read::<T>(component, ptr, len) }.map(Some)
     }
 
     /// Dispenses the next optional dense mutable `Option<&'chunk mut [T]>` column (`OPTIONAL_WRITE`).
@@ -3876,16 +4926,12 @@ impl<'chunk, 'ctx> ChunkColumnDispenser<'chunk, 'ctx> {
     ) -> Result<Option<&'chunk mut [T]>, FfiResult> {
         let term_index = self.next_term_index;
         self.next_term_index += 1;
-        let info = self.iter.column_info(term_index)?;
-        if info.mode != AccessMode::OPTIONAL_WRITE
-            || !validate_dense_write_info::<T>(&info, expected_uuid)
-        {
-            return Err(FfiResult::TYPE_MISMATCH);
-        }
+        let component = self
+            .iter
+            .validate_optional_write_term::<T>(term_index, expected_uuid)?;
         let len = self.iter.current_len();
-        let ptr = if term_index < self.iter.batch_col_count as usize {
-            // SAFETY: `advance_batch` initialized `iter.batch_col_ptrs[0..batch_col_count]`.
-            unsafe { self.iter.batch_col_ptrs[term_index].assume_init() }
+        let ptr = if let Some(batch_ptr) = self.batch_col_ptr(term_index) {
+            batch_ptr
         } else {
             let col_fn = self
                 .iter
@@ -3900,7 +4946,7 @@ impl<'chunk, 'ctx> ChunkColumnDispenser<'chunk, 'ctx> {
             return Ok(None);
         }
         // SAFETY: Present optional dense mutable column verified for layout, UUID, alignment, and disjointness.
-        unsafe { self.dispense_dense_write::<T>(info.component, ptr, len) }.map(Some)
+        unsafe { self.dispense_dense_write::<T>(component, ptr, len) }.map(Some)
     }
 
     /// Validates and advances past a pure filter term (`FILTER_ONLY` / `WITHOUT` / `ALLOW`).
@@ -3912,19 +4958,8 @@ impl<'chunk, 'ctx> ChunkColumnDispenser<'chunk, 'ctx> {
     ) -> Result<(), FfiResult> {
         let term_index = self.next_term_index;
         self.next_term_index += 1;
-        let info = self.iter.column_info(term_index)?;
-        if info.mode != expected_mode || info.is_resource() || info.is_message() {
-            return Err(FfiResult::TYPE_MISMATCH);
-        }
-        if info.size != core::mem::size_of::<T>() || info.align != core::mem::align_of::<T>() {
-            return Err(FfiResult::TYPE_MISMATCH);
-        }
-        if let Some(filter) = expected_uuid
-            && !filter.matches(info.uuid)
-        {
-            return Err(FfiResult::TYPE_MISMATCH);
-        }
-        Ok(())
+        self.iter
+            .validate_filter_term::<T>(term_index, expected_mode, expected_uuid)
     }
 
     /// Validates and advances past an untyped/bridged filter term (`FILTER_ONLY` / `WITHOUT` / `ALLOW`)
@@ -3937,16 +4972,8 @@ impl<'chunk, 'ctx> ChunkColumnDispenser<'chunk, 'ctx> {
     ) -> Result<(), FfiResult> {
         let term_index = self.next_term_index;
         self.next_term_index += 1;
-        let info = self.iter.column_info(term_index)?;
-        if info.mode != expected_mode || info.is_resource() || info.is_message() {
-            return Err(FfiResult::TYPE_MISMATCH);
-        }
-        if let Some(filter) = expected_uuid
-            && !filter.matches(info.uuid)
-        {
-            return Err(FfiResult::TYPE_MISMATCH);
-        }
-        Ok(())
+        self.iter
+            .validate_filter_untyped_term(term_index, expected_mode, expected_uuid)
     }
 
     /// Dispenses the next `AccessMode::HAS` presence indicator for `T: AbiPod`.
@@ -3957,28 +4984,13 @@ impl<'chunk, 'ctx> ChunkColumnDispenser<'chunk, 'ctx> {
     ) -> Result<bool, FfiResult> {
         let term_index = self.next_term_index;
         self.next_term_index += 1;
-        let info = self.iter.column_info(term_index)?;
-        if info.mode != AccessMode::HAS || info.is_resource() || info.is_message() {
-            return Err(FfiResult::TYPE_MISMATCH);
+        self.iter
+            .validate_has_term::<T>(term_index, expected_uuid)?;
+        if self.iter.raw.is_null() || self.iter.current_len() == 0 {
+            return Err(FfiResult::NULL_POINTER);
         }
-        if info.size != core::mem::size_of::<T>() || info.align != core::mem::align_of::<T>() {
-            return Err(FfiResult::TYPE_MISMATCH);
-        }
-        if let Some(filter) = expected_uuid
-            && !filter.matches(info.uuid)
-        {
-            return Err(FfiResult::TYPE_MISMATCH);
-        }
-        if term_index < self.iter.batch_col_count as usize {
-            if self.iter.current_len() == 0 {
-                return Err(FfiResult::NULL_POINTER);
-            }
-            // SAFETY: `advance_batch` initialized `iter.batch_col_ptrs[0..batch_col_count]`.
-            let ptr = unsafe {
-                self.iter.batch_col_ptrs[term_index]
-                    .assume_init()
-                    .cast_const()
-            };
+        if let Some(batch_ptr) = self.batch_col_ptr(term_index) {
+            let ptr = batch_ptr.cast_const();
             if ptr.is_null() {
                 return Err(FfiResult::NULL_POINTER);
             }
@@ -3987,7 +4999,7 @@ impl<'chunk, 'ctx> ChunkColumnDispenser<'chunk, 'ctx> {
             return Ok(unsafe { (*ptr.cast::<FfiBool>()).get() });
         }
         self.iter
-            .has_column(term_index)
+            .has_column_raw(term_index)
             .ok_or(FfiResult::NULL_POINTER)
     }
 
@@ -3999,25 +5011,13 @@ impl<'chunk, 'ctx> ChunkColumnDispenser<'chunk, 'ctx> {
     ) -> Result<bool, FfiResult> {
         let term_index = self.next_term_index;
         self.next_term_index += 1;
-        let info = self.iter.column_info(term_index)?;
-        if info.mode != AccessMode::HAS || info.is_resource() || info.is_message() {
-            return Err(FfiResult::TYPE_MISMATCH);
+        self.iter
+            .validate_has_untyped_term(term_index, expected_uuid)?;
+        if self.iter.raw.is_null() || self.iter.current_len() == 0 {
+            return Err(FfiResult::NULL_POINTER);
         }
-        if let Some(filter) = expected_uuid
-            && !filter.matches(info.uuid)
-        {
-            return Err(FfiResult::TYPE_MISMATCH);
-        }
-        if term_index < self.iter.batch_col_count as usize {
-            if self.iter.current_len() == 0 {
-                return Err(FfiResult::NULL_POINTER);
-            }
-            // SAFETY: `advance_batch` initialized `iter.batch_col_ptrs[0..batch_col_count]`.
-            let ptr = unsafe {
-                self.iter.batch_col_ptrs[term_index]
-                    .assume_init()
-                    .cast_const()
-            };
+        if let Some(batch_ptr) = self.batch_col_ptr(term_index) {
+            let ptr = batch_ptr.cast_const();
             if ptr.is_null() {
                 return Err(FfiResult::NULL_POINTER);
             }
@@ -4026,7 +5026,425 @@ impl<'chunk, 'ctx> ChunkColumnDispenser<'chunk, 'ctx> {
             return Ok(unsafe { (*ptr.cast::<FfiBool>()).get() });
         }
         self.iter
-            .has_column(term_index)
+            .has_column_raw(term_index)
             .ok_or(FfiResult::NULL_POINTER)
+    }
+}
+
+#[cfg(all(test, not(kani)))]
+mod tests {
+    use core::ffi::{c_char, c_void};
+    use core::mem::MaybeUninit;
+
+    use bamabi_sys::{
+        ABI_VERSION, BamCommands, BamHostApi, BamHostCtx, BamLoadCtx, BamSystemCtx, BamSystemDesc,
+        ComponentDesc,
+    };
+
+    use super::*;
+
+    struct EpochTestIter {
+        col_ro: [u32; 2],
+        col_rw: [u32; 2],
+        legacy_ro_calls: usize,
+        legacy_rw_calls: usize,
+    }
+
+    unsafe extern "C" fn stub_get_proc(
+        _ctx: *const BamHostCtx,
+        _name: *const c_char,
+    ) -> *const c_void {
+        core::ptr::null()
+    }
+
+    unsafe extern "C" fn stub_last_error(
+        _ctx: *const BamHostCtx,
+        _buf: *mut c_char,
+        _cap: usize,
+    ) -> usize {
+        0
+    }
+
+    unsafe extern "C" fn stub_load_host_ctx(load_ctx: *const BamLoadCtx) -> *const BamHostCtx {
+        load_ctx.cast()
+    }
+
+    unsafe extern "C" fn stub_register_comp(
+        _ctx: *mut BamLoadCtx,
+        _desc: *const ComponentDesc,
+        _out: *mut BamComponent,
+    ) -> FfiResult {
+        FfiResult::OK
+    }
+
+    unsafe extern "C" fn stub_resolve_comp(
+        _ctx: *const BamHostCtx,
+        _name: *const c_char,
+        _uuid: *const ComponentUuid,
+        _out: *mut BamComponent,
+    ) -> FfiResult {
+        FfiResult::OK
+    }
+
+    unsafe extern "C" fn stub_register_sys(
+        _ctx: *mut BamLoadCtx,
+        _desc: *const BamSystemDesc,
+    ) -> FfiResult {
+        FfiResult::OK
+    }
+
+    unsafe extern "C" fn stub_sys_host_ctx(sys_ctx: *const BamSystemCtx) -> *const BamHostCtx {
+        sys_ctx.cast()
+    }
+
+    unsafe extern "C" fn stub_sys_query(
+        _sys_ctx: *mut BamSystemCtx,
+        _idx: usize,
+        out_iter: *mut *mut BamIter,
+    ) -> FfiResult {
+        // SAFETY: Test-only null initializer when `out_iter` is non-null.
+        if !out_iter.is_null() {
+            // SAFETY: Caller passed writable `*mut *mut BamIter`.
+            unsafe { *out_iter = core::ptr::null_mut() };
+        }
+        FfiResult::OK
+    }
+
+    unsafe extern "C" fn stub_sys_commands(
+        _sys_ctx: *mut BamSystemCtx,
+        out_cmds: *mut *mut BamCommands,
+    ) -> FfiResult {
+        if !out_cmds.is_null() {
+            // SAFETY: Caller passed writable `*mut *mut BamCommands`.
+            unsafe { *out_cmds = core::ptr::null_mut() };
+        }
+        FfiResult::OK
+    }
+
+    unsafe extern "C" fn stub_iter_entities(_iter: *const BamIter) -> *const FfiEntity {
+        core::ptr::null()
+    }
+
+    unsafe extern "C" fn stub_iter_mark_changed(
+        _iter: *mut BamIter,
+        _idx: usize,
+        _start: usize,
+        _count: usize,
+    ) -> FfiResult {
+        FfiResult::OK
+    }
+
+    unsafe extern "C" fn stub_iter_rows_ro(_iter: *mut BamIter, _idx: usize) -> *const *const u8 {
+        core::ptr::null()
+    }
+
+    unsafe extern "C" fn stub_iter_rows_mut(_iter: *mut BamIter, _idx: usize) -> *const *mut u8 {
+        core::ptr::null()
+    }
+
+    unsafe extern "C" fn stub_res_ptr(_iter: *const BamIter, _idx: usize) -> *const u8 {
+        core::ptr::null()
+    }
+
+    unsafe extern "C" fn stub_res_mut_ptr(_iter: *mut BamIter, _idx: usize) -> *mut u8 {
+        core::ptr::null_mut()
+    }
+
+    unsafe extern "C" fn stub_cmd_spawn_empty(
+        _cmds: *mut BamCommands,
+        _out: *mut FfiEntity,
+    ) -> FfiResult {
+        FfiResult::OK
+    }
+
+    unsafe extern "C" fn stub_cmd_spawn(
+        _cmds: *mut BamCommands,
+        _comps: *const BamComponent,
+        _ptrs: *const *const u8,
+        _count: usize,
+        _out: *mut FfiEntity,
+    ) -> FfiResult {
+        FfiResult::OK
+    }
+
+    unsafe extern "C" fn stub_cmd_despawn(_cmds: *mut BamCommands, _e: FfiEntity) -> FfiResult {
+        FfiResult::OK
+    }
+
+    unsafe extern "C" fn stub_cmd_insert(
+        _cmds: *mut BamCommands,
+        _e: FfiEntity,
+        _c: BamComponent,
+        _ptr: *const u8,
+        _len: usize,
+    ) -> FfiResult {
+        FfiResult::OK
+    }
+
+    unsafe extern "C" fn stub_cmd_insert_default(
+        _cmds: *mut BamCommands,
+        _e: FfiEntity,
+        _c: BamComponent,
+    ) -> FfiResult {
+        FfiResult::OK
+    }
+
+    unsafe extern "C" fn stub_cmd_remove(
+        _cmds: *mut BamCommands,
+        _e: FfiEntity,
+        _c: BamComponent,
+    ) -> FfiResult {
+        FfiResult::OK
+    }
+
+    unsafe extern "C" fn epoch_col_info(
+        _: *const BamIter,
+        term_index: usize,
+        out: *mut BamColumnInfo,
+    ) -> FfiResult {
+        let info = match term_index {
+            0 => BamColumnInfo {
+                component: BamComponent::from_raw(1),
+                uuid: ComponentUuid::from_parts("iter_epoch::ReadU32", 4, 4, 0),
+                size: 4,
+                align: 4,
+                mode: AccessMode::READ,
+                storage_flags: 0,
+                reserved0: 0,
+            },
+            1 => BamColumnInfo {
+                component: BamComponent::from_raw(2),
+                uuid: ComponentUuid::from_parts("iter_epoch::WriteU32", 4, 4, 0),
+                size: 4,
+                align: 4,
+                mode: AccessMode::WRITE,
+                storage_flags: 0,
+                reserved0: 0,
+            },
+            _ => return FfiResult::OUT_OF_RANGE,
+        };
+        // SAFETY: `out` is writable stack storage provided by `column_info_uncached`.
+        unsafe { *out = info };
+        FfiResult::OK
+    }
+
+    unsafe extern "C" fn epoch_next_chunk(_iter: *mut BamIter, out_len: *mut usize) -> FfiBool {
+        // SAFETY: `out_len` is writable stack storage provided by `ValidatedIter::next_chunk`.
+        unsafe { *out_len = 2 };
+        FfiBool::TRUE
+    }
+
+    unsafe extern "C" fn epoch_next_chunk_batch(
+        iter: *mut BamIter,
+        out_len: *mut usize,
+        _out_entities: *mut *const FfiEntity,
+        out_col_ptrs: *mut *mut u8,
+        col_count: usize,
+        _mark_changed_mask: u32,
+    ) -> FfiBool {
+        // SAFETY: `iter` points to a valid `EpochTestIter` for the test lifetime.
+        let st = unsafe { &mut *iter.cast::<EpochTestIter>() };
+        // SAFETY: `out_len` is writable stack storage and `out_col_ptrs` has `col_count` slots.
+        unsafe {
+            *out_len = st.col_ro.len();
+            if col_count > 0 {
+                *out_col_ptrs.add(0) = st.col_ro.as_mut_ptr().cast::<u8>();
+            }
+            if col_count > 1 {
+                *out_col_ptrs.add(1) = st.col_rw.as_mut_ptr().cast::<u8>();
+            }
+        }
+        FfiBool::TRUE
+    }
+
+    unsafe extern "C" fn epoch_col_ro(iter: *const BamIter, term_index: usize) -> *const u8 {
+        // SAFETY: `iter` points to `EpochTestIter` with interior test counters updated sequentially.
+        let st = unsafe { &mut *iter.cast::<EpochTestIter>().cast_mut() };
+        st.legacy_ro_calls += 1;
+        if term_index == 0 {
+            st.col_ro.as_ptr().cast::<u8>()
+        } else {
+            core::ptr::null()
+        }
+    }
+
+    unsafe extern "C" fn epoch_col_rw(iter: *mut BamIter, term_index: usize) -> *mut u8 {
+        // SAFETY: `iter` points to `EpochTestIter`.
+        let st = unsafe { &mut *iter.cast::<EpochTestIter>() };
+        st.legacy_rw_calls += 1;
+        if term_index == 1 {
+            st.col_rw.as_mut_ptr().cast::<u8>()
+        } else {
+            core::ptr::null_mut()
+        }
+    }
+
+    unsafe extern "C" fn epoch_reset(_iter: *mut BamIter) -> FfiResult {
+        FfiResult::OK
+    }
+
+    fn make_epoch_api() -> BamHostApi {
+        // SAFETY: `BamHostApi` is `#[repr(C)]` of `u32` and `Option<extern "C" fn>`.
+        let mut api: BamHostApi = unsafe { MaybeUninit::zeroed().assume_init() };
+        api.struct_size = core::mem::size_of::<BamHostApi>() as u32;
+        api.abi_version = ABI_VERSION;
+        api.get_proc_address = Some(stub_get_proc);
+        api.last_error = Some(stub_last_error);
+        api.load_host_ctx = Some(stub_load_host_ctx);
+        api.register_component = Some(stub_register_comp);
+        api.resolve_component = Some(stub_resolve_comp);
+        api.register_system = Some(stub_register_sys);
+        api.sys_host_ctx = Some(stub_sys_host_ctx);
+        api.sys_query = Some(stub_sys_query);
+        api.sys_commands = Some(stub_sys_commands);
+        api.iter_next_chunk = Some(epoch_next_chunk);
+        api.iter_reset = Some(epoch_reset);
+        api.iter_entities = Some(stub_iter_entities);
+        api.iter_column_readonly = Some(epoch_col_ro);
+        api.iter_column_mutable = Some(epoch_col_rw);
+        api.iter_column_mutable_untracked = Some(epoch_col_rw);
+        api.iter_mark_changed_range = Some(stub_iter_mark_changed);
+        api.iter_column_rows_readonly = Some(stub_iter_rows_ro);
+        api.iter_column_rows_mutable = Some(stub_iter_rows_mut);
+        api.iter_column_info = Some(epoch_col_info);
+        api.res_ptr = Some(stub_res_ptr);
+        api.res_mut_ptr = Some(stub_res_mut_ptr);
+        api.cmd_spawn_empty = Some(stub_cmd_spawn_empty);
+        api.cmd_spawn = Some(stub_cmd_spawn);
+        api.cmd_despawn = Some(stub_cmd_despawn);
+        api.cmd_insert = Some(stub_cmd_insert);
+        api.cmd_insert_default = Some(stub_cmd_insert_default);
+        api.cmd_remove = Some(stub_cmd_remove);
+        api.iter_next_chunk_batch = Some(epoch_next_chunk_batch);
+        api
+    }
+
+    #[test]
+    fn bump_batch_epoch_saturates_sticky_zero_forever() {
+        let api = make_epoch_api();
+        let dummy_ctx = 0u64;
+        // SAFETY: `api` and `dummy_ctx` outlive `host`.
+        let host = unsafe { Host::from_raw(&api, (&raw const dummy_ctx).cast()) }.unwrap();
+
+        let mut st = EpochTestIter {
+            col_ro: [10, 20],
+            col_rw: [30, 40],
+            legacy_ro_calls: 0,
+            legacy_rw_calls: 0,
+        };
+        let mut scratch = QuerySlotScratch::new();
+        // SAFETY: `st` and `scratch` outlive `iter`.
+        let mut iter = unsafe {
+            ValidatedIter::from_raw_with_scratch(
+                (&raw mut st).cast::<BamIter>(),
+                &host,
+                &mut scratch,
+            )
+        };
+
+        // Populate `BatchColCache` at epoch 2 and `QuerySlotScratch` at epoch 3.
+        let mut cache_epoch2 = BatchColCache::new();
+        assert_eq!(
+            iter.advance_batch_into(&mut cache_epoch2, 2, false, 0),
+            Some(2)
+        );
+        assert_eq!(iter.batch_epoch, 2);
+        assert_eq!(cache_epoch2.batch_epoch, 2);
+        assert_eq!(cache_epoch2.len, 2);
+
+        assert_eq!(iter.advance_batch(2, false, 0), Some(2));
+        assert_eq!(iter.batch_epoch, 3);
+        assert_eq!(iter.scratch_batch_epoch, 3);
+
+        // Also populate a `BatchColCache` and `QuerySlotScratch` right at `u32::MAX`.
+        iter.batch_epoch = u32::MAX - 1;
+        let mut cache_epoch_max = BatchColCache::new();
+        assert_eq!(
+            iter.advance_batch_into(&mut cache_epoch_max, 2, false, 0),
+            Some(2)
+        );
+        assert_eq!(iter.batch_epoch, u32::MAX);
+        assert_eq!(cache_epoch_max.batch_epoch, u64::from(u32::MAX));
+
+        iter.batch_epoch = u32::MAX - 1;
+        assert_eq!(iter.advance_batch(2, false, 0), Some(2));
+        assert_eq!(iter.batch_epoch, u32::MAX);
+        assert_eq!(iter.scratch_batch_epoch, u32::MAX);
+
+        // Overflow `u32::MAX -> 0` and verify `0` is permanently sticky across repeated transitions.
+        iter.batch_epoch = u32::MAX;
+        iter.bump_batch_epoch();
+        assert_eq!(iter.batch_epoch, 0);
+
+        for _ in 0..8 {
+            iter.bump_batch_epoch();
+            assert_eq!(iter.batch_epoch, 0);
+        }
+
+        // Neither dispenser may match stale epoch-2 or epoch-u32::MAX caches once saturated at `0`.
+        {
+            let disp = ChunkColumnDispenser::new(&mut iter);
+            assert_eq!(disp.batch_col_count, 0);
+        }
+        {
+            let disp = ChunkColumnDispenser::new_with_batch(&mut iter, &cache_epoch2);
+            assert_eq!(disp.batch_col_count, 0);
+        }
+        {
+            let disp = ChunkColumnDispenser::new_with_batch(&mut iter, &cache_epoch_max);
+            assert_eq!(disp.batch_col_count, 0);
+        }
+
+        // Verify `next_chunk()`, `advance_batch()`, `advance_batch_into()`, and `reset()` keep
+        // `batch_epoch == 0` permanently and leave both dispensers with `batch_col_count == 0`.
+        assert_eq!(iter.next_chunk(), Some(2));
+        assert_eq!(iter.batch_epoch, 0);
+        assert_eq!(ChunkColumnDispenser::new(&mut iter).batch_col_count, 0);
+        assert_eq!(
+            ChunkColumnDispenser::new_with_batch(&mut iter, &cache_epoch2).batch_col_count,
+            0
+        );
+
+        assert_eq!(iter.advance_batch(2, false, 0), Some(2));
+        assert_eq!(iter.batch_epoch, 0);
+        assert_eq!(ChunkColumnDispenser::new(&mut iter).batch_col_count, 0);
+        assert_eq!(
+            ChunkColumnDispenser::new_with_batch(&mut iter, &cache_epoch_max).batch_col_count,
+            0
+        );
+
+        let mut cache_saturated = BatchColCache::new();
+        assert_eq!(
+            iter.advance_batch_into(&mut cache_saturated, 2, false, 0),
+            Some(2)
+        );
+        assert_eq!(iter.batch_epoch, 0);
+        assert_eq!(cache_saturated.batch_epoch, 0);
+        assert_eq!(cache_saturated.len, 0);
+        assert_eq!(ChunkColumnDispenser::new(&mut iter).batch_col_count, 0);
+        assert_eq!(
+            ChunkColumnDispenser::new_with_batch(&mut iter, &cache_saturated).batch_col_count,
+            0
+        );
+        assert_eq!(
+            ChunkColumnDispenser::new_with_batch(&mut iter, &cache_epoch2).batch_col_count,
+            0
+        );
+
+        assert_eq!(iter.reset(), FfiResult::OK);
+        assert_eq!(iter.batch_epoch, 0);
+        assert_eq!(iter.next_chunk(), Some(2));
+        assert_eq!(iter.batch_epoch, 0);
+        {
+            let mut disp = ChunkColumnDispenser::new_with_batch(&mut iter, &cache_epoch2);
+            assert_eq!(disp.batch_col_count, 0);
+            assert_eq!(
+                disp.next_read::<u32>(AccessMode::READ, None),
+                Ok(&[10, 20][..])
+            );
+            assert_eq!(disp.next_write::<u32>(None), Ok(&mut [30, 40][..]));
+        }
+        assert_eq!(st.legacy_ro_calls, 1);
+        assert_eq!(st.legacy_rw_calls, 1);
     }
 }

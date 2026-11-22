@@ -720,20 +720,20 @@ fn system_closure_trampoline_defers_sys_host_ctx_and_sys_commands_until_accessed
 }
 
 /// Verifies that [`ValidatedIter::column_info`] caches successful `BamColumnInfo` lookups for
-/// inline-cached terms (`0..4`) across repeated chunk/resource accesses while still forwarding
-/// higher term indices (`>= 4`) and never caching error results.
+/// inline-cached terms (`0..8`) across repeated chunk/resource accesses while still forwarding
+/// higher term indices (`>= 8`) and never caching error results.
 #[test]
 fn validated_iter_caches_column_info_per_term_across_repeated_lookups() {
     static INFO_CALLS: AtomicUsize = AtomicUsize::new(0);
 
-    /// Counting mock `iter_column_info` returning `OK` for `term_index < 6` and `OUT_OF_RANGE` otherwise.
+    /// Counting mock `iter_column_info` returning `OK` for `term_index < 10` and `OUT_OF_RANGE` otherwise.
     unsafe extern "C" fn counting_column_info(
         _iter: *const bamabi_sys::BamIter,
         term_index: usize,
         out_info: *mut bamabi_sys::BamColumnInfo,
     ) -> FfiResult {
         INFO_CALLS.fetch_add(1, Ordering::SeqCst);
-        if term_index >= 6 {
+        if term_index >= 10 {
             return FfiResult::OUT_OF_RANGE;
         }
         // SAFETY: `out_info` is writable stack storage supplied by `ValidatedIter::column_info`.
@@ -759,25 +759,36 @@ fn validated_iter_caches_column_info_per_term_across_repeated_lookups() {
     let mut dummy_iter = 2u8;
     // SAFETY: Stack pointers stay valid for the duration of this test.
     let host = unsafe { Host::from_raw(&raw const api, (&raw mut dummy_ctx).cast()) }.unwrap();
+    let mut scratch = bamabi_guest_sys::QuerySlotScratch::new();
     // SAFETY: `dummy_iter` acts as an opaque non-null `BamIter` for the mock callback.
-    let iter = unsafe { ValidatedIter::from_raw((&raw mut dummy_iter).cast(), &host) };
+    let iter = unsafe {
+        ValidatedIter::from_raw_with_scratch((&raw mut dummy_iter).cast(), &host, &mut scratch)
+    };
 
     // Repeated lookups on inline-cached terms `0` and `1` invoke FFI only once each.
     for _ in 0..8 {
         assert_eq!(iter.column_info(0).unwrap().component.0, 1);
         assert_eq!(iter.column_info(1).unwrap().component.0, 2);
+        assert_eq!(iter.column_info(7).unwrap().component.0, 8);
     }
-    assert_eq!(INFO_CALLS.load(Ordering::SeqCst), 2);
+    assert_eq!(INFO_CALLS.load(Ordering::SeqCst), 3);
 
-    // Term index `5` (beyond the 4-slot inline cache) still queries FFI cleanly.
-    assert_eq!(iter.column_info(5).unwrap().component.0, 6);
-    assert_eq!(iter.column_info(5).unwrap().component.0, 6);
-    assert_eq!(INFO_CALLS.load(Ordering::SeqCst), 4);
+    // Term index `9` (beyond the 8-slot inline cache) still queries FFI cleanly.
+    assert_eq!(iter.column_info(9).unwrap().component.0, 10);
+    assert_eq!(iter.column_info(9).unwrap().component.0, 10);
+    assert_eq!(INFO_CALLS.load(Ordering::SeqCst), 5);
 
     // Error results (`OUT_OF_RANGE`) are never cached.
-    assert_eq!(iter.column_info(7), Err(FfiResult::OUT_OF_RANGE));
-    assert_eq!(iter.column_info(7), Err(FfiResult::OUT_OF_RANGE));
-    assert_eq!(INFO_CALLS.load(Ordering::SeqCst), 6);
+    assert_eq!(iter.column_info(11), Err(FfiResult::OUT_OF_RANGE));
+    assert_eq!(iter.column_info(11), Err(FfiResult::OUT_OF_RANGE));
+    assert_eq!(INFO_CALLS.load(Ordering::SeqCst), 7);
+
+    // Bare `ValidatedIter::from_raw` without scratch queries FFI cleanly without caching.
+    // SAFETY: `dummy_iter` acts as an opaque non-null `BamIter` for the mock callback.
+    let uncached_iter = unsafe { ValidatedIter::from_raw((&raw mut dummy_iter).cast(), &host) };
+    assert_eq!(uncached_iter.column_info(0).unwrap().component.0, 1);
+    assert_eq!(uncached_iter.column_info(0).unwrap().component.0, 1);
+    assert_eq!(INFO_CALLS.load(Ordering::SeqCst), 9);
 }
 
 /// Verifies that `BamHostApi::iter_next_chunk_batch` (slot 68) fetches chunk length, entities,
@@ -960,9 +971,14 @@ fn validated_iter_advance_batch_uses_slot_68_and_falls_back_on_v03_prefix() {
     };
 
     {
+        let mut scratch = bamabi_guest_sys::QuerySlotScratch::new();
         // SAFETY: `state` outlives `iter`.
         let mut iter = unsafe {
-            ValidatedIter::from_raw((&raw mut state).cast::<bamabi_sys::BamIter>(), &host)
+            ValidatedIter::from_raw_with_scratch(
+                (&raw mut state).cast::<bamabi_sys::BamIter>(),
+                &host,
+                &mut scratch,
+            )
         };
         let mut chunks_seen = 0usize;
         while let Some(len) = iter.advance_batch(4, true, 0b0001) {
@@ -990,13 +1006,49 @@ fn validated_iter_advance_batch_uses_slot_68_and_falls_back_on_v03_prefix() {
     assert_eq!(state.legacy_ro_calls, 0);
     assert_eq!(state.legacy_rw_calls, 0);
 
-    // 2. Hostile overlapping batch pointers are still rejected with ACCESS_CONFLICT.
+    // 1b. Explicit `BatchColCache` + `advance_batch_into` + `ChunkColumnDispenser::new_with_batch`
+    //     works on bare `ValidatedIter::from_raw` with 0 legacy calls.
     state.chunks_left = 1;
-    state.hostile_overlap = true;
     {
         // SAFETY: `state` outlives `iter`.
         let mut iter = unsafe {
             ValidatedIter::from_raw((&raw mut state).cast::<bamabi_sys::BamIter>(), &host)
+        };
+        let mut cache = bamabi_guest_sys::BatchColCache::new();
+        assert_eq!(
+            iter.advance_batch_into(&mut cache, 4, true, 0b0001),
+            Some(2)
+        );
+        let mut dispenser = ChunkColumnDispenser::new_with_batch(&mut iter, &cache);
+        let ents = dispenser.entities().unwrap();
+        let c0 = dispenser.next_write::<u32>(None).unwrap();
+        let c1 = dispenser.next_read::<u32>(AccessMode::READ, None).unwrap();
+        let c2 = dispenser.next_optional_read::<u32>(None).unwrap();
+        let c3 = dispenser.next_has::<u8>(None).unwrap();
+        assert_eq!(ents, &[FfiEntity::from_bits(10), FfiEntity::from_bits(20)]);
+        c0[0] += c1[0];
+        assert!(c2.is_none());
+        assert!(c3);
+    }
+    assert_eq!(state.col0_write, [91, 82]);
+    assert_eq!(state.batch_calls, 4);
+    assert_eq!(state.legacy_next_calls, 0);
+    assert_eq!(state.legacy_ent_calls, 0);
+    assert_eq!(state.legacy_ro_calls, 0);
+    assert_eq!(state.legacy_rw_calls, 0);
+
+    // 2. Hostile overlapping batch pointers are still rejected with ACCESS_CONFLICT.
+    state.chunks_left = 1;
+    state.hostile_overlap = true;
+    {
+        let mut scratch = bamabi_guest_sys::QuerySlotScratch::new();
+        // SAFETY: `state` outlives `iter`.
+        let mut iter = unsafe {
+            ValidatedIter::from_raw_with_scratch(
+                (&raw mut state).cast::<bamabi_sys::BamIter>(),
+                &host,
+                &mut scratch,
+            )
         };
         assert_eq!(iter.advance_batch(2, false, 0b01), Some(2));
         let mut dispenser = ChunkColumnDispenser::new(&mut iter);
@@ -1689,4 +1741,681 @@ fn run_if_ctx_trampoline_and_registration_config_forward_to_system_desc() {
 
     // SAFETY: `raw_inst` was returned by `init_guest_instance`.
     unsafe { bamabi_guest_sys::shutdown_guest_instance(raw_inst) };
+}
+
+/// Deterministic mock-vtable counter test verifying that `command_burst`-style 0-query systems
+/// (`spawn_empty`, `insert_typed`, `checkpoint`, `rollback`) make ZERO `sys_host_ctx` calls,
+/// `ValidatedCommands::host()` resolves `sys_host_ctx` lazily at most once per tick, and
+/// `ValidatedSystemRef::intern_symbol` uses `resolve_ctx` with 1 `sys_host_ctx` call and clean
+/// null-context fallback.
+#[test]
+fn command_burst_commands_make_zero_sys_host_ctx_calls_and_intern_symbol_uses_ctx_only() {
+    static HOST_CTX_CALLS: AtomicUsize = AtomicUsize::new(0);
+    static COMMANDS_CALLS: AtomicUsize = AtomicUsize::new(0);
+    static SPAWN_EMPTY_CALLS: AtomicUsize = AtomicUsize::new(0);
+    static INSERT_CALLS: AtomicUsize = AtomicUsize::new(0);
+    static CHECKPOINT_CALLS: AtomicUsize = AtomicUsize::new(0);
+    static ROLLBACK_CALLS: AtomicUsize = AtomicUsize::new(0);
+    static INTERN_CALLS: AtomicUsize = AtomicUsize::new(0);
+    static LAST_INTERN_CTX_ADDR: AtomicUsize = AtomicUsize::new(0);
+    static RUNTIME_CTX_PTR: AtomicPtr<BamHostCtx> = AtomicPtr::new(core::ptr::null_mut());
+    static DUMMY_CMDS_PTR: AtomicPtr<bamabi_sys::BamCommands> =
+        AtomicPtr::new(core::ptr::null_mut());
+
+    unsafe extern "C" fn counting_sys_host_ctx(_sys_ctx: *const BamSystemCtx) -> *const BamHostCtx {
+        HOST_CTX_CALLS.fetch_add(1, Ordering::SeqCst);
+        RUNTIME_CTX_PTR.load(Ordering::SeqCst).cast_const()
+    }
+
+    unsafe extern "C" fn counting_sys_commands(
+        _sys_ctx: *mut BamSystemCtx,
+        out_cmds: *mut *mut bamabi_sys::BamCommands,
+    ) -> FfiResult {
+        COMMANDS_CALLS.fetch_add(1, Ordering::SeqCst);
+        // SAFETY: `out_cmds` is valid writable stack storage.
+        unsafe { *out_cmds = DUMMY_CMDS_PTR.load(Ordering::SeqCst) };
+        FfiResult::OK
+    }
+
+    unsafe extern "C" fn counting_spawn_empty(
+        _cmds: *mut bamabi_sys::BamCommands,
+        out_entity: *mut FfiEntity,
+    ) -> FfiResult {
+        let n = SPAWN_EMPTY_CALLS.fetch_add(1, Ordering::SeqCst) + 1;
+        // SAFETY: `out_entity` is valid writable stack storage.
+        unsafe { *out_entity = FfiEntity::from_bits(n as u64) };
+        FfiResult::OK
+    }
+
+    unsafe extern "C" fn counting_insert(
+        _cmds: *mut bamabi_sys::BamCommands,
+        _entity: FfiEntity,
+        _component: BamComponent,
+        _data: *const u8,
+        _len: usize,
+    ) -> FfiResult {
+        INSERT_CALLS.fetch_add(1, Ordering::SeqCst);
+        FfiResult::OK
+    }
+
+    unsafe extern "C" fn counting_checkpoint(
+        _cmds: *mut bamabi_sys::BamCommands,
+        out_token: *mut usize,
+    ) -> FfiResult {
+        CHECKPOINT_CALLS.fetch_add(1, Ordering::SeqCst);
+        // SAFETY: `out_token` is valid writable stack storage.
+        unsafe { *out_token = 77 };
+        FfiResult::OK
+    }
+
+    unsafe extern "C" fn counting_rollback(
+        _cmds: *mut bamabi_sys::BamCommands,
+        _token: usize,
+    ) -> FfiResult {
+        ROLLBACK_CALLS.fetch_add(1, Ordering::SeqCst);
+        FfiResult::OK
+    }
+
+    unsafe extern "C" fn counting_intern_symbol(
+        host_ctx: *const BamHostCtx,
+        _sym: bamabi_sys::StrView,
+        out_sym: *mut bamabi_sys::BamSymbol,
+    ) -> FfiResult {
+        INTERN_CALLS.fetch_add(1, Ordering::SeqCst);
+        LAST_INTERN_CTX_ADDR.store(host_ctx.addr(), Ordering::SeqCst);
+        // SAFETY: `out_sym` is valid writable stack storage.
+        unsafe { *out_sym = bamabi_sys::BamSymbol(42) };
+        FfiResult::OK
+    }
+
+    HOST_CTX_CALLS.store(0, Ordering::SeqCst);
+    COMMANDS_CALLS.store(0, Ordering::SeqCst);
+    SPAWN_EMPTY_CALLS.store(0, Ordering::SeqCst);
+    INSERT_CALLS.store(0, Ordering::SeqCst);
+    CHECKPOINT_CALLS.store(0, Ordering::SeqCst);
+    ROLLBACK_CALLS.store(0, Ordering::SeqCst);
+    INTERN_CALLS.store(0, Ordering::SeqCst);
+    LAST_INTERN_CTX_ADDR.store(0, Ordering::SeqCst);
+
+    let mut init_marker = 1u8;
+    let mut runtime_marker = 2u8;
+    let mut cmds_marker = 3u8;
+    let init_ctx = (&raw mut init_marker).cast::<BamHostCtx>().cast_const();
+    let runtime_ctx = (&raw mut runtime_marker).cast::<BamHostCtx>();
+    let cmds_ptr = (&raw mut cmds_marker).cast::<bamabi_sys::BamCommands>();
+    RUNTIME_CTX_PTR.store(runtime_ctx, Ordering::SeqCst);
+    DUMMY_CMDS_PTR.store(cmds_ptr, Ordering::SeqCst);
+
+    let mut api = make_mock_api();
+    api.sys_host_ctx = Some(counting_sys_host_ctx);
+    api.sys_commands = Some(counting_sys_commands);
+    api.cmd_spawn_empty = Some(counting_spawn_empty);
+    api.cmd_insert = Some(counting_insert);
+    api.cmd_checkpoint = Some(counting_checkpoint);
+    api.cmd_rollback = Some(counting_rollback);
+    api.intern_symbol = Some(counting_intern_symbol);
+
+    // SAFETY: `api` and `init_ctx` remain valid for the duration of this test.
+    let init_host = unsafe { Host::from_raw(&raw const api, init_ctx) }.unwrap();
+    let mut instance = GuestInstance::new(init_host, "burst_counter_mod");
+    // SAFETY: Mock component layout matches `[f32; 2]` (`8` bytes, `4` align).
+    let typed_pos = unsafe {
+        bamabi_guest_sys::TypedComponent::<[f32; 2]>::from_raw_unchecked(BamComponent::from_raw(9))
+    };
+
+    let mut dummy_sys = 0u64;
+    let sys_ctx = (&raw mut dummy_sys).cast::<BamSystemCtx>();
+
+    // 1. `command_burst` shape (0 queries + spawn_empty + insert_typed + checkpoint + rollback):
+    //    must make ZERO `sys_host_ctx` calls!
+    let (burst_fn, burst_ud) = bamabi_guest_sys::allocate_system_slice_trampoline::<0, _>(
+        &mut instance,
+        0,
+        0,
+        None,
+        move |inv| {
+            let mut cmds = inv.take_lazy_commands().resolve();
+            for i in 0..64 {
+                let e = cmds.spawn_empty().unwrap();
+                assert_eq!(
+                    cmds.insert_typed(e, typed_pos, &[i as f32, 1.0]),
+                    FfiResult::OK
+                );
+            }
+            let cp = cmds.checkpoint().unwrap();
+            let _ = cmds.spawn_empty().unwrap();
+            assert_eq!(cmds.rollback(cp), FfiResult::OK);
+            FfiResult::OK
+        },
+    );
+    // SAFETY: `sys_ctx` and `burst_ud` are valid for this synchronous call.
+    assert_eq!(unsafe { burst_fn(sys_ctx, burst_ud) }, FfiResult::OK);
+    assert_eq!(HOST_CTX_CALLS.load(Ordering::SeqCst), 0);
+    assert_eq!(COMMANDS_CALLS.load(Ordering::SeqCst), 1);
+    assert_eq!(SPAWN_EMPTY_CALLS.load(Ordering::SeqCst), 65);
+    assert_eq!(INSERT_CALLS.load(Ordering::SeqCst), 64);
+    assert_eq!(CHECKPOINT_CALLS.load(Ordering::SeqCst), 1);
+    assert_eq!(ROLLBACK_CALLS.load(Ordering::SeqCst), 1);
+
+    // 2. Lazy `.host()` on `ValidatedCommands`: 0 `sys_host_ctx` calls before `.host()`, then 1
+    //    call on first `.host()`, shared across `inv.host()` and subsequent `cmds.host()`.
+    let expected_runtime_addr = runtime_ctx.addr();
+    let (lazy_fn, lazy_ud) = bamabi_guest_sys::allocate_system_slice_trampoline::<0, _>(
+        &mut instance,
+        0,
+        0,
+        None,
+        move |inv| {
+            let mut cmds = inv.take_lazy_commands().resolve();
+            let _ = cmds.spawn_empty().unwrap();
+            assert_eq!(HOST_CTX_CALLS.load(Ordering::SeqCst), 0);
+            assert_eq!(cmds.host().host_ctx().addr(), expected_runtime_addr);
+            assert_eq!(HOST_CTX_CALLS.load(Ordering::SeqCst), 1);
+            assert_eq!(inv.host().host_ctx().addr(), expected_runtime_addr);
+            assert_eq!(cmds.host().host_ctx().addr(), expected_runtime_addr);
+            assert_eq!(HOST_CTX_CALLS.load(Ordering::SeqCst), 1);
+            FfiResult::OK
+        },
+    );
+    // SAFETY: `sys_ctx` and `lazy_ud` are valid for this synchronous call.
+    assert_eq!(unsafe { lazy_fn(sys_ctx, lazy_ud) }, FfiResult::OK);
+
+    // 3. `ValidatedSystemRef::intern_symbol`: 64 calls -> 1 `sys_host_ctx` call, observing
+    //    `runtime_ctx`, and `inv.host()` still reuses that cached `sys_host_ctx` resolution.
+    HOST_CTX_CALLS.store(0, Ordering::SeqCst);
+    let (intern_fn, intern_ud) = bamabi_guest_sys::allocate_system_slice_trampoline::<0, _>(
+        &mut instance,
+        0,
+        0,
+        None,
+        move |inv| {
+            let sys_ref = inv.take_system_ref().unwrap();
+            for _ in 0..64 {
+                assert_eq!(sys_ref.intern_symbol("bench.sym").unwrap().0, 42);
+            }
+            assert_eq!(HOST_CTX_CALLS.load(Ordering::SeqCst), 1);
+            assert_eq!(inv.host().host_ctx().addr(), expected_runtime_addr);
+            assert_eq!(HOST_CTX_CALLS.load(Ordering::SeqCst), 1);
+            FfiResult::OK
+        },
+    );
+    // SAFETY: `sys_ctx` and `intern_ud` are valid for this synchronous call.
+    assert_eq!(unsafe { intern_fn(sys_ctx, intern_ud) }, FfiResult::OK);
+    assert_eq!(INTERN_CALLS.load(Ordering::SeqCst), 64);
+    assert_eq!(
+        LAST_INTERN_CTX_ADDR.load(Ordering::SeqCst),
+        expected_runtime_addr
+    );
+
+    // 4. Null `sys_host_ctx` fallback: `sys_ref.intern_symbol` and `cmds.host().host_ctx()`
+    //    both observe `init_ctx` with `HOST_CTX_CALLS == 1`.
+    HOST_CTX_CALLS.store(0, Ordering::SeqCst);
+    RUNTIME_CTX_PTR.store(core::ptr::null_mut(), Ordering::SeqCst);
+    let expected_init_addr = init_ctx.addr();
+    let (fallback_fn, fallback_ud) = bamabi_guest_sys::allocate_system_slice_trampoline::<0, _>(
+        &mut instance,
+        0,
+        0,
+        None,
+        move |inv| {
+            let sys_ref = inv.take_system_ref().unwrap();
+            let cmds = inv.take_lazy_commands().resolve();
+            assert_eq!(sys_ref.intern_symbol("bench.sym").unwrap().0, 42);
+            assert_eq!(cmds.host().host_ctx().addr(), expected_init_addr);
+            assert_eq!(HOST_CTX_CALLS.load(Ordering::SeqCst), 1);
+            FfiResult::OK
+        },
+    );
+    // SAFETY: `sys_ctx` and `fallback_ud` are valid for this synchronous call.
+    assert_eq!(unsafe { fallback_fn(sys_ctx, fallback_ud) }, FfiResult::OK);
+    assert_eq!(
+        LAST_INTERN_CTX_ADDR.load(Ordering::SeqCst),
+        expected_init_addr
+    );
+}
+
+/// Verifies persistent per-system `QuerySlotScratch` metadata caching across ticks for:
+/// 1. `ChunkColumnDispenser` (`0` steady-state `iter_column_info` calls on tick >= 2, dynamic
+///    branching `TypeId` / `AccessMode` / `UuidFilter` mismatch rejection without poisoning, and
+///    `> INLINE_COL_INFO_CAP` fallback for 10+ terms).
+/// 2. `ValidatedIter::resource_with_ticks_checked` (`0` steady-state `iter_column_info` calls
+///    across 64-call loops on tick 1 calls 2..=64 and all of tick >= 2, plus type/UUID mismatch).
+/// 3. `par_for_each_chunk` and `par_for_each_chunk_readonly` reading the frozen cache lock-free
+///    with `0` `iter_column_info` calls across worker invocations.
+#[test]
+fn persistent_slot_cache_zero_steady_state_column_info_and_mismatch_guard() {
+    #[repr(C)]
+    struct MockIter {
+        col_info_calls: *const AtomicUsize,
+        res_ticks_calls: *const AtomicUsize,
+        chunk_idx: AtomicUsize,
+        chunk_count: AtomicUsize,
+        col0_write: core::cell::UnsafeCell<[u32; 2]>,
+        col1_read: [u32; 2],
+        res_val: u32,
+        is_resource: bool,
+    }
+
+    #[repr(C)]
+    struct MockSys {
+        entity_iter: MockIter,
+        res_iter: MockIter,
+    }
+
+    let uuid_w = ComponentUuid::from_parts("m3::WriteU32", 4, 4, 0);
+    let uuid_r = ComponentUuid::from_parts("m3::ReadU32", 4, 4, 0);
+    let uuid_res = ComponentUuid::from_parts("m3::ResU32", 4, 4, 0);
+    let uuid_wrong = ComponentUuid::from_parts("m3::Wrong", 4, 4, 0);
+
+    unsafe extern "C" fn sys_query(
+        sys_ctx: *mut BamSystemCtx,
+        query_index: usize,
+        out_iter: *mut *mut bamabi_sys::BamIter,
+    ) -> FfiResult {
+        // SAFETY: Test binds `sys_ctx` to `MockSys`.
+        let sys = unsafe { &*sys_ctx.cast::<MockSys>() };
+        let ptr = match query_index {
+            0 => (&raw const sys.entity_iter)
+                .cast_mut()
+                .cast::<bamabi_sys::BamIter>(),
+            1 => (&raw const sys.res_iter)
+                .cast_mut()
+                .cast::<bamabi_sys::BamIter>(),
+            _ => return FfiResult::OUT_OF_RANGE,
+        };
+        // SAFETY: `out_iter` is writable stack storage.
+        unsafe { *out_iter = ptr };
+        FfiResult::OK
+    }
+
+    unsafe extern "C" fn iter_next_chunk(
+        iter: *mut bamabi_sys::BamIter,
+        out_len: *mut usize,
+    ) -> FfiBool {
+        // SAFETY: `iter` points to `MockIter`.
+        let st = unsafe { &*iter.cast::<MockIter>() };
+        let cur = st.chunk_idx.load(Ordering::SeqCst);
+        if cur >= st.chunk_count.load(Ordering::SeqCst) {
+            return FfiBool::FALSE;
+        }
+        st.chunk_idx.store(cur + 1, Ordering::SeqCst);
+        // SAFETY: `out_len` is writable stack storage.
+        unsafe { *out_len = 2 };
+        FfiBool::TRUE
+    }
+
+    unsafe extern "C" fn iter_next_chunk_batch(
+        iter: *mut bamabi_sys::BamIter,
+        out_len: *mut usize,
+        _out_entities: *mut *const FfiEntity,
+        out_col_ptrs: *mut *mut u8,
+        col_count: usize,
+        _mark_changed_mask: u32,
+    ) -> FfiBool {
+        // SAFETY: `iter` points to `MockIter`.
+        let st = unsafe { &*iter.cast::<MockIter>() };
+        let cur = st.chunk_idx.load(Ordering::SeqCst);
+        if cur >= st.chunk_count.load(Ordering::SeqCst) {
+            return FfiBool::FALSE;
+        }
+        st.chunk_idx.store(cur + 1, Ordering::SeqCst);
+        // SAFETY: `out_len` and `out_col_ptrs[0..col_count]` are valid writable slots.
+        unsafe {
+            *out_len = 2;
+            if col_count > 0 {
+                *out_col_ptrs.add(0) = st.col0_write.get().cast::<u8>();
+            }
+            if col_count > 1 {
+                *out_col_ptrs.add(1) = st.col1_read.as_ptr().cast_mut().cast::<u8>();
+            }
+        }
+        FfiBool::TRUE
+    }
+
+    unsafe extern "C" fn iter_col_ro(
+        iter: *const bamabi_sys::BamIter,
+        term_index: usize,
+    ) -> *const u8 {
+        // SAFETY: `iter` points to `MockIter`.
+        let st = unsafe { &*iter.cast::<MockIter>() };
+        if term_index >= 1 {
+            st.col1_read.as_ptr().cast::<u8>()
+        } else {
+            st.col0_write.get().cast_const().cast::<u8>()
+        }
+    }
+
+    unsafe extern "C" fn iter_col_mut(
+        iter: *mut bamabi_sys::BamIter,
+        term_index: usize,
+    ) -> *mut u8 {
+        // SAFETY: `iter` points to `MockIter`.
+        let st = unsafe { &*iter.cast::<MockIter>() };
+        if term_index == 0 {
+            st.col0_write.get().cast::<u8>()
+        } else {
+            core::ptr::null_mut()
+        }
+    }
+
+    unsafe extern "C" fn iter_col_info(
+        iter: *const bamabi_sys::BamIter,
+        term_index: usize,
+        out_info: *mut bamabi_sys::BamColumnInfo,
+    ) -> FfiResult {
+        // SAFETY: `iter` points to `MockIter`.
+        let st = unsafe { &*iter.cast::<MockIter>() };
+        // SAFETY: `st.col_info_calls` points to test stack `AtomicUsize`.
+        unsafe { (*st.col_info_calls).fetch_add(1, Ordering::SeqCst) };
+        let info = if st.is_resource {
+            if term_index != 0 {
+                return FfiResult::OUT_OF_RANGE;
+            }
+            bamabi_sys::BamColumnInfo {
+                component: BamComponent::from_raw(30),
+                uuid: ComponentUuid::from_parts("m3::ResU32", 4, 4, 0),
+                size: 4,
+                align: 4,
+                mode: AccessMode::RESOURCE_READ,
+                storage_flags: bamabi_sys::BAM_STORAGE_FLAG_RESOURCE,
+                reserved0: 0,
+            }
+        } else if term_index == 0 {
+            bamabi_sys::BamColumnInfo {
+                component: BamComponent::from_raw(10),
+                uuid: ComponentUuid::from_parts("m3::WriteU32", 4, 4, 0),
+                size: 4,
+                align: 4,
+                mode: AccessMode::WRITE,
+                storage_flags: 0,
+                reserved0: 0,
+            }
+        } else if term_index < 10 {
+            bamabi_sys::BamColumnInfo {
+                component: BamComponent::from_raw((11 + term_index) as u32),
+                uuid: ComponentUuid::from_parts("m3::ReadU32", 4, 4, 0),
+                size: 4,
+                align: 4,
+                mode: AccessMode::READ,
+                storage_flags: 0,
+                reserved0: 0,
+            }
+        } else {
+            return FfiResult::OUT_OF_RANGE;
+        };
+        // SAFETY: `out_info` is writable stack storage.
+        unsafe { *out_info = info };
+        FfiResult::OK
+    }
+
+    unsafe extern "C" fn iter_res_ptr(
+        iter: *const bamabi_sys::BamIter,
+        term_index: usize,
+    ) -> *const u8 {
+        if term_index != 0 {
+            return core::ptr::null();
+        }
+        // SAFETY: `iter` points to `MockIter`.
+        let st = unsafe { &*iter.cast::<MockIter>() };
+        (&raw const st.res_val).cast::<u8>()
+    }
+
+    unsafe extern "C" fn iter_res_ticks(
+        iter: *const bamabi_sys::BamIter,
+        term_index: usize,
+        out_ticks: *mut bamabi_sys::BamChangeTicks,
+    ) -> FfiResult {
+        if term_index != 0 {
+            return FfiResult::OUT_OF_RANGE;
+        }
+        // SAFETY: `iter` points to `MockIter`.
+        let st = unsafe { &*iter.cast::<MockIter>() };
+        // SAFETY: `st.res_ticks_calls` points to test stack `AtomicUsize`.
+        unsafe { (*st.res_ticks_calls).fetch_add(1, Ordering::SeqCst) };
+        // SAFETY: `out_ticks` is writable stack storage.
+        unsafe {
+            *out_ticks = bamabi_sys::BamChangeTicks {
+                added: 1,
+                changed: 2,
+                last_run: 1,
+                this_run: 2,
+            };
+        }
+        FfiResult::OK
+    }
+
+    unsafe extern "C" fn par_for_each(
+        iter: *mut bamabi_sys::BamIter,
+        task_fn: Option<unsafe extern "C" fn(*mut bamabi_sys::BamIter, *mut c_void) -> FfiResult>,
+        user_data: *mut c_void,
+    ) -> FfiResult {
+        let Some(func) = task_fn else {
+            return FfiResult::NULL_POINTER;
+        };
+        // SAFETY: `iter` points to `MockIter`; invoke worker trampoline twice for two sub-chunks.
+        let st = unsafe { &*iter.cast::<MockIter>() };
+        st.chunk_idx.store(0, Ordering::SeqCst);
+        for step in 0..2 {
+            st.chunk_count.store(step + 1, Ordering::SeqCst);
+            // SAFETY: `iter` and `user_data` are valid for this synchronous sub-chunk task call.
+            let rc = unsafe { func(iter, user_data) };
+            if !rc.is_ok() {
+                return rc;
+            }
+        }
+        FfiResult::OK
+    }
+
+    let entity_info_calls = AtomicUsize::new(0);
+    let res_info_calls = AtomicUsize::new(0);
+    let res_ticks_calls = AtomicUsize::new(0);
+
+    let mut api = make_mock_api();
+    api.sys_query = Some(sys_query);
+    api.iter_next_chunk = Some(iter_next_chunk);
+    api.iter_next_chunk_batch = Some(iter_next_chunk_batch);
+    api.iter_column_readonly = Some(iter_col_ro);
+    api.iter_column_mutable = Some(iter_col_mut);
+    api.iter_column_info = Some(iter_col_info);
+    api.res_ptr = Some(iter_res_ptr);
+    api.res_ticks = Some(iter_res_ticks);
+    api.par_for_each_chunk = Some(par_for_each);
+    api.par_for_each_chunk_readonly = Some(par_for_each);
+
+    let mut dummy_ctx = 1u8;
+    // SAFETY: `api` and `dummy_ctx` outlive `host` and `instance`.
+    let host = unsafe { Host::from_raw(&raw const api, (&raw mut dummy_ctx).cast()) }.unwrap();
+    let mut instance = GuestInstance::new(host, "m3_cache_mod");
+
+    let mut tick_phase = 0usize;
+    let (sys_fn, sys_ud) =
+        allocate_system_slice_trampoline::<4, _>(&mut instance, 2, 1, Some(1), move |inv| {
+            tick_phase += 1;
+            let mut entity_iter = inv.take_raw_query_slot(0).unwrap();
+            let res_iter = inv.take_raw_query_slot(1).unwrap();
+            let mut batch = BatchColCache::new();
+
+            match tick_phase {
+                1 | 2 => {
+                    // Tick 1 warms cache (2 `iter_column_info` calls across 2 chunks);
+                    // Tick 2 must make 0 `iter_column_info` calls!
+                    while entity_iter
+                        .advance_batch_into(&mut batch, 2, false, 1)
+                        .is_some()
+                    {
+                        let mut disp =
+                            ChunkColumnDispenser::new_with_batch(&mut entity_iter, &batch);
+                        let w = disp
+                            .next_write::<u32>(Some(UuidFilter::exact(uuid_w)))
+                            .unwrap();
+                        let r = disp
+                            .next_read::<u32>(AccessMode::READ, Some(UuidFilter::exact(uuid_r)))
+                            .unwrap();
+                        w[0] += r[0];
+                        w[1] += r[1];
+                    }
+                    // 64-call `res_with_ticks` loop: Tick 1 makes 1 info call; Tick 2 makes 0.
+                    let mut sum = 0u32;
+                    for _ in 0..64 {
+                        let (val, ticks) = res_iter
+                            .resource_with_ticks_checked::<u32>(
+                                0,
+                                Some(UuidFilter::exact(uuid_res)),
+                            )
+                            .unwrap();
+                        sum += *val + ticks.this_run;
+                    }
+                    assert!(sum > 0);
+                }
+                3 => {
+                    // Dynamic branching mismatch on same slot/term must be rejected without poisoning.
+                    assert!(
+                        entity_iter
+                            .advance_batch_into(&mut batch, 2, false, 1)
+                            .is_some()
+                    );
+                    {
+                        let mut disp =
+                            ChunkColumnDispenser::new_with_batch(&mut entity_iter, &batch);
+                        assert_eq!(disp.next_write::<u64>(None), Err(FfiResult::TYPE_MISMATCH));
+                    }
+                    {
+                        let mut disp =
+                            ChunkColumnDispenser::new_with_batch(&mut entity_iter, &batch);
+                        assert_eq!(
+                            disp.next_write::<u32>(Some(UuidFilter::exact(uuid_wrong))),
+                            Err(FfiResult::TYPE_MISMATCH)
+                        );
+                    }
+                    {
+                        let mut disp =
+                            ChunkColumnDispenser::new_with_batch(&mut entity_iter, &batch);
+                        assert_eq!(
+                            disp.next_read::<u32>(
+                                AccessMode::CHANGED,
+                                Some(UuidFilter::exact(uuid_w))
+                            ),
+                            Err(FfiResult::TYPE_MISMATCH)
+                        );
+                    }
+                    assert!(
+                        res_iter
+                            .resource_with_ticks_checked::<u64>(
+                                0,
+                                Some(UuidFilter::exact(uuid_res))
+                            )
+                            .is_none()
+                    );
+                    assert!(
+                        res_iter
+                            .resource_with_ticks_checked::<u32>(
+                                0,
+                                Some(UuidFilter::exact(uuid_wrong))
+                            )
+                            .is_none()
+                    );
+                    assert!(
+                        res_iter
+                            .resource_with_ticks_checked::<u32>(0, None)
+                            .is_some()
+                    );
+                    assert!(
+                        res_iter
+                            .resource_with_ticks_checked::<u32>(
+                                0,
+                                Some(UuidFilter::exact(uuid_res))
+                            )
+                            .is_some()
+                    );
+                }
+                4 => {
+                    // Parallel frozen cache snapshot: 0 `iter_column_info` calls on worker threads!
+                    let rc = entity_iter.par_for_each_chunk(|task_iter| {
+                        let mut disp = ChunkColumnDispenser::new(task_iter);
+                        let _w = disp
+                            .next_write::<u32>(Some(UuidFilter::exact(uuid_w)))
+                            .unwrap();
+                        let _r = disp
+                            .next_read::<u32>(AccessMode::READ, Some(UuidFilter::exact(uuid_r)))
+                            .unwrap();
+                        FfiResult::OK
+                    });
+                    assert_eq!(rc, FfiResult::OK);
+                }
+                5 => {
+                    // `> INLINE_COL_INFO_CAP` (10 terms): terms 0..8 cached, terms 8..10 fall back cleanly.
+                    assert!(entity_iter.next_chunk().is_some());
+                    let mut disp = ChunkColumnDispenser::new(&mut entity_iter);
+                    let _ = disp
+                        .next_write::<u32>(Some(UuidFilter::exact(uuid_w)))
+                        .unwrap();
+                    for _ in 1..10 {
+                        let _ = disp
+                            .next_read::<u32>(AccessMode::READ, Some(UuidFilter::exact(uuid_r)))
+                            .unwrap();
+                    }
+                }
+                _ => unreachable!(),
+            }
+            FfiResult::OK
+        });
+
+    let sys = MockSys {
+        entity_iter: MockIter {
+            col_info_calls: &raw const entity_info_calls,
+            res_ticks_calls: &raw const res_ticks_calls,
+            chunk_idx: AtomicUsize::new(0),
+            chunk_count: AtomicUsize::new(2),
+            col0_write: core::cell::UnsafeCell::new([1, 2]),
+            col1_read: [10, 20],
+            res_val: 7,
+            is_resource: false,
+        },
+        res_iter: MockIter {
+            col_info_calls: &raw const res_info_calls,
+            res_ticks_calls: &raw const res_ticks_calls,
+            chunk_idx: AtomicUsize::new(0),
+            chunk_count: AtomicUsize::new(0),
+            col0_write: core::cell::UnsafeCell::new([0, 0]),
+            col1_read: [0, 0],
+            res_val: 77,
+            is_resource: true,
+        },
+    };
+    let sys_ctx = (&raw const sys).cast_mut().cast::<BamSystemCtx>();
+
+    // Tick 1: 2 entity info calls (1 per term across 2 chunks) + 1 resource info call (across 64 calls).
+    // SAFETY: `sys_ctx` and `sys_ud` are valid for this call.
+    assert_eq!(unsafe { sys_fn(sys_ctx, sys_ud) }, FfiResult::OK);
+    assert_eq!(entity_info_calls.load(Ordering::SeqCst), 2);
+    assert_eq!(res_info_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(res_ticks_calls.load(Ordering::SeqCst), 64);
+
+    // Tick 2: 0 steady-state `iter_column_info` calls for BOTH entity query AND 64-call resource loop!
+    sys.entity_iter.chunk_idx.store(0, Ordering::SeqCst);
+    // SAFETY: `sys_ctx` and `sys_ud` are valid for this call.
+    assert_eq!(unsafe { sys_fn(sys_ctx, sys_ud) }, FfiResult::OK);
+    assert_eq!(entity_info_calls.load(Ordering::SeqCst), 2);
+    assert_eq!(res_info_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(res_ticks_calls.load(Ordering::SeqCst), 128);
+
+    // Tick 3: mismatch paths hit cached `BamColumnInfo` (0 FFI calls) and still reject safely!
+    sys.entity_iter.chunk_idx.store(0, Ordering::SeqCst);
+    // SAFETY: `sys_ctx` and `sys_ud` are valid for this call.
+    assert_eq!(unsafe { sys_fn(sys_ctx, sys_ud) }, FfiResult::OK);
+    assert_eq!(entity_info_calls.load(Ordering::SeqCst), 2);
+    assert_eq!(res_info_calls.load(Ordering::SeqCst), 1);
+
+    // Tick 4: `par_for_each_chunk` reads frozen cache with 0 `iter_column_info` calls across workers!
+    sys.entity_iter.chunk_idx.store(0, Ordering::SeqCst);
+    // SAFETY: `sys_ctx` and `sys_ud` are valid for this call.
+    assert_eq!(unsafe { sys_fn(sys_ctx, sys_ud) }, FfiResult::OK);
+    assert_eq!(entity_info_calls.load(Ordering::SeqCst), 2);
+
+    // Tick 5: terms 0..2 hit cache, terms 2..10 warm/fall back cleanly (8 new info calls: 2..10).
+    sys.entity_iter.chunk_idx.store(0, Ordering::SeqCst);
+    sys.entity_iter.chunk_count.store(1, Ordering::SeqCst);
+    // SAFETY: `sys_ctx` and `sys_ud` are valid for this call.
+    assert_eq!(unsafe { sys_fn(sys_ctx, sys_ud) }, FfiResult::OK);
+    assert_eq!(entity_info_calls.load(Ordering::SeqCst), 10);
 }

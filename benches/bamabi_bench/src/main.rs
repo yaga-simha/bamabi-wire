@@ -631,15 +631,15 @@ mod tests {
 
     use bamabi_sys::{
         ABI_VERSION, AccessMode, BamChangeTicks, BamColumnInfo, BamComponent, BamHostApi,
-        BamLayoutInfo, BamSymbol, BamTermDesc, ComponentDesc, FfiBool, FfiEntity, FfiResult,
-        StrView,
+        BamLayoutInfo, BamSymbol, BamSystem, BamSystemSet, BamTermDesc, ComponentDesc,
+        ComponentUuid, FfiBool, FfiEntity, FfiResult, ScheduleId, StrView,
     };
 
     use super::*;
     use crate::host::{
-        BENCH_DT, HostWorld, POSITION_NAME, POSITION_UUID, Position, SIM_PARAMS_NAME,
-        SIM_PARAMS_UUID, SimParams, VELOCITY_NAME, VELOCITY_UUID, Velocity, initial_position,
-        initial_velocity,
+        BENCH_DT, CmdHeader, HostWorld, OwnedHostWorld, POSITION_NAME, POSITION_UUID, Position,
+        SIM_PARAMS_NAME, SIM_PARAMS_UUID, SimParams, SystemFrame, VELOCITY_NAME, VELOCITY_UUID,
+        Velocity, initial_position, initial_velocity,
     };
     use crate::workloads::{
         compute_stats, native_command_burst, native_dense_update, position_checksum,
@@ -1033,5 +1033,674 @@ mod tests {
             w: 4.0,
         }]);
         assert!((csum[0] - 1.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn command_queue_split_buffer_layout_payloads_and_edge_rollbacks() {
+        #[repr(C)]
+        struct LargePod {
+            bytes: [u8; 64],
+        }
+
+        let mut world = HostWorld::new();
+        let zst_comp = world.expose_component::<()>(
+            "bench::ZstTag",
+            ComponentUuid::from_parts("bench::ZstTag", 0, 1, 0),
+            0,
+            true,
+        );
+        let large_comp = world.expose_component::<LargePod>(
+            "bench::LargePod",
+            ComponentUuid::from_parts("bench::LargePod", 64, 1, 0),
+            0,
+            false,
+        );
+        let pos_comp = world.pos_handle;
+
+        assert_eq!(core::mem::size_of::<CmdHeader>(), 16);
+        assert_eq!(core::mem::align_of::<CmdHeader>(), 4);
+
+        let api = world.api;
+        let spawn_empty = api.cmd_spawn_empty.unwrap();
+        let spawn = api.cmd_spawn.unwrap();
+        let spawn_batch = api.cmd_spawn_batch.unwrap();
+        let despawn = api.cmd_despawn.unwrap();
+        let insert = api.cmd_insert.unwrap();
+        let insert_if_new = api.cmd_insert_if_new.unwrap();
+        let insert_default = api.cmd_insert_default.unwrap();
+        let remove = api.cmd_remove.unwrap();
+        let checkpoint = api.cmd_checkpoint.unwrap();
+        let rollback = api.cmd_rollback.unwrap();
+
+        world.reserve_command_capacity(100);
+        let reserved_ops_cap = world.commands_mut().ops.capacity();
+        let reserved_payload_cap = world.commands_mut().payload_bytes.capacity();
+        assert!(reserved_ops_cap >= 100);
+        assert!(reserved_payload_cap >= 1600);
+
+        let cmds_of = |w: &mut OwnedHostWorld| {
+            core::ptr::from_mut(w.commands_mut()).cast::<bamabi_sys::BamCommands>()
+        };
+        let mut e1 = FfiEntity::NULL;
+        // SAFETY: `cmds` and `e1` are valid outside guest execution.
+        let r_spawn_empty = unsafe { spawn_empty(cmds_of(&mut world), &mut e1) };
+        assert_eq!(r_spawn_empty, FfiResult::OK);
+        assert!(e1.is_valid());
+
+        // 0-byte ZST insert must succeed even with a dangling non-null pointer under Miri.
+        let dangling_zst = core::ptr::NonNull::<u8>::dangling().as_ptr();
+        // SAFETY: `cmds` is valid and `data_len == 0` must not dereference `dangling_zst`.
+        let r_zst = unsafe { insert(cmds_of(&mut world), e1, zst_comp, dangling_zst, 0) };
+        assert_eq!(r_zst, FfiResult::OK);
+        // SAFETY: `cmds` is valid.
+        let r_def = unsafe { insert_default(cmds_of(&mut world), e1, zst_comp) };
+        assert_eq!(r_def, FfiResult::OK);
+
+        // 16B POD insert.
+        let pos = Position {
+            x: 1.5,
+            y: 2.5,
+            z: 3.5,
+            w: 4.5,
+        };
+        // SAFETY: `cmds` and `pos` are valid for 16 readable bytes.
+        let r_pos = unsafe {
+            insert(
+                cmds_of(&mut world),
+                e1,
+                pos_comp,
+                core::ptr::from_ref(&pos).cast::<u8>(),
+                16,
+            )
+        };
+        assert_eq!(r_pos, FfiResult::OK);
+        assert_eq!(world.commands_mut().payload_bytes.len(), 16);
+
+        // 0-op no-op rollback at `token == ops.len()` must succeed without reading past `ops`.
+        let mut cp_noop = 0usize;
+        // SAFETY: `cmds` and `cp_noop` are valid.
+        let r_cp_noop = unsafe { checkpoint(cmds_of(&mut world), &mut cp_noop) };
+        assert_eq!(r_cp_noop, FfiResult::OK);
+        // SAFETY: `cmds` is valid.
+        let r_rb_noop = unsafe { rollback(cmds_of(&mut world), cp_noop) };
+        assert_eq!(r_rb_noop, FfiResult::OK);
+        let noop_stats = world.command_stats();
+        assert_eq!(noop_stats.checkpoints, 1);
+        assert_eq!(noop_stats.rollbacks, 1);
+        assert_eq!(noop_stats.rolled_back_ops, 0);
+        assert_eq!(world.commands_mut().payload_bytes.len(), 16);
+
+        // Nested checkpoint + >32B insert + empty-payload ops + rollback.
+        let mut cp1 = 0usize;
+        // SAFETY: `cmds` and `cp1` are valid.
+        let r_cp1 = unsafe { checkpoint(cmds_of(&mut world), &mut cp1) };
+        assert_eq!(r_cp1, FfiResult::OK);
+        let large = LargePod { bytes: [0xAB; 64] };
+        // SAFETY: `cmds` and `large` are valid for 64 readable bytes.
+        let r_large = unsafe {
+            insert_if_new(
+                cmds_of(&mut world),
+                e1,
+                large_comp,
+                core::ptr::from_ref(&large).cast::<u8>(),
+                64,
+            )
+        };
+        assert_eq!(r_large, FfiResult::OK);
+        assert_eq!(world.commands_mut().payload_bytes.len(), 80);
+        assert_eq!(&world.commands_mut().payload_bytes[16..80], &[0xAB; 64]);
+
+        let mut cp2 = 0usize;
+        // SAFETY: `cmds` and `cp2` are valid.
+        let r_cp2 = unsafe { checkpoint(cmds_of(&mut world), &mut cp2) };
+        assert_eq!(r_cp2, FfiResult::OK);
+        let mut e2 = FfiEntity::NULL;
+        // SAFETY: `cmds` and `e2` are valid.
+        let r_e2 = unsafe { spawn_empty(cmds_of(&mut world), &mut e2) };
+        assert_eq!(r_e2, FfiResult::OK);
+        // SAFETY: `cmds` is valid.
+        let r_rem = unsafe { remove(cmds_of(&mut world), e2, pos_comp) };
+        assert_eq!(r_rem, FfiResult::OK);
+        // SAFETY: `cmds` is valid.
+        let r_des = unsafe { despawn(cmds_of(&mut world), e2) };
+        assert_eq!(r_des, FfiResult::OK);
+
+        // Rollback to `cp2` drops 3 zero-payload ops, keeping the 64B insert.
+        // SAFETY: `cmds` is valid.
+        let r_rb2 = unsafe { rollback(cmds_of(&mut world), cp2) };
+        assert_eq!(r_rb2, FfiResult::OK);
+        assert_eq!(world.commands_mut().payload_bytes.len(), 80);
+        let after_cp2 = world.command_stats();
+        assert_eq!(after_cp2.last_insert_component, large_comp);
+        assert_eq!(after_cp2.last_insert_len, 64);
+        assert_eq!(after_cp2.rolled_back_ops, 3);
+
+        // Rollback to `cp1` drops the 64B insert and truncates `payload_bytes` back to 16.
+        // SAFETY: `cmds` is valid.
+        let r_rb1 = unsafe { rollback(cmds_of(&mut world), cp1) };
+        assert_eq!(r_rb1, FfiResult::OK);
+        assert_eq!(world.commands_mut().payload_bytes.len(), 16);
+        let after_cp1 = world.command_stats();
+        assert_eq!(after_cp1.last_insert_component, pos_comp);
+        assert_eq!(after_cp1.last_insert_len, 16);
+        assert_eq!(after_cp1.rolled_back_ops, 4);
+
+        // Rollback to 0 clears everything.
+        // SAFETY: `cmds` is valid.
+        let r_rb0 = unsafe { rollback(cmds_of(&mut world), 0) };
+        assert_eq!(r_rb0, FfiResult::OK);
+        assert!(world.commands_mut().ops.is_empty());
+        assert!(world.commands_mut().payload_bytes.is_empty());
+
+        // `clear()` preserves reserved capacities across repeated bursts.
+        world.reset_commands();
+        assert_eq!(world.commands_mut().ops.capacity(), reserved_ops_cap);
+        assert_eq!(
+            world.commands_mut().payload_bytes.capacity(),
+            reserved_payload_cap
+        );
+
+        // SAFETY: `cmds` and `pos` are valid.
+        let r_ins = unsafe {
+            insert(
+                cmds_of(&mut world),
+                e1,
+                pos_comp,
+                core::ptr::from_ref(&pos).cast::<u8>(),
+                16,
+            )
+        };
+        assert_eq!(r_ins, FfiResult::OK);
+        let inline_comps = [pos_comp, zst_comp];
+        let inline_ptrs = [core::ptr::from_ref(&pos).cast::<u8>(), dangling_zst];
+        let mut e3 = FfiEntity::NULL;
+        // SAFETY: `cmds`, `inline_comps`, `inline_ptrs`, and `e3` are valid.
+        let r_spawn = unsafe {
+            spawn(
+                cmds_of(&mut world),
+                inline_comps.as_ptr(),
+                inline_ptrs.as_ptr(),
+                2,
+                &mut e3,
+            )
+        };
+        assert_eq!(r_spawn, FfiResult::OK);
+        // SAFETY: `cmds`, `inline_comps`, and `inline_ptrs` are valid for 3 entities.
+        let r_batch = unsafe {
+            spawn_batch(
+                cmds_of(&mut world),
+                inline_comps.as_ptr(),
+                inline_ptrs.as_ptr(),
+                2,
+                3,
+                core::ptr::null_mut(),
+            )
+        };
+        assert_eq!(r_batch, FfiResult::OK);
+        let batch_stats = world.command_stats();
+        assert_eq!(batch_stats.committed_spawns, 4);
+        assert_eq!(batch_stats.committed_inserts, 1 + 2 + 6);
+        assert_eq!(batch_stats.last_insert_component, pos_comp);
+        assert_eq!(batch_stats.last_insert_len, 16);
+
+        // FFI validation error paths.
+        let cmds = cmds_of(&mut world);
+        // SAFETY: Testing explicit null/invalid inputs against FFI guards.
+        unsafe {
+            assert_eq!(
+                insert(core::ptr::null_mut(), e1, pos_comp, core::ptr::null(), 16),
+                FfiResult::NULL_POINTER
+            );
+            assert_eq!(
+                insert(cmds, FfiEntity::NULL, pos_comp, core::ptr::null(), 16),
+                FfiResult::INVALID_ENTITY
+            );
+            assert_eq!(
+                insert(cmds, e1, BamComponent::INVALID, core::ptr::null(), 0),
+                FfiResult::INVALID_COMPONENT
+            );
+            assert_eq!(
+                insert(cmds, e1, pos_comp, core::ptr::null(), 8),
+                FfiResult::TYPE_MISMATCH
+            );
+            assert_eq!(
+                insert_if_new(cmds, e1, pos_comp, core::ptr::null(), 16),
+                FfiResult::NULL_POINTER
+            );
+        }
+        assert_eq!(
+            world.commands_mut().ops.capacity(),
+            reserved_ops_cap,
+            "operations within reserved capacity must not reallocate ops"
+        );
+        assert_eq!(
+            world.commands_mut().payload_bytes.capacity(),
+            reserved_payload_cap,
+            "payloads within reserved capacity must not reallocate payload_bytes"
+        );
+    }
+
+    #[test]
+    fn system_frame_layout_arity_and_reentrancy() {
+        use core::cell::Cell;
+        use core::sync::atomic::{AtomicUsize, Ordering};
+
+        assert_eq!(
+            core::mem::size_of::<SystemFrame>(),
+            6 * core::mem::size_of::<usize>()
+        );
+        assert_eq!(
+            core::mem::align_of::<SystemFrame>(),
+            core::mem::align_of::<usize>()
+        );
+
+        struct ReentrantCtx {
+            world: Cell<*const OwnedHostWorld>,
+            inner_idx: Cell<usize>,
+            outer_calls: AtomicUsize,
+            inner_calls: AtomicUsize,
+        }
+
+        unsafe extern "C" fn zero_query_cb(
+            sys_ctx: *mut bamabi_sys::BamSystemCtx,
+            user_data: *mut c_void,
+        ) -> FfiResult {
+            // SAFETY: `user_data` points to `BamHostApi` alive for the test.
+            let api = unsafe { &*user_data.cast::<BamHostApi>() };
+            // SAFETY: `sys_ctx` is valid for this callback.
+            let host_ctx = unsafe { (api.sys_host_ctx.unwrap())(sys_ctx) };
+            assert!(!host_ctx.is_null());
+
+            let mut cmds = core::ptr::null_mut();
+            // SAFETY: `sys_ctx` and `cmds` are valid.
+            let cmds_res = unsafe { (api.sys_commands.unwrap())(sys_ctx, &mut cmds) };
+            assert_eq!(cmds_res, FfiResult::OK);
+            assert!(!cmds.is_null());
+
+            let mut iter = core::ptr::null_mut();
+            // SAFETY: `sys_ctx` and `iter` are valid; query 0 is out of range for 0-query system.
+            let q_res = unsafe { (api.sys_query.unwrap())(sys_ctx, 0, &mut iter) };
+            assert_eq!(q_res, FfiResult::OUT_OF_RANGE);
+            assert!(iter.is_null());
+
+            let bogus_ent = FfiEntity::from_bits(1);
+            // SAFETY: Out-of-range query index returns null without dereferencing `iters`.
+            assert!(unsafe { (api.sys_entity_get.unwrap())(sys_ctx, 0, bogus_ent, 0) }.is_null());
+            // SAFETY: Out-of-range query index returns null without dereferencing `iters`.
+            let get_mut_ptr =
+                unsafe { (api.sys_entity_get_mut.unwrap())(sys_ctx, 0, bogus_ent, 0) };
+            assert!(get_mut_ptr.is_null());
+            FfiResult::OK
+        }
+
+        unsafe extern "C" fn return_false(_user_data: *mut c_void) -> FfiBool {
+            FfiBool::FALSE
+        }
+
+        unsafe extern "C" fn panic_if_called(
+            _sys_ctx: *mut bamabi_sys::BamSystemCtx,
+            _user_data: *mut c_void,
+        ) -> FfiResult {
+            panic!("run_if returned FALSE; system callback must not run");
+        }
+
+        unsafe extern "C" fn dummy_cb(
+            _sys_ctx: *mut bamabi_sys::BamSystemCtx,
+            _user_data: *mut c_void,
+        ) -> FfiResult {
+            FfiResult::OK
+        }
+
+        unsafe extern "C" fn inner_2q_cb(
+            sys_ctx: *mut bamabi_sys::BamSystemCtx,
+            user_data: *mut c_void,
+        ) -> FfiResult {
+            // SAFETY: `user_data` points to `ReentrantCtx` alive for the test.
+            let ctx = unsafe { &*user_data.cast::<ReentrantCtx>() };
+            // SAFETY: `ctx.world` is valid for the test.
+            let world = unsafe { &*ctx.world.get() };
+            ctx.inner_calls.fetch_add(1, Ordering::Relaxed);
+
+            let mut iter0 = core::ptr::null_mut();
+            let mut iter1 = core::ptr::null_mut();
+            let mut iter2 = core::ptr::null_mut();
+            // SAFETY: `sys_ctx` has 2 queries.
+            unsafe {
+                assert_eq!(
+                    (world.api.sys_query.unwrap())(sys_ctx, 0, &mut iter0),
+                    FfiResult::OK
+                );
+                assert_eq!(
+                    (world.api.sys_query.unwrap())(sys_ctx, 1, &mut iter1),
+                    FfiResult::OK
+                );
+                assert_ne!(iter0, iter1);
+                assert_eq!(
+                    (world.api.sys_query.unwrap())(sys_ctx, 2, &mut iter2),
+                    FfiResult::OUT_OF_RANGE
+                );
+            }
+
+            let mut count0 = 0usize;
+            let mut count1 = 0usize;
+            // SAFETY: `iter0` and `iter1` are valid query iterators.
+            unsafe {
+                assert_eq!(
+                    (world.api.iter_count.unwrap())(iter0, &mut count0),
+                    FfiResult::OK
+                );
+                assert_eq!(
+                    (world.api.iter_count.unwrap())(iter1, &mut count1),
+                    FfiResult::OK
+                );
+            }
+            assert_eq!(count0, 300);
+            assert_eq!(count1, 300);
+
+            let mut len = 0usize;
+            let mut seen_entities = 0usize;
+            let mut first_entity = FfiEntity::NULL;
+            // SAFETY: `iter1` is a valid query iterator.
+            while unsafe { (world.api.iter_next_chunk.unwrap())(iter1, &mut len) } == FfiBool::TRUE
+            {
+                // SAFETY: Active chunk has valid entities slice of length `len`.
+                let ents = unsafe { (world.api.iter_entities.unwrap())(iter1) };
+                assert!(!ents.is_null());
+                if first_entity.is_null() && len > 0 {
+                    // SAFETY: `ents` points to `len` readable entities.
+                    first_entity = unsafe { *ents };
+                }
+                seen_entities += len;
+            }
+            assert_eq!(seen_entities, 300);
+
+            // SAFETY: `first_entity` is a valid entity in query 1 (`Read(Position)`).
+            let pos_ptr =
+                unsafe { (world.api.sys_entity_get.unwrap())(sys_ctx, 1, first_entity, 0) };
+            assert!(!pos_ptr.is_null());
+            FfiResult::OK
+        }
+
+        unsafe extern "C" fn outer_reentrant_cb(
+            sys_ctx: *mut bamabi_sys::BamSystemCtx,
+            user_data: *mut c_void,
+        ) -> FfiResult {
+            // SAFETY: `user_data` points to `ReentrantCtx` alive for the test.
+            let ctx = unsafe { &*user_data.cast::<ReentrantCtx>() };
+            // SAFETY: `ctx.world` is valid for the test.
+            let world = unsafe { &*ctx.world.get() };
+            ctx.outer_calls.fetch_add(1, Ordering::Relaxed);
+
+            let mut iter0 = core::ptr::null_mut();
+            let mut iter1 = core::ptr::null_mut();
+            // SAFETY: `sys_ctx` has 2 queries.
+            unsafe {
+                assert_eq!(
+                    (world.api.sys_query.unwrap())(sys_ctx, 0, &mut iter0),
+                    FfiResult::OK
+                );
+                assert_eq!(
+                    (world.api.sys_query.unwrap())(sys_ctx, 1, &mut iter1),
+                    FfiResult::OK
+                );
+                assert_eq!(
+                    (world.api.sys_query.unwrap())(sys_ctx, 2, &mut iter1),
+                    FfiResult::OUT_OF_RANGE
+                );
+            }
+
+            // Advance outer query 0 by 1 chunk, test `sys_entity_get_mut` on query 0, then call `inner_2q_cb` reentrantly.
+            let mut len0 = 0usize;
+            // SAFETY: `iter0` is valid.
+            let next_ok = unsafe { (world.api.iter_next_chunk.unwrap())(iter0, &mut len0) };
+            assert_eq!(next_ok, FfiBool::TRUE);
+            // SAFETY: Active chunk has valid entities slice.
+            let ents = unsafe { (world.api.iter_entities.unwrap())(iter0) };
+            // SAFETY: `ents` has `len0 >= 1` entities.
+            let ent0 = unsafe { *ents };
+            // SAFETY: `ent0` has mutable `Position` at term 0 of query 0.
+            let mut_pos_ptr =
+                unsafe { (world.api.sys_entity_get_mut.unwrap())(sys_ctx, 0, ent0, 0) };
+            assert!(!mut_pos_ptr.is_null());
+
+            // Reentrant `run_system` on inner 2-query system while outer `SystemFrame` is active.
+            assert_eq!(world.run_system(ctx.inner_idx.get()), FfiResult::OK);
+
+            // Outer iterator state must remain intact across reentrant call.
+            let mut rem_chunks = 0usize;
+            let mut rem_entities = 0usize;
+            // SAFETY: `iter0` is still valid after inner `run_system`.
+            while unsafe { (world.api.iter_next_chunk.unwrap())(iter0, &mut len0) } == FfiBool::TRUE
+            {
+                rem_chunks += 1;
+                rem_entities += len0;
+            }
+            assert_eq!(rem_chunks, 2);
+            assert_eq!(rem_entities, 300 - 128);
+            FfiResult::OK
+        }
+
+        let mut world = HostWorld::new();
+        world.setup_dense_entities(300, 128);
+        let api_ptr = world.api_ptr().cast_mut().cast::<c_void>();
+        let reg_sys = world.api.register_system.unwrap();
+        let reg_sys_handle = world.api.register_system_handle.unwrap();
+        let mount_sys = world.api.mount_system_in_schedule.unwrap();
+
+        // 0-query system.
+        let zero_desc = bamabi_sys::BamSystemDesc::new(
+            c"zero_q".as_ptr(),
+            core::ptr::null(),
+            0,
+            zero_query_cb,
+            api_ptr,
+        );
+        // SAFETY: `load_ctx_ptr` and `zero_desc` are valid during init.
+        let r_zero = unsafe { reg_sys(world.load_ctx_ptr(), &zero_desc) };
+        assert_eq!(r_zero, FfiResult::OK);
+        let zero_idx = world.find_system("zero_q").unwrap();
+        assert_eq!(world.run_system(zero_idx), FfiResult::OK);
+
+        // `run_if` returning FALSE skips callback.
+        let q_pos_terms = [BamTermDesc::read(world.pos_handle)];
+        let q_pos = [bamabi_sys::BamQueryDesc::new(
+            q_pos_terms.as_ptr(),
+            q_pos_terms.len(),
+        )];
+        let mut skipped_desc = bamabi_sys::BamSystemDesc::new(
+            c"skipped_sys".as_ptr(),
+            q_pos.as_ptr(),
+            q_pos.len(),
+            panic_if_called,
+            core::ptr::null_mut(),
+        );
+        skipped_desc.run_if = Some(return_false);
+        // SAFETY: `load_ctx_ptr` and `skipped_desc` are valid during init.
+        let r_skip = unsafe { reg_sys(world.load_ctx_ptr(), &skipped_desc) };
+        assert_eq!(r_skip, FfiResult::OK);
+        let skipped_idx = world.find_system("skipped_sys").unwrap();
+        assert_eq!(world.run_system(skipped_idx), FfiResult::OK);
+
+        // Inner 2-query system registered via `register_system_handle` and mounted via `mount_system_in_schedule`.
+        let q0_terms = [
+            BamTermDesc::write(world.pos_handle),
+            BamTermDesc::read(world.vel_handle),
+        ];
+        let q1_terms = [BamTermDesc::read(world.pos_handle)];
+        let two_queries = [
+            bamabi_sys::BamQueryDesc::new(q0_terms.as_ptr(), q0_terms.len()),
+            bamabi_sys::BamQueryDesc::new(q1_terms.as_ptr(), q1_terms.len()),
+        ];
+
+        let ctx = ReentrantCtx {
+            world: Cell::new(core::ptr::null()),
+            inner_idx: Cell::new(0),
+            outer_calls: AtomicUsize::new(0),
+            inner_calls: AtomicUsize::new(0),
+        };
+        let ctx_ptr = core::ptr::from_ref(&ctx).cast_mut().cast::<c_void>();
+
+        let inner_desc = bamabi_sys::BamSystemDesc::new(
+            c"inner_2q".as_ptr(),
+            two_queries.as_ptr(),
+            two_queries.len(),
+            inner_2q_cb,
+            ctx_ptr,
+        );
+        let mut inner_handle = BamSystem::INVALID;
+        // SAFETY: `load_ctx_ptr`, `inner_desc`, and `inner_handle` are valid during init.
+        let r_inner =
+            unsafe { reg_sys_handle(world.load_ctx_ptr(), &inner_desc, &mut inner_handle) };
+        assert_eq!(r_inner, FfiResult::OK);
+        // SAFETY: `load_ctx_ptr` is valid during init; mutating `&mut RegisteredSystem` must remain Miri-sound.
+        let r_mount = unsafe {
+            mount_sys(
+                world.load_ctx_ptr(),
+                inner_handle,
+                ScheduleId::FIXED_UPDATE,
+                BamSystemSet::INVALID,
+            )
+        };
+        assert_eq!(r_mount, FfiResult::OK);
+        let inner_idx = world.find_system("inner_2q").unwrap();
+        ctx.inner_idx.set(inner_idx);
+
+        // Register 8 more systems to force `HostWorld::systems` `Vec` reallocation after mounting `inner_2q`.
+        for i in 0..8 {
+            let name = format!("dummy_sys_{i}\0");
+            let dummy_desc = bamabi_sys::BamSystemDesc::new(
+                name.as_ptr().cast(),
+                core::ptr::null(),
+                0,
+                dummy_cb,
+                core::ptr::null_mut(),
+            );
+            // SAFETY: `load_ctx_ptr` and `dummy_desc` are valid during init.
+            let r_dummy = unsafe { reg_sys(world.load_ctx_ptr(), &dummy_desc) };
+            assert_eq!(r_dummy, FfiResult::OK);
+        }
+
+        let outer_desc = bamabi_sys::BamSystemDesc::new(
+            c"outer_2q".as_ptr(),
+            two_queries.as_ptr(),
+            two_queries.len(),
+            outer_reentrant_cb,
+            ctx_ptr,
+        );
+        // SAFETY: `load_ctx_ptr` and `outer_desc` are valid during init.
+        let r_outer = unsafe { reg_sys(world.load_ctx_ptr(), &outer_desc) };
+        assert_eq!(r_outer, FfiResult::OK);
+        let outer_idx = world.find_system("outer_2q").unwrap();
+        ctx.world.set(core::ptr::from_ref(&world));
+
+        assert_eq!(world.run_system(outer_idx), FfiResult::OK);
+        assert_eq!(world.run_system(outer_idx), FfiResult::OK);
+        assert_eq!(ctx.outer_calls.load(Ordering::Relaxed), 2);
+        assert_eq!(ctx.inner_calls.load(Ordering::Relaxed), 2);
+    }
+
+    #[test]
+    fn symbol_table_intern_dedup_concurrency_and_utf8_validation() {
+        let world = HostWorld::new();
+        let s0 = world.shared.intern_symbol_str("a");
+        let s1 = world.shared.intern_symbol_str("b");
+        let s2 = world.shared.intern_symbol_str("bench.sym");
+        let s3 = world.shared.intern_symbol_str("αβγ::λ");
+        assert_eq!(s0.to_raw(), 0);
+        assert_eq!(s1.to_raw(), 1);
+        assert_eq!(s2.to_raw(), 2);
+        assert_eq!(s3.to_raw(), 3);
+        assert_eq!(world.shared.intern_symbol_str("bench.sym"), s2);
+        assert_eq!(world.shared.intern_symbol_str("αβγ::λ"), s3);
+        assert_eq!(world.intern_symbol_calls(), 6);
+
+        world.reset_intern_symbol_calls();
+        let shared = &world.shared;
+        let thread_results = std::thread::scope(|scope| {
+            let mut handles = Vec::new();
+            for tid in 0..4usize {
+                handles.push(scope.spawn(move || {
+                    let mut out = Vec::new();
+                    for round in 0..8usize {
+                        let a = shared.intern_symbol_str("bench.sym");
+                        let b = shared.intern_symbol_str("αβγ::λ");
+                        let shared_new = shared.intern_symbol_str("concurrent.shared");
+                        let per_thread = shared.intern_symbol_str(&format!("worker_{tid}_{round}"));
+                        out.push((a, b, shared_new, per_thread));
+                    }
+                    out
+                }));
+            }
+            handles
+                .into_iter()
+                .map(|h| h.join().expect("thread must not panic"))
+                .collect::<Vec<_>>()
+        });
+        assert_eq!(world.intern_symbol_calls(), 4 * 8 * 4);
+        let expected_shared_new = thread_results[0][0].2;
+        for per_t in &thread_results {
+            for &(a, b, shared_new, per_thread) in per_t {
+                assert_eq!(a, s2);
+                assert_eq!(b, s3);
+                assert_eq!(shared_new, expected_shared_new);
+                assert!(per_thread.is_valid());
+            }
+        }
+
+        // FFI error validation checks must not increment `intern_symbol_calls`.
+        world.reset_intern_symbol_calls();
+        let intern_fn = world.api.intern_symbol.unwrap();
+        let host_ctx = world.host_ctx_ptr();
+        let mut sym_out = BamSymbol::INVALID;
+        let invalid_utf8 = [0xffu8, 0xfeu8];
+        // SAFETY: Testing explicit invalid arguments and pointers against FFI guards.
+        unsafe {
+            assert_eq!(
+                intern_fn(core::ptr::null(), StrView::from_str("x"), &mut sym_out),
+                FfiResult::NULL_POINTER
+            );
+            assert_eq!(
+                intern_fn(host_ctx, StrView::from_str("x"), core::ptr::null_mut()),
+                FfiResult::NULL_POINTER
+            );
+            assert_eq!(
+                intern_fn(host_ctx, StrView::from_str(""), &mut sym_out),
+                FfiResult::INVALID_ARGUMENT
+            );
+            assert_eq!(
+                intern_fn(
+                    host_ctx,
+                    StrView {
+                        ptr: core::ptr::null(),
+                        len: 0,
+                    },
+                    &mut sym_out
+                ),
+                FfiResult::INVALID_ARGUMENT
+            );
+            assert_eq!(
+                intern_fn(
+                    host_ctx,
+                    StrView {
+                        ptr: core::ptr::null(),
+                        len: 4,
+                    },
+                    &mut sym_out
+                ),
+                FfiResult::NULL_POINTER
+            );
+            assert_eq!(
+                intern_fn(
+                    host_ctx,
+                    StrView {
+                        ptr: invalid_utf8.as_ptr(),
+                        len: invalid_utf8.len(),
+                    },
+                    &mut sym_out
+                ),
+                FfiResult::INVALID_UTF8
+            );
+        }
+        assert_eq!(world.intern_symbol_calls(), 0);
     }
 }

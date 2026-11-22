@@ -25,6 +25,8 @@
 //!     Layer 0 stress/telemetry notes (`TESTING.md`)
 //!   - [`benchmarks`] — Layer 0 testing & polyglot host-guest benchmarking strategy and recorded
 //!     results (`BENCHMARKS.md`)
+//!   - [`profiling`] — Layered `hotpath-rs` + disassembly profiling & optimization record
+//!     (`PROFILING.md`)
 //!   - [`wire_spec`] — Canonical byte-level wire specification (`spec.md`)
 //!   - [`crates`] — Curated index of all 6 functional crates with direct links to every crate root,
 //!     architecture guide, and test catalog
@@ -227,6 +229,11 @@ pub mod benchmarks {
 }
 
 #[cfg(doc)]
+pub mod profiling {
+    #![doc = include_str!("../../../PROFILING.md")]
+}
+
+#[cfg(doc)]
 pub mod wire_spec {
     #![doc = include_str!("../../../spec.md")]
 }
@@ -254,5 +261,6 @@ pub mod crates {
     //! - [`development`](../development/index.html) — Workspace `DEVELOPMENT.md`
     //! - [`testing`](../testing/index.html) — Workspace `TESTING.md`
     //! - [`benchmarks`](../benchmarks/index.html) — Workspace `BENCHMARKS.md`
+    //! - [`profiling`](../profiling/index.html) — Workspace `PROFILING.md`
     //! - [`wire_spec`](../wire_spec/index.html) — Canonical `spec.md`
 }

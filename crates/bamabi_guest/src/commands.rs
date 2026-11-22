@@ -54,9 +54,10 @@ impl<'a> GuestCommands<'a> {
         self.inner.is_valid()
     }
 
-    /// Returns the cached [`Host`] table for this mod instance.
+    /// Returns the active [`Host`] table for this mod instance, lazily resolving
+    /// `BamHostApi::sys_host_ctx` on demand when backed by a system trampoline frame.
     #[inline]
-    pub const fn host(&self) -> &'a Host {
+    pub fn host(&self) -> &'a Host {
         self.inner.host()
     }
 

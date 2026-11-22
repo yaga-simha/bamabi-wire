@@ -20,10 +20,12 @@ use crate::{
     },
     instance::{GuestInstance, RuntimeAllocTracker},
     trampoline::{
-        PreparedRunIf, SystemRegistrationConfig, ValidatedSystemInvocation, configure_schedule_set,
-        configure_schedule_set_raw, mount_system_in_schedule, register_lifecycle_observer_closure,
-        register_observer_closure, register_observer_closure_with_options,
-        register_observer_mut_closure, register_system_closure, register_system_handle_closure,
+        PreparedRunIf, SystemRegistrationConfig, ValidatedSystemInvocation, ValidatedSystemSlice,
+        configure_schedule_set, configure_schedule_set_raw, mount_system_in_schedule,
+        register_lifecycle_observer_closure, register_observer_closure,
+        register_observer_closure_with_options, register_observer_mut_closure,
+        register_system_closure, register_system_handle_closure,
+        register_system_handle_slice_closure, register_system_slice_closure,
     },
 };
 
@@ -392,15 +394,18 @@ impl Host {
         self.host_ctx.0
     }
 
-    /// Reads the most recent human-readable UTF-8 diagnostic message recorded on this instance's
-    /// [`BamHostCtx`], returning an empty string if no error is recorded.
-    pub fn last_error(&self) -> String {
-        let Some(last_error_fn) = self.api.last_error else {
+    /// Reads the most recent human-readable UTF-8 diagnostic message recorded on `host_ctx`
+    /// without materializing a full [`Host`] copy.
+    ///
+    /// # Safety
+    /// `host_ctx` must be a valid active [`BamHostCtx`] matching `api` for the duration of this call.
+    pub unsafe fn last_error_with_ctx(api: &BamHostApi, host_ctx: *const BamHostCtx) -> String {
+        let Some(last_error_fn) = api.last_error else {
             return String::new();
         };
-        // SAFETY: `self.host_ctx.0` is a valid active `BamHostCtx`, and `(null, 0)` queries the
+        // SAFETY: `host_ctx` is a valid active `BamHostCtx`, and `(null, 0)` queries the
         // required byte length under the `snprintf` sizing contract without writing to `buf`.
-        let byte_len = unsafe { last_error_fn(self.host_ctx.0, core::ptr::null_mut(), 0) };
+        let byte_len = unsafe { last_error_fn(host_ctx, core::ptr::null_mut(), 0) };
         if byte_len == 0 {
             return String::new();
         }
@@ -408,11 +413,18 @@ impl Host {
             return String::new();
         };
         let mut buf = vec![0u8; cap];
-        // SAFETY: `buf` provides `cap` writable bytes on the guest heap and `self.host_ctx.0` is valid.
-        let reported = unsafe { last_error_fn(self.host_ctx.0, buf.as_mut_ptr().cast(), cap) };
+        // SAFETY: `buf` provides `cap` writable bytes on the guest heap and `host_ctx` is valid.
+        let reported = unsafe { last_error_fn(host_ctx, buf.as_mut_ptr().cast(), cap) };
         let valid_len = reported.min(byte_len);
         buf.truncate(valid_len);
         String::from_utf8_lossy(&buf).into_owned()
+    }
+
+    /// Reads the most recent human-readable UTF-8 diagnostic message recorded on this instance's
+    /// [`BamHostCtx`], returning an empty string if no error is recorded.
+    pub fn last_error(&self) -> String {
+        // SAFETY: `self.host_ctx.0` is a valid active `BamHostCtx` matching `&self.api`.
+        unsafe { Self::last_error_with_ctx(&self.api, self.host_ctx.0) }
     }
 
     /// Queries a host-exported VTable or `"bam.v0.*"` custom symbol pointer via
@@ -602,17 +614,52 @@ impl Host {
     }
 
     /// Emits a structured guest diagnostic message via `BamHostApi::log_diagnostic` (slot 50)
+    /// against an explicit `host_ctx` without copying [`Host`].
+    ///
+    /// # Safety
+    /// `host_ctx` must be a valid active [`BamHostCtx`] matching `api` for the duration of this call.
+    #[inline]
+    pub unsafe fn log_diagnostic_with_ctx(
+        api: &BamHostApi,
+        host_ctx: *const BamHostCtx,
+        level: u32,
+        message: &str,
+    ) -> FfiResult {
+        let Some(log_fn) = host_slot!(api, log_diagnostic) else {
+            return FfiResult::UNSUPPORTED;
+        };
+        // SAFETY: `host_ctx` is a valid active `BamHostCtx`, and `StrView::from_str(message)`
+        // borrows valid UTF-8 bytes for the synchronous duration of this call.
+        unsafe { log_fn(host_ctx, level, StrView::from_str(message)) }
+    }
+
+    /// Emits a structured guest diagnostic message via `BamHostApi::log_diagnostic` (slot 50)
     /// without clobbering `last_error`.
     ///
     /// Returns [`FfiResult::UNSUPPORTED`] when connected to an ABI `0.2` host.
     #[inline]
     pub fn log_diagnostic(&self, level: u32, message: &str) -> FfiResult {
-        let Some(log_fn) = host_slot!(&self.api, log_diagnostic) else {
+        // SAFETY: `self.host_ctx.0` is a valid active `BamHostCtx` matching `&self.api`.
+        unsafe { Self::log_diagnostic_with_ctx(&self.api, self.host_ctx.0, level, message) }
+    }
+
+    /// Records a guest-reported fault message on `host_ctx` via
+    /// `BamHostApi::report_guest_fault` (slot 51) without copying [`Host`].
+    ///
+    /// # Safety
+    /// `host_ctx` must be a valid active [`BamHostCtx`] matching `api` for the duration of this call.
+    #[inline]
+    pub unsafe fn report_guest_fault_with_ctx(
+        api: &BamHostApi,
+        host_ctx: *const BamHostCtx,
+        message: &str,
+    ) -> FfiResult {
+        let Some(fault_fn) = host_slot!(api, report_guest_fault) else {
             return FfiResult::UNSUPPORTED;
         };
-        // SAFETY: `self.host_ctx.0` is a valid active `BamHostCtx`, and `StrView::from_str(message)`
+        // SAFETY: `host_ctx` is a valid active `BamHostCtx`, and `StrView::from_str(message)`
         // borrows valid UTF-8 bytes for the synchronous duration of this call.
-        unsafe { log_fn(self.host_ctx.0, level, StrView::from_str(message)) }
+        unsafe { fault_fn(host_ctx, StrView::from_str(message)) }
     }
 
     /// Records a guest-reported fault message on this world's host context via
@@ -621,12 +668,35 @@ impl Host {
     /// Returns [`FfiResult::UNSUPPORTED`] when connected to an ABI `0.2` host.
     #[inline]
     pub fn report_guest_fault(&self, message: &str) -> FfiResult {
-        let Some(fault_fn) = host_slot!(&self.api, report_guest_fault) else {
-            return FfiResult::UNSUPPORTED;
-        };
-        // SAFETY: `self.host_ctx.0` is a valid active `BamHostCtx`, and `StrView::from_str(message)`
-        // borrows valid UTF-8 bytes for the synchronous duration of this call.
-        unsafe { fault_fn(self.host_ctx.0, StrView::from_str(message)) }
+        // SAFETY: `self.host_ctx.0` is a valid active `BamHostCtx` matching `&self.api`.
+        unsafe { Self::report_guest_fault_with_ctx(&self.api, self.host_ctx.0, message) }
+    }
+
+    /// Resolves a registered component or resource handle by its 128-bit [`ComponentUuid`] via
+    /// `BamHostApi::resolve_component_by_uuid` (slot 52) using an explicit `host_ctx` without
+    /// copying [`Host`].
+    ///
+    /// # Safety
+    /// `host_ctx` must be a valid active [`BamHostCtx`] matching `api` for the duration of this call.
+    #[inline]
+    pub unsafe fn resolve_component_by_uuid_with_ctx(
+        api: &BamHostApi,
+        host_ctx: *const BamHostCtx,
+        uuid: ComponentUuid,
+    ) -> Result<BamComponent, FfiResult> {
+        let resolve_fn =
+            host_slot!(api, resolve_component_by_uuid).ok_or(FfiResult::UNSUPPORTED)?;
+        let mut out = BamComponent::INVALID;
+        // SAFETY: `host_ctx` is an active `BamHostCtx`, `&uuid` is readable, and `&mut out`
+        // is aligned writable stack storage.
+        let status = unsafe { resolve_fn(host_ctx, &uuid, &mut out) };
+        if !status.is_ok() {
+            return Err(status);
+        }
+        if !out.is_valid() {
+            return Err(FfiResult::INVALID_COMPONENT);
+        }
+        Ok(out)
     }
 
     /// Resolves a registered component or resource handle strictly by its 128-bit
@@ -638,19 +708,30 @@ impl Host {
         &self,
         uuid: ComponentUuid,
     ) -> Result<BamComponent, FfiResult> {
-        let resolve_fn =
-            host_slot!(&self.api, resolve_component_by_uuid).ok_or(FfiResult::UNSUPPORTED)?;
-        let mut out = BamComponent::INVALID;
-        // SAFETY: `self.host_ctx.0` is an active `BamHostCtx`, `&uuid` is readable, and `&mut out`
-        // is aligned writable stack storage.
-        let status = unsafe { resolve_fn(self.host_ctx.0, &uuid, &mut out) };
-        if !status.is_ok() {
-            return Err(status);
-        }
-        if !out.is_valid() {
+        // SAFETY: `self.host_ctx.0` is an active `BamHostCtx` matching `&self.api`.
+        unsafe { Self::resolve_component_by_uuid_with_ctx(&self.api, self.host_ctx.0, uuid) }
+    }
+
+    /// Queries ABI `0.3.0` layout metadata for `component` via
+    /// `BamHostApi::component_layout_info` (slot 53) using an explicit `host_ctx` without copying
+    /// [`Host`].
+    ///
+    /// # Safety
+    /// `host_ctx` must be a valid active [`BamHostCtx`] matching `api` for the duration of this call.
+    #[inline]
+    pub unsafe fn component_layout_info_with_ctx(
+        api: &BamHostApi,
+        host_ctx: *const BamHostCtx,
+        component: BamComponent,
+    ) -> Result<BamLayoutInfo, FfiResult> {
+        if !component.is_valid() {
             return Err(FfiResult::INVALID_COMPONENT);
         }
-        Ok(out)
+        let info_fn = host_slot!(api, component_layout_info).ok_or(FfiResult::UNSUPPORTED)?;
+        let mut out = BamLayoutInfo::empty();
+        // SAFETY: `host_ctx` is an active `BamHostCtx` and `&mut out` is aligned writable storage.
+        let status = unsafe { info_fn(host_ctx, component, &mut out) };
+        if status.is_ok() { Ok(out) } else { Err(status) }
     }
 
     /// Queries ABI `0.3.0` layout metadata (`size`, `align`, `schema_fingerprint`, `storage_flags`,
@@ -663,30 +744,29 @@ impl Host {
         &self,
         component: BamComponent,
     ) -> Result<BamLayoutInfo, FfiResult> {
-        if !component.is_valid() {
-            return Err(FfiResult::INVALID_COMPONENT);
-        }
-        let info_fn = host_slot!(&self.api, component_layout_info).ok_or(FfiResult::UNSUPPORTED)?;
-        let mut out = BamLayoutInfo::empty();
-        // SAFETY: `self.host_ctx.0` is an active `BamHostCtx` and `&mut out` is aligned writable storage.
-        let status = unsafe { info_fn(self.host_ctx.0, component, &mut out) };
-        if status.is_ok() { Ok(out) } else { Err(status) }
+        // SAFETY: `self.host_ctx.0` is an active `BamHostCtx` matching `&self.api`.
+        unsafe { Self::component_layout_info_with_ctx(&self.api, self.host_ctx.0, component) }
     }
 
     /// Interns a non-empty UTF-8 symbol string to an `O(1)` comparable [`BamSymbol`] handle via
-    /// `BamHostApi::intern_symbol` (slot 55).
+    /// `BamHostApi::intern_symbol` (slot 55) using an explicit `host_ctx` without copying [`Host`].
     ///
-    /// Returns [`FfiResult::UNSUPPORTED`] when connected to an ABI `0.2` host.
+    /// # Safety
+    /// `host_ctx` must be a valid active [`BamHostCtx`] matching `api` for the duration of this call.
     #[inline]
-    pub fn intern_symbol(&self, symbol: &str) -> Result<BamSymbol, FfiResult> {
+    pub unsafe fn intern_symbol_with_ctx(
+        api: &BamHostApi,
+        host_ctx: *const BamHostCtx,
+        symbol: &str,
+    ) -> Result<BamSymbol, FfiResult> {
         if symbol.is_empty() {
             return Err(FfiResult::INVALID_ARGUMENT);
         }
-        let intern_fn = host_slot!(&self.api, intern_symbol).ok_or(FfiResult::UNSUPPORTED)?;
+        let intern_fn = host_slot!(api, intern_symbol).ok_or(FfiResult::UNSUPPORTED)?;
         let mut out = BamSymbol::INVALID;
-        // SAFETY: `self.host_ctx.0` is an active `BamHostCtx`, `StrView::from_str(symbol)` borrows
+        // SAFETY: `host_ctx` is an active `BamHostCtx`, `StrView::from_str(symbol)` borrows
         // valid UTF-8 bytes for this call, and `&mut out` is aligned writable stack storage.
-        let status = unsafe { intern_fn(self.host_ctx.0, StrView::from_str(symbol), &mut out) };
+        let status = unsafe { intern_fn(host_ctx, StrView::from_str(symbol), &mut out) };
         if !status.is_ok() {
             return Err(status);
         }
@@ -696,24 +776,50 @@ impl Host {
         Ok(out)
     }
 
-    /// Binds a canonical non-empty UTF-8 lookup `name` to `entity` in the host symbol registry via
-    /// `BamHostApi::bind_named_object` (slot 56).
+    /// Interns a non-empty UTF-8 symbol string to an `O(1)` comparable [`BamSymbol`] handle via
+    /// `BamHostApi::intern_symbol` (slot 55).
     ///
     /// Returns [`FfiResult::UNSUPPORTED`] when connected to an ABI `0.2` host.
     #[inline]
-    pub fn bind_named_object(&self, name: &str, entity: FfiEntity) -> FfiResult {
+    pub fn intern_symbol(&self, symbol: &str) -> Result<BamSymbol, FfiResult> {
+        // SAFETY: `self.host_ctx.0` is an active `BamHostCtx` matching `&self.api`.
+        unsafe { Self::intern_symbol_with_ctx(&self.api, self.host_ctx.0, symbol) }
+    }
+
+    /// Binds a canonical non-empty UTF-8 lookup `name` to `entity` in the host symbol registry via
+    /// `BamHostApi::bind_named_object` (slot 56) using an explicit `host_ctx` without copying [`Host`].
+    ///
+    /// # Safety
+    /// `host_ctx` must be a valid active [`BamHostCtx`] matching `api` for the duration of this call.
+    #[inline]
+    pub unsafe fn bind_named_object_with_ctx(
+        api: &BamHostApi,
+        host_ctx: *const BamHostCtx,
+        name: &str,
+        entity: FfiEntity,
+    ) -> FfiResult {
         if name.is_empty() {
             return FfiResult::INVALID_ARGUMENT;
         }
         if entity.is_null() {
             return FfiResult::INVALID_ENTITY;
         }
-        let Some(bind_fn) = host_slot!(&self.api, bind_named_object) else {
+        let Some(bind_fn) = host_slot!(api, bind_named_object) else {
             return FfiResult::UNSUPPORTED;
         };
-        // SAFETY: `self.host_ctx.0` is an active `BamHostCtx` and `StrView::from_str(name)` borrows
+        // SAFETY: `host_ctx` is an active `BamHostCtx` and `StrView::from_str(name)` borrows
         // valid UTF-8 bytes for this synchronous call.
-        unsafe { bind_fn(self.host_ctx.0, StrView::from_str(name), entity) }
+        unsafe { bind_fn(host_ctx, StrView::from_str(name), entity) }
+    }
+
+    /// Binds a canonical non-empty UTF-8 lookup `name` to `entity` in the host symbol registry via
+    /// `BamHostApi::bind_named_object` (slot 56).
+    ///
+    /// Returns [`FfiResult::UNSUPPORTED`] when connected to an ABI `0.2` host.
+    #[inline]
+    pub fn bind_named_object(&self, name: &str, entity: FfiEntity) -> FfiResult {
+        // SAFETY: `self.host_ctx.0` is an active `BamHostCtx` matching `&self.api`.
+        unsafe { Self::bind_named_object_with_ctx(&self.api, self.host_ctx.0, name, entity) }
     }
 }
 
@@ -993,6 +1099,60 @@ impl<'a> ValidatedLoadCtx<'a> {
         // and `PreparedRunIf` encapsulates a valid `(BamRunIfFn, *mut c_void)` pair.
         unsafe {
             register_system_handle_closure(
+                instance,
+                self.raw,
+                config,
+                run_if.map(PreparedRunIf::into_raw),
+                closure,
+            )
+        }
+    }
+
+    /// Registers a unified [`bamabi_sys::BamSystemDesc`] backed by a bucketed
+    /// `system_closure_slice_trampoline<N, F>` (`N ∈ {0, 1, 4, 16}`), storing all closures and
+    /// owned descriptor buffers inside `instance`.
+    #[inline]
+    pub fn register_system_slice<const N: usize, F>(
+        &self,
+        instance: &mut GuestInstance,
+        config: &SystemRegistrationConfig<'_>,
+        run_if: Option<PreparedRunIf>,
+        closure: F,
+    ) -> FfiResult
+    where
+        F: FnMut(&mut ValidatedSystemSlice<'_>) -> FfiResult + Send + 'static,
+    {
+        // SAFETY: `self.raw` was validated as an active `BamLoadCtx` in `ValidatedLoadCtx::from_raw`,
+        // and `PreparedRunIf` encapsulates a valid `(BamRunIfFn, *mut c_void)` pair.
+        unsafe {
+            register_system_slice_closure::<N, F>(
+                instance,
+                self.raw,
+                config,
+                run_if.map(PreparedRunIf::into_raw),
+                closure,
+            )
+        }
+    }
+
+    /// Registers a unified [`bamabi_sys::BamSystemDesc`] backed by a bucketed
+    /// `system_closure_slice_trampoline<N, F>` via `BamHostApi::register_system_handle` (slot 60)
+    /// and returns its assigned [`BamSystem`] handle.
+    #[inline]
+    pub fn register_system_handle_slice<const N: usize, F>(
+        &self,
+        instance: &mut GuestInstance,
+        config: &SystemRegistrationConfig<'_>,
+        run_if: Option<PreparedRunIf>,
+        closure: F,
+    ) -> Result<BamSystem, FfiResult>
+    where
+        F: FnMut(&mut ValidatedSystemSlice<'_>) -> FfiResult + Send + 'static,
+    {
+        // SAFETY: `self.raw` was validated as an active `BamLoadCtx` in `ValidatedLoadCtx::from_raw`,
+        // and `PreparedRunIf` encapsulates a valid `(BamRunIfFn, *mut c_void)` pair.
+        unsafe {
+            register_system_handle_slice_closure::<N, F>(
                 instance,
                 self.raw,
                 config,

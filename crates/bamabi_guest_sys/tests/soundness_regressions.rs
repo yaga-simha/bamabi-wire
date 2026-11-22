@@ -1667,3 +1667,573 @@ fn s10_restore_state_observer_mut_reentrancy_pod_clone_overlap_and_bridged_bound
         Err(FfiResult::TYPE_MISMATCH)
     );
 }
+
+// ============================================================================
+// S11: `BatchColCache`, `advance_batch_into`, and `ChunkColumnDispenser`
+//      scratch/epoch/cross-iter soundness under Miri
+// ============================================================================
+
+/// Verifies under Miri (Tree & Stacked Borrows) that:
+/// 1. `advance_batch_into(&mut cache, ...)` followed by `ChunkColumnDispenser::new(&mut iter)`
+///    does NOT read uninitialized or stale `QuerySlotScratch::batch_col_ptrs` and falls back cleanly
+///    to `iter_column_readonly` / `iter_column_mutable`.
+/// 2. Passing a stale `BatchColCache` (from an earlier chunk, before `next_chunk`/`reset`, or from
+///    a different `ValidatedIter`) to `ChunkColumnDispenser::new_with_batch` falls back cleanly
+///    without reading dangling or mismatched-length pointers.
+#[test]
+fn s11_batch_col_cache_and_dispenser_epoch_and_scratch_soundness() {
+    struct MultiChunkBatchIter {
+        chunk_idx: usize,
+        chunk0_ro: Vec<u32>,
+        chunk0_rw: Vec<u32>,
+        chunk1_ro: Vec<u32>,
+        chunk1_rw: Vec<u32>,
+        legacy_ro_calls: usize,
+        legacy_rw_calls: usize,
+    }
+
+    impl MultiChunkBatchIter {
+        fn cur_len(&self) -> usize {
+            match self.chunk_idx {
+                1 => self.chunk0_ro.len(),
+                2 => self.chunk1_ro.len(),
+                _ => 0,
+            }
+        }
+    }
+
+    unsafe extern "C" fn s11_col_info(
+        _: *const BamIter,
+        term_index: usize,
+        out: *mut BamColumnInfo,
+    ) -> FfiResult {
+        let info = match term_index {
+            0 => BamColumnInfo {
+                component: BamComponent::from_raw(1),
+                uuid: ComponentUuid::from_parts("s11::ReadU32", 4, 4, 0),
+                size: 4,
+                align: 4,
+                mode: AccessMode::READ,
+                storage_flags: 0,
+                reserved0: 0,
+            },
+            1 => BamColumnInfo {
+                component: BamComponent::from_raw(2),
+                uuid: ComponentUuid::from_parts("s11::WriteU32", 4, 4, 0),
+                size: 4,
+                align: 4,
+                mode: AccessMode::WRITE,
+                storage_flags: 0,
+                reserved0: 0,
+            },
+            _ => return FfiResult::OUT_OF_RANGE,
+        };
+        // SAFETY: `out` is writable stack storage.
+        unsafe { *out = info };
+        FfiResult::OK
+    }
+
+    unsafe extern "C" fn s11_next_chunk(iter: *mut BamIter, out_len: *mut usize) -> FfiBool {
+        // SAFETY: `iter` points to `MultiChunkBatchIter`.
+        let st = unsafe { &mut *iter.cast::<MultiChunkBatchIter>() };
+        st.chunk_idx += 1;
+        let len = st.cur_len();
+        if len == 0 {
+            FfiBool::FALSE
+        } else {
+            // SAFETY: `out_len` is writable stack storage.
+            unsafe { *out_len = len };
+            FfiBool::TRUE
+        }
+    }
+
+    unsafe extern "C" fn s11_next_chunk_batch(
+        iter: *mut BamIter,
+        out_len: *mut usize,
+        _out_entities: *mut *const FfiEntity,
+        out_col_ptrs: *mut *mut u8,
+        col_count: usize,
+        _mark_changed_mask: u32,
+    ) -> FfiBool {
+        // SAFETY: `iter` points to `MultiChunkBatchIter`.
+        let st = unsafe { &mut *iter.cast::<MultiChunkBatchIter>() };
+        st.chunk_idx += 1;
+        let len = st.cur_len();
+        if len == 0 {
+            return FfiBool::FALSE;
+        }
+        // SAFETY: `out_len` is writable stack storage.
+        unsafe { *out_len = len };
+        let (ro_ptr, rw_ptr) = match st.chunk_idx {
+            1 => (
+                st.chunk0_ro.as_mut_ptr().cast::<u8>(),
+                st.chunk0_rw.as_mut_ptr().cast::<u8>(),
+            ),
+            2 => (
+                st.chunk1_ro.as_mut_ptr().cast::<u8>(),
+                st.chunk1_rw.as_mut_ptr().cast::<u8>(),
+            ),
+            _ => return FfiBool::FALSE,
+        };
+        // SAFETY: Caller initializes `col_count` writable `*mut u8` slots at `out_col_ptrs`.
+        unsafe {
+            if col_count > 0 {
+                *out_col_ptrs.add(0) = ro_ptr;
+            }
+            if col_count > 1 {
+                *out_col_ptrs.add(1) = rw_ptr;
+            }
+        }
+        FfiBool::TRUE
+    }
+
+    unsafe extern "C" fn s11_col_ro(iter: *const BamIter, term_index: usize) -> *const u8 {
+        // SAFETY: `iter` points to `MultiChunkBatchIter`.
+        let st = unsafe { &mut *iter.cast::<MultiChunkBatchIter>().cast_mut() };
+        st.legacy_ro_calls += 1;
+        if term_index != 0 {
+            return core::ptr::null();
+        }
+        match st.chunk_idx {
+            1 => st.chunk0_ro.as_ptr().cast::<u8>(),
+            2 => st.chunk1_ro.as_ptr().cast::<u8>(),
+            _ => core::ptr::null(),
+        }
+    }
+
+    unsafe extern "C" fn s11_col_rw(iter: *mut BamIter, term_index: usize) -> *mut u8 {
+        // SAFETY: `iter` points to `MultiChunkBatchIter`.
+        let st = unsafe { &mut *iter.cast::<MultiChunkBatchIter>() };
+        st.legacy_rw_calls += 1;
+        if term_index != 1 {
+            return core::ptr::null_mut();
+        }
+        match st.chunk_idx {
+            1 => st.chunk0_rw.as_mut_ptr().cast::<u8>(),
+            2 => st.chunk1_rw.as_mut_ptr().cast::<u8>(),
+            _ => core::ptr::null_mut(),
+        }
+    }
+
+    unsafe extern "C" fn s11_reset(iter: *mut BamIter) -> FfiResult {
+        // SAFETY: `iter` points to `MultiChunkBatchIter`.
+        let st = unsafe { &mut *iter.cast::<MultiChunkBatchIter>() };
+        st.chunk_idx = 0;
+        FfiResult::OK
+    }
+
+    let mut api = make_mock_api();
+    api.iter_column_info = Some(s11_col_info);
+    api.iter_next_chunk = Some(s11_next_chunk);
+    api.iter_next_chunk_batch = Some(s11_next_chunk_batch);
+    api.iter_column_readonly = Some(s11_col_ro);
+    api.iter_column_mutable = Some(s11_col_rw);
+    api.iter_reset = Some(s11_reset);
+
+    let dummy_ctx = 0u64;
+    // SAFETY: Stack pointers remain valid for test.
+    let host = unsafe { Host::from_raw(&api, (&raw const dummy_ctx).cast()) }.unwrap();
+
+    // Case (a1): `advance_batch_into` on an iter with uninitialized `QuerySlotScratch`, followed
+    // by `ChunkColumnDispenser::new(&mut iter)` must NOT read uninit `slot_scratch.batch_col_ptrs`.
+    {
+        let mut st = MultiChunkBatchIter {
+            chunk_idx: 0,
+            chunk0_ro: vec![11],
+            chunk0_rw: vec![100],
+            chunk1_ro: vec![21, 22, 23, 24],
+            chunk1_rw: vec![200, 201, 202, 203],
+            legacy_ro_calls: 0,
+            legacy_rw_calls: 0,
+        };
+        let mut scratch = QuerySlotScratch::new();
+        // SAFETY: `st` and `scratch` outlive `iter`.
+        let mut iter = unsafe {
+            ValidatedIter::from_raw_with_scratch(
+                (&raw mut st).cast::<BamIter>(),
+                &host,
+                &mut scratch,
+            )
+        };
+        let mut cache = BatchColCache::new();
+        assert_eq!(iter.advance_batch_into(&mut cache, 2, false, 0), Some(1));
+        {
+            let mut disp = ChunkColumnDispenser::new(&mut iter);
+            assert_eq!(disp.next_read::<u32>(AccessMode::READ, None), Ok(&[11][..]));
+            let rw = disp.next_write::<u32>(None).unwrap();
+            assert_eq!(rw, &[100]);
+            rw[0] = 101;
+        }
+        assert_eq!(st.legacy_ro_calls, 1);
+        assert_eq!(st.legacy_rw_calls, 1);
+        assert_eq!(st.chunk0_rw, vec![101]);
+
+        // Case (a2): `advance_batch` populates `slot_scratch` on chunk 0 (len=1) -- wait: we already
+        // consumed chunk 0, so reset to chunk 0 first!
+        assert_eq!(iter.reset(), FfiResult::OK);
+        assert_eq!(iter.advance_batch(2, false, 0), Some(1));
+        // Now advance chunk 1 (len=4) via `advance_batch_into`: `slot_scratch` still holds chunk 0's
+        // 1-element pointers! `ChunkColumnDispenser::new(&mut iter)` MUST fall back cleanly rather than
+        // pairing chunk 0's 1-element pointers with chunk 1's `len = 4`!
+        assert_eq!(iter.advance_batch_into(&mut cache, 2, false, 0), Some(4));
+        {
+            let mut disp = ChunkColumnDispenser::new(&mut iter);
+            assert_eq!(
+                disp.next_read::<u32>(AccessMode::READ, None),
+                Ok(&[21, 22, 23, 24][..])
+            );
+            assert_eq!(
+                disp.next_write::<u32>(None),
+                Ok(&mut [200, 201, 202, 203][..])
+            );
+        }
+        assert_eq!(st.legacy_ro_calls, 2);
+        assert_eq!(st.legacy_rw_calls, 2);
+    }
+
+    // Case (b1): Adversarial Challenger 2 repro — stale chunk-0 `BatchColCache` (len=1) passed to
+    // `ChunkColumnDispenser::new_with_batch` while active chunk is chunk 1 (len=4).
+    {
+        let mut st = MultiChunkBatchIter {
+            chunk_idx: 0,
+            chunk0_ro: vec![11],
+            chunk0_rw: vec![100],
+            chunk1_ro: vec![21, 22, 23, 24],
+            chunk1_rw: vec![200, 201, 202, 203],
+            legacy_ro_calls: 0,
+            legacy_rw_calls: 0,
+        };
+        // SAFETY: `st` outlives `iter`.
+        let mut iter = unsafe { ValidatedIter::from_raw((&raw mut st).cast::<BamIter>(), &host) };
+        let mut cache0 = BatchColCache::new();
+        let mut cache1 = BatchColCache::new();
+        assert_eq!(iter.advance_batch_into(&mut cache0, 2, false, 0), Some(1));
+        assert_eq!(iter.advance_batch_into(&mut cache1, 2, false, 0), Some(4));
+
+        // Passing stale `cache0` MUST fall back cleanly to legacy columns (zero UB under Miri!).
+        {
+            let mut disp = ChunkColumnDispenser::new_with_batch(&mut iter, &cache0);
+            assert_eq!(
+                disp.next_read::<u32>(AccessMode::READ, None),
+                Ok(&[21, 22, 23, 24][..])
+            );
+            assert_eq!(
+                disp.next_write::<u32>(None),
+                Ok(&mut [200, 201, 202, 203][..])
+            );
+        }
+        assert_eq!(st.legacy_ro_calls, 1);
+        assert_eq!(st.legacy_rw_calls, 1);
+
+        // Passing matching `cache1` STILL uses slot-68 batch pointers with 0 extra legacy calls!
+        {
+            let mut disp = ChunkColumnDispenser::new_with_batch(&mut iter, &cache1);
+            assert_eq!(
+                disp.next_read::<u32>(AccessMode::READ, None),
+                Ok(&[21, 22, 23, 24][..])
+            );
+            assert_eq!(
+                disp.next_write::<u32>(None),
+                Ok(&mut [200, 201, 202, 203][..])
+            );
+        }
+        assert_eq!(st.legacy_ro_calls, 1);
+        assert_eq!(st.legacy_rw_calls, 1);
+
+        // After `reset()` and `next_chunk()` to chunk 0, `cache0` (from an earlier epoch) MUST also
+        // fall back cleanly rather than reusing the old epoch's pointers!
+        assert_eq!(iter.reset(), FfiResult::OK);
+        assert_eq!(iter.next_chunk(), Some(1));
+        {
+            let mut disp = ChunkColumnDispenser::new_with_batch(&mut iter, &cache0);
+            assert_eq!(disp.next_read::<u32>(AccessMode::READ, None), Ok(&[11][..]));
+        }
+        assert_eq!(st.legacy_ro_calls, 2);
+
+        // After `next_chunk_batch` advances to chunk 1, `cache1` (from an earlier epoch) MUST also
+        // fall back cleanly rather than reusing stale batch pointers!
+        let mut raw_cols = [core::ptr::null_mut(); 2];
+        assert_eq!(iter.next_chunk_batch(None, &mut raw_cols, 0), Ok(Some(4)));
+        {
+            let mut disp = ChunkColumnDispenser::new_with_batch(&mut iter, &cache1);
+            assert_eq!(
+                disp.next_read::<u32>(AccessMode::READ, None),
+                Ok(&[21, 22, 23, 24][..])
+            );
+        }
+        assert_eq!(st.legacy_ro_calls, 3);
+    }
+
+    // Case (b2): Cross-iterator mismatch — `BatchColCache` populated on `iter_a` (len=1) passed
+    // to `ChunkColumnDispenser::new_with_batch(&mut iter_b, &cache_a)` (len=4) falls back cleanly.
+    {
+        let mut st_a = MultiChunkBatchIter {
+            chunk_idx: 0,
+            chunk0_ro: vec![99],
+            chunk0_rw: vec![999],
+            chunk1_ro: vec![],
+            chunk1_rw: vec![],
+            legacy_ro_calls: 0,
+            legacy_rw_calls: 0,
+        };
+        let mut st_b = MultiChunkBatchIter {
+            chunk_idx: 1, // so first advance yields chunk 1 (len=4)
+            chunk0_ro: vec![1],
+            chunk0_rw: vec![2],
+            chunk1_ro: vec![31, 32, 33, 34],
+            chunk1_rw: vec![300, 301, 302, 303],
+            legacy_ro_calls: 0,
+            legacy_rw_calls: 0,
+        };
+        // SAFETY: `st_a` outlives `iter_a`.
+        let mut iter_a =
+            unsafe { ValidatedIter::from_raw((&raw mut st_a).cast::<BamIter>(), &host) };
+        // SAFETY: `st_b` outlives `iter_b`.
+        let mut iter_b =
+            unsafe { ValidatedIter::from_raw((&raw mut st_b).cast::<BamIter>(), &host) };
+        let mut cache_a = BatchColCache::new();
+        let mut cache_b = BatchColCache::new();
+        assert_eq!(
+            iter_a.advance_batch_into(&mut cache_a, 2, false, 0),
+            Some(1)
+        );
+        assert_eq!(
+            iter_b.advance_batch_into(&mut cache_b, 2, false, 0),
+            Some(4)
+        );
+
+        // Both have `batch_epoch == 2`, so only `iter_id` distinguishes them!
+        {
+            let mut disp = ChunkColumnDispenser::new_with_batch(&mut iter_b, &cache_a);
+            assert_eq!(
+                disp.next_read::<u32>(AccessMode::READ, None),
+                Ok(&[31, 32, 33, 34][..])
+            );
+            assert_eq!(
+                disp.next_write::<u32>(None),
+                Ok(&mut [300, 301, 302, 303][..])
+            );
+        }
+        assert_eq!(st_b.legacy_ro_calls, 1);
+        assert_eq!(st_b.legacy_rw_calls, 1);
+    }
+}
+
+// ============================================================================
+// S12: `ValidatedIter::from_raw_with_scratch` resets `col_info_mask` on reuse
+// ============================================================================
+
+/// Verifies that reusing the same `&mut QuerySlotScratch` across `iter_a` (writable `u32` at
+/// term 0) and `iter_b` (read-only `u64` / `u32` at term 0) resets `col_info_mask` in
+/// `ValidatedIter::from_raw_with_scratch`, preventing `iter_b` from observing `iter_a`'s cached
+/// `BamColumnInfo`.
+#[test]
+fn s12_query_slot_scratch_reuse_resets_column_info_mask() {
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum IterKind {
+        WritableU32,
+        ReadOnlyU64,
+        ReadOnlyU32,
+    }
+
+    struct ScratchIterState {
+        kind: IterKind,
+        advanced: bool,
+        u32_buf: [u32; 2],
+        u64_buf: [u64; 2],
+        col_info_calls: usize,
+    }
+
+    let write_u32_uuid = ComponentUuid::from_parts("s12::WriteU32", 4, 4, 0);
+    let read_u64_uuid = ComponentUuid::from_parts("s12::ReadU64", 8, 8, 0);
+    let read_u32_uuid = ComponentUuid::from_parts("s12::ReadU32", 4, 4, 0);
+
+    unsafe extern "C" fn s12_col_info(
+        iter: *const BamIter,
+        term_index: usize,
+        out: *mut BamColumnInfo,
+    ) -> FfiResult {
+        if term_index != 0 {
+            return FfiResult::OUT_OF_RANGE;
+        }
+        // SAFETY: `iter` points to a valid `ScratchIterState` for the test duration.
+        let st = unsafe { &mut *iter.cast::<ScratchIterState>().cast_mut() };
+        st.col_info_calls += 1;
+        let info = match st.kind {
+            IterKind::WritableU32 => BamColumnInfo {
+                component: BamComponent::from_raw(10),
+                uuid: ComponentUuid::from_parts("s12::WriteU32", 4, 4, 0),
+                size: 4,
+                align: 4,
+                mode: AccessMode::WRITE,
+                storage_flags: 0,
+                reserved0: 0,
+            },
+            IterKind::ReadOnlyU64 => BamColumnInfo {
+                component: BamComponent::from_raw(11),
+                uuid: ComponentUuid::from_parts("s12::ReadU64", 8, 8, 0),
+                size: 8,
+                align: 8,
+                mode: AccessMode::READ,
+                storage_flags: 0,
+                reserved0: 0,
+            },
+            IterKind::ReadOnlyU32 => BamColumnInfo {
+                component: BamComponent::from_raw(12),
+                uuid: ComponentUuid::from_parts("s12::ReadU32", 4, 4, 0),
+                size: 4,
+                align: 4,
+                mode: AccessMode::READ,
+                storage_flags: 0,
+                reserved0: 0,
+            },
+        };
+        // SAFETY: `out` is writable stack storage.
+        unsafe { *out = info };
+        FfiResult::OK
+    }
+
+    unsafe extern "C" fn s12_next_chunk(iter: *mut BamIter, out_len: *mut usize) -> FfiBool {
+        // SAFETY: `iter` points to `ScratchIterState`.
+        let st = unsafe { &mut *iter.cast::<ScratchIterState>() };
+        if st.advanced {
+            return FfiBool::FALSE;
+        }
+        st.advanced = true;
+        // SAFETY: `out_len` is writable stack storage.
+        unsafe { *out_len = 2 };
+        FfiBool::TRUE
+    }
+
+    unsafe extern "C" fn s12_col_ro(iter: *const BamIter, term_index: usize) -> *const u8 {
+        if term_index != 0 {
+            return core::ptr::null();
+        }
+        // SAFETY: `iter` points to `ScratchIterState`.
+        let st = unsafe { &*iter.cast::<ScratchIterState>() };
+        match st.kind {
+            IterKind::WritableU32 | IterKind::ReadOnlyU32 => st.u32_buf.as_ptr().cast::<u8>(),
+            IterKind::ReadOnlyU64 => st.u64_buf.as_ptr().cast::<u8>(),
+        }
+    }
+
+    unsafe extern "C" fn s12_col_rw(iter: *mut BamIter, term_index: usize) -> *mut u8 {
+        if term_index != 0 {
+            return core::ptr::null_mut();
+        }
+        // SAFETY: `iter` points to `ScratchIterState`.
+        let st = unsafe { &mut *iter.cast::<ScratchIterState>() };
+        match st.kind {
+            IterKind::WritableU32 => st.u32_buf.as_mut_ptr().cast::<u8>(),
+            // Read-only iterators must never expose mutable pointers.
+            IterKind::ReadOnlyU64 | IterKind::ReadOnlyU32 => core::ptr::null_mut(),
+        }
+    }
+
+    let mut api = make_mock_api();
+    api.iter_column_info = Some(s12_col_info);
+    api.iter_next_chunk = Some(s12_next_chunk);
+    api.iter_column_readonly = Some(s12_col_ro);
+    api.iter_column_mutable = Some(s12_col_rw);
+
+    let dummy_ctx = 0u64;
+    // SAFETY: Stack pointers remain valid for test.
+    let host = unsafe { Host::from_raw(&api, (&raw const dummy_ctx).cast()) }.unwrap();
+    let mut scratch = QuerySlotScratch::new();
+
+    // 1. First iterator populates `scratch` at term 0 with `WRITE` `u32`.
+    let mut st_a = ScratchIterState {
+        kind: IterKind::WritableU32,
+        advanced: false,
+        u32_buf: [10, 20],
+        u64_buf: [0; 2],
+        col_info_calls: 0,
+    };
+    {
+        // SAFETY: `st_a` and `scratch` outlive `iter_a`.
+        let mut iter_a = unsafe {
+            ValidatedIter::from_raw_with_scratch(
+                (&raw mut st_a).cast::<BamIter>(),
+                &host,
+                &mut scratch,
+            )
+        };
+        assert_eq!(iter_a.next_chunk(), Some(2));
+        let info_a = iter_a.column_info(0).unwrap();
+        assert_eq!(info_a.mode, AccessMode::WRITE);
+        assert_eq!(info_a.uuid, write_u32_uuid);
+        let rw = iter_a
+            .column_mut_checked::<u32>(0, Some(UuidFilter::exact(write_u32_uuid)))
+            .unwrap();
+        rw[0] = 11;
+        assert_eq!(st_a.col_info_calls, 1);
+    }
+
+    // 2. Reusing the same `scratch` for `iter_b` (`READ` `u64` at term 0) must reset
+    // `col_info_mask` and fetch `iter_b`'s metadata rather than leaking `iter_a`'s `WRITE u32`.
+    let mut st_b = ScratchIterState {
+        kind: IterKind::ReadOnlyU64,
+        advanced: false,
+        u32_buf: [0; 2],
+        u64_buf: [100, 200],
+        col_info_calls: 0,
+    };
+    {
+        // SAFETY: `st_b` and `scratch` outlive `iter_b`.
+        let mut iter_b = unsafe {
+            ValidatedIter::from_raw_with_scratch(
+                (&raw mut st_b).cast::<BamIter>(),
+                &host,
+                &mut scratch,
+            )
+        };
+        assert_eq!(iter_b.next_chunk(), Some(2));
+        let info_b = iter_b.column_info(0).unwrap();
+        assert_eq!(st_b.col_info_calls, 1);
+        assert_eq!(info_b.mode, AccessMode::READ);
+        assert_eq!(info_b.uuid, read_u64_uuid);
+        assert_eq!(info_b.size, 8);
+        assert_eq!(info_b.align, 8);
+
+        assert!(iter_b.column_mut_checked::<u32>(0, None).is_none());
+        assert!(iter_b.column_checked::<u32>(0, None).is_none());
+        {
+            let mut disp = ChunkColumnDispenser::new(&mut iter_b);
+            assert_eq!(disp.next_write::<u32>(None), Err(FfiResult::TYPE_MISMATCH));
+        }
+        assert_eq!(
+            iter_b.column_checked::<u64>(0, Some(UuidFilter::exact(read_u64_uuid))),
+            Some(&[100u64, 200u64][..])
+        );
+    }
+
+    // 3. Reusing the same `scratch` again for `iter_c` (`READ` `u32` — same size/align as `iter_a`,
+    //    but read-only and distinct UUID) also rejects mutable access and reads `iter_c`'s slice.
+    let mut st_c = ScratchIterState {
+        kind: IterKind::ReadOnlyU32,
+        advanced: false,
+        u32_buf: [42, 43],
+        u64_buf: [0; 2],
+        col_info_calls: 0,
+    };
+    {
+        // SAFETY: `st_c` and `scratch` outlive `iter_c`.
+        let mut iter_c = unsafe {
+            ValidatedIter::from_raw_with_scratch(
+                (&raw mut st_c).cast::<BamIter>(),
+                &host,
+                &mut scratch,
+            )
+        };
+        assert_eq!(iter_c.next_chunk(), Some(2));
+        let info_c = iter_c.column_info(0).unwrap();
+        assert_eq!(st_c.col_info_calls, 1);
+        assert_eq!(info_c.mode, AccessMode::READ);
+        assert_eq!(info_c.uuid, read_u32_uuid);
+        assert!(iter_c.column_mut_checked::<u32>(0, None).is_none());
+        assert_eq!(
+            iter_c.column_checked::<u32>(0, Some(UuidFilter::exact(read_u32_uuid))),
+            Some(&[42u32, 43u32][..])
+        );
+    }
+}

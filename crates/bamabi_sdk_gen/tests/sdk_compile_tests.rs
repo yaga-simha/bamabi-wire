@@ -73,7 +73,16 @@ fn exported_cpp17_header_compiles_and_passes_strict_checks() {
 
 struct BamHostCtx { int id; };
 struct BamLoadCtx { BamHostCtx* h; };
-struct BamIter { size_t step; BamEntity ents[1]; float col[1]; uint32_t added[1]; uint32_t changed[1]; };
+struct BamIter {
+    size_t step;
+    BamEntity ents[2];
+    float col[2];
+    float col1[2];
+    uint32_t added[1];
+    uint32_t changed[1];
+    uint32_t last_mask;
+    size_t batch_calls;
+};
 struct BamCommands {
     size_t checkpoints;
     size_t rollbacks;
@@ -98,6 +107,39 @@ static BamResult mock_sys_commands(BamSystemCtx* sc, BamCommands** out) {
 static BamBool mock_iter_next_chunk(BamIter* it, size_t* out_len) {
     if (it->step == 0u) { it->step = 1u; *out_len = 1u; return BAM_TRUE; }
     *out_len = 0u;
+    return BAM_FALSE;
+}
+static BamBool mock_iter_next_chunk_batch(
+    BamIter* it,
+    size_t* out_len,
+    const BamEntity** out_entities,
+    uint8_t** out_col_ptrs,
+    size_t col_count,
+    uint32_t mark_changed_mask
+) {
+    it->batch_calls += 1u;
+    it->last_mask = mark_changed_mask;
+    if (it->step == 0u) {
+        it->step = 1u;
+        *out_len = 2u;
+        if (out_entities != nullptr) {
+            *out_entities = it->ents;
+        }
+        if (out_col_ptrs != nullptr) {
+            if (col_count > 0u) out_col_ptrs[0] = reinterpret_cast<uint8_t*>(it->col);
+            if (col_count > 1u) out_col_ptrs[1] = reinterpret_cast<uint8_t*>(it->col1);
+        }
+        return BAM_TRUE;
+    }
+    *out_len = 0u;
+    if (out_entities != nullptr) {
+        *out_entities = nullptr;
+    }
+    if (out_col_ptrs != nullptr) {
+        for (size_t i = 0u; i < col_count; ++i) {
+            out_col_ptrs[i] = nullptr;
+        }
+    }
     return BAM_FALSE;
 }
 static BamResult mock_iter_reset(BamIter* it) { it->step = 0u; return BAM_RESULT_OK; }
@@ -160,6 +202,7 @@ int main() {
     api.sys_query = mock_sys_query;
     api.sys_commands = mock_sys_commands;
     api.iter_next_chunk = mock_iter_next_chunk;
+    api.iter_next_chunk_batch = mock_iter_next_chunk_batch;
     api.iter_reset = mock_iter_reset;
     api.iter_entities = mock_iter_entities;
     api.iter_column_readonly = mock_iter_col_ro;
@@ -174,7 +217,7 @@ int main() {
 
     BamHostCtx h{42};
     BamLoadCtx lc{&h};
-    BamIter it{0u, {7ull}, {3.5f}, {11u}, {12u}};
+    BamIter it{0u, {7ull, 8ull}, {3.5f, 4.5f}, {10.0f, 20.0f}, {11u}, {12u}, 0u, 0u};
     BamCommands cmds{0u, 0u, 0u, 0u, 0u, 0u};
     BamSystemCtx sc{&h, &it, &cmds};
 
@@ -207,6 +250,57 @@ int main() {
     assert(bam::is_ok(cview.column_ticks(0u, added_ticks, changed_ticks, last_run, this_run)));
     assert(added_ticks[0] == 11u && changed_ticks[0] == 12u && last_run == 10u && this_run == 12u);
     assert(bam::is_ok(cview.reset()));
+
+    // Slot 68 (iter_next_chunk_batch): supported host, non-null & null out_entities, exhaustion zeroing.
+    assert(cview.supports_next_chunk_batch());
+    size_t batch_len = 0u;
+    const BamEntity* batch_ents = nullptr;
+    uint8_t* col_ptrs[2] = {nullptr, nullptr};
+    assert(cview.next_chunk_batch(batch_len, &batch_ents, col_ptrs, 2u, 0x1u));
+    assert(batch_len == 2u && cview.len() == 2u);
+    assert(batch_ents != nullptr && batch_ents[0] == 7ull && batch_ents[1] == 8ull);
+    assert(col_ptrs[0] != nullptr && col_ptrs[1] != nullptr);
+    assert(reinterpret_cast<const float*>(col_ptrs[0])[0] == 9.0f);
+    assert(reinterpret_cast<const float*>(col_ptrs[0])[1] == 4.5f);
+    assert(reinterpret_cast<const float*>(col_ptrs[1])[0] == 10.0f);
+    assert(reinterpret_cast<const float*>(col_ptrs[1])[1] == 20.0f);
+    assert(it.last_mask == 0x1u && it.batch_calls == 1u);
+
+    // Exhaustion must return false and zero out_len, cview.len(), batch_ents, and col_ptrs.
+    assert(!cview.next_chunk_batch(batch_len, &batch_ents, col_ptrs, 2u, 0x1u));
+    assert(batch_len == 0u && cview.len() == 0u);
+    assert(batch_ents == nullptr && col_ptrs[0] == nullptr && col_ptrs[1] == nullptr);
+
+    // Unchecked path with out_entities == nullptr and col_count == 2.
+    assert(bam::is_ok(cview.reset()));
+    assert(cview.next_chunk_batch_unchecked(batch_len, nullptr, col_ptrs, 2u, 0x3u));
+    assert(batch_len == 2u && cview.len() == 2u && it.last_mask == 0x3u);
+    assert(col_ptrs[0] != nullptr && col_ptrs[1] != nullptr);
+    assert(!cview.next_chunk_batch_unchecked(batch_len, nullptr, col_ptrs, 2u, 0x3u));
+    assert(batch_len == 0u && cview.len() == 0u);
+    assert(col_ptrs[0] == nullptr && col_ptrs[1] == nullptr);
+
+    // Null iter_next_chunk_batch slot must report unsupported and return false.
+    BamHostApi null_batch_api = api;
+    null_batch_api.iter_next_chunk_batch = nullptr;
+    bam::ChunkView null_batch_cview(null_batch_api, &it, 1u);
+    assert(!null_batch_cview.supports_next_chunk_batch());
+    batch_len = 99u;
+    assert(!null_batch_cview.next_chunk_batch(batch_len, &batch_ents, col_ptrs, 2u, 0x1u));
+    assert(batch_len == 0u && null_batch_cview.len() == 0u);
+
+    // BAM_HOST_API_MIN_V0_3_SIZE-only host (even with non-null fn ptr) must not dispatch slot 68 and falls back to next_chunk.
+    assert(bam::is_ok(cview.reset()));
+    const size_t calls_before_v03 = it.batch_calls;
+    BamHostApi v03_api = api;
+    v03_api.struct_size = static_cast<uint32_t>(BAM_HOST_API_MIN_V0_3_SIZE);
+    bam::ChunkView v03_cview(v03_api, &it);
+    assert(!v03_cview.supports_next_chunk_batch());
+    batch_len = 77u;
+    assert(!v03_cview.next_chunk_batch(batch_len, &batch_ents, col_ptrs, 2u, 0x1u));
+    assert(batch_len == 0u && v03_cview.len() == 0u && it.batch_calls == calls_before_v03);
+    assert(v03_cview.next_chunk(batch_len) && batch_len == 1u && v03_cview.len() == 1u);
+    assert(bam::is_ok(v03_cview.reset()));
 
     bam::CommandsView cmd_view;
     assert(bam::is_ok(sview.commands_view(cmd_view)));
@@ -275,7 +369,7 @@ int main() {
 }
 
 /// Scenario: exports `bamabi.h` and `bamabi.zig`, builds a Zig test suite via `b.addTranslateC`
-/// verifying all 18 `BamResult` round-trips and semantic compilation of all 68 slot wrappers on
+/// verifying all 18 `BamResult` round-trips and semantic compilation of all 73 slot wrappers on
 /// `HostContextView`, `LoadContextView`, `ChunkView`, `CommandsView`, and `SystemContextView`.
 ///
 /// Proves:
@@ -283,7 +377,7 @@ int main() {
 /// - `bamabi.zig` `comptime` offset assertions (`STRUCT_SIZE`, `ABI_VERSION`, `GET_PROC_ADDRESS`,
 ///   and `MIGRATE_COMPONENT_COLUMN`) match `c.BamHostApi` exactly.
 /// - All 18 `BamResult` codes round-trip losslessly through `checkResult` / `mapError`.
-/// - All 68 slot wrapper methods type-check cleanly and enforce `null` / `error.Unsupported` guards.
+/// - All 73 slot wrapper methods type-check cleanly and enforce `null` / `error.Unsupported` guards.
 #[test]
 fn exported_zig_sdk_compiles_and_passes_with_translate_c() {
     let Ok(ver_out) = Command::new("zig").arg("version").output() else {
@@ -406,6 +500,8 @@ test "all Zig views compile and enforce unsupported/null guards" {
     _ = &bam.LoadContextView.migrateComponentColumn;
 
     _ = &bam.ChunkView.nextChunk;
+    _ = &bam.ChunkView.supportsNextChunkBatch;
+    _ = &bam.ChunkView.nextChunkBatchUnchecked;
     _ = &bam.ChunkView.nextChunkBatch;
     _ = &bam.ChunkView.reset;
     _ = &bam.ChunkView.entities;
@@ -470,6 +566,10 @@ test "all Zig views compile and enforce unsupported/null guards" {
     var buf = [_]f32{0.0};
     try std.testing.expectError(error.Unsupported, cv.msgReadBatch(f32, 0, &buf));
     try std.testing.expectError(error.Unsupported, cv.msgWriteBatch(f32, 0, &buf));
+    try std.testing.expect(!cv.supportsNextChunkBatch());
+    var cv_mut = cv;
+    var empty_cols = [_]?[*]u8{ null, null };
+    try std.testing.expectError(error.Unsupported, cv_mut.nextChunkBatch(null, &empty_cols, 1));
 
     const sctx: *c.BamSystemCtx = @ptrCast(&dummy_byte);
     const sv = bam.SystemContextView{ .api = &api, .ctx = sctx };
@@ -573,6 +673,137 @@ test "Zig ScopedTransaction and new command wrappers execute cleanly" {
     }
     try std.testing.expectEqual(@as(usize, 2), state.rollbacks);
     try std.testing.expectEqual(@as(usize, 3), state.last_token);
+}
+
+const MockBatchIter = struct {
+    step: usize = 0,
+    calls: usize = 0,
+    last_mask: u32 = 0,
+    last_col_count: usize = 0,
+    ents: [2]c.BamEntity = .{ 101, 202 },
+    col0: [2]f32 = .{ 1.5, 2.5 },
+    col1: [2]f32 = .{ 3.5, 4.5 },
+};
+
+fn zigMockIterNextChunkBatch(
+    iter_opt: ?*c.BamIter,
+    out_len_opt: [*c]usize,
+    out_entities_opt: [*c][*c]const c.BamEntity,
+    out_col_ptrs_opt: [*c][*c]u8,
+    col_count: usize,
+    mark_changed_mask: u32,
+) callconv(.c) c.BamBool {
+    const it: *MockBatchIter = @ptrCast(@alignCast(iter_opt.?));
+    it.calls += 1;
+    it.last_mask = mark_changed_mask;
+    it.last_col_count = col_count;
+    if (it.step == 0) {
+        it.step = 1;
+        out_len_opt[0] = 2;
+        if (out_entities_opt != null) {
+            out_entities_opt[0] = @constCast(&it.ents);
+        }
+        if (out_col_ptrs_opt != null) {
+            if (col_count > 0) out_col_ptrs_opt[0] = @ptrCast(&it.col0);
+            if (col_count > 1) out_col_ptrs_opt[1] = @ptrCast(&it.col1);
+        }
+        return c.BAM_TRUE;
+    }
+    out_len_opt[0] = 0;
+    if (out_entities_opt != null) {
+        out_entities_opt[0] = null;
+    }
+    if (out_col_ptrs_opt != null) {
+        for (0..col_count) |i| {
+            out_col_ptrs_opt[i] = null;
+        }
+    }
+    return c.BAM_FALSE;
+}
+
+fn zigMockIterReset(iter_opt: ?*c.BamIter) callconv(.c) c.BamResult {
+    const it: *MockBatchIter = @ptrCast(@alignCast(iter_opt.?));
+    it.step = 0;
+    return c.BAM_RESULT_OK;
+}
+
+test "Zig ChunkView.nextChunkBatch handles supported, col_count=0, exhaustion, and MIN_V0_3_SIZE hosts" {
+    var api: c.BamHostApi = std.mem.zeroes(c.BamHostApi);
+    api.struct_size = @sizeOf(c.BamHostApi);
+    api.abi_version = c.BAM_ABI_VERSION;
+    api.iter_next_chunk_batch = zigMockIterNextChunkBatch;
+    api.iter_reset = zigMockIterReset;
+
+    var state = MockBatchIter{};
+    var cview = bam.ChunkView{ .api = &api, .iter = @ptrCast(&state) };
+    try std.testing.expect(cview.supportsNextChunkBatch());
+
+    // Supported host with non-null out_entities and 2 columns.
+    var ents: ?[*]const c.BamEntity = null;
+    var col_ptrs = [_]?[*]u8{ null, null };
+    const n1 = try cview.nextChunkBatch(&ents, &col_ptrs, 0x1);
+    try std.testing.expectEqual(@as(?usize, 2), n1);
+    try std.testing.expectEqual(@as(usize, 2), cview.len);
+    try std.testing.expectEqual(@as(u32, 0x1), state.last_mask);
+    try std.testing.expectEqual(@as(usize, 2), state.last_col_count);
+    try std.testing.expectEqual(@as(c.BamEntity, 101), ents.?[0]);
+    try std.testing.expectEqual(@as(c.BamEntity, 202), ents.?[1]);
+    const c0: [*]const f32 = @ptrCast(@alignCast(col_ptrs[0].?));
+    const c1: [*]const f32 = @ptrCast(@alignCast(col_ptrs[1].?));
+    try std.testing.expectEqual(@as(f32, 1.5), c0[0]);
+    try std.testing.expectEqual(@as(f32, 2.5), c0[1]);
+    try std.testing.expectEqual(@as(f32, 3.5), c1[0]);
+    try std.testing.expectEqual(@as(f32, 4.5), c1[1]);
+
+    // Exhaustion returns null and zeroes cview.len, ents, and col_ptrs.
+    const n2 = try cview.nextChunkBatch(&ents, &col_ptrs, 0x1);
+    try std.testing.expectEqual(@as(?usize, null), n2);
+    try std.testing.expectEqual(@as(usize, 0), cview.len);
+    try std.testing.expectEqual(@as(?[*]const c.BamEntity, null), ents);
+    try std.testing.expectEqual(@as(?[*]u8, null), col_ptrs[0]);
+    try std.testing.expectEqual(@as(?[*]u8, null), col_ptrs[1]);
+
+    // Unchecked path with out_entities == null and col_count == 2.
+    try cview.reset();
+    const un1 = cview.nextChunkBatchUnchecked(null, &col_ptrs, 0x3);
+    try std.testing.expectEqual(@as(?usize, 2), un1);
+    try std.testing.expectEqual(@as(usize, 2), cview.len);
+    try std.testing.expectEqual(@as(u32, 0x3), state.last_mask);
+    try std.testing.expect(col_ptrs[0] != null and col_ptrs[1] != null);
+    const un2 = cview.nextChunkBatchUnchecked(null, &col_ptrs, 0x3);
+    try std.testing.expectEqual(@as(?usize, null), un2);
+    try std.testing.expectEqual(@as(usize, 0), cview.len);
+    try std.testing.expectEqual(@as(?[*]u8, null), col_ptrs[0]);
+    try std.testing.expectEqual(@as(?[*]u8, null), col_ptrs[1]);
+
+    // col_count == 0 (empty slice).
+    try cview.reset();
+    var empty_cols = [_]?[*]u8{};
+    const z1 = try cview.nextChunkBatch(&ents, &empty_cols, 0x0);
+    try std.testing.expectEqual(@as(?usize, 2), z1);
+    try std.testing.expectEqual(@as(usize, 0), state.last_col_count);
+    try std.testing.expectEqual(@as(c.BamEntity, 101), ents.?[0]);
+    const z2 = try cview.nextChunkBatch(&ents, &empty_cols, 0x0);
+    try std.testing.expectEqual(@as(?usize, null), z2);
+    try std.testing.expectEqual(@as(?[*]const c.BamEntity, null), ents);
+
+    // Null iter_next_chunk_batch slot returns error.Unsupported.
+    var null_api = api;
+    null_api.iter_next_chunk_batch = null;
+    var null_cv = bam.ChunkView{ .api = &null_api, .iter = @ptrCast(&state) };
+    try std.testing.expect(!null_cv.supportsNextChunkBatch());
+    try std.testing.expectError(error.Unsupported, null_cv.nextChunkBatch(null, &col_ptrs, 0x1));
+
+    // BAM_HOST_API_MIN_V0_3_SIZE-only host (even with non-null fn ptr) returns error.Unsupported without invoking slot 68.
+    const min_v03_size: u32 = @intCast(bam.offsets.MIGRATE_COMPONENT_COLUMN + @sizeOf(c.BamMigrateComponentColumnFn));
+    try std.testing.expectEqual(bam.offsets.ITER_NEXT_CHUNK_BATCH, @as(usize, min_v03_size));
+    const calls_before = state.calls;
+    var v03_api = api;
+    v03_api.struct_size = min_v03_size;
+    var v03_cv = bam.ChunkView{ .api = &v03_api, .iter = @ptrCast(&state) };
+    try std.testing.expect(!v03_cv.supportsNextChunkBatch());
+    try std.testing.expectError(error.Unsupported, v03_cv.nextChunkBatch(&ents, &col_ptrs, 0x1));
+    try std.testing.expectEqual(calls_before, state.calls);
 }
 "#,
     )

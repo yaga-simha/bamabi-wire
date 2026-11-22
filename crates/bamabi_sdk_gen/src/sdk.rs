@@ -583,20 +583,23 @@ public:
         return ok != BAM_FALSE;
     }
 
-    bool next_chunk_batch(
+    bool supports_next_chunk_batch() const noexcept {
+        return api_ != nullptr && iter_ != nullptr &&
+            bam_host_api_covers_slot(
+                api_,
+                BAM_HOST_API_OFFSET_ITER_NEXT_CHUNK_BATCH,
+                sizeof(BamIterNextChunkBatchFn)
+            ) != BAM_FALSE &&
+            api_->iter_next_chunk_batch != nullptr;
+    }
+
+    bool next_chunk_batch_unchecked(
         size_t& out_len,
         const BamEntity** out_entities,
         uint8_t** out_col_ptrs,
         size_t col_count,
         uint32_t mark_changed_mask
     ) noexcept {
-        if (api_ == nullptr || iter_ == nullptr ||
-            !bam_host_api_covers_slot(api_, BAM_HOST_API_OFFSET_ITER_NEXT_CHUNK_BATCH, sizeof(BamIterNextChunkBatchFn)) ||
-            api_->iter_next_chunk_batch == nullptr) {
-            count_ = 0u;
-            out_len = 0u;
-            return false;
-        }
         BamBool ok = api_->iter_next_chunk_batch(
             iter_,
             &out_len,
@@ -607,6 +610,27 @@ public:
         );
         count_ = (ok != BAM_FALSE) ? out_len : 0u;
         return ok != BAM_FALSE;
+    }
+
+    bool next_chunk_batch(
+        size_t& out_len,
+        const BamEntity** out_entities,
+        uint8_t** out_col_ptrs,
+        size_t col_count,
+        uint32_t mark_changed_mask
+    ) noexcept {
+        if (!supports_next_chunk_batch()) {
+            count_ = 0u;
+            out_len = 0u;
+            return false;
+        }
+        return next_chunk_batch_unchecked(
+            out_len,
+            out_entities,
+            out_col_ptrs,
+            col_count,
+            mark_changed_mask
+        );
     }
 
     BamResult reset() noexcept {
@@ -1519,16 +1543,21 @@ pub const ChunkView = struct {
         return count;
     }
 
-    pub fn nextChunkBatch(
+    pub inline fn supportsNextChunkBatch(self: ChunkView) bool {
+        return coversHostApiSlot(
+            self.api,
+            offsets.ITER_NEXT_CHUNK_BATCH,
+            @sizeOf(c.BamIterNextChunkBatchFn),
+        ) and self.api.iter_next_chunk_batch != null;
+    }
+
+    pub inline fn nextChunkBatchUnchecked(
         self: *ChunkView,
         out_entities: ?*?[*]const c.BamEntity,
         out_col_ptrs: []?[*]u8,
         mark_changed_mask: u32,
-    ) BamError!?usize {
-        if (!coversHostApiSlot(self.api, offsets.ITER_NEXT_CHUNK_BATCH, @sizeOf(c.BamIterNextChunkBatchFn))) {
-            return error.Unsupported;
-        }
-        const f = self.api.iter_next_chunk_batch orelse return error.Unsupported;
+    ) ?usize {
+        const f = self.api.iter_next_chunk_batch.?;
         var count: usize = 0;
         const ok = f(
             self.iter,
@@ -1544,6 +1573,18 @@ pub const ChunkView = struct {
         }
         self.len = count;
         return count;
+    }
+
+    pub fn nextChunkBatch(
+        self: *ChunkView,
+        out_entities: ?*?[*]const c.BamEntity,
+        out_col_ptrs: []?[*]u8,
+        mark_changed_mask: u32,
+    ) BamError!?usize {
+        if (!self.supportsNextChunkBatch()) {
+            return error.Unsupported;
+        }
+        return self.nextChunkBatchUnchecked(out_entities, out_col_ptrs, mark_changed_mask);
     }
 
     pub fn reset(self: *ChunkView) BamError!void {
@@ -2182,7 +2223,7 @@ mod tests {
     }
 
     /// Test scenario: verifies cross-language offset and aliasing-qualifier parity across C99,
-    /// C++17, and Zig by checking that `BAM_RESTRICT` / `noalias` and every single one of the 68
+    /// C++17, and Zig by checking that `BAM_RESTRICT` / `noalias` and every single one of the 73
     /// `BamHostApi` vtable slot offsets (plus header offsets) are mirrored identically in
     /// `c99_header()`, [`CPP17_HEADER`], and [`ZIG_SDK`].
     #[test]
@@ -2248,7 +2289,7 @@ mod tests {
         }
     }
 
-    /// Test scenario: verifies that all 68 `BamHostApi` function-pointer slots are wrapped by
+    /// Test scenario: verifies that all 73 `BamHostApi` function-pointer slots are wrapped by
     /// ergonomic view methods in both [`CPP17_HEADER`] (`HostContextView`, `LoadContextView`,
     /// `ChunkView`, `CommandsView`, `ScopedTransaction`, `SystemContextView`) and [`ZIG_SDK`],
     /// and that [`ZIG_SDK`] maps all 18 `BamResult` status codes losslessly in `checkResult` and

@@ -11,17 +11,18 @@ use std::ffi::CString;
 
 use bamabi_sys::{
     AbiPod, BAM_STORAGE_FLAG_IMMUTABLE, BAM_SYSTEM_KNOWN_FLAGS, BamChangeTicks, BamCommands,
-    BamComponent, BamEventKind, BamIter, BamLoadCtx, BamObserverDesc, BamObserverFn,
-    BamObserverMutFn, BamQueryDesc, BamRunIfFn, BamScheduleSetDesc, BamSystem, BamSystemCtx,
-    BamSystemDesc, BamSystemFn, BamSystemSet, BamTermDesc, ComponentUuid, FfiBool, FfiEntity,
-    FfiResult, MAX_QUERIES_PER_SYSTEM, MAX_TERMS_PER_QUERY, ModComponent, ScheduleId,
+    BamComponent, BamEventKind, BamHostCtx, BamIter, BamLayoutInfo, BamLoadCtx, BamObserverDesc,
+    BamObserverFn, BamObserverMutFn, BamQueryDesc, BamRunIfFn, BamScheduleSetDesc, BamSymbol,
+    BamSystem, BamSystemCtx, BamSystemDesc, BamSystemFn, BamSystemSet, BamTermDesc, ComponentUuid,
+    FfiBool, FfiEntity, FfiResult, MAX_QUERIES_PER_SYSTEM, MAX_TERMS_PER_QUERY, ModComponent,
+    ScheduleId,
 };
 
 use crate::{
     commands::{SpawnEntry, ValidatedCommands, validate_spawn_entry},
     host::{Host, ValidatedWireVTable},
     instance::{GuestInstance, qualify_mod_component_identity},
-    iter::{UuidFilter, ValidatedIter},
+    iter::{QuerySlotScratch, UuidFilter, ValidatedIter},
     panic::{catch_guest_bool, catch_guest_result},
 };
 
@@ -133,32 +134,47 @@ impl PinnedHostPtr {
     }
 }
 
-/// Stack-pinned lazy per-tick [`Host`] resolver allocated on `system_closure_trampoline`'s stack
-/// frame.
+const CTX_UNRESOLVED: u8 = 0;
+const CTX_BASE_FALLBACK: u8 = 1;
+const CTX_RUNTIME_ONLY: u8 = 2;
+const CTX_HOST_MATERIALIZED: u8 = 3;
+
+/// Compact stack-pinned lazy per-tick [`Host`] and [`BamHostCtx`] resolver (`40` bytes).
 ///
 /// Systems that never inspect `Host::host_ctx` pay zero `BamHostApi::sys_host_ctx` FFI calls and
-/// zero 584-byte `Host` struct copies. On first demand, `sys_host_ctx(sys_ctx)` is queried at most
-/// once; if it returns null or the slot is absent, `base_host` is reused directly. Otherwise an
-/// updated `Host` stamped with `raw_ctx` (preserving its exact pointer provenance under Miri
-/// Tree/Stacked Borrows even when `raw_ctx` shares the same address as `base_host.host_ctx()`) is
-/// materialized once in `storage`.
+/// zero 624-byte `Host` struct copies. Systems that only need a refreshed [`BamHostCtx`] pointer
+/// (`ValidatedSystemRef::intern_symbol`, `ValidatedCommands::insert_resource`, etc.) query
+/// `sys_host_ctx(sys_ctx)` at most once via [`Self::resolve_ctx`] without materializing a 624B
+/// [`Host`] copy. Only callers requesting `&Host` materialize a single `Host` into the owning
+/// `SystemClosureState::host_scratch` slot, preserving strict Tree/Stacked Borrows provenance by
+/// always stamping non-null `raw_ctx` without numeric address comparison.
 pub(crate) struct LazyInvocationHost<'base> {
     base_host: &'base Host,
     sys_ctx: *mut BamSystemCtx,
-    resolved: Cell<*const Host>,
-    storage: UnsafeCell<MaybeUninit<Host>>,
+    scratch_slot: &'base UnsafeCell<MaybeUninit<Host>>,
+    cached_ctx: Cell<*const BamHostCtx>,
+    ctx_state: Cell<u8>,
 }
 
+const _: () = {
+    assert!(core::mem::size_of::<LazyInvocationHost<'static>>() <= 48);
+};
+
 impl<'base> LazyInvocationHost<'base> {
-    /// Creates an unresolved lazy host frame referencing `base_host` and `sys_ctx` without
-    /// initializing the 584-byte `storage` slot or calling `sys_host_ctx`.
+    /// Creates an unresolved lazy host frame referencing `base_host`, `sys_ctx`, and the
+    /// heap-pinned `scratch_slot` without calling `sys_host_ctx`.
     #[inline]
-    pub(crate) const fn new(base_host: &'base Host, sys_ctx: *mut BamSystemCtx) -> Self {
+    pub(crate) const fn new(
+        base_host: &'base Host,
+        sys_ctx: *mut BamSystemCtx,
+        scratch_slot: &'base UnsafeCell<MaybeUninit<Host>>,
+    ) -> Self {
         Self {
             base_host,
             sys_ctx,
-            resolved: Cell::new(core::ptr::null()),
-            storage: UnsafeCell::new(MaybeUninit::uninit()),
+            scratch_slot,
+            cached_ctx: Cell::new(core::ptr::null()),
+            ctx_state: Cell::new(CTX_UNRESOLVED),
         }
     }
 
@@ -168,86 +184,141 @@ impl<'base> LazyInvocationHost<'base> {
         self.base_host
     }
 
+    /// Resolves and caches the active per-tick [`BamHostCtx`] pointer at most once per invocation
+    /// without materializing a 624-byte [`Host`] copy.
+    #[inline]
+    pub(crate) fn resolve_ctx(&self) -> *const BamHostCtx {
+        if self.ctx_state.get() != CTX_UNRESOLVED {
+            return self.cached_ctx.get();
+        }
+        self.resolve_ctx_slow()
+    }
+
+    /// Cold path querying `BamHostApi::sys_host_ctx(sys_ctx)` once and recording either
+    /// `CTX_RUNTIME_ONLY` (for non-null `raw_ctx`) or `CTX_BASE_FALLBACK`.
+    #[cold]
+    #[inline(never)]
+    fn resolve_ctx_slow(&self) -> *const BamHostCtx {
+        let mut ptr = self.base_host.host_ctx();
+        let mut next_state = CTX_BASE_FALLBACK;
+        if !self.sys_ctx.is_null() {
+            if let Some(sys_host_ctx_fn) = host_slot!(self.base_host.api(), sys_host_ctx) {
+                // SAFETY: `self.sys_ctx` is non-null and active for the duration of this system call.
+                let raw_ctx = unsafe { sys_host_ctx_fn(self.sys_ctx.cast_const()) };
+                if !raw_ctx.is_null() {
+                    // Always stamp `raw_ctx` rather than comparing addresses with `base_host.host_ctx()`:
+                    // under strict provenance / Tree Borrows, `raw_ctx` may carry a fresh borrow tag
+                    // at the same numeric address as the init-time `host_ctx`.
+                    ptr = raw_ctx;
+                    next_state = CTX_RUNTIME_ONLY;
+                }
+            }
+        }
+        self.cached_ctx.set(ptr);
+        self.ctx_state.set(next_state);
+        ptr
+    }
+
     /// Resolves and caches the active per-tick [`Host`] reference at most once per invocation.
     #[inline]
     pub(crate) fn resolve(&self) -> &Host {
-        let cached = self.resolved.get();
-        if !cached.is_null() {
-            // SAFETY: `cached` was set by `resolve_slow` and points either to `self.base_host`
-            // (valid for `'base: 'self`) or to initialized `self.storage` (never mutated again
-            // after `resolved` becomes non-null, valid for `'self`).
-            return unsafe { &*cached };
+        match self.ctx_state.get() {
+            CTX_HOST_MATERIALIZED => {
+                // SAFETY: `ctx_state == CTX_HOST_MATERIALIZED` proves `self.scratch_slot` was
+                // initialized once for this tick by `resolve_slow` and will not be overwritten
+                // again until after all `'self` references expire at tick end.
+                unsafe { &*self.scratch_slot.get().cast::<Host>() }
+            }
+            CTX_BASE_FALLBACK => self.base_host,
+            _ => self.resolve_slow(),
         }
-        self.resolve_slow()
     }
 
-    /// Cold path performing the one-time `BamHostApi::sys_host_ctx(sys_ctx)` FFI query and
-    /// materializing an updated `Host` in `self.storage` only if the runtime `BamHostCtx` differs.
+    /// Cold path performing the one-time `sys_host_ctx` query (if unresolved) and materializing an
+    /// updated `Host` into `self.scratch_slot` only when a non-null runtime context was returned.
     #[cold]
     #[inline(never)]
     fn resolve_slow(&self) -> &Host {
-        let ptr: *const Host = if !self.sys_ctx.is_null()
-            && let Some(sys_host_ctx_fn) = host_slot!(self.base_host.api(), sys_host_ctx)
-        {
-            // SAFETY: `self.sys_ctx` is non-null and active for the duration of this system call.
-            let raw_ctx = unsafe { sys_host_ctx_fn(self.sys_ctx.cast_const()) };
-            if raw_ctx.is_null() {
-                core::ptr::from_ref(self.base_host)
-            } else {
-                // Always stamp `raw_ctx` rather than comparing addresses with `base_host.host_ctx()`:
-                // under strict provenance / Tree Borrows, `raw_ctx` may carry a fresh borrow tag
-                // at the same numeric address as the init-time `host_ctx`.
-                // SAFETY: `raw_ctx` was returned by `BamHostApi::sys_host_ctx(sys_ctx)` and
-                // remains valid for the duration of this system invocation.
-                let updated = unsafe { self.base_host.with_host_ctx_ptr(raw_ctx) };
-                let slot_ptr: *mut Host = self.storage.get().cast::<Host>();
-                // SAFETY: `LazyInvocationHost` is `!Sync`, `self.resolved` is still null so no
-                // shared reference into `self.storage` exists yet, and writing directly via
-                // `ptr::write` preserves `SharedReadWrite` raw provenance without forming `&mut`.
-                unsafe { slot_ptr.write(updated) };
-                slot_ptr.cast_const()
-            }
-        } else {
-            core::ptr::from_ref(self.base_host)
-        };
-        self.resolved.set(ptr);
-        // SAFETY: `ptr` points either to `self.base_host` or to the just-initialized `self.storage`,
-        // which is never mutated again for the remainder of `&self`'s lifetime.
-        unsafe { &*ptr }
+        if self.ctx_state.get() == CTX_UNRESOLVED {
+            let _ = self.resolve_ctx_slow();
+        }
+        if self.ctx_state.get() == CTX_BASE_FALLBACK {
+            return self.base_host;
+        }
+        if self.ctx_state.get() == CTX_RUNTIME_ONLY {
+            let raw_ctx = self.cached_ctx.get();
+            // SAFETY: `raw_ctx` was returned by `BamHostApi::sys_host_ctx(sys_ctx)` and remains
+            // valid for the duration of this system invocation.
+            let updated = unsafe { self.base_host.with_host_ctx_ptr(raw_ctx) };
+            let slot_ptr: *mut Host = self.scratch_slot.get().cast::<Host>();
+            // SAFETY: `LazyInvocationHost` is `!Sync`, `SystemClosureState::closure.try_with_mut`
+            // holds exclusive access to `scratch_slot` for this tick, `ctx_state` is
+            // `CTX_RUNTIME_ONLY` so no shared reference into `scratch_slot` exists yet this tick,
+            // and `ptr::write` preserves raw `SharedReadWrite` provenance without forming `&mut`.
+            unsafe { slot_ptr.write(updated) };
+            self.ctx_state.set(CTX_HOST_MATERIALIZED);
+            // SAFETY: `slot_ptr` was just initialized and will not be mutated again this tick.
+            return unsafe { &*slot_ptr.cast_const() };
+        }
+        // SAFETY: Only remaining state is `CTX_HOST_MATERIALIZED`.
+        unsafe { &*self.scratch_slot.get().cast::<Host>() }
     }
 }
 
-/// Fetches query slot `index` via `BamHostApi::sys_query` out-of-line using only scalar register
-/// arguments so callers' [`ValidatedSystemInvocation`] frames never escape to the stack.
+/// Fetches raw `*mut BamIter` for query slot `index` via `BamHostApi::sys_query` out-of-line
+/// returning a scalar `Result<*mut BamIter, FfiResult>` (`16` bytes) in registers.
 #[inline(never)]
-fn fetch_query_slot_raw<'a>(
+fn fetch_query_slot_raw(
+    sys_ctx: *mut BamSystemCtx,
+    host: &Host,
+    index: usize,
+) -> Result<*mut BamIter, FfiResult> {
+    if sys_ctx.is_null() {
+        return Err(FfiResult::NULL_POINTER);
+    }
+    let Some(sys_query_fn) = host.api().sys_query else {
+        return Err(FfiResult::NULL_POINTER);
+    };
+    let mut raw_iter: *mut BamIter = core::ptr::null_mut();
+    // SAFETY: `sys_ctx` is active for this tick, `index < total_query_count`, and
+    // `raw_iter` is writable stack storage.
+    let status = unsafe { sys_query_fn(sys_ctx, index, &mut raw_iter) };
+    if status.is_ok() && !raw_iter.is_null() {
+        Ok(raw_iter)
+    } else if !status.is_ok() {
+        Err(status)
+    } else {
+        Err(FfiResult::NULL_POINTER)
+    }
+}
+
+/// Fetches query slot `index` via [`fetch_query_slot_raw`] and constructs [`ValidatedIter`]
+/// directly in the caller's target slot without a struct-return `_memcpy`.
+#[inline(always)]
+fn build_query_slot<'a>(
     sys_ctx: *mut BamSystemCtx,
     host: &'a Host,
     lazy_host: Option<&'a LazyInvocationHost<'a>>,
+    scratch: Option<&'a QuerySlotScratch>,
     index: usize,
 ) -> ValidatedIter<'a> {
-    if sys_ctx.is_null() {
-        return ValidatedIter::empty(host);
-    }
-    if let Some(sys_query_fn) = host.api().sys_query {
-        let mut raw_iter: *mut BamIter = core::ptr::null_mut();
-        // SAFETY: `sys_ctx` is active for `'a`, `index < total_query_count`, and
-        // `raw_iter` is writable stack storage.
-        let status = unsafe { sys_query_fn(sys_ctx, index, &mut raw_iter) };
-        if status.is_ok() && !raw_iter.is_null() {
-            // SAFETY: `raw_iter` was returned by `sys_query` for query `index` on `sys_ctx`.
-            return unsafe { ValidatedIter::from_raw_with_lazy_host(raw_iter, host, lazy_host) };
+    match fetch_query_slot_raw(sys_ctx, host, index) {
+        Ok(raw_iter) => {
+            // SAFETY: `raw_iter` was returned by `sys_query` for query `index` on active `sys_ctx`,
+            // and callers ensure `scratch` is exclusively bound to slot `index` for `'a`.
+            unsafe { ValidatedIter::from_raw_with_parts(raw_iter, host, lazy_host, scratch) }
         }
+        Err(_) => ValidatedIter::empty(host),
     }
-    ValidatedIter::empty(host)
 }
 
-/// Fetches the active invocation's [`ValidatedCommands`] buffer via `BamHostApi::sys_commands`,
-/// returning an empty disabled buffer if unavailable.
+/// Fetches the active invocation's [`ValidatedCommands`] buffer via `BamHostApi::sys_commands`
+/// without calling `sys_host_ctx` or copying [`Host`], forwarding `lazy_host` for on-demand use.
 #[inline]
 fn fetch_commands_from_raw<'a>(
     sys_ctx: *mut BamSystemCtx,
     host: &'a Host,
+    lazy_host: Option<&'a LazyInvocationHost<'a>>,
 ) -> ValidatedCommands<'a> {
     if sys_ctx.is_null() {
         return ValidatedCommands::empty(host);
@@ -260,7 +331,7 @@ fn fetch_commands_from_raw<'a>(
     let status = unsafe { sys_cmds_fn(sys_ctx, &mut raw_cmds) };
     if status.is_ok() && !raw_cmds.is_null() {
         // SAFETY: `raw_cmds` was returned by `sys_commands` for `sys_ctx`.
-        unsafe { ValidatedCommands::from_raw(raw_cmds, host) }
+        unsafe { ValidatedCommands::from_raw_with_lazy_host(raw_cmds, host, lazy_host) }
     } else {
         ValidatedCommands::empty(host)
     }
@@ -278,9 +349,10 @@ enum LazyCommandsState<'a> {
 
 /// Single-use, non-`Copy`, non-`Clone` lazy handle to the per-system [`BamCommands`] buffer.
 ///
-/// Extracted at most once from [`ValidatedSystemInvocation::take_lazy_commands`] so systems that
-/// never touch commands avoid the `BamHostApi::sys_commands` FFI call while preserving single-owner
-/// exclusivity (no duplicate [`ValidatedCommands`] handles can be created for the same tick).
+/// Extracted at most once from [`ValidatedSystemInvocation::take_lazy_commands`] or
+/// [`ValidatedSystemSlice::take_lazy_commands`] so systems that never touch commands avoid the
+/// `BamHostApi::sys_commands` FFI call while preserving single-owner exclusivity (no duplicate
+/// [`ValidatedCommands`] handles can be created for the same tick).
 pub struct LazyCommands<'a> {
     state: LazyCommandsState<'a>,
 }
@@ -295,8 +367,8 @@ impl<'a> LazyCommands<'a> {
     }
 
     /// Consumes this handle and materializes the per-system [`ValidatedCommands`] buffer on demand
-    /// via `BamHostApi::sys_commands`, lazily resolving the active per-tick `BamHostCtx` when
-    /// backed by a trampoline frame.
+    /// via `BamHostApi::sys_commands`, keeping `BamHostApi::sys_host_ctx` deferred until a caller
+    /// inspects [`ValidatedCommands::host`] or a layout-checked command requires `host_ctx`.
     #[inline]
     pub fn resolve(self) -> ValidatedCommands<'a> {
         match self.state {
@@ -305,13 +377,7 @@ impl<'a> LazyCommands<'a> {
                 sys_ctx,
                 host,
                 lazy_host,
-            } => {
-                let active_host = match lazy_host {
-                    Some(lazy) => lazy.resolve(),
-                    None => host,
-                };
-                fetch_commands_from_raw(sys_ctx, active_host)
-            }
+            } => fetch_commands_from_raw(sys_ctx, host, lazy_host),
         }
     }
 }
@@ -322,6 +388,7 @@ pub struct ValidatedSystemInvocation<'a> {
     sys_ctx: *mut BamSystemCtx,
     host: &'a Host,
     lazy_host: Option<&'a LazyInvocationHost<'a>>,
+    scratches: &'a [QuerySlotScratch],
     total_query_count: usize,
     user_query_count: usize,
     resource_query_index: Option<usize>,
@@ -329,19 +396,20 @@ pub struct ValidatedSystemInvocation<'a> {
     queries: [MaybeUninit<ValidatedIter<'a>>; MAX_QUERIES_PER_SYSTEM],
     query_init_mask: u16,
     query_taken_mask: u16,
-    empty_iter: ValidatedIter<'a>,
+    empty_iter: Option<ValidatedIter<'a>>,
     commands: Option<ValidatedCommands<'a>>,
     commands_taken: bool,
-    empty_commands: ValidatedCommands<'a>,
+    empty_commands: Option<ValidatedCommands<'a>>,
 }
 
 impl<'a> ValidatedSystemInvocation<'a> {
-    /// Internal constructor shared by [`Self::from_raw`] and [`Self::from_raw_with_lazy_host`].
+    /// Internal constructor shared by [`Self::from_raw`] and [`Self::from_raw_with_parts`].
     #[inline]
     unsafe fn from_parts(
         sys_ctx: *mut BamSystemCtx,
         host: &'a Host,
         lazy_host: Option<&'a LazyInvocationHost<'a>>,
+        scratches: &'a [QuerySlotScratch],
         total_query_count: usize,
         user_query_count: usize,
         resource_query_index: Option<usize>,
@@ -352,6 +420,7 @@ impl<'a> ValidatedSystemInvocation<'a> {
             sys_ctx,
             host,
             lazy_host,
+            scratches,
             total_query_count: clamped_total,
             user_query_count: clamped_user,
             resource_query_index: resource_query_index.filter(|&idx| idx < clamped_total),
@@ -363,10 +432,10 @@ impl<'a> ValidatedSystemInvocation<'a> {
             queries: [const { MaybeUninit::uninit() }; MAX_QUERIES_PER_SYSTEM],
             query_init_mask: 0,
             query_taken_mask: 0,
-            empty_iter: ValidatedIter::empty(host),
+            empty_iter: None,
             commands: None,
             commands_taken: false,
-            empty_commands: ValidatedCommands::empty(host),
+            empty_commands: None,
         }
     }
 
@@ -389,6 +458,7 @@ impl<'a> ValidatedSystemInvocation<'a> {
                 sys_ctx,
                 host,
                 None,
+                &[],
                 total_query_count,
                 user_query_count,
                 resource_query_index,
@@ -396,27 +466,29 @@ impl<'a> ValidatedSystemInvocation<'a> {
         }
     }
 
-    /// Creates a new system execution frame backed by a stack-pinned [`LazyInvocationHost`],
-    /// deferring `BamHostApi::sys_host_ctx(sys_ctx)` until a caller actually requests the active
-    /// [`Host`].
+    /// Creates a new system execution frame backed by a [`LazyInvocationHost`] and per-slot
+    /// [`QuerySlotScratch`] slice, deferring `BamHostApi::sys_host_ctx(sys_ctx)` until demanded.
     ///
     /// # Safety
-    /// `sys_ctx` must be a non-null, active [`BamSystemCtx`] matching `lazy_host` for `'a` with
-    /// `total_query_count <= MAX_QUERIES_PER_SYSTEM`.
+    /// - `sys_ctx` must be a non-null, active [`BamSystemCtx`] matching `lazy_host` for `'a` with
+    ///   `total_query_count <= MAX_QUERIES_PER_SYSTEM`.
+    /// - `scratches` must be exclusively borrowed for this tick (`try_with_mut` locked).
     #[inline]
     pub(crate) unsafe fn from_raw_with_lazy_host(
         sys_ctx: *mut BamSystemCtx,
         lazy_host: &'a LazyInvocationHost<'a>,
+        scratches: &'a [QuerySlotScratch],
         total_query_count: usize,
         user_query_count: usize,
         resource_query_index: Option<usize>,
     ) -> Self {
-        // SAFETY: Forwarding caller contract on `sys_ctx` and query counts.
+        // SAFETY: Forwarding caller contract on `sys_ctx`, `scratches`, and query counts.
         unsafe {
             Self::from_parts(
                 sys_ctx,
                 lazy_host.base_host(),
                 Some(lazy_host),
+                scratches,
                 total_query_count,
                 user_query_count,
                 resource_query_index,
@@ -483,7 +555,13 @@ impl<'a> ValidatedSystemInvocation<'a> {
     /// Fetches query slot `index` via `BamHostApi::sys_query` without touching `self.queries`.
     #[inline]
     fn fetch_query_slot(&self, index: usize) -> ValidatedIter<'a> {
-        fetch_query_slot_raw(self.sys_ctx, self.host, self.lazy_host, index)
+        build_query_slot(
+            self.sys_ctx,
+            self.host,
+            self.lazy_host,
+            self.scratches.get(index),
+            index,
+        )
     }
 
     /// Borrows initialized query slot `index` immutably if populated in `self.queries`.
@@ -595,10 +673,10 @@ impl<'a> ValidatedSystemInvocation<'a> {
     }
 
     /// Fetches the active invocation's [`ValidatedCommands`] buffer via `BamHostApi::sys_commands`,
-    /// returning an empty disabled buffer if unavailable.
+    /// returning an empty disabled buffer if unavailable without calling `sys_host_ctx`.
     #[inline]
     fn fetch_commands_slot(&self) -> ValidatedCommands<'a> {
-        fetch_commands_from_raw(self.sys_ctx, self.host())
+        fetch_commands_from_raw(self.sys_ctx, self.host, self.lazy_host)
     }
 
     /// Populates `self.commands` on first access if not already fetched or taken.
@@ -614,14 +692,19 @@ impl<'a> ValidatedSystemInvocation<'a> {
     #[inline]
     pub fn iter_mut(&mut self) -> &mut ValidatedIter<'a> {
         if self.user_query_count == 0 {
-            return &mut self.empty_iter;
+            let host = self.host;
+            return self
+                .empty_iter
+                .get_or_insert_with(|| ValidatedIter::empty(host));
         }
         self.ensure_query_slot(0);
         if (self.query_init_mask & 1u16) != 0 {
             // SAFETY: `query_init_mask & 1 != 0` proves `self.queries[0]` is initialized.
             unsafe { self.queries[0].assume_init_mut() }
         } else {
-            &mut self.empty_iter
+            let host = self.host;
+            self.empty_iter
+                .get_or_insert_with(|| ValidatedIter::empty(host))
         }
     }
 
@@ -666,7 +749,10 @@ impl<'a> ValidatedSystemInvocation<'a> {
     #[inline]
     pub fn commands_mut(&mut self) -> &mut ValidatedCommands<'a> {
         if self.commands_taken {
-            return &mut self.empty_commands;
+            let host = self.host;
+            return self
+                .empty_commands
+                .get_or_insert_with(|| ValidatedCommands::empty(host));
         }
         let fetched = if self.commands.is_none() {
             Some(self.fetch_commands_slot())
@@ -676,7 +762,11 @@ impl<'a> ValidatedSystemInvocation<'a> {
         if let Some(cmds) = fetched {
             self.commands.insert(cmds)
         } else {
-            self.commands.as_mut().unwrap_or(&mut self.empty_commands)
+            let host = self.host;
+            let empty_cmds = &mut self.empty_commands;
+            self.commands
+                .as_mut()
+                .unwrap_or_else(|| empty_cmds.get_or_insert_with(|| ValidatedCommands::empty(host)))
         }
     }
 
@@ -689,13 +779,18 @@ impl<'a> ValidatedSystemInvocation<'a> {
             self.ensure_query_slot(0);
         }
         self.ensure_commands_slot();
+        let host = self.host;
+        let empty_cmds = &mut self.empty_commands;
         let cmds = if self.commands_taken {
-            &mut self.empty_commands
+            empty_cmds.get_or_insert_with(|| ValidatedCommands::empty(host))
         } else {
-            self.commands.as_mut().unwrap_or(&mut self.empty_commands)
+            self.commands
+                .as_mut()
+                .unwrap_or_else(|| empty_cmds.get_or_insert_with(|| ValidatedCommands::empty(host)))
         };
+        let empty_iter = &mut self.empty_iter;
         let iter = if self.user_query_count == 0 || (self.query_init_mask & 1u16) == 0 {
-            &mut self.empty_iter
+            empty_iter.get_or_insert_with(|| ValidatedIter::empty(host))
         } else {
             // SAFETY: `query_init_mask & 1 != 0` proves `self.queries[0]` is initialized.
             unsafe { self.queries[0].assume_init_mut() }
@@ -782,6 +877,198 @@ impl<'a> ValidatedSystemInvocation<'a> {
     }
 }
 
+/// Zero-array per-tick system execution view passed to bucketed `system_closure_slice_trampoline`
+/// closures, avoiding duplicate `[MaybeUninit<ValidatedIter>; 16]` stack storage when callers
+/// (`SystemContext`) already own an exact-bucket `[Option<ChunkIter>; N]` slice.
+pub struct ValidatedSystemSlice<'a> {
+    sys_ctx: *mut BamSystemCtx,
+    host: &'a Host,
+    lazy_host: Option<&'a LazyInvocationHost<'a>>,
+    scratches: &'a [QuerySlotScratch],
+    total_query_count: usize,
+    user_query_count: usize,
+    resource_query_index: Option<usize>,
+    sys_ref: Option<ValidatedSystemRef<'a>>,
+    query_taken_mask: u16,
+    commands_taken: bool,
+}
+
+const _: () = {
+    assert!(core::mem::size_of::<ValidatedSystemSlice<'static>>() <= 128);
+};
+
+impl<'a> ValidatedSystemSlice<'a> {
+    /// Creates a new zero-array system execution view backed by [`LazyInvocationHost`] and
+    /// per-slot [`QuerySlotScratch`] storage.
+    ///
+    /// # Safety
+    /// - `sys_ctx` must be a non-null, active [`BamSystemCtx`] matching `lazy_host` for `'a` with
+    ///   `total_query_count <= MAX_QUERIES_PER_SYSTEM`.
+    /// - `scratches` must be exclusively borrowed for this tick (`try_with_mut` locked).
+    #[inline(always)]
+    pub(crate) unsafe fn from_raw_with_lazy_host(
+        sys_ctx: *mut BamSystemCtx,
+        lazy_host: &'a LazyInvocationHost<'a>,
+        scratches: &'a [QuerySlotScratch],
+        total_query_count: usize,
+        user_query_count: usize,
+        resource_query_index: Option<usize>,
+    ) -> Self {
+        let clamped_total = total_query_count.min(MAX_QUERIES_PER_SYSTEM);
+        let clamped_user = user_query_count.min(clamped_total);
+        let base_host = lazy_host.base_host();
+        Self {
+            sys_ctx,
+            host: base_host,
+            lazy_host: Some(lazy_host),
+            scratches,
+            total_query_count: clamped_total,
+            user_query_count: clamped_user,
+            resource_query_index: resource_query_index.filter(|&idx| idx < clamped_total),
+            sys_ref: Some(ValidatedSystemRef {
+                sys_ctx,
+                host: base_host,
+                lazy_host: Some(lazy_host),
+            }),
+            query_taken_mask: 0,
+            commands_taken: false,
+        }
+    }
+
+    /// Creates a standalone [`ValidatedSystemSlice`] without a [`LazyInvocationHost`] or scratch
+    /// slice (used for Kani proofs and unit tests).
+    ///
+    /// # Safety
+    /// `sys_ctx` must be a non-null, active [`BamSystemCtx`] supplied by the host for `'a`.
+    #[cfg(kani)]
+    #[inline]
+    pub(crate) unsafe fn from_raw_for_kani(
+        sys_ctx: *mut BamSystemCtx,
+        host: &'a Host,
+        total_query_count: usize,
+        user_query_count: usize,
+        resource_query_index: Option<usize>,
+    ) -> Self {
+        let clamped_total = total_query_count.min(MAX_QUERIES_PER_SYSTEM);
+        let clamped_user = user_query_count.min(clamped_total);
+        Self {
+            sys_ctx,
+            host,
+            lazy_host: None,
+            scratches: &[],
+            total_query_count: clamped_total,
+            user_query_count: clamped_user,
+            resource_query_index: resource_query_index.filter(|&idx| idx < clamped_total),
+            sys_ref: Some(ValidatedSystemRef {
+                sys_ctx,
+                host,
+                lazy_host: None,
+            }),
+            query_taken_mask: 0,
+            commands_taken: false,
+        }
+    }
+
+    /// Returns the raw `*mut BamSystemCtx` pointer.
+    #[inline]
+    pub const fn as_raw_sys_ctx(&self) -> *mut BamSystemCtx {
+        self.sys_ctx
+    }
+
+    /// Borrows the unique [`ValidatedSystemRef`] token immutably (`None` if already extracted via
+    /// [`Self::take_system_ref`]).
+    #[inline]
+    pub const fn system_ref(&self) -> Option<&ValidatedSystemRef<'a>> {
+        self.sys_ref.as_ref()
+    }
+
+    /// Borrows the unique [`ValidatedSystemRef`] token mutably (`None` if already extracted via
+    /// [`Self::take_system_ref`]).
+    #[inline]
+    pub fn system_ref_mut(&mut self) -> Option<&mut ValidatedSystemRef<'a>> {
+        self.sys_ref.as_mut()
+    }
+
+    /// Extracts the unique non-`Copy` [`ValidatedSystemRef`] token by value (succeeds at most once).
+    #[inline(always)]
+    pub fn take_system_ref(&mut self) -> Option<ValidatedSystemRef<'a>> {
+        self.sys_ref.take()
+    }
+
+    /// Returns the init-time base [`Host`] table without invoking `BamHostApi::sys_host_ctx`.
+    #[inline(always)]
+    pub const fn base_host(&self) -> &'a Host {
+        self.host
+    }
+
+    /// Returns the active [`Host`] table for this system invocation, lazily resolving
+    /// `BamHostApi::sys_host_ctx(sys_ctx)` at most once per tick when backed by a trampoline frame.
+    #[inline]
+    pub fn host(&self) -> &'a Host {
+        match self.lazy_host {
+            Some(lazy) => lazy.resolve(),
+            None => self.host,
+        }
+    }
+
+    /// Returns the number of entity/explicit queries declared on this system (`0..=MAX_QUERIES_PER_SYSTEM`).
+    #[inline(always)]
+    pub const fn query_count(&self) -> usize {
+        self.user_query_count
+    }
+
+    /// Returns the dedicated resource query index if system-level resources were declared.
+    #[inline(always)]
+    pub const fn resource_query_index(&self) -> Option<usize> {
+        self.resource_query_index
+    }
+
+    /// Extracts validated query slot `index` (`0..total_query_count`) by value (succeeds at most once
+    /// per slot).
+    #[inline(always)]
+    pub fn take_raw_query_slot(&mut self, index: usize) -> Option<ValidatedIter<'a>> {
+        if index >= self.total_query_count {
+            return None;
+        }
+        let bit = 1u16 << index;
+        if (self.query_taken_mask & bit) != 0 {
+            return None;
+        }
+        self.query_taken_mask |= bit;
+        Some(build_query_slot(
+            self.sys_ctx,
+            self.host,
+            self.lazy_host,
+            self.scratches.get(index),
+            index,
+        ))
+    }
+
+    /// Extracts a single-use [`LazyCommands`] token deferring `BamHostApi::sys_commands` until
+    /// [`LazyCommands::resolve`] is invoked.
+    #[inline(always)]
+    pub fn take_lazy_commands(&mut self) -> LazyCommands<'a> {
+        if self.commands_taken {
+            return LazyCommands::empty(self.host);
+        }
+        self.commands_taken = true;
+        LazyCommands {
+            state: LazyCommandsState::Pending {
+                sys_ctx: self.sys_ctx,
+                host: self.host,
+                lazy_host: self.lazy_host,
+            },
+        }
+    }
+
+    /// Fetches a [`ValidatedCommands`] buffer for this system invocation by value (returns an empty
+    /// disabled buffer if already extracted).
+    #[inline]
+    pub fn take_commands(&mut self) -> ValidatedCommands<'a> {
+        self.take_lazy_commands().resolve()
+    }
+}
+
 /// Unique (non-`Copy`, non-`Clone`) validated per-tick `*mut BamSystemCtx` token supporting
 /// borrow-checked random per-entity component lookups and handle-based singleton resource access.
 ///
@@ -820,6 +1107,16 @@ impl<'a> ValidatedSystemRef<'a> {
         self.host
     }
 
+    /// Resolves and caches the active per-tick [`BamHostCtx`] pointer at most once per invocation
+    /// without materializing a 624-byte [`Host`] copy.
+    #[inline]
+    pub(crate) fn resolve_ctx(&self) -> *const BamHostCtx {
+        match self.lazy_host {
+            Some(lazy) => lazy.resolve_ctx(),
+            None => self.host.host_ctx(),
+        }
+    }
+
     /// Returns the active [`Host`] table for this system invocation, lazily resolving
     /// `BamHostApi::sys_host_ctx(sys_ctx)` at most once per tick when backed by a trampoline frame.
     #[inline]
@@ -827,6 +1124,76 @@ impl<'a> ValidatedSystemRef<'a> {
         match self.lazy_host {
             Some(lazy) => lazy.resolve(),
             None => self.host,
+        }
+    }
+
+    /// Reads the most recent human-readable UTF-8 diagnostic recorded on this world's host context
+    /// without materializing a 624-byte [`Host`] copy.
+    #[inline]
+    pub fn last_error(&self) -> String {
+        // SAFETY: `self.resolve_ctx()` returns a valid active `BamHostCtx` matching `self.host.api()`.
+        unsafe { Host::last_error_with_ctx(self.host.api(), self.resolve_ctx()) }
+    }
+
+    /// Emits a structured guest diagnostic message via `BamHostApi::log_diagnostic` (slot 50)
+    /// without materializing a 624-byte [`Host`] copy.
+    #[inline]
+    pub fn log_diagnostic(&self, level: u32, message: &str) -> FfiResult {
+        // SAFETY: `self.resolve_ctx()` returns a valid active `BamHostCtx` matching `self.host.api()`.
+        unsafe {
+            Host::log_diagnostic_with_ctx(self.host.api(), self.resolve_ctx(), level, message)
+        }
+    }
+
+    /// Records a guest-side fault message on this world's host context via
+    /// `BamHostApi::report_guest_fault` (slot 51) without materializing a 624-byte [`Host`] copy.
+    #[inline]
+    pub fn report_guest_fault(&self, message: &str) -> FfiResult {
+        // SAFETY: `self.resolve_ctx()` returns a valid active `BamHostCtx` matching `self.host.api()`.
+        unsafe { Host::report_guest_fault_with_ctx(self.host.api(), self.resolve_ctx(), message) }
+    }
+
+    /// Resolves a registered component or resource strictly by its 128-bit [`ComponentUuid`] via
+    /// `BamHostApi::resolve_component_by_uuid` (slot 52) without materializing a 624-byte [`Host`] copy.
+    #[inline]
+    pub fn resolve_component_by_uuid(
+        &self,
+        uuid: ComponentUuid,
+    ) -> Result<BamComponent, FfiResult> {
+        // SAFETY: `self.resolve_ctx()` returns a valid active `BamHostCtx` matching `self.host.api()`.
+        unsafe {
+            Host::resolve_component_by_uuid_with_ctx(self.host.api(), self.resolve_ctx(), uuid)
+        }
+    }
+
+    /// Queries ABI `0.3.0` [`BamLayoutInfo`] metadata for `component` via
+    /// `BamHostApi::component_layout_info` (slot 53) without materializing a 624-byte [`Host`] copy.
+    #[inline]
+    pub fn component_layout_info(
+        &self,
+        component: BamComponent,
+    ) -> Result<BamLayoutInfo, FfiResult> {
+        // SAFETY: `self.resolve_ctx()` returns a valid active `BamHostCtx` matching `self.host.api()`.
+        unsafe {
+            Host::component_layout_info_with_ctx(self.host.api(), self.resolve_ctx(), component)
+        }
+    }
+
+    /// Interns a non-empty UTF-8 symbol string to an `O(1)` comparable [`BamSymbol`] handle via
+    /// `BamHostApi::intern_symbol` (slot 55) without materializing a 624-byte [`Host`] copy.
+    #[inline]
+    pub fn intern_symbol(&self, symbol: &str) -> Result<BamSymbol, FfiResult> {
+        // SAFETY: `self.resolve_ctx()` returns a valid active `BamHostCtx` matching `self.host.api()`.
+        unsafe { Host::intern_symbol_with_ctx(self.host.api(), self.resolve_ctx(), symbol) }
+    }
+
+    /// Binds a canonical UTF-8 lookup `name` to `entity` in the host symbol registry via
+    /// `BamHostApi::bind_named_object` (slot 56) without materializing a 624-byte [`Host`] copy.
+    #[inline]
+    pub fn bind_named_object(&self, name: &str, entity: FfiEntity) -> FfiResult {
+        // SAFETY: `self.resolve_ctx()` returns a valid active `BamHostCtx` matching `self.host.api()`.
+        unsafe {
+            Host::bind_named_object_with_ctx(self.host.api(), self.resolve_ctx(), name, entity)
         }
     }
 
@@ -1074,7 +1441,7 @@ impl<'a> ValidatedSystemRef<'a> {
         if self.sys_ctx.is_null() || !component.is_valid() {
             return None;
         }
-        let info = self.host().component_layout_info(component).ok()?;
+        let info = self.component_layout_info(component).ok()?;
         if info.size != core::mem::size_of::<R>() || info.align != core::mem::align_of::<R>() {
             return None;
         }
@@ -1118,7 +1485,7 @@ impl<'a> ValidatedSystemRef<'a> {
         if self.sys_ctx.is_null() || !component.is_valid() {
             return None;
         }
-        let info = self.host().component_layout_info(component).ok()?;
+        let info = self.component_layout_info(component).ok()?;
         if (info.flags & BAM_STORAGE_FLAG_IMMUTABLE) != 0
             || info.size != core::mem::size_of::<R>()
             || info.align != core::mem::align_of::<R>()
@@ -1210,7 +1577,7 @@ impl<'a> ValidatedSystemRef<'a> {
         vtable: &ValidatedWireVTable<W>,
         require_mutable: bool,
     ) -> Result<(), FfiResult> {
-        let info = self.host().component_layout_info(component)?;
+        let info = self.component_layout_info(component)?;
         if info.size != vtable.host_size()
             || info.align != vtable.host_align()
             || (vtable.host_size() > 0
@@ -1304,13 +1671,70 @@ impl<'a> ValidatedSystemRef<'a> {
     }
 }
 
+/// Heap-pinned per-system scratch slot storing a lazily materialized [`Host`] copy when
+/// `BamHostApi::sys_host_ctx` returns a non-null runtime context pointer.
+pub(crate) struct InvocationHostScratch(pub(crate) UnsafeCell<MaybeUninit<Host>>);
+
+impl InvocationHostScratch {
+    /// Creates an uninitialized per-system host scratch slot.
+    #[inline]
+    pub(crate) const fn new() -> Self {
+        Self(UnsafeCell::new(MaybeUninit::uninit()))
+    }
+}
+
+// SAFETY: `InvocationHostScratch` is only accessed by `LazyInvocationHost` while
+// `SystemClosureState::closure.try_with_mut` holds its `Acquire`/`Release` lock, ensuring
+// exclusive single-thread, non-reentrant access for the duration of one tick.
+unsafe impl Sync for InvocationHostScratch {}
+
+/// Heap-pinned per-query-slot scratch storage owned by [`SystemClosureState`].
+pub(crate) struct SlotScratchesCell(UnsafeCell<Box<[QuerySlotScratch]>>);
+
+impl SlotScratchesCell {
+    /// Creates an empty zero-allocation scratch slice (used for 0-query systems and Kani proofs).
+    #[inline]
+    pub(crate) fn empty() -> Self {
+        Self(UnsafeCell::new(Box::default()))
+    }
+
+    /// Allocates `count` [`QuerySlotScratch`] entries (`0` heap allocations when `count == 0`).
+    #[inline]
+    fn with_len(count: usize) -> Self {
+        if count == 0 {
+            Self::empty()
+        } else {
+            let vec: Vec<QuerySlotScratch> = (0..count).map(|_| QuerySlotScratch::new()).collect();
+            Self(UnsafeCell::new(vec.into_boxed_slice()))
+        }
+    }
+
+    /// Borrows the underlying scratch slice immutably while `try_with_mut` holds exclusive access.
+    ///
+    /// # Safety
+    /// Caller must hold `SystemClosureState::closure.try_with_mut` exclusive access for `'a`.
+    #[inline]
+    unsafe fn borrow_locked(&self) -> &[QuerySlotScratch] {
+        // SAFETY: `try_with_mut` guarantees exclusive non-reentrant access for the active tick,
+        // and no mutable reference into the `Box<[QuerySlotScratch]>` exists.
+        unsafe { &*self.0.get() }
+    }
+}
+
+// SAFETY: `QuerySlotScratch` is `Send`, and `SlotScratchesCell` is only accessed via
+// `borrow_locked` while `SystemClosureState::closure.try_with_mut` holds exclusive access.
+unsafe impl Sync for SlotScratchesCell {}
+
 /// Heap-pinned system callback state owned by [`GuestInstance`], pairing a pointer to the
-/// instance's pinned [`Host`], query slot metadata, and a [`ReentrantCell`]-guarded guest closure.
+/// instance's pinned [`Host`], query slot metadata, heap-pinned scratch slots, and a
+/// [`ReentrantCell`]-guarded guest closure.
 pub(crate) struct SystemClosureState<F> {
     pub(crate) host: PinnedHostPtr,
     pub(crate) total_query_count: usize,
     pub(crate) user_query_count: usize,
     pub(crate) resource_query_index: Option<usize>,
+    pub(crate) host_scratch: InvocationHostScratch,
+    pub(crate) slot_scratches: SlotScratchesCell,
     pub(crate) closure: ReentrantCell<F>,
 }
 
@@ -1348,18 +1772,98 @@ where
         // alive and immutable until after `state` is dropped on `bamabi_shutdown`.
         let base_host = unsafe { state.host.as_ref() };
         let Some(result) = state.closure.try_with_mut(|func| {
-            let lazy_host = LazyInvocationHost::new(base_host, sys_ctx);
+            let lazy_host = LazyInvocationHost::new(base_host, sys_ctx, &state.host_scratch.0);
+            // SAFETY: `state.closure.try_with_mut` holds exclusive non-reentrant access for this tick.
+            let scratches = unsafe { state.slot_scratches.borrow_locked() };
+            let mut idx = 0usize;
+            while idx < MAX_QUERIES_PER_SYSTEM {
+                let Some(scratch) = scratches.get(idx) else {
+                    break;
+                };
+                scratch.reset_per_tick();
+                idx += 1;
+            }
             // SAFETY: `sys_ctx` is non-null and active for the duration of this `BamSystemFn` call.
             let mut invocation = unsafe {
                 ValidatedSystemInvocation::from_raw_with_lazy_host(
                     sys_ctx,
                     &lazy_host,
+                    scratches,
                     state.total_query_count,
                     state.user_query_count,
                     state.resource_query_index,
                 )
             };
             func(&mut invocation)
+        }) else {
+            return FfiResult::ACCESS_CONFLICT;
+        };
+        result
+    })
+}
+
+/// Const-bucketed panic-safe, re-entrancy-guarded `extern "C"` [`BamSystemFn`] trampoline passing
+/// a zero-array [`ValidatedSystemSlice`] (`N ∈ {0, 1, 4, 16}`).
+///
+/// When `N == 0`, query counts and scratch resetting fold to compile-time constants (`0`),
+/// eliminating all `sys_query` / `fetch_query_slot_raw` calls and stack query arrays.
+pub(crate) unsafe extern "C" fn system_closure_slice_trampoline<const N: usize, F>(
+    sys_ctx: *mut BamSystemCtx,
+    user_data: *mut c_void,
+) -> FfiResult
+where
+    F: FnMut(&mut ValidatedSystemSlice<'_>) -> FfiResult + Send + 'static,
+{
+    catch_guest_result(|| {
+        if sys_ctx.is_null() || user_data.is_null() {
+            return FfiResult::NULL_POINTER;
+        }
+        if !(user_data as usize).is_multiple_of(core::mem::align_of::<SystemClosureState<F>>()) {
+            return FfiResult::INVALID_ARGUMENT;
+        }
+        // SAFETY: `user_data` is non-null, aligned, and allocated via
+        // `GuestInstance::track_allocation` for `SystemClosureState<F>`.
+        let state = unsafe { &*user_data.cast::<SystemClosureState<F>>() };
+        // SAFETY: `state.host` points to `GuestInstance`'s heap-pinned `Host` which remains
+        // alive and immutable until after `state` is dropped on `bamabi_shutdown`.
+        let base_host = unsafe { state.host.as_ref() };
+        let Some(result) = state.closure.try_with_mut(|func| {
+            let lazy_host = LazyInvocationHost::new(base_host, sys_ctx, &state.host_scratch.0);
+            let (clamped_total, clamped_user, clamped_res, scratches): (
+                usize,
+                usize,
+                Option<usize>,
+                &[QuerySlotScratch],
+            ) = if N == 0 {
+                (0, 0, None, &[])
+            } else {
+                // SAFETY: `state.closure.try_with_mut` holds exclusive access for this tick.
+                let scratch_slice = unsafe { state.slot_scratches.borrow_locked() };
+                let mut idx = 0usize;
+                while idx < N {
+                    let Some(scratch) = scratch_slice.get(idx) else {
+                        break;
+                    };
+                    scratch.reset_per_tick();
+                    idx += 1;
+                }
+                let total = state.total_query_count.min(N).min(MAX_QUERIES_PER_SYSTEM);
+                let user = state.user_query_count.min(total);
+                let res = state.resource_query_index.filter(|&idx| idx < total);
+                (total, user, res, scratch_slice)
+            };
+            // SAFETY: `sys_ctx` is non-null and active for the duration of this `BamSystemFn` call.
+            let mut slice = unsafe {
+                ValidatedSystemSlice::from_raw_with_lazy_host(
+                    sys_ctx,
+                    &lazy_host,
+                    scratches,
+                    clamped_total,
+                    clamped_user,
+                    clamped_res,
+                )
+            };
+            func(&mut slice)
         }) else {
             return FfiResult::ACCESS_CONFLICT;
         };
@@ -1407,14 +1911,50 @@ where
     F: FnMut(&mut ValidatedSystemInvocation<'_>) -> FfiResult + Send + 'static,
 {
     let host = PinnedHostPtr::new(instance.pinned_host_ptr());
+    let scratch_len = total_query_count.min(MAX_QUERIES_PER_SYSTEM);
     let raw = instance.track_allocation(Box::new(SystemClosureState {
         host,
         total_query_count,
         user_query_count,
         resource_query_index,
+        host_scratch: InvocationHostScratch::new(),
+        slot_scratches: SlotScratchesCell::with_len(scratch_len),
         closure: ReentrantCell::new(closure),
     }));
     (system_closure_trampoline::<F>, raw.cast::<c_void>())
+}
+
+/// Allocates a const-bucketed `(BamSystemFn, *mut c_void)` closure pair inside `instance`
+/// targeting [`ValidatedSystemSlice`], allocating `0` query scratch slots when `N == 0`.
+pub fn allocate_system_slice_trampoline<const N: usize, F>(
+    instance: &mut GuestInstance,
+    total_query_count: usize,
+    user_query_count: usize,
+    resource_query_index: Option<usize>,
+    closure: F,
+) -> (BamSystemFn, *mut c_void)
+where
+    F: FnMut(&mut ValidatedSystemSlice<'_>) -> FfiResult + Send + 'static,
+{
+    let host = PinnedHostPtr::new(instance.pinned_host_ptr());
+    let scratch_len = if N == 0 {
+        0
+    } else {
+        total_query_count.min(N).min(MAX_QUERIES_PER_SYSTEM)
+    };
+    let raw = instance.track_allocation(Box::new(SystemClosureState {
+        host,
+        total_query_count,
+        user_query_count,
+        resource_query_index,
+        host_scratch: InvocationHostScratch::new(),
+        slot_scratches: SlotScratchesCell::with_len(scratch_len),
+        closure: ReentrantCell::new(closure),
+    }));
+    (
+        system_closure_slice_trampoline::<N, F>,
+        raw.cast::<c_void>(),
+    )
 }
 
 /// Validated `(BamRunIfFn, *mut c_void)` pair allocated inside a [`GuestInstance`].
@@ -1699,18 +2239,28 @@ struct OwnedDescriptorStorage {
 // after construction (nor retagged on move).
 unsafe impl Send for OwnedDescriptorStorage {}
 
-/// Validates `config`, pins all owned strings/term slices and closure state inside `instance`,
-/// and assembles a validated [`BamSystemDesc`] ready for `register_system` or
-/// `register_system_handle`.
-fn prepare_system_desc<F>(
+/// Pinned descriptor pointers and query layout counts extracted by non-generic
+/// [`pin_system_descriptor_storage`].
+struct PinnedSystemDescParts {
+    total_query_count: usize,
+    user_query_count: usize,
+    resource_query_index: Option<usize>,
+    name_ptr: *const c_char,
+    queries_ptr: *const BamQueryDesc,
+    after_ptr: *const *const c_char,
+    before_ptr: *const *const c_char,
+    in_sets_ptr: *const *const c_char,
+    after_weak_ptr: *const *const c_char,
+    before_weak_ptr: *const *const c_char,
+    ambiguous_with_ptr: *const *const c_char,
+}
+
+/// Validates `config` and pins all owned descriptor strings and query term slices inside
+/// `instance` (non-generic to avoid monomorphizing descriptor setup across `N` or `F`).
+fn pin_system_descriptor_storage(
     instance: &mut GuestInstance,
     config: &SystemRegistrationConfig<'_>,
-    run_if: Option<(BamRunIfFn, *mut c_void)>,
-    closure: F,
-) -> Result<BamSystemDesc, FfiResult>
-where
-    F: FnMut(&mut ValidatedSystemInvocation<'_>) -> FfiResult + Send + 'static,
-{
+) -> Result<PinnedSystemDescParts, FfiResult> {
     if config.name.to_bytes().is_empty() {
         return Err(FfiResult::INVALID_ARGUMENT);
     }
@@ -1839,12 +2389,6 @@ where
     // SAFETY: `raw_storage` was just allocated by `instance.track_allocation` and remains pinned
     // on the heap until `instance` drops.
     let storage_ref = unsafe { &*raw_storage };
-    let name_ptr = storage_ref.name.as_ptr();
-    let queries_ptr = if storage_ref.queries.is_empty() {
-        core::ptr::null()
-    } else {
-        storage_ref.queries.as_ptr()
-    };
     let slice_ptr_or_null = |s: &[*const c_char]| {
         if s.is_empty() {
             core::ptr::null()
@@ -1852,36 +2396,48 @@ where
             s.as_ptr()
         }
     };
-    let after_ptr = slice_ptr_or_null(&storage_ref.after_ptrs);
-    let before_ptr = slice_ptr_or_null(&storage_ref.before_ptrs);
-    let in_sets_ptr = slice_ptr_or_null(&storage_ref.in_set_ptrs);
-    let after_weak_ptr = slice_ptr_or_null(&storage_ref.after_weak_ptrs);
-    let before_weak_ptr = slice_ptr_or_null(&storage_ref.before_weak_ptrs);
-    let ambiguous_with_ptr = slice_ptr_or_null(&storage_ref.ambiguous_with_ptrs);
-
-    let (callback_fn, user_data) = allocate_system_trampoline(
-        instance,
+    Ok(PinnedSystemDescParts {
         total_query_count,
-        config.user_queries.len(),
+        user_query_count: config.user_queries.len(),
         resource_query_index,
-        closure,
-    );
+        name_ptr: storage_ref.name.as_ptr(),
+        queries_ptr: if storage_ref.queries.is_empty() {
+            core::ptr::null()
+        } else {
+            storage_ref.queries.as_ptr()
+        },
+        after_ptr: slice_ptr_or_null(&storage_ref.after_ptrs),
+        before_ptr: slice_ptr_or_null(&storage_ref.before_ptrs),
+        in_sets_ptr: slice_ptr_or_null(&storage_ref.in_set_ptrs),
+        after_weak_ptr: slice_ptr_or_null(&storage_ref.after_weak_ptrs),
+        before_weak_ptr: slice_ptr_or_null(&storage_ref.before_weak_ptrs),
+        ambiguous_with_ptr: slice_ptr_or_null(&storage_ref.ambiguous_with_ptrs),
+    })
+}
 
+/// Assembles and validates a [`BamSystemDesc`] from `parts` and an allocated `(callback_fn, user_data)` pair.
+fn assemble_and_validate_system_desc(
+    parts: PinnedSystemDescParts,
+    config: &SystemRegistrationConfig<'_>,
+    run_if: Option<(BamRunIfFn, *mut c_void)>,
+    callback_fn: BamSystemFn,
+    user_data: *mut c_void,
+) -> Result<BamSystemDesc, FfiResult> {
     let mut desc = BamSystemDesc::new(
-        name_ptr,
-        queries_ptr,
-        total_query_count,
+        parts.name_ptr,
+        parts.queries_ptr,
+        parts.total_query_count,
         callback_fn,
         user_data,
     )
     .with_flags(config.flags)
     .with_schedule(config.schedule)
-    .with_after(after_ptr, config.after.len())
-    .with_before(before_ptr, config.before.len())
-    .with_in_sets(in_sets_ptr, config.in_sets.len())
-    .with_after_weak(after_weak_ptr, config.after_weak.len())
-    .with_before_weak(before_weak_ptr, config.before_weak.len())
-    .with_ambiguous_with(ambiguous_with_ptr, config.ambiguous_with.len());
+    .with_after(parts.after_ptr, config.after.len())
+    .with_before(parts.before_ptr, config.before.len())
+    .with_in_sets(parts.in_sets_ptr, config.in_sets.len())
+    .with_after_weak(parts.after_weak_ptr, config.after_weak.len())
+    .with_before_weak(parts.before_weak_ptr, config.before_weak.len())
+    .with_ambiguous_with(parts.ambiguous_with_ptr, config.ambiguous_with.len());
 
     if let Some((run_if_fn, run_if_data)) = run_if {
         desc = desc.with_run_if(run_if_fn, run_if_data);
@@ -1900,6 +2456,47 @@ where
         return Err(validation);
     }
     Ok(desc)
+}
+
+/// Shared descriptor preparation helper factoring validation, storage pinning, and descriptor
+/// assembly across both [`ValidatedSystemInvocation`] and [`ValidatedSystemSlice`] trampolines.
+#[inline]
+fn prepare_system_desc_with(
+    instance: &mut GuestInstance,
+    config: &SystemRegistrationConfig<'_>,
+    run_if: Option<(BamRunIfFn, *mut c_void)>,
+    allocate_cb: impl FnOnce(
+        &mut GuestInstance,
+        usize,
+        usize,
+        Option<usize>,
+    ) -> (BamSystemFn, *mut c_void),
+) -> Result<BamSystemDesc, FfiResult> {
+    let parts = pin_system_descriptor_storage(instance, config)?;
+    let (callback_fn, user_data) = allocate_cb(
+        instance,
+        parts.total_query_count,
+        parts.user_query_count,
+        parts.resource_query_index,
+    );
+    assemble_and_validate_system_desc(parts, config, run_if, callback_fn, user_data)
+}
+
+/// Validates `config`, pins all owned strings/term slices and closure state inside `instance`,
+/// and assembles a validated [`BamSystemDesc`] ready for `register_system` or
+/// `register_system_handle`.
+fn prepare_system_desc<F>(
+    instance: &mut GuestInstance,
+    config: &SystemRegistrationConfig<'_>,
+    run_if: Option<(BamRunIfFn, *mut c_void)>,
+    closure: F,
+) -> Result<BamSystemDesc, FfiResult>
+where
+    F: FnMut(&mut ValidatedSystemInvocation<'_>) -> FfiResult + Send + 'static,
+{
+    prepare_system_desc_with(instance, config, run_if, |inst, total, user, res_idx| {
+        allocate_system_trampoline(inst, total, user, res_idx, closure)
+    })
 }
 
 /// Validates and registers a unified [`BamSystemDesc`] on `load_ctx`, tracking all closure state
@@ -1957,6 +2554,78 @@ where
     let register_handle_fn =
         host_slot!(instance.host().api(), register_system_handle).ok_or(FfiResult::UNSUPPORTED)?;
     let desc = prepare_system_desc(instance, config, run_if, closure)?;
+    let mut out = BamSystem::INVALID;
+    // SAFETY: `load_ctx` is active per caller contract, `desc` passed validation with all pointed-to
+    // buffers owned by `instance`, and `&mut out` is aligned writable stack storage.
+    let status = unsafe { register_handle_fn(load_ctx, &desc, &mut out) };
+    if !status.is_ok() {
+        return Err(status);
+    }
+    if !out.is_valid() {
+        return Err(FfiResult::INVALID_ARGUMENT);
+    }
+    Ok(out)
+}
+
+/// Validates and registers a unified [`BamSystemDesc`] backed by a const-bucketed
+/// `system_closure_slice_trampoline<N, F>` on `load_ctx`.
+///
+/// # Safety
+/// `load_ctx` must be a non-null, active [`BamLoadCtx`] belonging to `instance` during
+/// `bamabi_init`.
+pub unsafe fn register_system_slice_closure<const N: usize, F>(
+    instance: &mut GuestInstance,
+    load_ctx: *mut BamLoadCtx,
+    config: &SystemRegistrationConfig<'_>,
+    run_if: Option<(BamRunIfFn, *mut c_void)>,
+    closure: F,
+) -> FfiResult
+where
+    F: FnMut(&mut ValidatedSystemSlice<'_>) -> FfiResult + Send + 'static,
+{
+    if load_ctx.is_null() {
+        return FfiResult::NULL_POINTER;
+    }
+    let Some(register_fn) = instance.host().api().register_system else {
+        return FfiResult::NULL_POINTER;
+    };
+    let desc = match prepare_system_desc_with(instance, config, run_if, |inst, total, user, res| {
+        allocate_system_slice_trampoline::<N, F>(inst, total, user, res, closure)
+    }) {
+        Ok(d) => d,
+        Err(err) => return err,
+    };
+    // SAFETY: `load_ctx` is active per caller contract and `desc` passed full validation with all
+    // pointed-to strings, term slices, and closures owned by `instance`.
+    unsafe { register_fn(load_ctx, &desc) }
+}
+
+/// Validates and registers a unified [`BamSystemDesc`] backed by a const-bucketed
+/// `system_closure_slice_trampoline<N, F>` via `BamHostApi::register_system_handle` (slot 60).
+///
+/// Returns [`FfiResult::UNSUPPORTED`] on ABI `0.2` hosts without allocating closure state.
+///
+/// # Safety
+/// `load_ctx` must be a non-null, active [`BamLoadCtx`] belonging to `instance` during
+/// `bamabi_init`.
+pub unsafe fn register_system_handle_slice_closure<const N: usize, F>(
+    instance: &mut GuestInstance,
+    load_ctx: *mut BamLoadCtx,
+    config: &SystemRegistrationConfig<'_>,
+    run_if: Option<(BamRunIfFn, *mut c_void)>,
+    closure: F,
+) -> Result<BamSystem, FfiResult>
+where
+    F: FnMut(&mut ValidatedSystemSlice<'_>) -> FfiResult + Send + 'static,
+{
+    if load_ctx.is_null() {
+        return Err(FfiResult::NULL_POINTER);
+    }
+    let register_handle_fn =
+        host_slot!(instance.host().api(), register_system_handle).ok_or(FfiResult::UNSUPPORTED)?;
+    let desc = prepare_system_desc_with(instance, config, run_if, |inst, total, user, res| {
+        allocate_system_slice_trampoline::<N, F>(inst, total, user, res, closure)
+    })?;
     let mut out = BamSystem::INVALID;
     // SAFETY: `load_ctx` is active per caller contract, `desc` passed validation with all pointed-to
     // buffers owned by `instance`, and `&mut out` is aligned writable stack storage.

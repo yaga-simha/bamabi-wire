@@ -215,6 +215,10 @@ struct MockV03World {
     rollback_calls: usize,
     sys_host_ctx_calls: AtomicUsize,
     sys_commands_calls: AtomicUsize,
+    iter_column_info_calls: AtomicUsize,
+    res_ticks_calls: AtomicUsize,
+    iter_column_ro_calls: AtomicUsize,
+    iter_column_mut_calls: AtomicUsize,
     next_entity_bits: u64,
     logs: Vec<(u32, String)>,
     faults: Vec<String>,
@@ -283,6 +287,10 @@ impl V03TestHost {
                 rollback_calls: 0,
                 sys_host_ctx_calls: AtomicUsize::new(0),
                 sys_commands_calls: AtomicUsize::new(0),
+                iter_column_info_calls: AtomicUsize::new(0),
+                res_ticks_calls: AtomicUsize::new(0),
+                iter_column_ro_calls: AtomicUsize::new(0),
+                iter_column_mut_calls: AtomicUsize::new(0),
                 next_entity_bits: 1000,
                 logs: Vec::new(),
                 faults: Vec::new(),
@@ -807,6 +815,7 @@ unsafe extern "C" fn host_iter_col_ro(iter: *const BamIter, term_index: usize) -
         return core::ptr::null();
     };
     let world = unsafe { &*state.world };
+    world.iter_column_ro_calls.fetch_add(1, Ordering::Relaxed);
     world.chunks[idx]
         .columns
         .get(&term.component)
@@ -823,6 +832,7 @@ unsafe extern "C" fn host_iter_col_mut(iter: *mut BamIter, term_index: usize) ->
         return core::ptr::null_mut();
     };
     let world = unsafe { &mut *state.world };
+    world.iter_column_mut_calls.fetch_add(1, Ordering::Relaxed);
     world.chunks[idx]
         .columns
         .get_mut(&term.component)
@@ -868,6 +878,7 @@ unsafe extern "C" fn host_iter_col_info(
         return FfiResult::OUT_OF_RANGE;
     };
     let world = unsafe { &*state.world };
+    world.iter_column_info_calls.fetch_add(1, Ordering::Relaxed);
     let Some(meta) = world.comp_meta(term.component) else {
         return FfiResult::NOT_FOUND;
     };
@@ -926,6 +937,7 @@ unsafe extern "C" fn host_res_ticks(
         return FfiResult::OUT_OF_RANGE;
     };
     let world = unsafe { &*state.world };
+    world.res_ticks_calls.fetch_add(1, Ordering::Relaxed);
     let Some((_, ticks)) = world.resources.get(&term.component) else {
         return FfiResult::NOT_FOUND;
     };
@@ -1850,6 +1862,57 @@ fn make_v02_only_host_api(truncated_struct_size: bool) -> BamHostApi {
         cmd_insert_resource: None,
         cmd_remove_resource: None,
     }
+}
+
+/// Mock `BamHostApi::iter_next_chunk_batch` (slot 68) advancing chunks and filling column pointers.
+unsafe extern "C" fn host_iter_next_chunk_batch(
+    iter: *mut BamIter,
+    out_len: *mut usize,
+    out_entities: *mut *const FfiEntity,
+    out_col_ptrs: *mut *mut u8,
+    col_count: usize,
+    _mark_changed_mask: u32,
+) -> FfiBool {
+    let state = unsafe { &mut *iter.cast::<MockIterState>() };
+    let world = unsafe { &mut *state.world };
+    let limit = state
+        .end_chunk_idx
+        .unwrap_or(world.chunks.len())
+        .min(world.chunks.len());
+    while state.next_chunk_idx < limit {
+        let idx = state.next_chunk_idx;
+        state.next_chunk_idx += 1;
+        let len = world.chunks[idx].entities.len();
+        if len > 0 {
+            state.active_chunk_idx = Some(idx);
+            unsafe { *out_len = len };
+            if !out_entities.is_null() {
+                unsafe { *out_entities = world.chunks[idx].entities.as_ptr() };
+            }
+            for term_idx in 0..col_count {
+                let ptr = if let Some(term) = state.terms.get(term_idx) {
+                    world.chunks[idx]
+                        .columns
+                        .get_mut(&term.component)
+                        .map_or(core::ptr::null_mut(), |w| w.as_mut_ptr().cast::<u8>())
+                } else {
+                    core::ptr::null_mut()
+                };
+                unsafe { *out_col_ptrs.add(term_idx) = ptr };
+            }
+            return FfiBool::TRUE;
+        }
+    }
+    state.active_chunk_idx = None;
+    unsafe { *out_len = 0 };
+    FfiBool::FALSE
+}
+
+/// Constructs a complete ABI `0.3.0` `BamHostApi` wired with slot 68 (`iter_next_chunk_batch`).
+fn make_v03_host_api_with_batch() -> BamHostApi {
+    let mut api = make_v03_host_api();
+    api.iter_next_chunk_batch = Some(host_iter_next_chunk_batch);
+    api
 }
 
 /// Constructs a complete 68-slot ABI `0.3.0` `BamHostApi` wired to all `host_*` callbacks.
@@ -3501,29 +3564,18 @@ fn sixteen_term_query_tuple_and_eight_branch_or() {
 /// once per tick when `ctx.commands()` or `ctx.intern_symbol()` / `ctx.host()` are invoked.
 #[test]
 fn system_context_defers_sys_host_ctx_and_sys_commands_on_noop_and_queries() {
-    #[repr(C)]
-    #[derive(Clone, Copy, Default, AbiPod, GuestComponent)]
-    #[guest_component(name = "lazy_test::A")]
-    struct CompA(u32);
-
-    #[repr(C)]
-    #[derive(Clone, Copy, Default, AbiPod, GuestComponent)]
-    #[guest_component(name = "lazy_test::B")]
-    struct CompB(u32);
-
-    #[repr(C)]
-    #[derive(Clone, Copy, Default, AbiPod, GuestComponent)]
-    #[guest_component(name = "lazy_test::C")]
-    struct CompC(u32);
+    define_pod_component!(struct CompA { v: u32 } => c"lazy_test::A");
+    define_pod_component!(struct CompB { v: u32 } => c"lazy_test::B");
+    define_pod_component!(struct CompC { v: u32 } => c"lazy_test::C");
 
     let mut host = V03TestHost::new();
     let ha = host.expose_component::<CompA>("lazy_test::A", CompA::UUID, 0, &[]);
     let hb = host.expose_component::<CompB>("lazy_test::B", CompB::UUID, 0, &[]);
     let hc = host.expose_component::<CompC>("lazy_test::C", CompC::UUID, 0, &[]);
     let mut chunk = MockChunk::new(vec![FfiEntity::from_bits(1)]);
-    chunk.insert_dense(ha, &[CompA(1)]);
-    chunk.insert_dense(hb, &[CompB(2)]);
-    chunk.insert_dense(hc, &[CompC(3)]);
+    chunk.insert_dense(ha, &[CompA { v: 1 }]);
+    chunk.insert_dense(hb, &[CompB { v: 2 }]);
+    chunk.insert_dense(hc, &[CompC { v: 3 }]);
     host.chunks.push(chunk);
 
     let inst = host
@@ -4088,6 +4140,264 @@ fn commands_clone_entity_resource_insert_remove_and_clone_to() {
             RecordedCmd::RemoveResource { resource: h_res },
         ]
     );
+
+    host.unload(inst);
+}
+
+/// Verifies M3 persistent `BamColumnInfo` & term caching for `TypedChunkIter` across multiple
+/// ticks:
+/// 1. Tick 1 calls `iter_column_info` at most once per term (not once per chunk) and uses slot 68
+///    (`0` legacy `iter_column_readonly` / `iter_column_mutable` calls).
+/// 2. Tick 2+ makes **`0` steady-state `iter_column_info` calls**.
+/// 3. Dynamic branching mismatch (`TypeId` swap on the same slot) misses cache and returns
+///    `FfiResult::TYPE_MISMATCH` without poisoning subsequent valid ticks.
+/// 4. `QueryTuple::StaticKey` produces pairwise-distinct `TypeId`s across `&T`, `&mut T`,
+///    `Option<&T>`, `Option<&mut T>`, `With<T>`, `Without<T>`, `Changed<T>`, `Added<T>`.
+/// 5. `par_for_each_chunk_readonly` reads the frozen cache snapshot with `0` `iter_column_info` calls.
+/// 6. Optional duplicate component `(&mut Pos, Option<&mut Pos>)` present in chunk still catches
+///    `ACCESS_CONFLICT` even when metadata is cached on tick 2!
+#[test]
+fn typed_chunk_iter_caches_column_info_across_ticks_and_catches_mismatch() {
+    use core::any::TypeId;
+    use std::sync::Arc;
+
+    define_pod_component!(struct CachePos { x: f32, y: f32 } => c"m3::CachePos");
+    define_pod_component!(struct CacheVel { vx: f32, vy: f32 } => c"m3::CacheVel");
+    define_pod_component!(struct WrongPos { x: f64, y: f64 } => c"m3::WrongPos");
+
+    // Verify `StaticKey` TypeIds are strictly distinct across all access modes.
+    let keys = [
+        TypeId::of::<<&CachePos as QueryTuple>::StaticKey>(),
+        TypeId::of::<<&mut CachePos as QueryTuple>::StaticKey>(),
+        TypeId::of::<<Option<&CachePos> as QueryTuple>::StaticKey>(),
+        TypeId::of::<<Option<&mut CachePos> as QueryTuple>::StaticKey>(),
+        TypeId::of::<<With<CachePos> as QueryTuple>::StaticKey>(),
+        TypeId::of::<<Without<CachePos> as QueryTuple>::StaticKey>(),
+        TypeId::of::<<Changed<CachePos> as QueryTuple>::StaticKey>(),
+        TypeId::of::<<Added<CachePos> as QueryTuple>::StaticKey>(),
+    ];
+    for i in 0..keys.len() {
+        for j in (i + 1)..keys.len() {
+            assert_ne!(keys[i], keys[j], "StaticKey collision at ({i}, {j})");
+        }
+    }
+
+    let mut host = V03TestHost::with_api(make_v03_host_api_with_batch());
+    let h_pos = host.expose_component::<CachePos>("m3::CachePos", CachePos::UUID, 0, &[]);
+    let h_vel = host.expose_component::<CacheVel>("m3::CacheVel", CacheVel::UUID, 0, &[]);
+
+    // 3 non-empty chunks so tick 1 proves per-query caching (2 info calls, not 2 * 3 = 6).
+    for c_idx in 0..3u64 {
+        let mut chunk = MockChunk::new(vec![
+            FfiEntity::from_bits(c_idx * 10 + 1),
+            FfiEntity::from_bits(c_idx * 10 + 2),
+        ]);
+        chunk.insert_dense(
+            h_pos,
+            &[CachePos { x: 1.0, y: 2.0 }, CachePos { x: 3.0, y: 4.0 }],
+        );
+        chunk.insert_dense(
+            h_vel,
+            &[CacheVel { vx: 0.5, vy: 1.5 }, CacheVel { vx: 2.5, vy: 3.5 }],
+        );
+        host.chunks.push(chunk);
+    }
+
+    let sys0_tick = Arc::new(AtomicUsize::new(0));
+    let sys0_tick_clone = Arc::clone(&sys0_tick);
+
+    let inst = host
+        .load_fn(c"m3_typed_cache_mod", move |app| {
+            // System 0: (&mut CachePos, &CacheVel) across ticks 1..=4 (tick 3 swaps to WrongPos).
+            let rc = app
+                .system(c"dense_cached_sys")
+                .query_typed::<(&mut CachePos, &CacheVel)>()
+                .build(move |ctx| {
+                    let tick = sys0_tick_clone.fetch_add(1, Ordering::Relaxed) + 1;
+                    if tick == 3 {
+                        return ctx
+                            .single_query::<(&mut WrongPos, &CacheVel)>()
+                            .for_each(|_| FfiResult::OK);
+                    }
+                    ctx.single_query::<(&mut CachePos, &CacheVel)>().for_each(
+                        |(positions, velocities)| {
+                            for (p, v) in positions.iter_mut().zip(velocities.iter()) {
+                                p.x += v.vx;
+                                p.y += v.vy;
+                            }
+                        },
+                    )
+                });
+            if !rc.is_ok() {
+                return rc;
+            }
+
+            // System 1: Read-only query warming cache on tick 1, then running `par_for_each_chunk_readonly`
+            // on tick 2 with 0 `iter_column_info` calls across workers.
+            let sys1_tick = AtomicUsize::new(0);
+            let rc = app
+                .system(c"par_ro_cached_sys")
+                .query_typed::<(&CachePos, &CacheVel)>()
+                .build(move |ctx| {
+                    let tick = sys1_tick.fetch_add(1, Ordering::Relaxed) + 1;
+                    if tick == 1 {
+                        ctx.single_query::<(&CachePos, &CacheVel)>()
+                            .for_each(|_| FfiResult::OK)
+                    } else {
+                        ctx.single_query::<(&CachePos, &CacheVel)>()
+                            .par_for_each_chunk_readonly(|(pos, vel)| {
+                                assert_eq!(pos.len(), vel.len());
+                                FfiResult::OK
+                            })
+                    }
+                });
+            if !rc.is_ok() {
+                return rc;
+            }
+
+            // System 2: Hostile duplicate optional component `(&mut CachePos, Option<&mut CachePos>)`.
+            app.system(c"dup_optional_write_sys")
+                .query(|q| q.write::<CachePos>().optional_write::<CachePos>())
+                .build(|ctx| {
+                    ctx.single_query::<(&mut CachePos, Option<&mut CachePos>)>()
+                        .for_each(|_| FfiResult::OK)
+                })
+        })
+        .unwrap();
+
+    // Tick 1 of System 0 (3 chunks): <= 2 `iter_column_info` calls, 0 legacy col calls!
+    assert_eq!(host.run_system(0), FfiResult::OK);
+    assert_eq!(host.iter_column_info_calls.load(Ordering::Relaxed), 2);
+    assert_eq!(host.iter_column_ro_calls.load(Ordering::Relaxed), 0);
+    assert_eq!(host.iter_column_mut_calls.load(Ordering::Relaxed), 0);
+
+    // Tick 2 of System 0 (3 chunks): 0 steady-state `iter_column_info` calls!
+    assert_eq!(host.run_system(0), FfiResult::OK);
+    assert_eq!(host.iter_column_info_calls.load(Ordering::Relaxed), 2);
+    assert_eq!(host.iter_column_ro_calls.load(Ordering::Relaxed), 0);
+    assert_eq!(host.iter_column_mut_calls.load(Ordering::Relaxed), 0);
+
+    // Tick 3 of System 0 (`WrongPos` mismatch): returns `TYPE_MISMATCH` without extra FFI (hits col_infos).
+    assert_eq!(host.run_system(0), FfiResult::TYPE_MISMATCH);
+    assert_eq!(host.iter_column_info_calls.load(Ordering::Relaxed), 2);
+
+    // Tick 4 of System 0: cache wasn't poisoned by tick 3's mismatch; still 0 `iter_column_info` calls!
+    assert_eq!(host.run_system(0), FfiResult::OK);
+    assert_eq!(host.iter_column_info_calls.load(Ordering::Relaxed), 2);
+
+    // Verify math from ticks 1, 2, 4 (3 updates of +vx/+vy):
+    let updated = host.chunks[0].read_dense::<CachePos>(h_pos);
+    assert_eq!(
+        updated,
+        vec![CachePos { x: 2.5, y: 6.5 }, CachePos { x: 10.5, y: 14.5 }]
+    );
+
+    // System 1: Tick 1 warms cache (2 calls), Tick 2 `par_for_each_chunk_readonly` makes 0 calls!
+    let before_sys1 = host.iter_column_info_calls.load(Ordering::Relaxed);
+    assert_eq!(host.run_system(1), FfiResult::OK);
+    assert_eq!(
+        host.iter_column_info_calls.load(Ordering::Relaxed) - before_sys1,
+        2
+    );
+    let before_sys1_t2 = host.iter_column_info_calls.load(Ordering::Relaxed);
+    assert_eq!(host.run_system(1), FfiResult::OK);
+    assert_eq!(
+        host.iter_column_info_calls.load(Ordering::Relaxed) - before_sys1_t2,
+        0
+    );
+
+    // System 2: Hostile duplicate optional component (`h_pos` present in chunk) rejected with ACCESS_CONFLICT,
+    // even on tick 2 when `BamColumnInfo` is cached!
+    assert_eq!(host.run_system(2), FfiResult::ACCESS_CONFLICT);
+    let before_sys2_t2 = host.iter_column_info_calls.load(Ordering::Relaxed);
+    assert_eq!(host.run_system(2), FfiResult::ACCESS_CONFLICT);
+    assert_eq!(
+        host.iter_column_info_calls.load(Ordering::Relaxed) - before_sys2_t2,
+        0
+    );
+
+    host.unload(inst);
+}
+
+/// Verifies M3 persistent resource metadata caching for `ctx.res_with_ticks::<R>(0)`:
+/// 1. Tick 1 (64-call loop): exactly `1` `iter_column_info` call (call #1) and `0` on calls `2..=64`,
+///    with `res_ticks_calls == 64`.
+/// 2. Tick 2 (64-call loop): **`0` steady-state `iter_column_info` calls**, `res_ticks_calls == 64`.
+/// 3. Tick 3 (mismatched resource type `OtherParams`): returns `Err(FfiResult::NOT_FOUND)` cleanly
+///    without aliasing or poisoning the cache for Tick 4.
+#[test]
+fn res_with_ticks_64_call_loop_makes_zero_steady_state_iter_column_info_calls() {
+    use std::sync::Arc;
+
+    define_pod_component!(struct SimParamsRes { dt: f32, tick: u32 } => c"m3::SimParamsRes");
+    define_pod_component!(struct OtherParamsRes { scale: f32, mode: u32 } => c"m3::OtherParamsRes");
+
+    let mut host = V03TestHost::with_api(make_v03_host_api_with_batch());
+    let h_sim =
+        host.expose_component::<SimParamsRes>("m3::SimParamsRes", SimParamsRes::UUID, 0, &[]);
+    let _h_other =
+        host.expose_component::<OtherParamsRes>("m3::OtherParamsRes", OtherParamsRes::UUID, 0, &[]);
+    host.set_resource(
+        h_sim,
+        SimParamsRes { dt: 0.016, tick: 7 },
+        BamChangeTicks {
+            added: 1,
+            changed: 6,
+            last_run: 5,
+            this_run: 10,
+        },
+    );
+
+    let tick_counter = Arc::new(AtomicUsize::new(0));
+    let tick_clone = Arc::clone(&tick_counter);
+
+    let inst = host
+        .load_fn(c"m3_res_cache_mod", move |app| {
+            app.system(c"res_roundtrip_sys")
+                .query(|q| q.resource_read::<SimParamsRes>())
+                .build(move |ctx| {
+                    let tick = tick_clone.fetch_add(1, Ordering::Relaxed) + 1;
+                    if tick == 3 {
+                        assert_eq!(
+                            ctx.res_with_ticks::<OtherParamsRes>(0).err(),
+                            Some(FfiResult::NOT_FOUND)
+                        );
+                        return FfiResult::OK;
+                    }
+                    let mut sum = 0u32;
+                    for _ in 0..64 {
+                        let res = match ctx.res_with_ticks::<SimParamsRes>(0) {
+                            Ok(r) => r,
+                            Err(err) => return err,
+                        };
+                        assert_eq!(res.tick, 7);
+                        assert!((res.dt - 0.016).abs() < 1e-6);
+                        sum = sum.wrapping_add(res.ticks().this_run + res.tick);
+                    }
+                    assert_eq!(sum, 64 * (10 + 7));
+                    FfiResult::OK
+                })
+        })
+        .unwrap();
+
+    // Tick 1 (64 calls): 1 `iter_column_info` call, 64 `res_ticks` calls.
+    assert_eq!(host.run_system(0), FfiResult::OK);
+    assert_eq!(host.iter_column_info_calls.load(Ordering::Relaxed), 1);
+    assert_eq!(host.res_ticks_calls.load(Ordering::Relaxed), 64);
+
+    // Tick 2 (64 calls): 0 steady-state `iter_column_info` calls, 64 `res_ticks` calls!
+    assert_eq!(host.run_system(0), FfiResult::OK);
+    assert_eq!(host.iter_column_info_calls.load(Ordering::Relaxed), 1);
+    assert_eq!(host.res_ticks_calls.load(Ordering::Relaxed), 128);
+
+    // Tick 3 (mismatched `OtherParamsRes`): rejects cleanly without extra FFI or cache poisoning.
+    assert_eq!(host.run_system(0), FfiResult::OK);
+    assert_eq!(host.iter_column_info_calls.load(Ordering::Relaxed), 1);
+
+    // Tick 4 (64 calls of `SimParamsRes` again): still 0 steady-state `iter_column_info` calls!
+    assert_eq!(host.run_system(0), FfiResult::OK);
+    assert_eq!(host.iter_column_info_calls.load(Ordering::Relaxed), 1);
+    assert_eq!(host.res_ticks_calls.load(Ordering::Relaxed), 193);
 
     host.unload(inst);
 }

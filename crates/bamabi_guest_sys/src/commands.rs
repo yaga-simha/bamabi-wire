@@ -3,15 +3,15 @@
 use core::{ffi::c_void, marker::PhantomData};
 
 use bamabi_sys::{
-    AbiPod, BamCommands, BamComponent, BamEventKind, BamObserverDesc, BamTermDesc, BamTriggerDesc,
-    FfiAssetHandle, FfiEntity, FfiResult,
+    AbiPod, BamCommands, BamComponent, BamEventKind, BamHostApi, BamHostCtx, BamObserverDesc,
+    BamTermDesc, BamTriggerDesc, FfiAssetHandle, FfiEntity, FfiResult,
 };
 
 use crate::{
     host::Host,
     trampoline::{
-        allocate_runtime_lifecycle_observer_desc, allocate_runtime_observer_desc,
-        allocate_runtime_observer_mut_desc,
+        LazyInvocationHost, allocate_runtime_lifecycle_observer_desc,
+        allocate_runtime_observer_desc, allocate_runtime_observer_mut_desc,
     },
 };
 
@@ -206,14 +206,24 @@ impl<'a> SpawnEntry<'a> {
     }
 }
 
-/// Validates a [`SpawnEntry`] against `host.component_layout_info(entry.component)` (failing
-/// closed on layout mismatch or `UNSUPPORTED` when safe layout metadata is present).
-pub(crate) fn validate_spawn_entry(host: &Host, entry: &SpawnEntry<'_>) -> Result<(), FfiResult> {
+/// Validates a [`SpawnEntry`] against `Host::component_layout_info_with_ctx` (failing closed on
+/// layout mismatch or `UNSUPPORTED` when safe layout metadata is present), resolving `host_ctx`
+/// lazily only when `entry.size` is `Some`.
+///
+/// # Safety
+/// `resolve_ctx` must return a valid active [`BamHostCtx`] matching `api` for the duration of this call.
+pub(crate) unsafe fn validate_spawn_entry_with_ctx(
+    api: &BamHostApi,
+    resolve_ctx: impl FnOnce() -> *const BamHostCtx,
+    entry: &SpawnEntry<'_>,
+) -> Result<(), FfiResult> {
     if !entry.component.is_valid() {
         return Err(FfiResult::INVALID_COMPONENT);
     }
     if let Some(expected_size) = entry.size {
-        let info = host.component_layout_info(entry.component)?;
+        // SAFETY: Caller guarantees `resolve_ctx()` returns a valid active `BamHostCtx` matching `api`.
+        let info =
+            unsafe { Host::component_layout_info_with_ctx(api, resolve_ctx(), entry.component) }?;
         if info.size != expected_size {
             return Err(FfiResult::TYPE_MISMATCH);
         }
@@ -227,6 +237,13 @@ pub(crate) fn validate_spawn_entry(host: &Host, entry: &SpawnEntry<'_>) -> Resul
         }
     }
     Ok(())
+}
+
+/// Validates a [`SpawnEntry`] against `host.component_layout_info(entry.component)` (failing
+/// closed on layout mismatch or `UNSUPPORTED` when safe layout metadata is present).
+pub(crate) fn validate_spawn_entry(host: &Host, entry: &SpawnEntry<'_>) -> Result<(), FfiResult> {
+    // SAFETY: `host.host_ctx()` is a valid active `BamHostCtx` matching `host.api()`.
+    unsafe { validate_spawn_entry_with_ctx(host.api(), || host.host_ctx(), entry) }
 }
 
 /// Columnar slice descriptor `(BamComponent, *const u8, len)` for multi-entity
@@ -346,14 +363,15 @@ impl<'a> SpawnBatchColumn<'a> {
     }
 }
 
-/// Validates a [`SpawnBatchColumn`] against `host.component_layout_info(col.component)` and
-/// checks buffer bounds before passing columnar pointers to `BamHostApi::cmd_spawn_batch`.
+/// Validates a [`SpawnBatchColumn`] against `Host::component_layout_info_with_ctx` and checks
+/// buffer bounds before passing columnar pointers to `BamHostApi::cmd_spawn_batch`, invoking
+/// `resolve_ctx` only when `col.elem_size` is `Some`.
 ///
-/// Verifies that `col.component` is valid, `col.entity_count >= entity_count`, layout `(size,
-/// align)` matches the host's registered metadata when statically known, non-empty columns are
-/// non-null, and `entity_count * expected_size` does not overflow `isize::MAX`.
-pub(crate) fn validate_spawn_batch_column(
-    host: &Host,
+/// # Safety
+/// `resolve_ctx` must return a valid active [`BamHostCtx`] matching `api` for the duration of this call.
+pub(crate) unsafe fn validate_spawn_batch_column_with_ctx(
+    api: &BamHostApi,
+    resolve_ctx: impl FnOnce() -> *const BamHostCtx,
     col: &SpawnBatchColumn<'_>,
     entity_count: usize,
 ) -> FfiResult {
@@ -364,7 +382,10 @@ pub(crate) fn validate_spawn_batch_column(
         return FfiResult::INVALID_ARGUMENT;
     }
     if let Some(expected_size) = col.elem_size {
-        let info = match host.component_layout_info(col.component) {
+        // SAFETY: Caller guarantees `resolve_ctx()` returns a valid active `BamHostCtx` matching `api`.
+        let info = match unsafe {
+            Host::component_layout_info_with_ctx(api, resolve_ctx(), col.component)
+        } {
             Ok(i) => i,
             Err(err) => return err,
         };
@@ -391,10 +412,29 @@ pub(crate) fn validate_spawn_batch_column(
     FfiResult::OK
 }
 
+/// Validates a [`SpawnBatchColumn`] against `host.component_layout_info(col.component)` and
+/// checks buffer bounds before passing columnar pointers to `BamHostApi::cmd_spawn_batch`.
+///
+/// Verifies that `col.component` is valid, `col.entity_count >= entity_count`, layout `(size,
+/// align)` matches the host's registered metadata when statically known, non-empty columns are
+/// non-null, and `entity_count * expected_size` does not overflow `isize::MAX`.
+#[cfg(kani)]
+pub(crate) fn validate_spawn_batch_column(
+    host: &Host,
+    col: &SpawnBatchColumn<'_>,
+    entity_count: usize,
+) -> FfiResult {
+    // SAFETY: `host.host_ctx()` is a valid active `BamHostCtx` matching `host.api()`.
+    unsafe {
+        validate_spawn_batch_column_with_ctx(host.api(), || host.host_ctx(), col, entity_count)
+    }
+}
+
 /// Validated deferred command buffer wrapper bound to an active system invocation.
 pub struct ValidatedCommands<'a> {
     raw: *mut BamCommands,
     host: &'a Host,
+    lazy_host: Option<&'a LazyInvocationHost<'a>>,
 }
 
 impl<'a> ValidatedCommands<'a> {
@@ -408,7 +448,29 @@ impl<'a> ValidatedCommands<'a> {
     /// system invocation on `host` and must not outlive `'a`.
     #[inline]
     pub const unsafe fn from_raw(raw: *mut BamCommands, host: &'a Host) -> Self {
-        Self { raw, host }
+        Self {
+            raw,
+            host,
+            lazy_host: None,
+        }
+    }
+
+    /// Wraps a raw [`BamCommands`] pointer paired with an optional lazy per-tick host resolver.
+    ///
+    /// # Safety
+    /// If `raw` is non-null, it must point to the active [`BamCommands`] belonging to the current
+    /// system invocation on `host` and must not outlive `'a`.
+    #[inline]
+    pub(crate) const unsafe fn from_raw_with_lazy_host(
+        raw: *mut BamCommands,
+        host: &'a Host,
+        lazy_host: Option<&'a LazyInvocationHost<'a>>,
+    ) -> Self {
+        Self {
+            raw,
+            host,
+            lazy_host,
+        }
     }
 
     /// Constructs a disabled command buffer (`raw = null`) that rejects operations with
@@ -418,6 +480,7 @@ impl<'a> ValidatedCommands<'a> {
         Self {
             raw: core::ptr::null_mut(),
             host,
+            lazy_host: None,
         }
     }
 
@@ -433,10 +496,30 @@ impl<'a> ValidatedCommands<'a> {
         self.raw
     }
 
-    /// Returns the cached [`Host`] table for this system invocation.
+    /// Returns the init-time base [`Host`] table without invoking `BamHostApi::sys_host_ctx`.
     #[inline]
-    pub const fn host(&self) -> &'a Host {
+    pub const fn base_host(&self) -> &'a Host {
         self.host
+    }
+
+    /// Resolves and caches the active per-tick [`BamHostCtx`] pointer at most once per invocation
+    /// without materializing a full [`Host`] copy.
+    #[inline]
+    pub(crate) fn resolve_ctx(&self) -> *const BamHostCtx {
+        match self.lazy_host {
+            Some(lazy) => lazy.resolve_ctx(),
+            None => self.host.host_ctx(),
+        }
+    }
+
+    /// Returns the active [`Host`] table for this system invocation, lazily resolving
+    /// `BamHostApi::sys_host_ctx` on demand when backed by a trampoline frame.
+    #[inline]
+    pub fn host(&self) -> &'a Host {
+        match self.lazy_host {
+            Some(lazy) => lazy.resolve(),
+            None => self.host,
+        }
     }
 
     /// Reserves a fresh empty entity atomically and returns its [`FfiEntity`] identifier.
@@ -460,6 +543,7 @@ impl<'a> ValidatedCommands<'a> {
     /// pointers into stack scratch arrays when `entries.len() <= INLINE_SPAWN_CAP` (zero heap
     /// allocation on hot paths) or falls back to temporary `Vec`s for larger archetypes, and
     /// forwards to [`Self::spawn_raw`] or [`Self::spawn_persistent_raw`].
+    #[inline]
     fn spawn_entries_impl(
         &mut self,
         entries: &[SpawnEntry<'_>],
@@ -482,13 +566,16 @@ impl<'a> ValidatedCommands<'a> {
             let mut ptrs =
                 [const { core::mem::MaybeUninit::<*const u8>::uninit() }; INLINE_SPAWN_CAP];
             for (i, entry) in entries.iter().enumerate() {
-                validate_spawn_entry(self.host, entry)?;
+                // SAFETY: `self.resolve_ctx()` returns a valid active `BamHostCtx` matching `self.host.api()`.
+                unsafe {
+                    validate_spawn_entry_with_ctx(self.host.api(), || self.resolve_ctx(), entry)?;
+                }
                 comps[i].write(entry.component);
                 ptrs[i].write(entry.data_ptr);
             }
             // SAFETY: The loop above initialized `comps[0..entries.len()]` and
             // `ptrs[0..entries.len()]`, `MaybeUninit<T>` is `#[repr(transparent)]`, and each safe
-            // `SpawnEntry` passed `validate_spawn_entry` while raw entries satisfy `from_raw`.
+            // `SpawnEntry` passed `validate_spawn_entry_with_ctx` while raw entries satisfy `from_raw`.
             unsafe {
                 let c = core::slice::from_raw_parts(
                     comps.as_ptr().cast::<BamComponent>(),
@@ -506,7 +593,10 @@ impl<'a> ValidatedCommands<'a> {
             let mut comps = Vec::with_capacity(entries.len());
             let mut ptrs = Vec::with_capacity(entries.len());
             for entry in entries {
-                validate_spawn_entry(self.host, entry)?;
+                // SAFETY: `self.resolve_ctx()` returns a valid active `BamHostCtx` matching `self.host.api()`.
+                unsafe {
+                    validate_spawn_entry_with_ctx(self.host.api(), || self.resolve_ctx(), entry)?;
+                }
                 comps.push(entry.component);
                 ptrs.push(entry.data_ptr);
             }
@@ -524,6 +614,7 @@ impl<'a> ValidatedCommands<'a> {
     /// Reserves an entity and batch-inserts `entries` in a single archetype placement via
     /// `BamHostApi::cmd_spawn`, validating each safe [`SpawnEntry`]'s layout against
     /// `Host::component_layout_info`.
+    #[inline]
     pub fn spawn(&mut self, entries: &[SpawnEntry<'_>]) -> Result<FfiEntity, FfiResult> {
         self.spawn_entries_impl(entries, false)
     }
@@ -734,6 +825,7 @@ impl<'a> ValidatedCommands<'a> {
     /// Reserves an entity that survives mod unload (`BamHostApi::cmd_spawn_persistent`) and
     /// batch-inserts `entries`, validating each safe [`SpawnEntry`]'s layout against
     /// `Host::component_layout_info`.
+    #[inline]
     pub fn spawn_persistent(&mut self, entries: &[SpawnEntry<'_>]) -> Result<FfiEntity, FfiResult> {
         self.spawn_entries_impl(entries, true)
     }
@@ -793,7 +885,15 @@ impl<'a> ValidatedCommands<'a> {
             return FfiResult::INVALID_ARGUMENT;
         }
         for col in columns {
-            let status = validate_spawn_batch_column(self.host, col, entity_count);
+            // SAFETY: `self.resolve_ctx()` returns a valid active `BamHostCtx` matching `self.host.api()`.
+            let status = unsafe {
+                validate_spawn_batch_column_with_ctx(
+                    self.host.api(),
+                    || self.resolve_ctx(),
+                    col,
+                    entity_count,
+                )
+            };
             if !status.is_ok() {
                 return status;
             }
@@ -1177,6 +1277,7 @@ impl<'a> ValidatedCommands<'a> {
         ValidatedCommands {
             raw: self.raw,
             host: self.host,
+            lazy_host: self.lazy_host,
         }
     }
 
@@ -1337,7 +1438,10 @@ impl<'a> ValidatedCommands<'a> {
         let Some(insert_res_fn) = host_slot!(self.host.api(), cmd_insert_resource) else {
             return FfiResult::UNSUPPORTED;
         };
-        let info = match self.host.component_layout_info(resource) {
+        // SAFETY: `self.resolve_ctx()` returns a valid active `BamHostCtx` matching `self.host.api()`.
+        let info = match unsafe {
+            Host::component_layout_info_with_ctx(self.host.api(), self.resolve_ctx(), resource)
+        } {
             Ok(info) => info,
             Err(err) => return err,
         };
