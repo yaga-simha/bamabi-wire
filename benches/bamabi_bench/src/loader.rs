@@ -217,6 +217,14 @@ impl DynamicLibrary {
     }
 }
 
+/// Optional message benchmark system names recognized if exported by a guest in
+/// [`ScheduleId::UPDATE`].
+pub(crate) const OPTIONAL_MESSAGE_SYSTEMS: [&str; 3] = [
+    "bench_message_idle_poll",
+    "bench_message_burst_256",
+    "bench_message_burst_4096",
+];
+
 /// Resolved system indices registered by a loaded guest module.
 #[derive(Debug, Copy, Clone)]
 pub(crate) struct GuestSystems {
@@ -224,6 +232,9 @@ pub(crate) struct GuestSystems {
     pub(crate) dense_update: usize,
     pub(crate) command_burst: usize,
     pub(crate) host_api_roundtrip: usize,
+    pub(crate) message_idle_poll: Option<usize>,
+    pub(crate) message_burst_256: Option<usize>,
+    pub(crate) message_burst_4096: Option<usize>,
 }
 
 /// Metadata extracted from a guest's [`BamManifest`].
@@ -391,11 +402,27 @@ impl LoadedGuest {
             }
             indices[slot] = idx;
         }
+        let mut opt_indices = [None; 3];
+        for (slot, sys_name) in OPTIONAL_MESSAGE_SYSTEMS.iter().enumerate() {
+            if let Some(idx) = world.find_system(sys_name) {
+                let sched = world.systems[idx].schedule;
+                if sched != ScheduleId::UPDATE {
+                    return Err(format!(
+                        "{} (`{mod_name}`): system `{sys_name}` registered in schedule {sched}, expected UPDATE",
+                        path.display()
+                    ));
+                }
+                opt_indices[slot] = Some(idx);
+            }
+        }
         Ok(GuestSystems {
             noop: indices[0],
             dense_update: indices[1],
             command_burst: indices[2],
             host_api_roundtrip: indices[3],
+            message_idle_poll: opt_indices[0],
+            message_burst_256: opt_indices[1],
+            message_burst_4096: opt_indices[2],
         })
     }
 

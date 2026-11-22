@@ -422,6 +422,36 @@ enum MockMsgItem {
     Ptr(*const c_void),
 }
 
+impl Default for MockMsgItem {
+    fn default() -> Self {
+        Self::Bytes(Vec::new())
+    }
+}
+
+/// Stateful cursor iterator advancing `cursor` before yielding and draining consumed items on drop.
+struct StatefulCursorIter<'a, T: Default> {
+    items: &'a mut Vec<T>,
+    cursor: usize,
+}
+
+impl<T: Default> Iterator for StatefulCursorIter<'_, T> {
+    type Item = T;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let slot = self.items.get_mut(self.cursor)?;
+        self.cursor += 1;
+        Some(core::mem::take(slot))
+    }
+}
+
+impl<T: Default> Drop for StatefulCursorIter<'_, T> {
+    fn drop(&mut self) {
+        if self.cursor > 0 {
+            self.items.drain(..self.cursor);
+        }
+    }
+}
+
 /// Per-query simulated chunk iterator state passed as `*mut BamIter` in [`MockHost`].
 struct MockIterState {
     host: *mut MockHost,
@@ -1013,9 +1043,13 @@ unsafe extern "C" fn mock_msg_read_batch(
         unsafe { *out_read = 0 };
         return FfiResult::OK;
     };
-    let take = max_count.min(queue.len());
+    let cursor_iter = StatefulCursorIter {
+        items: queue,
+        cursor: 0,
+    };
+    let mut take = 0usize;
     let mut byte_offset = 0usize;
-    for item in queue.drain(..take) {
+    for item in cursor_iter.take(max_count) {
         match item {
             MockMsgItem::Bytes(bytes) => {
                 if !bytes.is_empty() && !out_buf.is_null() {
@@ -1043,6 +1077,7 @@ unsafe extern "C" fn mock_msg_read_batch(
                 }
             }
         }
+        take += 1;
     }
     unsafe { *out_read = take };
     FfiResult::OK

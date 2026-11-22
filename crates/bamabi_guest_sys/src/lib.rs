@@ -272,8 +272,8 @@ pub use instance::{
     resolve_mod_component, shutdown_guest_instance,
 };
 pub use iter::{
-    BatchColCache, ChunkColumnDispenser, QuerySlotScratch, SparseRows, SparseRowsIter,
-    SparseRowsMut, UuidFilter, ValidatedIter, ValidatedSlice, ValidatedSliceMut,
+    BatchColCache, ChunkColumnDispenser, DrainOptions, QuerySlotScratch, SparseRows,
+    SparseRowsIter, SparseRowsMut, UuidFilter, ValidatedIter, ValidatedSlice, ValidatedSliceMut,
 };
 pub use panic::{catch_guest_bool, catch_guest_result, catch_guest_unit};
 pub use trampoline::{

@@ -7,8 +7,15 @@ license.workspace = true
 authors.workspace = true
 publish = false
 
+[features]
+default = []
+hotpath = ["dep:hotpath", "hotpath/hotpath"]
+hotpath-alloc = ["hotpath", "hotpath/hotpath-alloc"]
+
 [dependencies]
 bamabi_sys = { workspace = true }
+bamabi_guest = { path = "../../crates/bamabi_guest", features = ["derive"] }
+hotpath = { version = "0.32.1", optional = true }
 
 [lints]
 workspace = true

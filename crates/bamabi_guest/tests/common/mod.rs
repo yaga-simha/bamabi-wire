@@ -1332,6 +1332,22 @@ unsafe extern "C" fn host_sys_entity_get_mut(
     core::ptr::null_mut()
 }
 
+/// Stateful cursor over a slice advancing `cursor` inside `Iterator::next` before yielding.
+struct StatefulSliceCursor<'a, T> {
+    slice: &'a [T],
+    cursor: &'a mut usize,
+}
+
+impl<'a, T> Iterator for StatefulSliceCursor<'a, T> {
+    type Item = &'a T;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let item = self.slice.get(*self.cursor)?;
+        *self.cursor += 1;
+        Some(item)
+    }
+}
+
 /// Mock `BamHostApi::msg_read_batch` draining unread messages for the reader's per-system cursor.
 unsafe extern "C" fn host_msg_read_batch(
     iter: *mut BamIter,
@@ -1360,15 +1376,17 @@ unsafe extern "C" fn host_msg_read_batch(
         return FfiResult::NULL_POINTER;
     }
     let cursor_key = (state.sys_idx, state.query_idx, term_index);
-    let cursor = world.msg_cursors.get(&cursor_key).copied().unwrap_or(0);
     let Some(stream) = world.messages.get(&term.component) else {
         return FfiResult::OK;
     };
-    let avail = stream.len().saturating_sub(cursor);
-    let to_copy = avail.min(max_count);
-    for i in 0..to_copy {
+    let cursor_ref = world.msg_cursors.entry(cursor_key).or_insert(0);
+    let cursor_iter = StatefulSliceCursor {
+        slice: stream.as_slice(),
+        cursor: cursor_ref,
+    };
+    let mut to_copy = 0usize;
+    for (i, bytes) in cursor_iter.take(max_count).enumerate() {
         if elem_size > 0 {
-            let bytes = &stream[cursor + i];
             unsafe {
                 core::ptr::copy_nonoverlapping(
                     bytes.as_ptr(),
@@ -1377,8 +1395,8 @@ unsafe extern "C" fn host_msg_read_batch(
                 );
             }
         }
+        to_copy = i + 1;
     }
-    world.msg_cursors.insert(cursor_key, cursor + to_copy);
     unsafe { *out_read = to_copy };
     FfiResult::OK
 }

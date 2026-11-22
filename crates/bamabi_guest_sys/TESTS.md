@@ -8,7 +8,7 @@
    - `tests/iter_tests.rs` (**1 test**) — non-POD witness message serialization/reconstruction and marker enforcement.
    - `tests/soundness_regressions.rs` (**11 tests**, covering audit findings **S1–S13**) — adversarial host/pointer/re-entrancy/overlap/hot-reload/Tree-Borrows regressions.
 3. **Property-Based Fuzzing (`tests/proptest_guest_sys.rs`, 3 `proptest!` suites):** Randomized borrow sequences, hostile message counts, and malformed sparse-row pointer arrays.
-4. **Formal Verification (`src/kani_proofs.rs` & `src/kani_bounds_proofs.rs`, 30 `#[kani::proof]` harnesses across `PO-G1`, `PO-G3`..`PO-G9`):** Symbolic CBMC proofs over unbounded/adversarial pointers, sizes, counts, and overlap offsets.
+4. **Formal Verification (`src/kani_proofs.rs` & `src/kani_bounds_proofs.rs`, `35` `#[kani::proof]` harnesses across `PO-G1`, `PO-G3`..`PO-G10`):** Symbolic CBMC proofs over unbounded/adversarial pointers, sizes, counts, stack scratch bounds, and overlap offsets.
 
 *(Integration, property, and soundness suites live in `tests/` alongside `tests/common/mod.rs` mock fixtures, while `src/commands.rs` also carries 1 focused unit test for `SpawnBatchColumn::typed` so Miri and `cargo test` verify its zero-FFI bounds directly.)*
 
@@ -108,10 +108,14 @@
 | **PO-G8** | `po_g8_pod_component_hook_trampolines` | `pod_on_add_trampoline` and `pod_on_remove_trampoline` reject null/misaligned `user_data` and `component_ptr`, handle ZSTs, reject re-entrancy, and are panic-free. |
 | **PO-G8** | `po_g8_non_pod_message_witness_callbacks` | `forward_field` and `append_field` reject null/misaligned `ctx`, reject null non-empty `StrView` / `FfiSlice`, guard `u32` packet-length/field-count overflow (`CAPACITY_EXCEEDED`), and are panic-free. |
 
-### 6.2 `src/kani_bounds_proofs.rs` — 8 Harnesses (`PO-G9`)
+### 6.2 `src/kani_bounds_proofs.rs` — Harnesses (`PO-G9` & `PO-G10`)
 
 | Proof ID | Harness Function | What It Symbolically Proves |
 |---|---|---|
+| **PO-G10** | `kani_proof_raw_msg_stack_scratch_alignment_and_bounds` | `RawMsgStackScratch` fits within `512 B`, keeps `align(16)`, and rejects any host `read_count > cap` (`INTERNAL_ERROR`) without OOB writes. |
+| **PO-G10** | `kani_proof_drain_messages_conservation_and_ramp` | `drain_messages_into_vec_checked` conserves all ZST messages (`0..=200`) across probe and exponential ramp chunks cleanly. |
+| **PO-G10** | `kani_proof_drain_messages_small_batch_ramp` | `drain_messages_into_vec_checked` conserves `u32` messages across stack-probe to heap-ramp transitions with `DrainOptions`. |
+| **PO-G10** | `kani_proof_drain_messages_pre_reserved_exact_fit` | Pre-reserved `Vec<u32>` exact-fit drain fills `spare_capacity_mut()` without spurious heap growth via stack EOF probing. |
 | **PO-G9.1** | `po_g9_read_messages_batch_clamps_hostile_count` | Hostile `read_count > max_count` (including `usize::MAX`) is clamped to `max_count` before `scratch.set_len` / `assume_init`; null/`UNSUPPORTED`/`TYPE_MISMATCH`/host errors fail closed. |
 | **PO-G9.2** | `po_g9_spawn_batch_column_validation_bounds` | `validate_spawn_batch_column` and `spawn_batch_columns` fail closed before `cmd_spawn_batch` on `entity_count * expected_size > isize::MAX`, `col.entity_count < entity_count`, layout mismatches, and null non-empty pointers, and prove `SpawnBatchColumn::typed` skips `component_layout_info` while still enforcing `entity_count`, null-pointer, and `isize::MAX` overflow bounds. |
 | **PO-G9.3a** | `po_g9_init_guest_instance_early_error_paths` | Every pre-builder failure path in `init_guest_instance` leaves `*instance_out == null` cleanly. |

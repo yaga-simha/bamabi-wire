@@ -102,10 +102,10 @@ pub use crate::{
     export_mod, guest_log,
     iter::{
         Added, AddedMut, Allow, Changed, ChangedMut, Chunk, ChunkIter, ChunkSlice, ChunkSliceMut,
-        CopyableQueryTerm, CopyableQueryTuple, Has, Mut, MutSlice, Or, Or2, Or3, OrFilterTerm,
-        OrFilterTuple, PairwiseQueryTerm, PairwiseQueryTuple, QuerySingleError, QueryTerm,
-        QueryTuple, Ref, RefSlice, SparseRows, SparseRowsIter, SparseRowsMut, TypedChunkIter, With,
-        WithAdded, WithChanged, Without,
+        CopyableQueryTerm, CopyableQueryTuple, DrainOptions, Has, Mut, MutSlice, Or, Or2, Or3,
+        OrFilterTerm, OrFilterTuple, PairwiseQueryTerm, PairwiseQueryTuple, QuerySingleError,
+        QueryTerm, QueryTuple, Ref, RefSlice, SparseRows, SparseRowsIter, SparseRowsMut,
+        TypedChunkIter, With, WithAdded, WithChanged, Without,
     },
     lifecycle::GuestPlugin,
 };

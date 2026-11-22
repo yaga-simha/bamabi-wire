@@ -1,6 +1,6 @@
 # `bamabi_guest` Test & Verification Guide
 
-`bamabi_guest` proves safety (`#![forbid(unsafe_code)]`), ABI `0.2.0` / `0.3.0` wire compatibility, Bevy `0.20` feature parity, and Miri/Tree-Borrows soundness across **unit tests**, **7 integration test suites** backed by mock host worlds, and **compile-fail / compile-pass doctests** under both `--no-default-features` and `--all-features`.
+`bamabi_guest` proves safety (`#![forbid(unsafe_code)]`), ABI `0.2.0` / `0.3.0` wire compatibility, Bevy `0.20` feature parity, and Miri/Tree-Borrows soundness across **unit tests**, **integration test suites** (including [`tests/zero_alloc_messages.rs`](tests/zero_alloc_messages.rs)) backed by mock host worlds, and **compile-fail / compile-pass doctests** under both `--no-default-features` and `--all-features`.
 
 ---
 
@@ -124,6 +124,12 @@ Verifies full Bevy `0.20` SDK parity and fail-closed invariants under both `--no
 | `export_mod_manifest_and_multi_world_instance_isolation` | Exercises a real `export_mod!(plugin: IsolatedPlugin)` loaded into two `MockHostWorld` instances simultaneously, proving manifest metadata, auto-prefixed component names, independent per-world ticks, and that shutting down World A leaves World B ticking cleanly. |
 | `split_borrows_and_multi_query_nested_reset_enforce_disjointness` | Proves `queries_2_and_commands` and `Chunk::{component_write_2, entities_and_component_read_write}` reject duplicate column indices or duplicate component handles, while permitting disjoint simultaneous borrows and nested `reset()` N × M loops. |
 | `unqualified_guest_component_sparse_resource_and_cross_mod_rejection` | Proves unqualified `GuestComponent` names auto-prefix with `<manifest_name>::` across sparse rows and resources while rejecting layout-identical columns owned by another mod (`other_mod::LocalCounter`). |
+
+### [`tests/zero_alloc_messages.rs`](tests/zero_alloc_messages.rs)
+
+| Test | Why It Exists & What It Proves |
+|---|---|
+| `zero_alloc_idle_and_pre_reserved_message_streaming` | Uses a `#[global_allocator] CountingAlloc` guard to prove `0 allocs / 0 B` for idle POD `read_messages`/`drain_messages`, idle non-POD `read_non_pod_messages`, `read_messages_into` / `read_messages_into_uninit`, pre-reserved `read_messages_into_vec` / `drain_messages_into_vec` (including exact-fit `cap = 256, N = 256`), and `RunConditionSystemContext::has_messages` (`N = 0`, `N = 5`, `N = 150` draining completely). |
 
 ---
 

@@ -1,8 +1,10 @@
 //! Safe query chunk iterator (`ChunkIter`) and singleton resource accessor.
 
-use core::marker::PhantomData;
+use core::{marker::PhantomData, mem::MaybeUninit};
 
-use bamabi_guest_sys::{BatchColCache, Host, SparseRows, SparseRowsMut, UuidFilter, ValidatedIter};
+use bamabi_guest_sys::{
+    BatchColCache, DrainOptions, Host, SparseRows, SparseRowsMut, UuidFilter, ValidatedIter,
+};
 use bamabi_sys::{
     AbiPod, BamChangeTicks, BamColumnInfo, BamComponent, BamIter, FfiEntity, FfiResult,
     ModComponent,
@@ -398,6 +400,181 @@ impl<'a> ChunkIter<'a> {
             .drain_messages_checked::<M>(term_index, Some(filter))
     }
 
+    /// Reads up to `out.len()` unread messages (`M: GuestComponent`) directly into uninitialized
+    /// slice `out` with zero heap allocations, validating `M`'s UUID.
+    #[inline]
+    pub fn read_messages_into_uninit<M: GuestComponent>(
+        &mut self,
+        term_index: usize,
+        out: &mut [MaybeUninit<M>],
+    ) -> Result<usize, FfiResult> {
+        let filter = guest_uuid_filter::<M>(self.inner.base_host().manifest_name());
+        self.inner
+            .read_messages_into_uninit_checked::<M>(term_index, Some(filter), out)
+    }
+
+    /// Reads up to `out.len()` unread POD messages (`M: AbiPod`) directly into uninitialized slice
+    /// `out` with zero heap allocations.
+    #[inline]
+    pub fn read_pod_messages_into_uninit<M: AbiPod>(
+        &mut self,
+        term_index: usize,
+        out: &mut [MaybeUninit<M>],
+    ) -> Result<usize, FfiResult> {
+        self.inner
+            .read_messages_into_uninit_checked::<M>(term_index, None, out)
+    }
+
+    /// Reads up to `out.len()` unread messages (`M: GuestComponent`) directly into `out` with zero
+    /// heap allocations, validating `M`'s UUID.
+    #[inline]
+    pub fn read_messages_into<M: GuestComponent>(
+        &mut self,
+        term_index: usize,
+        out: &mut [M],
+    ) -> Result<usize, FfiResult> {
+        let filter = guest_uuid_filter::<M>(self.inner.base_host().manifest_name());
+        self.inner
+            .read_messages_into_checked::<M>(term_index, Some(filter), out)
+    }
+
+    /// Reads up to `out.len()` unread POD messages (`M: AbiPod`) directly into `out` with zero
+    /// heap allocations.
+    #[inline]
+    pub fn read_pod_messages_into<M: AbiPod>(
+        &mut self,
+        term_index: usize,
+        out: &mut [M],
+    ) -> Result<usize, FfiResult> {
+        self.inner
+            .read_messages_into_checked::<M>(term_index, None, out)
+    }
+
+    /// Appends up to `max_count` unread messages (`M: GuestComponent`) into `out`, reusing spare
+    /// capacity when available and validating `M`'s UUID.
+    #[inline]
+    pub fn read_messages_into_vec<M: GuestComponent>(
+        &mut self,
+        term_index: usize,
+        out: &mut Vec<M>,
+        max_count: usize,
+    ) -> Result<usize, FfiResult> {
+        let filter = guest_uuid_filter::<M>(self.inner.base_host().manifest_name());
+        self.inner
+            .read_messages_into_vec_checked::<M>(term_index, Some(filter), out, max_count)
+    }
+
+    /// Appends up to `max_count` unread POD messages (`M: AbiPod`) into `out`, reusing spare
+    /// capacity when available.
+    #[inline]
+    pub fn read_pod_messages_into_vec<M: AbiPod>(
+        &mut self,
+        term_index: usize,
+        out: &mut Vec<M>,
+        max_count: usize,
+    ) -> Result<usize, FfiResult> {
+        self.inner
+            .read_messages_into_vec_checked::<M>(term_index, None, out, max_count)
+    }
+
+    /// Reads up to `max_count` unread messages (`M: GuestComponent`) from `term_index`, validating
+    /// `M`'s UUID.
+    #[inline]
+    pub fn read_messages_batch<M: GuestComponent>(
+        &mut self,
+        term_index: usize,
+        max_count: usize,
+    ) -> Result<Vec<M>, FfiResult> {
+        let filter = guest_uuid_filter::<M>(self.inner.base_host().manifest_name());
+        self.inner
+            .read_messages_batch_checked::<M>(term_index, Some(filter), max_count)
+    }
+
+    /// Reads up to `max_count` unread POD messages (`M: AbiPod`) from `term_index`.
+    #[inline]
+    pub fn read_pod_messages_batch<M: AbiPod>(
+        &mut self,
+        term_index: usize,
+        max_count: usize,
+    ) -> Result<Vec<M>, FfiResult> {
+        self.inner
+            .read_messages_batch_checked::<M>(term_index, None, max_count)
+    }
+
+    /// Drains all unread messages (`M: GuestComponent`) from `term_index` using custom
+    /// [`DrainOptions`], validating `M`'s UUID.
+    #[inline]
+    pub fn drain_messages_with_options<M: GuestComponent>(
+        &mut self,
+        term_index: usize,
+        opts: DrainOptions,
+    ) -> Result<Vec<M>, FfiResult> {
+        let filter = guest_uuid_filter::<M>(self.inner.base_host().manifest_name());
+        self.inner
+            .drain_messages_with_options_checked::<M>(term_index, Some(filter), opts)
+    }
+
+    /// Drains all unread POD messages (`M: AbiPod`) from `term_index` using custom [`DrainOptions`].
+    #[inline]
+    pub fn drain_pod_messages_with_options<M: AbiPod>(
+        &mut self,
+        term_index: usize,
+        opts: DrainOptions,
+    ) -> Result<Vec<M>, FfiResult> {
+        self.inner
+            .drain_messages_with_options_checked::<M>(term_index, None, opts)
+    }
+
+    /// Drains all unread messages (`M: GuestComponent`) from `term_index` directly into `out`,
+    /// validating `M`'s UUID and returning the number of appended messages.
+    #[inline]
+    pub fn drain_messages_into_vec<M: GuestComponent>(
+        &mut self,
+        term_index: usize,
+        out: &mut Vec<M>,
+        opts: DrainOptions,
+    ) -> Result<usize, FfiResult> {
+        let filter = guest_uuid_filter::<M>(self.inner.base_host().manifest_name());
+        self.inner
+            .drain_messages_into_vec_checked::<M>(term_index, Some(filter), out, opts)
+    }
+
+    /// Drains all unread POD messages (`M: AbiPod`) from `term_index` directly into `out`,
+    /// returning the number of appended messages.
+    #[inline]
+    pub fn drain_pod_messages_into_vec<M: AbiPod>(
+        &mut self,
+        term_index: usize,
+        out: &mut Vec<M>,
+        opts: DrainOptions,
+    ) -> Result<usize, FfiResult> {
+        self.inner
+            .drain_messages_into_vec_checked::<M>(term_index, None, out, opts)
+    }
+
+    /// Drains the unread message cursor (`M: GuestComponent`) at `term_index` with zero heap
+    /// allocations, validating `M`'s UUID and returning the drained message count.
+    #[inline]
+    pub fn drain_messages_count<M: GuestComponent>(
+        &mut self,
+        term_index: usize,
+    ) -> Result<usize, FfiResult> {
+        let filter = guest_uuid_filter::<M>(self.inner.base_host().manifest_name());
+        self.inner
+            .drain_messages_count_checked::<M>(term_index, Some(filter))
+    }
+
+    /// Drains the unread POD message cursor (`M: AbiPod`) at `term_index` with zero heap
+    /// allocations, returning the drained message count.
+    #[inline]
+    pub fn drain_pod_messages_count<M: AbiPod>(
+        &mut self,
+        term_index: usize,
+    ) -> Result<usize, FfiResult> {
+        self.inner
+            .drain_messages_count_checked::<M>(term_index, None)
+    }
+
     /// Sends a POD message (`M: AbiPod`) on `term_index` declared with `MESSAGE_WRITE`.
     #[inline]
     pub fn send_pod_message<M: AbiPod>(&mut self, term_index: usize, msg: &M) -> FfiResult {
@@ -448,6 +625,21 @@ impl<'a> ChunkIter<'a> {
     ) -> Result<Vec<M>, FfiResult> {
         self.inner
             .drain_non_pod_messages_checked::<M>(term_index, Some(UuidFilter::exact(M::UUID)))
+    }
+
+    /// Drains unread VTable-backed non-POD messages (`M: ModComponent + Default`) from
+    /// `term_index` using custom [`DrainOptions`].
+    #[inline]
+    pub fn drain_non_pod_messages_with_options<M: ModComponent + Default>(
+        &mut self,
+        term_index: usize,
+        opts: DrainOptions,
+    ) -> Result<Vec<M>, FfiResult> {
+        self.inner.drain_non_pod_messages_with_options_checked::<M>(
+            term_index,
+            Some(UuidFilter::exact(M::UUID)),
+            opts,
+        )
     }
 
     /// Reads up to `max_count` unread VTable-backed non-POD messages (`M: ModComponent + Default`)

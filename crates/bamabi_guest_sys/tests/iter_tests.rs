@@ -169,7 +169,25 @@ impl ModComponent for MockPodWithoutMarker {
 /// Mock world backing `BamIter` for non-POD message read/send tests.
 struct MockMsgWorld {
     stored: Vec<MockNonPodMsg>,
+    cursor_pos: usize,
     sent_packets: Vec<Vec<u8>>,
+}
+
+/// Stateful cursor iterator advancing `cursor` in `Iterator::next` before yielding each stored
+/// message reference.
+struct MockMsgCursor<'a> {
+    stored: &'a [MockNonPodMsg],
+    cursor: &'a mut usize,
+}
+
+impl<'a> Iterator for MockMsgCursor<'a> {
+    type Item = &'a MockNonPodMsg;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let item = self.stored.get(*self.cursor)?;
+        *self.cursor += 1;
+        Some(item)
+    }
 }
 
 /// Mock `get_proc_address` exporting `export_fields` and `non_pod_message` marker for `NonPodChat`.
@@ -221,11 +239,15 @@ unsafe extern "C" fn mock_msg_read_batch(
     out_count: *mut usize,
 ) -> FfiResult {
     // SAFETY: `iter` points to `MockMsgWorld`.
-    let world = unsafe { &*iter.cast::<MockMsgWorld>() };
-    let take = world.stored.len().min(max_count);
-    for (i, stored_msg) in world.stored.iter().enumerate().take(take) {
+    let world = unsafe { &mut *iter.cast::<MockMsgWorld>() };
+    let cursor = MockMsgCursor {
+        stored: &world.stored,
+        cursor: &mut world.cursor_pos,
+    };
+    let mut take = 0usize;
+    for (i, stored_msg) in cursor.take(max_count).enumerate() {
         let msg_ptr = core::ptr::from_ref(stored_msg).cast::<c_void>();
-        // SAFETY: `out_buf` is writable for `take * size_of::<*const c_void>()` bytes;
+        // SAFETY: `out_buf` is writable for `max_count * size_of::<*const c_void>()` bytes;
         // `write_unaligned` preserves full pointer provenance.
         #[allow(clippy::cast_ptr_alignment)]
         unsafe {
@@ -236,6 +258,7 @@ unsafe extern "C" fn mock_msg_read_batch(
                 msg_ptr,
             );
         }
+        take = i + 1;
     }
     // SAFETY: `out_count` is writable.
     unsafe {
@@ -275,6 +298,7 @@ fn validated_iter_non_pod_message_read_and_send_encode_witness_packets() {
             label: "hello".to_owned(),
             nums: vec![10, 20, 30],
         }],
+        cursor_pos: 0,
         sent_packets: Vec::new(),
     };
     let host_ctx = (&raw mut world).cast::<BamHostCtx>();
@@ -433,10 +457,14 @@ fn guest_instance_caches_symbol_lookups_and_spills_large_witness_packets() {
         vtable_lookups: AtomicUsize::new(0),
     };
     let mut world = MockMsgWorld {
-        stored: vec![MockNonPodMsg {
-            label: "cached".to_owned(),
-            nums: vec![1, 2, 3],
-        }],
+        stored: vec![
+            MockNonPodMsg {
+                label: "cached".to_owned(),
+                nums: vec![1, 2, 3],
+            };
+            4
+        ],
+        cursor_pos: 0,
         sent_packets: Vec::new(),
     };
     let host_ctx = (&raw const counters).cast::<BamHostCtx>();
@@ -453,12 +481,20 @@ fn guest_instance_caches_symbol_lookups_and_spills_large_witness_packets() {
             .read_non_pod_messages_checked::<MockNonPodMsg>(
                 0,
                 Some(UuidFilter::exact(MockNonPodMsg::UUID)),
-                4,
+                1,
             )
             .unwrap();
         assert_eq!(got.len(), 1);
         assert_eq!(got[0].label, "cached");
     }
+    assert!(
+        iter.drain_non_pod_messages_checked::<MockNonPodMsg>(
+            0,
+            Some(UuidFilter::exact(MockNonPodMsg::UUID)),
+        )
+        .unwrap()
+        .is_empty()
+    );
 
     // Small packet (fits in 256-byte stack scratch buffer).
     let small_msg = MockNonPodMsg {

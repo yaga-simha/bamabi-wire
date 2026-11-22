@@ -1,4 +1,4 @@
-//! Kani formal verification proof harnesses for `bamabi_guest_sys` bounds and aliasing (`PO-G9`).
+//! Kani formal verification proof harnesses for `bamabi_guest_sys` bounds and aliasing (`PO-G9`, `PO-G10`).
 //!
 //! Targets ABI-threshold `unsafe` operations not covered by `PO-G1`..`PO-G8`:
 //! 1. `ValidatedIter::read_messages_batch_checked`: clamping hostile `read_count > max_count`
@@ -16,6 +16,9 @@
 //! 5. `ValidatedIter::entities_and_column_mut_checked` & `entities_and_read_write_checked`:
 //!    rejecting hostile overlapping `(entities, read, write)` pointers with `None` before forming
 //!    aliasing slices.
+//! 6. `PO-G10`: `RawMsgStackScratch` 512 B / `align(16)` bounds & unaligned element reads across
+//!    concrete layouts, plus `drain_messages_into_vec_checked` sequence conservation and exponential
+//!    ramp invariants.
 
 use core::{
     ffi::{CStr, c_char, c_void},
@@ -24,17 +27,18 @@ use core::{
 };
 
 use bamabi_sys::{
-    ABI_VERSION, AccessMode, BAM_STORAGE_FLAG_IMMUTABLE, BAM_STORAGE_FLAG_MESSAGE,
+    ABI_VERSION, AbiPod, AccessMode, BAM_STORAGE_FLAG_IMMUTABLE, BAM_STORAGE_FLAG_MESSAGE,
     BAM_STORAGE_FLAG_RESOURCE, BamChangeTicks, BamColumnInfo, BamCommands, BamComponent,
     BamHostApi, BamHostCtx, BamInstance, BamIter, BamLayoutInfo, BamLoadCtx, BamManifest,
     BamObserverDesc, BamSystemCtx, BamTermDesc, BamTriggerDesc, ComponentDesc, ComponentUuid,
-    FfiBool, FfiEntity, FfiResult, ModComponent, SymbolEntry, VTableHeader,
+    FfiBool, FfiEntity, FfiResult, ModComponent, RawInsertable, SymbolEntry, VTableHeader,
 };
 
 use crate::{
-    GuestInstance, Host, SpawnBatchColumn, TypedComponent, UuidFilter, ValidatedCommands,
-    ValidatedIter, ValidatedLoadCtx, ValidatedSystemInvocation, ValidatedSystemRef,
-    commands::validate_spawn_batch_column, init_guest_instance,
+    DrainOptions, GuestInstance, Host, SpawnBatchColumn, TypedComponent, UuidFilter,
+    ValidatedCommands, ValidatedIter, ValidatedLoadCtx, ValidatedSystemInvocation,
+    ValidatedSystemRef, commands::validate_spawn_batch_column, init_guest_instance,
+    iter::RawMsgStackScratch,
 };
 
 /// Zero-sized `AbiPod` marker alias for ZST proof paths.
@@ -2004,5 +2008,432 @@ fn po_g9_iter_entities_and_column_overlap_guards() {
     kani::cover!(
         !erw_expected_ok && (ew_overlap || rw_overlap),
         "entities_and_read_write_checked hostile overlap rejection reachable"
+    );
+}
+
+// ============================================================================
+// PO-G10: `RawMsgStackScratch` Alignment/Bounds & `drain_messages_into_vec_checked`
+//         Sequence Conservation and Ramp Invariants
+// ============================================================================
+
+/// PO-G10.1: Proves `RawMsgStackScratch` enforces `size == 512` / `align == 16`, `probe_cap *
+/// elem_size <= 512` across `elem_size in [0, 1, 4, 12, 16, 64, 512, 1024]` (`0` for `1024`),
+/// `validate_probe_count` fails closed with `INTERNAL_ERROR` whenever `actual > probe_cap` or
+/// `actual * elem_size > 512`, and `read_elem` via `read_unaligned` is sound across `ZstPod`,
+/// `u8`, `u32`, `[u32; 3]`, `Align16`, `[u64; 8]`, and `[u8; 512]`.
+#[kani::proof]
+#[kani::unwind(70)]
+fn kani_proof_raw_msg_stack_scratch_alignment_and_bounds() {
+    #[repr(C, align(16))]
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    struct Align16([u64; 2]);
+    // SAFETY: `#[repr(C, align(16))]` of `[u64; 2]` has no drop glue or padding.
+    unsafe impl RawInsertable for Align16 {}
+    // SAFETY: Deterministic fixed C99 layout across targets.
+    unsafe impl AbiPod for Align16 {}
+
+    assert_eq!(size_of::<RawMsgStackScratch>(), 512);
+    assert_eq!(align_of::<RawMsgStackScratch>(), 16);
+
+    let size_idx: usize = kani::any();
+    kani::assume(size_idx < 8);
+    let elem_sizes = [0usize, 1, 4, 12, 16, 64, 512, 1024];
+    let elem_size = elem_sizes[size_idx];
+
+    let requested: usize = kani::any();
+    let actual: usize = kani::any();
+
+    let probe_cap = RawMsgStackScratch::probe_cap_for_size(elem_size, requested);
+    if elem_size == 1024 {
+        assert_eq!(probe_cap, 0);
+    } else if elem_size == 0 {
+        assert_eq!(probe_cap, requested);
+    } else {
+        assert!(probe_cap <= requested);
+        assert!(
+            probe_cap
+                .checked_mul(elem_size)
+                .is_some_and(|bytes| bytes <= 512)
+        );
+    }
+
+    let validated = RawMsgStackScratch::validate_probe_count(elem_size, probe_cap, actual);
+    let expected_ok = actual <= probe_cap
+        && actual
+            .checked_mul(elem_size)
+            .is_some_and(|bytes| bytes <= 512);
+    if expected_ok {
+        assert_eq!(validated, Ok(actual));
+    } else {
+        assert_eq!(validated, Err(FfiResult::INTERNAL_ERROR));
+    }
+    kani::cover!(expected_ok, "validate_probe_count Ok reachable");
+    kani::cover!(
+        !expected_ok,
+        "validate_probe_count INTERNAL_ERROR rejection reachable"
+    );
+
+    let layout_idx: u8 = kani::any();
+    kani::assume(layout_idx < 7);
+    let mut scratch = RawMsgStackScratch::uninit();
+    assert!((scratch.as_mut_u8_ptr() as usize).is_multiple_of(16));
+
+    match layout_idx {
+        0 => {
+            let cap = RawMsgStackScratch::probe_cap_for_size(size_of::<ZstPod>(), 4);
+            assert_eq!(cap, 4);
+            let idx: usize = kani::any();
+            kani::assume(idx < cap);
+            // SAFETY: `ZstPod` is zero-sized; `read_elem` yields `[0u8; 0]`.
+            let z = unsafe { scratch.read_elem::<ZstPod>(idx) };
+            assert_eq!(z, []);
+        }
+        1 => {
+            let b0: u8 = kani::any();
+            let b1: u8 = kani::any();
+            // SAFETY: `scratch` holds 512 writable bytes.
+            unsafe {
+                scratch.as_mut_u8_ptr().add(0).write(b0);
+                scratch.as_mut_u8_ptr().add(1).write(b1);
+            }
+            // SAFETY: Indices `0` and `1` were initialized above within 512 bytes.
+            unsafe {
+                assert_eq!(scratch.read_elem::<u8>(0), b0);
+                assert_eq!(scratch.read_elem::<u8>(1), b1);
+            }
+        }
+        2 => {
+            let x0: u32 = kani::any();
+            let x1: u32 = kani::any();
+            // SAFETY: `scratch` holds 512 writable bytes (`2 * 4 <= 512`).
+            unsafe {
+                let p = scratch.as_mut_u8_ptr().cast::<u32>();
+                p.add(0).write_unaligned(x0);
+                p.add(1).write_unaligned(x1);
+            }
+            // SAFETY: Slots `0` and `1` were initialized above.
+            unsafe {
+                assert_eq!(scratch.read_elem::<u32>(0), x0);
+                assert_eq!(scratch.read_elem::<u32>(1), x1);
+            }
+        }
+        3 => {
+            let v0: [u32; 3] = [kani::any(), kani::any(), kani::any()];
+            let v1: [u32; 3] = [kani::any(), kani::any(), kani::any()];
+            // SAFETY: `scratch` holds 512 writable bytes (`2 * 12 = 24 <= 512`).
+            unsafe {
+                let p = scratch.as_mut_u8_ptr().cast::<[u32; 3]>();
+                p.add(0).write_unaligned(v0);
+                p.add(1).write_unaligned(v1);
+            }
+            // SAFETY: Slots `0` and `1` were initialized above.
+            unsafe {
+                assert_eq!(scratch.read_elem::<[u32; 3]>(0), v0);
+                assert_eq!(scratch.read_elem::<[u32; 3]>(1), v1);
+            }
+        }
+        4 => {
+            let a0 = Align16([kani::any(), kani::any()]);
+            let a1 = Align16([kani::any(), kani::any()]);
+            // SAFETY: `scratch` holds 512 writable bytes (`2 * 16 = 32 <= 512`) and is 16-aligned.
+            unsafe {
+                let p = scratch.as_mut_u8_ptr().cast::<Align16>();
+                p.add(0).write_unaligned(a0);
+                p.add(1).write_unaligned(a1);
+            }
+            // SAFETY: Slots `0` and `1` were initialized above.
+            unsafe {
+                assert_eq!(scratch.read_elem::<Align16>(0), a0);
+                assert_eq!(scratch.read_elem::<Align16>(1), a1);
+            }
+        }
+        5 => {
+            let w0: [u64; 8] = [
+                kani::any(),
+                kani::any(),
+                kani::any(),
+                kani::any(),
+                kani::any(),
+                kani::any(),
+                kani::any(),
+                kani::any(),
+            ];
+            let w1: [u64; 8] = [
+                kani::any(),
+                kani::any(),
+                kani::any(),
+                kani::any(),
+                kani::any(),
+                kani::any(),
+                kani::any(),
+                kani::any(),
+            ];
+            // SAFETY: `scratch` holds 512 writable bytes (`2 * 64 = 128 <= 512`).
+            unsafe {
+                let p = scratch.as_mut_u8_ptr().cast::<[u64; 8]>();
+                p.add(0).write_unaligned(w0);
+                p.add(1).write_unaligned(w1);
+            }
+            // SAFETY: Slots `0` and `1` were initialized above.
+            unsafe {
+                assert_eq!(scratch.read_elem::<[u64; 8]>(0), w0);
+                assert_eq!(scratch.read_elem::<[u64; 8]>(1), w1);
+            }
+        }
+        _ => {
+            let fill: u8 = kani::any();
+            let first: u8 = kani::any();
+            let last: u8 = kani::any();
+            // SAFETY: `scratch` holds 512 writable bytes; initialize all 512 bytes before reading.
+            unsafe {
+                scratch
+                    .as_mut_u8_ptr()
+                    .cast::<[u8; 512]>()
+                    .write([fill; 512]);
+                scratch.as_mut_u8_ptr().add(0).write(first);
+                scratch.as_mut_u8_ptr().add(511).write(last);
+            }
+            // SAFETY: All 512 bytes of `scratch` were initialized above.
+            let got = unsafe { scratch.read_elem::<[u8; 512]>(0) };
+            assert_eq!(got[0], first);
+            assert_eq!(got[511], last);
+        }
+    }
+}
+
+/// Shared stateful cursor harness helper for `PO-G10.2` harnesses.
+fn run_drain_conservation_harness(n: usize, opts: DrainOptions, pre_cap: usize) {
+    const SEQ_UUID: ComponentUuid = ComponentUuid::from_parts("kani::SeqU32", 4, 4, 0);
+
+    struct HostCursorState {
+        total: usize,
+        pos: usize,
+    }
+
+    struct StatefulSeqIter<'a> {
+        state: &'a mut HostCursorState,
+    }
+
+    impl Iterator for StatefulSeqIter<'_> {
+        type Item = u32;
+
+        fn next(&mut self) -> Option<Self::Item> {
+            if self.state.pos >= self.state.total {
+                return None;
+            }
+            let val = self.state.pos as u32;
+            self.state.pos += 1;
+            Some(val)
+        }
+    }
+
+    unsafe extern "C" fn mock_info(
+        _iter: *const BamIter,
+        term: usize,
+        out: *mut BamColumnInfo,
+    ) -> FfiResult {
+        if term != 0 {
+            return FfiResult::OUT_OF_RANGE;
+        }
+        // SAFETY: Caller supplies writable `out`.
+        unsafe {
+            *out = BamColumnInfo {
+                component: BamComponent::from_raw(1),
+                mode: AccessMode::MESSAGE_READ,
+                uuid: SEQ_UUID,
+                size: size_of::<u32>(),
+                align: align_of::<u32>(),
+                storage_flags: BAM_STORAGE_FLAG_MESSAGE,
+                reserved0: 0,
+            };
+        }
+        FfiResult::OK
+    }
+
+    unsafe extern "C" fn mock_msg_read_batch(
+        iter: *mut BamIter,
+        term: usize,
+        out_buf: *mut u8,
+        max_count: usize,
+        out_read: *mut usize,
+    ) -> FfiResult {
+        if term != 0 {
+            return FfiResult::OUT_OF_RANGE;
+        }
+        // SAFETY: Test binds `iter` to `HostCursorState`.
+        let st = unsafe { &mut *iter.cast::<HostCursorState>() };
+        let typed_out = out_buf.cast::<u32>();
+        let mut cursor = StatefulSeqIter { state: st };
+        let mut count = 0usize;
+        while count < max_count {
+            let Some(val) = cursor.next() else {
+                break;
+            };
+            // SAFETY: Caller supplies writable 4-byte aligned `u32` storage for `max_count` elements
+            // (`RawMsgStackScratch` has `align(16)` and `Vec<u32>` has `align(4)`).
+            unsafe { typed_out.add(count).write(val) };
+            count += 1;
+        }
+        // SAFETY: Caller supplies writable `out_read`.
+        unsafe { *out_read = count };
+        FfiResult::OK
+    }
+
+    let dummy_ctx = 1u8;
+    let mut api = make_core_api(size_of::<BamHostApi>() as u32, ABI_VERSION);
+    api.iter_column_info = Some(mock_info);
+    api.msg_read_batch = Some(mock_msg_read_batch);
+    let host = make_valid_host(api, (&raw const dummy_ctx).cast::<BamHostCtx>());
+
+    let mut state = HostCursorState { total: n, pos: 0 };
+    // SAFETY: `state` stays pinned on the stack across `iter`.
+    let mut iter = unsafe { ValidatedIter::from_raw((&raw mut state).cast::<BamIter>(), &host) };
+    let mut out = Vec::<u32>::with_capacity(pre_cap);
+    let drained = iter
+        .drain_messages_into_vec_checked::<u32>(0, None, &mut out, opts)
+        .expect("drain_messages_into_vec_checked must succeed");
+    assert_eq!(drained, n);
+    assert_eq!(out.len(), n);
+    assert_eq!(state.pos, n);
+    let mut i = 0usize;
+    while i < n {
+        assert_eq!(out[i], i as u32);
+        i += 1;
+    }
+}
+
+/// PO-G10.2a: Proves `drain_messages_into_vec_checked` preserves exact item count across
+/// `N in 0..=200` and full exponential `DrainOptions` ramp (`initial_batch in 1..=64`,
+/// `max_batch in 32..=256`) without dropping or duplicating cursor items.
+#[kani::proof]
+#[kani::unwind(13)]
+fn kani_proof_drain_messages_conservation_and_ramp() {
+    type ZstMsg = [u8; 0];
+
+    const ZST_UUID: ComponentUuid = ComponentUuid::from_parts("kani::ZstMsg", 0, 1, 0);
+
+    struct ZstCursorState {
+        total: usize,
+        pos: usize,
+    }
+
+    unsafe extern "C" fn mock_zst_info(
+        _iter: *const BamIter,
+        term: usize,
+        out: *mut BamColumnInfo,
+    ) -> FfiResult {
+        if term != 0 {
+            return FfiResult::OUT_OF_RANGE;
+        }
+        // SAFETY: Caller supplies writable `out`.
+        unsafe {
+            *out = BamColumnInfo {
+                component: BamComponent::from_raw(1),
+                mode: AccessMode::MESSAGE_READ,
+                uuid: ZST_UUID,
+                size: 0,
+                align: 1,
+                storage_flags: BAM_STORAGE_FLAG_MESSAGE,
+                reserved0: 0,
+            };
+        }
+        FfiResult::OK
+    }
+
+    unsafe extern "C" fn mock_zst_read_batch(
+        iter: *mut BamIter,
+        term: usize,
+        _out_buf: *mut u8,
+        max_count: usize,
+        out_read: *mut usize,
+    ) -> FfiResult {
+        if term != 0 {
+            return FfiResult::OUT_OF_RANGE;
+        }
+        // SAFETY: Test binds `iter` to `ZstCursorState`.
+        let st = unsafe { &mut *iter.cast::<ZstCursorState>() };
+        let remaining = st.total - st.pos;
+        let actual = remaining.min(max_count);
+        st.pos += actual;
+        // SAFETY: Caller supplies writable `out_read`.
+        unsafe { *out_read = actual };
+        FfiResult::OK
+    }
+
+    let n: usize = kani::any();
+    kani::assume(n <= 200);
+    let initial_batch: usize = kani::any();
+    kani::assume((1..=64).contains(&initial_batch));
+    let max_batch: usize = kani::any();
+    kani::assume((32..=256).contains(&max_batch));
+
+    let dummy_ctx = 1u8;
+    let mut api = make_core_api(size_of::<BamHostApi>() as u32, ABI_VERSION);
+    api.iter_column_info = Some(mock_zst_info);
+    api.msg_read_batch = Some(mock_zst_read_batch);
+    let host = make_valid_host(api, (&raw const dummy_ctx).cast::<BamHostCtx>());
+
+    let mut state = ZstCursorState { total: n, pos: 0 };
+    // SAFETY: `state` stays pinned on stack across `iter`.
+    let mut iter = unsafe { ValidatedIter::from_raw((&raw mut state).cast::<BamIter>(), &host) };
+    let mut out = Vec::<ZstMsg>::new();
+    let drained = iter
+        .drain_messages_into_vec_checked::<ZstMsg>(
+            0,
+            None,
+            &mut out,
+            DrainOptions::new(initial_batch, max_batch),
+        )
+        .expect("ZST drain_messages_into_vec_checked must succeed");
+    assert_eq!(drained, n);
+    assert_eq!(out.len(), n);
+    assert_eq!(state.pos, n);
+    kani::cover!(n == 0, "empty N=0 drain reachable");
+    kani::cover!(n > 128, "multi-batch N>128 drain reachable");
+}
+
+/// PO-G10.2b: Proves `drain_messages_into_vec_checked::<u32>` preserves exact sequence `0..N`
+/// without dropping/duplicating any element or overflowing `spare_capacity_mut()` across the 512B
+/// stack probe (`Phase 2`) and exponential heap ramp (`Phase 3`), including zero/clamped
+/// `DrainOptions` (`0..=64`, `0..=256`) and multi-batch `max_batch = 1` drains.
+#[kani::proof]
+#[kani::unwind(3)]
+fn kani_proof_drain_messages_small_batch_ramp() {
+    let n: usize = kani::any();
+    kani::assume(n <= 2);
+    let initial_batch: usize = kani::any();
+    kani::assume(initial_batch <= 64);
+    let max_batch: usize = kani::any();
+    kani::assume(max_batch <= 256);
+
+    run_drain_conservation_harness(n, DrainOptions::new(initial_batch, max_batch), 0);
+    kani::cover!(
+        initial_batch == 0 || max_batch == 0,
+        "zero DrainOptions clamping reachable"
+    );
+    kani::cover!(
+        initial_batch == 1 && max_batch == 1 && n == 2,
+        "Phase 2 stack probe into Phase 3 heap ramp reachable"
+    );
+}
+
+/// PO-G10.2c: Proves `drain_messages_into_vec_checked::<u32>` with pre-reserved capacity (`Phase 1`
+/// direct `spare_capacity_mut()` drain + `Phase 2` stack EOF probe) preserves exact sequence `0..N`
+/// across multi-batch (`max_batch = 1`) and exact-fit (`N == pre_cap`) boundaries.
+#[kani::proof]
+#[kani::unwind(3)]
+fn kani_proof_drain_messages_pre_reserved_exact_fit() {
+    let n: usize = kani::any();
+    kani::assume(n <= 2);
+    let initial_batch: usize = kani::any();
+    kani::assume(initial_batch <= 4);
+    let max_batch: usize = kani::any();
+    kani::assume(max_batch <= 4);
+
+    run_drain_conservation_harness(n, DrainOptions::new(initial_batch, max_batch), 2);
+    kani::cover!(n == 2, "exact-fit pre_cap == N reachable");
+    kani::cover!(
+        n == 2 && max_batch == 1,
+        "multi-batch Phase 1 drain reachable"
     );
 }

@@ -951,6 +951,30 @@ unsafe extern "C" fn host_res_ticks(
     FfiResult::OK
 }
 
+/// Stateful cursor iterator advancing `cursor` before yielding and draining consumed items on drop.
+struct StatefulCursorIter<'a, T: Default> {
+    items: &'a mut Vec<T>,
+    cursor: usize,
+}
+
+impl<T: Default> Iterator for StatefulCursorIter<'_, T> {
+    type Item = T;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let slot = self.items.get_mut(self.cursor)?;
+        self.cursor += 1;
+        Some(core::mem::take(slot))
+    }
+}
+
+impl<T: Default> Drop for StatefulCursorIter<'_, T> {
+    fn drop(&mut self) {
+        if self.cursor > 0 {
+            self.items.drain(..self.cursor);
+        }
+    }
+}
+
 /// Mock `BamHostApi::msg_read_batch` draining queued mock messages for `term_index`.
 unsafe extern "C" fn host_msg_read_batch(
     iter: *mut BamIter,
@@ -972,12 +996,17 @@ unsafe extern "C" fn host_msg_read_batch(
     };
     let elem_size = meta.size;
     let queue = world.messages.entry(term.component).or_default();
-    let take = queue.len().min(max_count);
-    if take > 0 && elem_size > 0 {
-        if out_buf.is_null() {
-            return FfiResult::NULL_POINTER;
-        }
-        for (i, payload) in queue.drain(..take).enumerate() {
+    let avail = queue.len().min(max_count);
+    if avail > 0 && elem_size > 0 && out_buf.is_null() {
+        return FfiResult::NULL_POINTER;
+    }
+    let cursor_iter = StatefulCursorIter {
+        items: queue,
+        cursor: 0,
+    };
+    let mut take = 0usize;
+    for (i, payload) in cursor_iter.take(max_count).enumerate() {
+        if elem_size > 0 {
             unsafe {
                 core::ptr::copy_nonoverlapping(
                     payload.as_ptr(),
@@ -986,8 +1015,7 @@ unsafe extern "C" fn host_msg_read_batch(
                 );
             }
         }
-    } else {
-        queue.drain(..take);
+        take = i + 1;
     }
     unsafe { *out_count = take };
     FfiResult::OK

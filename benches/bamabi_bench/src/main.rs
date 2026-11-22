@@ -9,6 +9,106 @@ mod host;
 mod loader;
 mod workloads;
 
+#[cfg(feature = "hotpath-alloc")]
+pub(crate) mod alloc_probe {
+    use core::{
+        alloc::{GlobalAlloc, Layout},
+        cell::Cell,
+        sync::atomic::{AtomicBool, AtomicUsize, Ordering},
+    };
+    use std::{alloc::System, sync::Mutex};
+
+    /// Lightweight allocation counter nested inside [`hotpath::CountingAllocator`] so both
+    /// `hotpath` and deterministic steady-state zero-allocation assertions observe heap activity.
+    pub(crate) struct BenchAllocCounter;
+
+    static ALLOC_ACTIVE: AtomicBool = AtomicBool::new(false);
+    static ALLOC_COUNT: AtomicUsize = AtomicUsize::new(0);
+    static ALLOC_BYTES: AtomicUsize = AtomicUsize::new(0);
+
+    thread_local! {
+        static IN_MEASURED_THREAD: Cell<bool> = const { Cell::new(false) };
+    }
+
+    // SAFETY: Pure pass-through to `std::alloc::System`; only updates atomic counters when
+    // `ALLOC_ACTIVE` and `IN_MEASURED_THREAD` are enabled on the calling thread.
+    unsafe impl GlobalAlloc for BenchAllocCounter {
+        #[inline]
+        unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+            if ALLOC_ACTIVE.load(Ordering::Relaxed)
+                && IN_MEASURED_THREAD.try_with(Cell::get).unwrap_or(false)
+            {
+                ALLOC_COUNT.fetch_add(1, Ordering::Relaxed);
+                ALLOC_BYTES.fetch_add(layout.size(), Ordering::Relaxed);
+            }
+            // SAFETY: Forwards caller's `GlobalAlloc::alloc` contract unchanged to `System`.
+            unsafe { System.alloc(layout) }
+        }
+
+        #[inline]
+        unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
+            // SAFETY: `ptr` was allocated by `System` with `layout`.
+            unsafe { System.dealloc(ptr, layout) }
+        }
+
+        #[inline]
+        unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
+            if ALLOC_ACTIVE.load(Ordering::Relaxed)
+                && IN_MEASURED_THREAD.try_with(Cell::get).unwrap_or(false)
+            {
+                ALLOC_COUNT.fetch_add(1, Ordering::Relaxed);
+                ALLOC_BYTES.fetch_add(layout.size(), Ordering::Relaxed);
+            }
+            // SAFETY: Forwards caller's `GlobalAlloc::alloc_zeroed` contract unchanged to `System`.
+            unsafe { System.alloc_zeroed(layout) }
+        }
+
+        #[inline]
+        unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
+            // SAFETY: `ptr` was allocated by `System` with `layout` and `new_size` is valid.
+            let new_ptr = unsafe { System.realloc(ptr, layout, new_size) };
+            if !new_ptr.is_null()
+                && ALLOC_ACTIVE.load(Ordering::Relaxed)
+                && IN_MEASURED_THREAD.try_with(Cell::get).unwrap_or(false)
+            {
+                ALLOC_COUNT.fetch_add(1, Ordering::Relaxed);
+                ALLOC_BYTES.fetch_add(new_size, Ordering::Relaxed);
+            }
+            new_ptr
+        }
+    }
+
+    #[global_allocator]
+    static ALLOCATOR: hotpath::CountingAllocator<BenchAllocCounter> =
+        hotpath::CountingAllocator::with(BenchAllocCounter);
+
+    /// Measures `(alloc_count, alloc_bytes, result)` performed by `f` on the current thread.
+    pub(crate) fn measure<R>(f: impl FnOnce() -> R) -> (usize, usize, R) {
+        static PROBE_LOCK: Mutex<()> = Mutex::new(());
+        struct ResetGuard;
+        impl Drop for ResetGuard {
+            fn drop(&mut self) {
+                ALLOC_ACTIVE.store(false, Ordering::SeqCst);
+                let _ = IN_MEASURED_THREAD.try_with(|flag| flag.set(false));
+            }
+        }
+
+        let _lock = PROBE_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        IN_MEASURED_THREAD.with(|flag| flag.set(true));
+        ALLOC_COUNT.store(0, Ordering::SeqCst);
+        ALLOC_BYTES.store(0, Ordering::SeqCst);
+        ALLOC_ACTIVE.store(true, Ordering::SeqCst);
+        let _guard = ResetGuard;
+        let out = f();
+        ALLOC_ACTIVE.store(false, Ordering::SeqCst);
+        let count = ALLOC_COUNT.load(Ordering::SeqCst);
+        let bytes = ALLOC_BYTES.load(Ordering::SeqCst);
+        (count, bytes, out)
+    }
+}
+
 use std::{
     env, fs,
     path::{Path, PathBuf},
@@ -46,8 +146,10 @@ USAGE:
 
 OPTIONS:
     --guest <lang>:<profile>=<path>   Guest shared library to verify & benchmark (repeatable)
-    --workloads <csv>                 Comma-separated workloads:
-                                      noop,dense_query_update,command_burst,host_api_roundtrip
+    --workloads, --workload <csv>     Comma-separated workloads:
+                                      noop,dense_query_update,command_burst,host_api_roundtrip,
+                                      message_idle_poll,message_burst_256,message_burst_4096
+                                      (aliases: message, message_burst)
     --entities <csv>                  Entity counts for dense_query_update (default: 1000,100000)
     --chunks <csv>                    Chunk sizes for dense_query_update (default: 256,4096; quick: 256)
     --quick                           Fast mode with fewer warmup/timed samples
@@ -111,9 +213,20 @@ fn parse_workloads_csv(raw: &str) -> Result<Vec<WorkloadKind>, String> {
         if trimmed.is_empty() {
             return Err(format!("empty value in --workloads `{raw}`"));
         }
-        let kind = WorkloadKind::parse(trimmed)?;
-        if !out.contains(&kind) {
-            out.push(kind);
+        match trimmed {
+            "message" | "message_burst" => {
+                for kind in WorkloadKind::ALL_MESSAGES {
+                    if !out.contains(&kind) {
+                        out.push(kind);
+                    }
+                }
+            }
+            other => {
+                let kind = WorkloadKind::parse(other)?;
+                if !out.contains(&kind) {
+                    out.push(kind);
+                }
+            }
         }
     }
     if out.is_empty() {
@@ -166,8 +279,8 @@ where
                 let val = take_val(inline_val, &mut iter, "--guest")?;
                 guests.push(parse_guest_spec(&val)?);
             }
-            "--workloads" => {
-                let val = take_val(inline_val, &mut iter, "--workloads")?;
+            "--workloads" | "--workload" => {
+                let val = take_val(inline_val, &mut iter, flag.as_str())?;
                 workloads = Some(parse_workloads_csv(&val)?);
             }
             "--entities" => {
@@ -586,6 +699,11 @@ fn main() -> ExitCode {
         }
     };
 
+    #[cfg(feature = "hotpath")]
+    let _hp_guard = hotpath::HotpathGuardBuilder::new("bamabi_bench")
+        .functions_limit(30)
+        .build();
+
     let config = BenchConfig {
         guests: parsed.guests,
         workloads: parsed.workloads,
@@ -637,12 +755,14 @@ mod tests {
 
     use super::*;
     use crate::host::{
-        BENCH_DT, CmdHeader, HostWorld, OwnedHostWorld, POSITION_NAME, POSITION_UUID, Position,
-        SIM_PARAMS_NAME, SIM_PARAMS_UUID, SimParams, SystemFrame, VELOCITY_NAME, VELOCITY_UUID,
-        Velocity, initial_position, initial_velocity,
+        BENCH_DT, BENCH_MESSAGE_NAME, BENCH_MESSAGE_UUID, BenchMessage, CmdHeader, HostWorld,
+        OwnedHostWorld, POSITION_NAME, POSITION_UUID, Position, SIM_PARAMS_NAME, SIM_PARAMS_UUID,
+        SimParams, SystemFrame, VELOCITY_NAME, VELOCITY_UUID, Velocity, initial_position,
+        initial_velocity,
     };
     use crate::workloads::{
-        compute_stats, native_command_burst, native_dense_update, position_checksum,
+        GuestBenchMsg, InProcessGuest, compute_stats, native_command_burst, native_dense_update,
+        position_checksum,
     };
 
     #[test]
@@ -665,13 +785,20 @@ mod tests {
         let resolve_uuid = world.api.resolve_component_by_uuid.unwrap();
         let layout_fn = world.api.component_layout_info.unwrap();
 
-        for (c_name, uuid, expected_handle) in [
-            (c"bench::Position", POSITION_UUID, world.pos_handle),
-            (c"bench::Velocity", VELOCITY_UUID, world.vel_handle),
+        for (c_name, uuid, expected_handle, expected_align) in [
+            (c"bench::Position", POSITION_UUID, world.pos_handle, 4),
+            (c"bench::Velocity", VELOCITY_UUID, world.vel_handle, 4),
             (
                 c"bench::SimParams",
                 SIM_PARAMS_UUID,
                 world.sim_params_handle,
+                4,
+            ),
+            (
+                c"bench::BenchMessage",
+                BENCH_MESSAGE_UUID,
+                world.bench_msg_handle,
+                8,
             ),
         ] {
             let mut out = BamComponent::INVALID;
@@ -691,7 +818,7 @@ mod tests {
             let res3 = unsafe { layout_fn(host_ctx, expected_handle, &mut info) };
             assert_eq!(res3, FfiResult::OK);
             assert_eq!(info.size, 16);
-            assert_eq!(info.align, 4);
+            assert_eq!(info.align, expected_align);
             assert_eq!(info.uuid, uuid);
         }
 
@@ -708,7 +835,12 @@ mod tests {
         // SAFETY: `load_ctx_ptr` and `bad_desc` are valid during init.
         let r_bad = unsafe { reg(world.load_ctx_ptr(), &bad_desc, &mut reg_out) };
         assert_eq!(r_bad, FfiResult::TYPE_MISMATCH);
-        let _ = (POSITION_NAME, VELOCITY_NAME, SIM_PARAMS_NAME);
+        let _ = (
+            POSITION_NAME,
+            VELOCITY_NAME,
+            SIM_PARAMS_NAME,
+            BENCH_MESSAGE_NAME,
+        );
     }
 
     #[test]
@@ -975,6 +1107,53 @@ mod tests {
         assert!(parse_args(["--workloads", "bad_workload"]).is_err());
         assert!(parse_args(["--guest", "missing_equals"]).is_err());
         assert!(parse_args(["--markdown", " "]).is_err());
+
+        // Default workloads keep the original 4 workloads for xtask compatibility.
+        match parse_args(["--quick"]).unwrap() {
+            CliAction::Run(cli) => assert_eq!(cli.workloads, WorkloadKind::ALL.to_vec()),
+            CliAction::Help => panic!("expected Run"),
+        }
+
+        // `--workload` alias and `message` / `message_burst` expansion.
+        match parse_args(["--workload", "message"]).unwrap() {
+            CliAction::Run(cli) => {
+                assert_eq!(
+                    cli.workloads,
+                    vec![
+                        WorkloadKind::MessageIdlePoll,
+                        WorkloadKind::MessageBurst256,
+                        WorkloadKind::MessageBurst4096,
+                    ]
+                );
+            }
+            CliAction::Help => panic!("expected Run"),
+        }
+        match parse_args(["--workload=noop,message_burst,noop,message_burst_256"]).unwrap() {
+            CliAction::Run(cli) => {
+                assert_eq!(
+                    cli.workloads,
+                    vec![
+                        WorkloadKind::Noop,
+                        WorkloadKind::MessageIdlePoll,
+                        WorkloadKind::MessageBurst256,
+                        WorkloadKind::MessageBurst4096,
+                    ]
+                );
+            }
+            CliAction::Help => panic!("expected Run"),
+        }
+        match parse_args(["--workloads", "message_idle_poll,message_burst_4096"]).unwrap() {
+            CliAction::Run(cli) => {
+                assert_eq!(
+                    cli.workloads,
+                    vec![
+                        WorkloadKind::MessageIdlePoll,
+                        WorkloadKind::MessageBurst4096,
+                    ]
+                );
+            }
+            CliAction::Help => panic!("expected Run"),
+        }
     }
 
     #[test]
@@ -1702,5 +1881,358 @@ mod tests {
             );
         }
         assert_eq!(world.intern_symbol_calls(), 0);
+    }
+
+    #[test]
+    fn stateful_slice_cursor_conservation_across_sizes_and_batches() {
+        struct DrainProbeCtx {
+            api: *const BamHostApi,
+            max_count: usize,
+            observed_seqs: Vec<u64>,
+            zero_read_confirmed: bool,
+        }
+
+        unsafe extern "C" fn drain_probe_cb(
+            sys_ctx: *mut bamabi_sys::BamSystemCtx,
+            user_data: *mut c_void,
+        ) -> FfiResult {
+            // SAFETY: `user_data` points to `DrainProbeCtx` alive for this test.
+            let probe = unsafe { &mut *user_data.cast::<DrainProbeCtx>() };
+            // SAFETY: `probe.api` points to a validated `BamHostApi`.
+            let api = unsafe { &*probe.api };
+            let mut iter = core::ptr::null_mut();
+            // SAFETY: `sys_ctx` has query 0 (`MESSAGE_READ` of `BenchMessage`).
+            let q_res = unsafe { (api.sys_query.unwrap())(sys_ctx, 0, &mut iter) };
+            assert_eq!(q_res, FfiResult::OK);
+
+            // `max_count == 0` must read 0 items and must not advance cursor.
+            let mut zero_read = 99usize;
+            // SAFETY: `iter` and `zero_read` are valid; `max_count == 0` never reads `out_buf`.
+            let z_res = unsafe {
+                (api.msg_read_batch.unwrap())(iter, 0, core::ptr::null_mut(), 0, &mut zero_read)
+            };
+            assert_eq!(z_res, FfiResult::OK);
+            assert_eq!(zero_read, 0);
+
+            probe.observed_seqs.clear();
+            let mut buf = vec![BenchMessage::default(); probe.max_count];
+            loop {
+                let mut read = 0usize;
+                // SAFETY: `iter` is query 0, `buf` has `probe.max_count * 16` writable bytes, and `read` is valid.
+                let r_res = unsafe {
+                    (api.msg_read_batch.unwrap())(
+                        iter,
+                        0,
+                        buf.as_mut_ptr().cast::<u8>(),
+                        probe.max_count,
+                        &mut read,
+                    )
+                };
+                assert_eq!(r_res, FfiResult::OK);
+                for msg in &buf[..read] {
+                    assert_eq!(msg.payload, (msg.seq as u32).wrapping_mul(3));
+                    assert_eq!(msg.flags, 1);
+                    probe.observed_seqs.push(msg.seq);
+                }
+                if read == 0 {
+                    probe.zero_read_confirmed = true;
+                    break;
+                }
+            }
+            FfiResult::OK
+        }
+
+        const COUNTS: [usize; 9] = [0, 1, 63, 64, 65, 128, 129, 256, 4096];
+        const BATCHES: [usize; 6] = [1, 7, 32, 64, 65, 256];
+
+        let mut world = HostWorld::new();
+        let mut probe = DrainProbeCtx {
+            api: world.api_ptr(),
+            max_count: 1,
+            observed_seqs: Vec::new(),
+            zero_read_confirmed: false,
+        };
+        let terms = [BamTermDesc::message_read(world.bench_msg_handle)];
+        let queries = [bamabi_sys::BamQueryDesc::new(terms.as_ptr(), terms.len())];
+        let desc = bamabi_sys::BamSystemDesc::new(
+            c"cursor_probe".as_ptr(),
+            queries.as_ptr(),
+            queries.len(),
+            drain_probe_cb,
+            core::ptr::from_mut(&mut probe).cast::<c_void>(),
+        );
+        // SAFETY: `load_ctx_ptr()` and `desc` are valid during setup.
+        let reg_res = unsafe { (world.api.register_system.unwrap())(world.load_ctx_ptr(), &desc) };
+        assert_eq!(reg_res, FfiResult::OK);
+        let sys_idx = world.find_system("cursor_probe").unwrap();
+
+        for &n in &COUNTS {
+            world.enqueue_bench_messages(n);
+
+            // Direct `StatefulSliceCursor` conservation check (take + trailing None).
+            for &max_count in &BATCHES {
+                let mut cursor = 0usize;
+                let mut direct_seqs = Vec::with_capacity(n);
+                let queue = world.bench_message_queue().unwrap();
+                loop {
+                    let mut batch_count = 0usize;
+                    for raw in queue.cursor(&mut cursor).take(max_count) {
+                        assert_eq!(raw.len(), 16);
+                        let mut msg = core::mem::MaybeUninit::<BenchMessage>::uninit();
+                        // SAFETY: `msg` has 16 writable bytes and `raw` has 16 initialized bytes.
+                        let parsed = unsafe {
+                            core::ptr::copy_nonoverlapping(
+                                raw.as_ptr(),
+                                (&raw mut msg).cast::<core::mem::MaybeUninit<u8>>(),
+                                16,
+                            );
+                            msg.assume_init()
+                        };
+                        direct_seqs.push(parsed.seq);
+                        batch_count += 1;
+                    }
+                    if batch_count == 0 {
+                        break;
+                    }
+                }
+                assert_eq!(cursor, n);
+                assert_eq!(direct_seqs.len(), n);
+                assert!(direct_seqs.iter().enumerate().all(|(i, &s)| s == i as u64));
+
+                // C-ABI `host_msg_read_batch` conservation check + rewind.
+                world.rewind_msg_cursors();
+                probe.max_count = max_count;
+                probe.zero_read_confirmed = false;
+                assert_eq!(world.run_system(sys_idx), FfiResult::OK);
+                assert!(probe.zero_read_confirmed);
+                assert_eq!(probe.observed_seqs.len(), n);
+                assert!(
+                    probe
+                        .observed_seqs
+                        .iter()
+                        .enumerate()
+                        .all(|(i, &s)| s == i as u64)
+                );
+            }
+        }
+
+        // `clear_bench_messages` keeps data capacity and resets cursors.
+        let cap_before = world.bench_message_queue().unwrap().data.capacity();
+        assert!(cap_before >= 4096 * 16);
+        world.clear_bench_messages();
+        let q_after = world.bench_message_queue().unwrap();
+        assert_eq!(q_after.len, 0);
+        assert_eq!(q_after.data.capacity(), cap_before);
+    }
+
+    #[test]
+    fn run_if_ctx_cursor_isolation_and_gating() {
+        use core::sync::atomic::{AtomicU64, Ordering};
+        use std::sync::Arc;
+
+        use bamabi_guest::prelude::conditions;
+
+        // 1. Safe Rust SDK: `on_message` (`query_idx = usize::MAX`) must not consume body cursor (`query_idx = 0`).
+        {
+            let mut world = HostWorld::new();
+            let body_runs = Arc::new(AtomicU64::new(0));
+            let body_sum = Arc::new(AtomicU64::new(0));
+            let runs_clone = Arc::clone(&body_runs);
+            let sum_clone = Arc::clone(&body_sum);
+
+            let guest = InProcessGuest::load(c"test_run_if_isolation", &mut world, |app| {
+                app.system(c"gated_reader")
+                    .schedule(ScheduleId::UPDATE)
+                    .run_if_condition(conditions::on_message::<GuestBenchMsg>())
+                    .query(|q| q.message_read::<GuestBenchMsg>())
+                    .build(move |ctx| {
+                        runs_clone.fetch_add(1, Ordering::Relaxed);
+                        let msgs = ctx.read_messages::<GuestBenchMsg>(0)?;
+                        let s: u64 = msgs.iter().map(|m| m.seq).sum();
+                        sum_clone.store(s, Ordering::Relaxed);
+                        Ok(())
+                    })
+            })
+            .unwrap();
+            let sys_idx = world.find_system("gated_reader").unwrap();
+
+            // Empty queue -> `on_message` skips body.
+            assert_eq!(world.run_system(sys_idx), FfiResult::OK);
+            assert_eq!(body_runs.load(Ordering::Relaxed), 0);
+
+            // Queue 10 messages (sum 0..10 == 45) -> `on_message` passes, body reads all 10.
+            world.enqueue_bench_messages(10);
+            assert_eq!(world.run_system(sys_idx), FfiResult::OK);
+            assert_eq!(body_runs.load(Ordering::Relaxed), 1);
+            assert_eq!(body_sum.load(Ordering::Relaxed), 45);
+            // SAFETY: Reading `msg_cursors` outside guest callbacks.
+            let cursors = unsafe { &*world.msg_cursors.get() };
+            assert_eq!(cursors.get(&(sys_idx, usize::MAX, 0)), Some(&10));
+            assert_eq!(cursors.get(&(sys_idx, 0, 0)), Some(&10));
+
+            // Second tick without rewind -> `on_message` sees 0 unread and skips body.
+            assert_eq!(world.run_system(sys_idx), FfiResult::OK);
+            assert_eq!(body_runs.load(Ordering::Relaxed), 1);
+
+            // Rewind resets both `usize::MAX` and `0` cursors -> third tick runs and reads 45 again.
+            world.rewind_msg_cursors();
+            body_sum.store(0, Ordering::Relaxed);
+            assert_eq!(world.run_system(sys_idx), FfiResult::OK);
+            assert_eq!(body_runs.load(Ordering::Relaxed), 2);
+            assert_eq!(body_sum.load(Ordering::Relaxed), 45);
+
+            guest.shutdown(&mut world).unwrap();
+        }
+
+        // 2. Raw C-ABI `run_if_ctx` returning non-OK skips body, OK runs body with separate cursor.
+        {
+            struct RawCondCtx {
+                api: *const BamHostApi,
+                cond_read: usize,
+                body_read: usize,
+                allow_run: bool,
+            }
+
+            unsafe extern "C" fn raw_cond_cb(
+                sys_ctx: *mut bamabi_sys::BamSystemCtx,
+                user_data: *mut c_void,
+            ) -> FfiResult {
+                // SAFETY: `user_data` points to `RawCondCtx` alive for this test.
+                let ctx = unsafe { &mut *user_data.cast::<RawCondCtx>() };
+                if !ctx.allow_run {
+                    return FfiResult::NOT_FOUND;
+                }
+                // SAFETY: `ctx.api` points to a valid `BamHostApi`.
+                let api = unsafe { &*ctx.api };
+                let mut iter = core::ptr::null_mut();
+                // SAFETY: `run_if_query` provides query slot 0.
+                let q_res = unsafe { (api.sys_query.unwrap())(sys_ctx, 0, &mut iter) };
+                assert_eq!(q_res, FfiResult::OK);
+                let mut buf = [BenchMessage::default(); 3];
+                let mut read = 0usize;
+                // SAFETY: Reading up to 3 messages in `run_if_ctx` advances only `query_idx = usize::MAX`.
+                let r_res = unsafe {
+                    (api.msg_read_batch.unwrap())(
+                        iter,
+                        0,
+                        buf.as_mut_ptr().cast::<u8>(),
+                        3,
+                        &mut read,
+                    )
+                };
+                assert_eq!(r_res, FfiResult::OK);
+                ctx.cond_read = read;
+                FfiResult::OK
+            }
+
+            unsafe extern "C" fn raw_body_cb(
+                sys_ctx: *mut bamabi_sys::BamSystemCtx,
+                user_data: *mut c_void,
+            ) -> FfiResult {
+                // SAFETY: `user_data` points to `RawCondCtx` alive for this test.
+                let ctx = unsafe { &mut *user_data.cast::<RawCondCtx>() };
+                // SAFETY: `ctx.api` points to a valid `BamHostApi`.
+                let api = unsafe { &*ctx.api };
+                let mut iter = core::ptr::null_mut();
+                // SAFETY: `sys_ctx` has query 0.
+                let q_res = unsafe { (api.sys_query.unwrap())(sys_ctx, 0, &mut iter) };
+                assert_eq!(q_res, FfiResult::OK);
+                let mut buf = [BenchMessage::default(); 16];
+                let mut read = 0usize;
+                // SAFETY: Body reads all queued messages independently of `run_if_ctx` cursor.
+                let r_res = unsafe {
+                    (api.msg_read_batch.unwrap())(
+                        iter,
+                        0,
+                        buf.as_mut_ptr().cast::<u8>(),
+                        16,
+                        &mut read,
+                    )
+                };
+                assert_eq!(r_res, FfiResult::OK);
+                ctx.body_read = read;
+                FfiResult::OK
+            }
+
+            let mut world = HostWorld::new();
+            world.enqueue_bench_messages(7);
+            let mut state = RawCondCtx {
+                api: world.api_ptr(),
+                cond_read: 0,
+                body_read: 0,
+                allow_run: false,
+            };
+            let state_ptr = core::ptr::from_mut(&mut state).cast::<c_void>();
+            let terms = [BamTermDesc::message_read(world.bench_msg_handle)];
+            let body_q = [bamabi_sys::BamQueryDesc::new(terms.as_ptr(), terms.len())];
+            let cond_q = bamabi_sys::BamQueryDesc::new(terms.as_ptr(), terms.len());
+            let desc = bamabi_sys::BamSystemDesc::new(
+                c"raw_cond_sys".as_ptr(),
+                body_q.as_ptr(),
+                body_q.len(),
+                raw_body_cb,
+                state_ptr,
+            )
+            .with_run_if_ctx(raw_cond_cb, &raw const cond_q, state_ptr);
+
+            // SAFETY: `load_ctx_ptr()` and `desc` are valid during registration.
+            let reg_res =
+                unsafe { (world.api.register_system.unwrap())(world.load_ctx_ptr(), &desc) };
+            assert_eq!(reg_res, FfiResult::OK);
+            let idx = world.find_system("raw_cond_sys").unwrap();
+
+            assert_eq!(world.run_system(idx), FfiResult::OK);
+            assert_eq!(state.body_read, 0);
+
+            state.allow_run = true;
+            assert_eq!(world.run_system(idx), FfiResult::OK);
+            assert_eq!(state.cond_read, 3);
+            assert_eq!(state.body_read, 7);
+            // SAFETY: Reading `msg_cursors` outside guest callbacks.
+            let cursors = unsafe { &*world.msg_cursors.get() };
+            assert_eq!(cursors.get(&(idx, usize::MAX, 0)), Some(&3));
+            assert_eq!(cursors.get(&(idx, 0, 0)), Some(&7));
+        }
+    }
+
+    #[test]
+    fn message_workloads_run_verify_and_render_cleanly() {
+        let config = BenchConfig {
+            guests: Vec::new(),
+            workloads: WorkloadKind::ALL_MESSAGES.to_vec(),
+            entities: vec![256],
+            chunks: vec![64],
+            quick: true,
+            warmup_samples: 1,
+            timed_samples: 3,
+        };
+        let report = run_benchmarks(&config).expect("message workloads must succeed");
+        assert_eq!(report.rows.len(), 12);
+        assert!(report.rows.iter().all(|r| r.verified));
+        for workload in WorkloadKind::ALL_MESSAGES {
+            for subj in [
+                "native",
+                "rust_sdk:drain_messages",
+                "rust_sdk:reused_vec",
+                "c_abi:raw_batch",
+            ] {
+                assert!(
+                    report
+                        .rows
+                        .iter()
+                        .any(|r| r.workload == workload && r.subject == subj),
+                    "missing row for {} / {}",
+                    workload.as_str(),
+                    subj
+                );
+            }
+        }
+        let md = render_markdown_report(&report);
+        assert!(md.contains("message_idle_poll"));
+        assert!(md.contains("message_burst_256"));
+        assert!(md.contains("message_burst_4096"));
+        assert!(md.contains("rust_sdk:reused_vec"));
+        let json = render_json_report(&report);
+        assert!(json.contains("\"workload\": \"message_burst_4096\""));
     }
 }

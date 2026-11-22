@@ -6,7 +6,7 @@ pub mod filters;
 pub mod slice;
 pub mod typed_query;
 
-pub use bamabi_guest_sys::{SparseRows, SparseRowsIter, SparseRowsMut};
+pub use bamabi_guest_sys::{DrainOptions, SparseRows, SparseRowsIter, SparseRowsMut};
 pub use chunk::Chunk;
 pub use chunk_iter::ChunkIter;
 pub use slice::{ChunkSlice, ChunkSliceMut};

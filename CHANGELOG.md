@@ -9,6 +9,12 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 ## [Unreleased]
 
 ### Added
+- **Zero-Allocation POD/Non-POD Message Streaming & `DrainOptions` (`bamabi_guest_sys` & `bamabi_guest`):**
+  - Extended `CachedTermKind` (`MessageRead`, `MessageReadNonPod`, `MessageWrite`, `MessageWriteNonPod`, `RemovedRead`) in [`crates/bamabi_guest_sys/src/iter.rs`](crates/bamabi_guest_sys/src/iter.rs) so steady-state batch loops skip redundant `component_info` / `component_uuid` FFI calls.
+  - Added `512 B` (`#[repr(C, align(16))]`, zero `___chkstk_darwin` probes) `RawMsgStackScratch`, `DrainOptions`, `read_messages_into_uninit_checked`, `read_messages_into_checked`, `read_messages_into_vec_checked`, `drain_messages_into_vec_checked`, `drain_messages_with_options_checked`, `drain_messages_count_checked`, `read_removed_batch_checked`, `drain_removed_checked`, and `NON_POD_STACK_PTR_CAP = 64` stack probing in `bamabi_guest_sys`, plus symmetric `#![forbid(unsafe_code)]` safe SDK methods on `ChunkIter`, `Chunk`, `SystemContext`, and `RunConditionSystemContext` (`bamabi_guest`, including `Chunk::send_messages` / `send_pod_messages`) and `zero_alloc_messages` `CountingAlloc` tests.
+  - Added 4 `PO-G10` Kani proofs in [`crates/bamabi_guest_sys/src/kani_bounds_proofs.rs`](crates/bamabi_guest_sys/src/kani_bounds_proofs.rs) (`35` `bamabi_guest_sys` harnesses + `25` `bamabi_sys` harnesses = `60/60` PASS).
+- **Message Benchmarks & `hotpath` Profiling (`benches/bamabi_bench`):**
+  - Added optional `hotpath` / `hotpath-alloc` features, `StatefulSliceCursor` host storage, `run_if_ctx`/`run_if_query` support, and `message_idle_poll`, `message_burst_256`, and `message_burst_4096` workloads (`--workload message`).
 - **`SpawnBatchColumn::typed<T: AbiPod>` (`bamabi_guest_sys` & `bamabi_guest`):** Skips per-command `component_layout_info` and `sys_host_ctx` FFI calls for init-validated `TypedComponent<T>` handles while preserving `component.is_valid()`, `entity_count` length, null non-empty pointer, and `isize::MAX` byte-length overflow guards (covered by `commands::tests`, `v03_guest_sdk_tests::spawn_batch_column_typed_skips_layout_info_and_enforces_bounds`, and Kani `PO-G9.2` `po_g9_spawn_batch_column_validation_bounds`).
 - **Soundness Regression Test S13 (`bamabi_guest_sys`):** Added `s13_hot_reload_column_migration_and_scratch_shrink_soundness` verifying simulated `16 B -> 8 B` hot-reload column migration with clean `SlotScratchesCell` initialization, un-migrated v1 fail-closed Tick 1 rejection, and caller-owned `&mut QuerySlotScratch` shrink reuse (`reset_all()`) under dual-model Miri (Tree Borrows + Stacked Borrows with Strict Provenance).
 
@@ -17,6 +23,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 - **73-Slot / 16-Query ABI `0.3.0` Documentation Parity:** Reconciled `spec.md`, `README.md`, `ARCHITECTURE.md`, `TESTING.md`, crate docs (`bamabi_docs`, `bamabi_sys`, `bamabi_guest_sys`, `bamabi_sdk_gen`, `bamabi_guest`), and test/harness comments (`standalone_c_test.c`, `benches/bamabi_bench/src/loader.rs`) to full 73-slot `BamHostApi` (`592` B 64-bit / `300` B 32-bit; `MIN_V0_2_SIZE = 224` / `116`, `MIN_V0_3_SIZE = 552` / `280` for slots `0..68`, slots `68..=72`) and `MAX_QUERIES_PER_SYSTEM = 16` parity.
 
 ### Fixed
+- **`RunConditionSystemContext::has_messages` (`bamabi_guest`):** Drains the message cursor completely via `drain_messages_count::<M>` with zero heap allocations (`0 allocs / 0 B`) instead of allocating a batch buffer or leaving unread tail messages for the next tick.
 - **Native Benchmark LLVM `noalias` Parity (`bamabi_bench`):** Extracted `#[inline(always)] fn integrate_dense_chunk(pos: &mut [Position], vel: &[Velocity], dt: f32)` and moved `chunk.mark_changed(pos_handle)` outside the slice borrows in `native_dense_update` (`benches/bamabi_bench/src/workloads.rs`) so `native` receives the same LLVM `noalias` parameter optimization as polyglot guests.
 
 ---

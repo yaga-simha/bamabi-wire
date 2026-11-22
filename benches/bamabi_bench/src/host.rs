@@ -34,6 +34,8 @@ pub(crate) const POSITION_NAME: &str = "bench::Position";
 pub(crate) const VELOCITY_NAME: &str = "bench::Velocity";
 /// Canonical resource name for simulation parameters.
 pub(crate) const SIM_PARAMS_NAME: &str = "bench::SimParams";
+/// Canonical message name for benchmark messages.
+pub(crate) const BENCH_MESSAGE_NAME: &str = "bench::BenchMessage";
 
 /// Deterministic 128-bit UUID for `"bench::Position"` (`size = 16`, `align = 4`, `schema_hash = 0`).
 pub(crate) const POSITION_UUID: ComponentUuid = ComponentUuid::from_parts(POSITION_NAME, 16, 4, 0);
@@ -42,6 +44,9 @@ pub(crate) const VELOCITY_UUID: ComponentUuid = ComponentUuid::from_parts(VELOCI
 /// Deterministic 128-bit UUID for `"bench::SimParams"` (`size = 16`, `align = 4`, `schema_hash = 0`).
 pub(crate) const SIM_PARAMS_UUID: ComponentUuid =
     ComponentUuid::from_parts(SIM_PARAMS_NAME, 16, 4, 0);
+/// Deterministic 128-bit UUID for `"bench::BenchMessage"` (`size = 16`, `align = 8`, `schema_hash = 0`).
+pub(crate) const BENCH_MESSAGE_UUID: ComponentUuid =
+    ComponentUuid::from_parts(BENCH_MESSAGE_NAME, 16, 8, 0);
 
 /// Fixed integration timestep shared across native baseline and all polyglot guests.
 pub(crate) const BENCH_DT: f32 = 0.016;
@@ -91,6 +96,20 @@ unsafe impl RawInsertable for SimParams {}
 // SAFETY: `SimParams` has fixed-width C primitives and explicit `_pad` with zero implicit padding.
 unsafe impl AbiPod for SimParams {}
 
+/// Shared 16-byte POD message payload (`"bench::BenchMessage"`, 16 bytes, align 8).
+#[repr(C)]
+#[derive(Debug, Copy, Clone, Default, PartialEq, Eq)]
+pub(crate) struct BenchMessage {
+    pub(crate) seq: u64,
+    pub(crate) payload: u32,
+    pub(crate) flags: u32,
+}
+
+// SAFETY: `BenchMessage` is `#[repr(C)]`, `Copy + Send + Sync + 'static`, zero implicit padding, and no drop glue.
+unsafe impl RawInsertable for BenchMessage {}
+// SAFETY: `BenchMessage` consists solely of fixed-width integers with explicit fields and zero implicit padding.
+unsafe impl AbiPod for BenchMessage {}
+
 const _: () = {
     assert!(core::mem::size_of::<Position>() == 16);
     assert!(core::mem::align_of::<Position>() == 4);
@@ -112,6 +131,12 @@ const _: () = {
     assert!(core::mem::offset_of!(SimParams, damping) == 4);
     assert!(core::mem::offset_of!(SimParams, tick) == 8);
     assert!(core::mem::offset_of!(SimParams, _pad) == 12);
+
+    assert!(core::mem::size_of::<BenchMessage>() == 16);
+    assert!(core::mem::align_of::<BenchMessage>() == 8);
+    assert!(core::mem::offset_of!(BenchMessage, seq) == 0);
+    assert!(core::mem::offset_of!(BenchMessage, payload) == 8);
+    assert!(core::mem::offset_of!(BenchMessage, flags) == 12);
 };
 
 /// Static byte values returned by `iter_column_readonly` for `AccessMode::HAS` terms.
@@ -566,6 +591,99 @@ const _: () = {
     assert!(core::mem::align_of::<SystemFrame>() == core::mem::align_of::<usize>());
 };
 
+/// Contiguous byte queue backing a typed message stream in [`HostWorld`].
+pub(crate) struct MessageQueue {
+    pub(crate) elem_size: usize,
+    pub(crate) data: Vec<MaybeUninit<u8>>,
+    pub(crate) len: usize,
+}
+
+impl MessageQueue {
+    /// Creates an empty message queue for elements of `elem_size` bytes.
+    pub(crate) const fn new(elem_size: usize) -> Self {
+        Self {
+            elem_size,
+            data: Vec::new(),
+            len: 0,
+        }
+    }
+
+    /// Clears all queued elements while preserving allocated byte capacity.
+    pub(crate) fn clear(&mut self) {
+        self.len = 0;
+        self.data.clear();
+    }
+
+    /// Opens a stateful cursor borrowing `cursor` over this message queue.
+    #[inline]
+    pub(crate) fn cursor<'a>(&'a self, cursor: &'a mut usize) -> StatefulSliceCursor<'a> {
+        StatefulSliceCursor {
+            data: &self.data,
+            elem_size: self.elem_size,
+            total_len: self.len,
+            cursor,
+        }
+    }
+
+    /// Appends `count` elements of `self.elem_size` bytes from `src`.
+    ///
+    /// # Safety
+    /// If `self.elem_size > 0 && count > 0`, `src` must be non-null and readable for
+    /// `count * self.elem_size` initialized bytes.
+    pub(crate) unsafe fn push_batch_raw(&mut self, src: *const u8, count: usize) -> FfiResult {
+        if count == 0 {
+            return FfiResult::OK;
+        }
+        let Some(new_len) = self.len.checked_add(count) else {
+            return FfiResult::OUT_OF_RANGE;
+        };
+        if self.elem_size == 0 {
+            self.len = new_len;
+            return FfiResult::OK;
+        }
+        let Some(byte_len) = count.checked_mul(self.elem_size) else {
+            return FfiResult::OUT_OF_RANGE;
+        };
+        self.data.reserve(byte_len);
+        // SAFETY: Caller guarantees `src` is non-null and readable for `byte_len` bytes, and
+        // `self.data` reserved capacity for `byte_len` additional `MaybeUninit<u8>` elements.
+        let src_slice =
+            unsafe { core::slice::from_raw_parts(src.cast::<MaybeUninit<u8>>(), byte_len) };
+        self.data.extend_from_slice(src_slice);
+        self.len = new_len;
+        FfiResult::OK
+    }
+}
+
+/// Stateful slice iterator mirroring Bevy's `MessageCursor::read` consumption semantics,
+/// advancing `*self.cursor` before yielding each element slice.
+pub(crate) struct StatefulSliceCursor<'a> {
+    data: &'a [MaybeUninit<u8>],
+    elem_size: usize,
+    total_len: usize,
+    cursor: &'a mut usize,
+}
+
+impl<'a> Iterator for StatefulSliceCursor<'a> {
+    type Item = &'a [MaybeUninit<u8>];
+
+    #[inline]
+    fn next(&mut self) -> Option<Self::Item> {
+        let idx = *self.cursor;
+        if idx >= self.total_len {
+            return None;
+        }
+        // Advance `*self.cursor` BEFORE yielding, matching Bevy's stateful `MessageCursor::read`.
+        *self.cursor = idx + 1;
+        if self.elem_size == 0 {
+            Some(&[])
+        } else {
+            let start = idx * self.elem_size;
+            Some(&self.data[start..start + self.elem_size])
+        }
+    }
+}
+
 /// Registered guest system descriptor and pre-allocated query iterators.
 pub(crate) struct RegisteredSystem {
     pub(crate) name: String,
@@ -577,6 +695,9 @@ pub(crate) struct RegisteredSystem {
     pub(crate) user_data: *mut c_void,
     pub(crate) run_if: Option<BamRunIfFn>,
     pub(crate) run_if_user_data: *mut c_void,
+    pub(crate) run_if_ctx: Option<BamSystemFn>,
+    pub(crate) run_if_iter: Option<Box<UnsafeCell<IterState>>>,
+    pub(crate) run_if_ctx_user_data: *mut c_void,
 }
 
 const FX_SEED: u64 = 0x517c_c1b7_2722_0a95;
@@ -693,6 +814,7 @@ pub(crate) struct HostSharedState {
     intern_symbol_calls: AtomicU64,
     res_ticks_calls: AtomicU64,
     msg_send_calls: AtomicU64,
+    msg_read_batch_calls: AtomicU64,
     diagnostic_logs: AtomicU64,
 }
 
@@ -708,6 +830,7 @@ impl HostSharedState {
             intern_symbol_calls: AtomicU64::new(0),
             res_ticks_calls: AtomicU64::new(0),
             msg_send_calls: AtomicU64::new(0),
+            msg_read_batch_calls: AtomicU64::new(0),
             diagnostic_logs: AtomicU64::new(0),
         }
     }
@@ -739,7 +862,7 @@ pub(crate) struct HostWorld {
     pub(crate) name_to_handle: HashMap<String, BamComponent>,
     pub(crate) uuid_to_handle: HashMap<ComponentUuid, BamComponent>,
     pub(crate) resources: Vec<Option<ResourceSlot>>,
-    pub(crate) messages: UnsafeCell<HashMap<BamComponent, Vec<Vec<MaybeUninit<u8>>>>>,
+    pub(crate) messages: UnsafeCell<HashMap<BamComponent, MessageQueue>>,
     pub(crate) msg_cursors: UnsafeCell<HashMap<(usize, usize, usize), usize>>,
     pub(crate) chunks: Vec<ChunkStorage>,
     pub(crate) systems: Vec<RegisteredSystem>,
@@ -748,6 +871,7 @@ pub(crate) struct HostWorld {
     pub(crate) pos_handle: BamComponent,
     pub(crate) vel_handle: BamComponent,
     pub(crate) sim_params_handle: BamComponent,
+    pub(crate) bench_msg_handle: BamComponent,
 }
 
 /// Owning wrapper around a heap-pinned [`HostWorld`] preserving stable pointer provenance across
@@ -809,13 +933,28 @@ impl OwnedHostWorld {
     pub(crate) fn run_system(&self, sys_idx: usize) -> FfiResult {
         let world_ptr = self.raw;
         // SAFETY: No guest callback is active yet; extract metadata and drop `&HostWorld` before
-        // invoking `run_if` or `callback` so reentrant calls do not alias `&HostWorld`.
-        let (run_if, run_if_data, callback, user_data, iters_ptr, query_count) = unsafe {
+        // invoking `run_if`, `run_if_ctx`, or `callback` so reentrant calls do not alias `&HostWorld`.
+        let (
+            run_if,
+            run_if_data,
+            run_if_ctx,
+            run_if_iter_ptr,
+            run_if_ctx_data,
+            callback,
+            user_data,
+            iters_ptr,
+            query_count,
+        ) = unsafe {
             let world_ref = &*world_ptr;
             let sys = &world_ref.systems[sys_idx];
             (
                 sys.run_if,
                 sys.run_if_user_data,
+                sys.run_if_ctx,
+                sys.run_if_iter
+                    .as_deref()
+                    .map_or(core::ptr::null(), core::ptr::from_ref),
+                sys.run_if_ctx_user_data,
                 sys.callback,
                 sys.user_data,
                 sys.iters.as_ptr(),
@@ -827,6 +966,44 @@ impl OwnedHostWorld {
             // SAFETY: Guest registered `pred` and `run_if_data` during `bamabi_init`.
             let should_run = unsafe { pred(run_if_data) };
             if !should_run.get() {
+                return FfiResult::OK;
+            }
+        }
+
+        // SAFETY: Projecting disjoint raw pointers to `shared` and `commands` without holding `&mut HostWorld`.
+        let (shared_ptr, commands_ptr) = unsafe {
+            (
+                core::ptr::addr_of!((*world_ptr).shared),
+                (*world_ptr).commands.get(),
+            )
+        };
+
+        if let Some(pred_ctx) = run_if_ctx {
+            let run_if_query_count = if run_if_iter_ptr.is_null() {
+                0
+            } else {
+                // SAFETY: `run_if_iter_ptr` points to this system's heap-pinned `UnsafeCell<IterState>`
+                // and no guest callback is active yet.
+                unsafe {
+                    let iter_ptr = UnsafeCell::raw_get(run_if_iter_ptr);
+                    (*iter_ptr).next_chunk_idx = 0;
+                    (*iter_ptr).active_chunk_idx = None;
+                }
+                1
+            };
+            let mut run_if_frame = SystemFrame {
+                world: world_ptr,
+                shared: shared_ptr,
+                commands: commands_ptr,
+                sys_idx,
+                iters: run_if_iter_ptr,
+                query_count: run_if_query_count,
+            };
+            let run_if_sys_ctx = (&raw mut run_if_frame).cast::<BamSystemCtx>();
+            // SAFETY: `run_if_sys_ctx` points to a valid `SystemFrame` alive for this call and
+            // `pred_ctx`/`run_if_ctx_data` were registered by the loaded guest module.
+            let cond_res = unsafe { pred_ctx(run_if_sys_ctx, run_if_ctx_data) };
+            if !cond_res.is_ok() {
                 return FfiResult::OK;
             }
         }
@@ -843,13 +1020,6 @@ impl OwnedHostWorld {
             }
         }
 
-        // SAFETY: Projecting disjoint raw pointers to `shared` and `commands` without holding `&mut HostWorld`.
-        let (shared_ptr, commands_ptr) = unsafe {
-            (
-                core::ptr::addr_of!((*world_ptr).shared),
-                (*world_ptr).commands.get(),
-            )
-        };
         let mut frame = SystemFrame {
             world: world_ptr,
             shared: shared_ptr,
@@ -867,7 +1037,8 @@ impl OwnedHostWorld {
 
 impl HostWorld {
     /// Allocates and initializes a new [`OwnedHostWorld`] pre-populated with the shared benchmark
-    /// components (`"bench::Position"`, `"bench::Velocity"`) and `"bench::SimParams"` resource.
+    /// components (`"bench::Position"`, `"bench::Velocity"`, `"bench::BenchMessage"`) and
+    /// `"bench::SimParams"` resource.
     #[allow(clippy::new_ret_no_self)]
     pub(crate) fn new() -> OwnedHostWorld {
         let raw = Box::into_raw(Box::new(Self {
@@ -886,6 +1057,7 @@ impl HostWorld {
             pos_handle: BamComponent::INVALID,
             vel_handle: BamComponent::INVALID,
             sim_params_handle: BamComponent::INVALID,
+            bench_msg_handle: BamComponent::INVALID,
         }));
         let mut owned = OwnedHostWorld { raw };
         // SAFETY: `raw` was just initialized via `Box::into_raw`; initialize `shared.world` back-pointer
@@ -907,6 +1079,8 @@ impl HostWorld {
                 _pad: 0,
             },
         );
+        owned.bench_msg_handle =
+            owned.expose_component::<BenchMessage>(BENCH_MESSAGE_NAME, BENCH_MESSAGE_UUID, 0, true);
         owned
     }
 
@@ -1050,10 +1224,83 @@ impl HostWorld {
         self.systems.iter().position(|s| s.name == name)
     }
 
-    /// Clears registered systems and schedule sets prior to `dlclose` / `FreeLibrary`.
+    /// Clears registered systems, message cursors, and schedule sets prior to `dlclose` / `FreeLibrary`.
     pub(crate) fn clear_systems_for_unload(&mut self) {
         self.systems.clear();
         self.schedule_sets.clear();
+        self.msg_cursors.get_mut().clear();
+    }
+
+    /// Populates `count` deterministic [`BenchMessage`] entries (`0..count`) keeping existing
+    /// buffer capacity and resetting all existing cursor offsets to `0`.
+    pub(crate) fn enqueue_bench_messages(&mut self, count: usize) {
+        let elem_size = core::mem::size_of::<BenchMessage>();
+        let handle = self.bench_msg_handle;
+        let queue = self
+            .messages
+            .get_mut()
+            .entry(handle)
+            .or_insert_with(|| MessageQueue::new(elem_size));
+        queue.clear();
+        let total_bytes = count.saturating_mul(elem_size);
+        queue.data.reserve(total_bytes);
+        for i in 0..count {
+            let msg = BenchMessage {
+                seq: i as u64,
+                payload: (i as u32).wrapping_mul(3),
+                flags: 1,
+            };
+            // SAFETY: `BenchMessage` is `AbiPod` (`16` bytes, zero implicit padding) and valid
+            // for reading `elem_size` initialized `MaybeUninit<u8>` bytes.
+            let bytes = unsafe {
+                core::slice::from_raw_parts(
+                    core::ptr::from_ref(&msg).cast::<MaybeUninit<u8>>(),
+                    elem_size,
+                )
+            };
+            queue.data.extend_from_slice(bytes);
+        }
+        queue.len = count;
+        for cursor in self.msg_cursors.get_mut().values_mut() {
+            *cursor = 0;
+        }
+    }
+
+    /// Clears queued [`BenchMessage`] entries keeping allocated capacity and resets existing
+    /// cursor offsets to `0` with zero heap allocations.
+    pub(crate) fn clear_bench_messages(&mut self) {
+        let handle = self.bench_msg_handle;
+        if let Some(queue) = self.messages.get_mut().get_mut(&handle) {
+            queue.clear();
+        }
+        for cursor in self.msg_cursors.get_mut().values_mut() {
+            *cursor = 0;
+        }
+    }
+
+    /// Resets existing message cursor values to `0` in-place with zero heap allocations.
+    pub(crate) fn rewind_msg_cursors(&self) {
+        // SAFETY: Called outside active guest FFI system callbacks on the host thread.
+        let cursors = unsafe { &mut *self.msg_cursors.get() };
+        for cursor in cursors.values_mut() {
+            *cursor = 0;
+        }
+    }
+
+    /// Borrows the [`MessageQueue`] for [`BenchMessage`], if initialized.
+    pub(crate) fn bench_message_queue(&self) -> Option<&MessageQueue> {
+        // SAFETY: Called outside active mutable guest writes to `messages`.
+        unsafe { (&*self.messages.get()).get(&self.bench_msg_handle) }
+    }
+
+    /// Returns total `msg_read_batch` calls observed since last reset.
+    pub(crate) fn msg_read_batch_calls(&self) -> u64 {
+        self.shared.msg_read_batch_calls.load(Ordering::Relaxed)
+    }
+
+    /// Resets `msg_read_batch` call counter.
+    pub(crate) fn reset_msg_read_batch_calls(&self) {
+        self.shared.msg_read_batch_calls.store(0, Ordering::Relaxed);
     }
 
     /// Pre-reserves command queue capacity before a timed batch.
@@ -1507,6 +1754,31 @@ unsafe fn register_system_impl(
         }
     }
 
+    let run_if_terms = if d.run_if_ctx.is_some() && !d.run_if_query.is_null() {
+        // SAFETY: `d.run_if_query` was checked non-null and points to a readable `BamQueryDesc`.
+        let q = unsafe { read_descriptor::<BamQueryDesc>(d.run_if_query.cast::<c_void>()) }?;
+        let q_status = q.validate();
+        if !q_status.is_ok() {
+            return Err(q_status);
+        }
+        let terms = if q.term_count == 0 {
+            Vec::new()
+        } else {
+            // SAFETY: `q.validate()` verified `q.terms` is non-null for `q.term_count > 0`.
+            let slice = unsafe { core::slice::from_raw_parts(q.terms, q.term_count) };
+            for term in slice {
+                let t_status = term.validate();
+                if !t_status.is_ok() {
+                    return Err(t_status);
+                }
+            }
+            slice.to_vec()
+        };
+        Some(terms)
+    } else {
+        None
+    };
+
     // Capture root `HostWorld` pointer provenance before creating `&mut HostWorld`.
     let world_ptr = load_ctx.cast::<HostWorld>().cast_const();
     // SAFETY: `load_ctx` points to an exclusively held `HostWorld` during `bamabi_init`.
@@ -1531,6 +1803,21 @@ unsafe fn register_system_impl(
             })
         })
         .collect();
+    let run_if_iter = run_if_terms.map(|terms| {
+        Box::new(UnsafeCell::new(IterState {
+            world: world_ptr,
+            sys_idx,
+            query_idx: usize::MAX,
+            terms,
+            start_chunk_idx: 0,
+            next_chunk_idx: 0,
+            end_chunk_idx: None,
+            active_chunk_idx: None,
+            in_par_iter: false,
+            ro_rows_scratch: Vec::new(),
+            mut_rows_scratch: Vec::new(),
+        }))
+    });
 
     let Some(callback) = d.callback else {
         return Err(FfiResult::NULL_POINTER);
@@ -1545,6 +1832,9 @@ unsafe fn register_system_impl(
         user_data: d.user_data,
         run_if: d.run_if,
         run_if_user_data: d.run_if_user_data,
+        run_if_ctx: d.run_if_ctx,
+        run_if_iter,
+        run_if_ctx_user_data: d.run_if_ctx_user_data,
     });
     Ok(BamSystem::from_raw(sys_idx as u32))
 }
@@ -2489,19 +2779,28 @@ unsafe extern "C" fn host_msg_read_batch(
     if max_count > 0 && elem_size > 0 && out_buf.is_null() {
         return FfiResult::NULL_POINTER;
     }
+    world
+        .shared
+        .msg_read_batch_calls
+        .fetch_add(1, Ordering::Relaxed);
+    let effective_max = (isize::MAX as usize)
+        .checked_div(elem_size)
+        .map_or(max_count, |cap| max_count.min(cap));
     // SAFETY: `messages` and `msg_cursors` are accessed on the active system thread.
     let (messages, cursors) = unsafe { (&*world.messages.get(), &mut *world.msg_cursors.get()) };
-    let cursor_key = (state.sys_idx, state.query_idx, term_index);
-    let cursor = cursors.get(&cursor_key).copied().unwrap_or(0);
     let Some(stream) = messages.get(&term.component) else {
         return FfiResult::OK;
     };
-    let avail = stream.len().saturating_sub(cursor);
-    let to_copy = avail.min(max_count);
-    for i in 0..to_copy {
+    if stream.len == 0 {
+        return FfiResult::OK;
+    }
+    let cursor_key = (state.sys_idx, state.query_idx, term_index);
+    let cursor_slot = cursors.entry(cursor_key).or_insert(0);
+    let mut read_count = 0usize;
+    for (i, bytes) in stream.cursor(cursor_slot).take(effective_max).enumerate() {
         if elem_size > 0 {
-            let bytes = &stream[cursor + i];
-            // SAFETY: `out_buf` has `max_count * elem_size` writable bytes and `bytes` has `elem_size`.
+            // SAFETY: `out_buf` has `max_count * elem_size` writable bytes (`effective_max <= max_count`
+            // and `i * elem_size <= isize::MAX`), and `bytes` has `elem_size` initialized bytes.
             unsafe {
                 core::ptr::copy_nonoverlapping(
                     bytes.as_ptr(),
@@ -2510,11 +2809,11 @@ unsafe extern "C" fn host_msg_read_batch(
                 );
             }
         }
+        read_count = i + 1;
     }
-    cursors.insert(cursor_key, cursor + to_copy);
     // SAFETY: `out_read` is non-null writable `usize` storage.
     unsafe {
-        *out_read = to_copy;
+        *out_read = read_count;
     }
     FfiResult::OK
 }
@@ -2542,29 +2841,23 @@ unsafe extern "C" fn host_msg_send(
     let Some(meta) = world.comp_meta(term.component) else {
         return FfiResult::INVALID_COMPONENT;
     };
-    if meta.size != data_len {
+    let elem_size = meta.size;
+    if elem_size != data_len {
         return FfiResult::TYPE_MISMATCH;
     }
-    let mut entry = vec![MaybeUninit::uninit(); data_len];
-    if data_len > 0 {
-        if data_ptr.is_null() {
-            return FfiResult::NULL_POINTER;
-        }
-        // SAFETY: Caller guarantees `data_ptr` is readable for `data_len` bytes.
-        unsafe {
-            core::ptr::copy_nonoverlapping(
-                data_ptr.cast::<MaybeUninit<u8>>(),
-                entry.as_mut_ptr(),
-                data_len,
-            );
-        }
+    if data_len > 0 && data_ptr.is_null() {
+        return FfiResult::NULL_POINTER;
     }
     // SAFETY: `messages` is accessed exclusively here on the active system thread.
-    unsafe {
+    let stream = unsafe {
         (*world.messages.get())
             .entry(term.component)
-            .or_default()
-            .push(entry);
+            .or_insert_with(|| MessageQueue::new(elem_size))
+    };
+    // SAFETY: `data_ptr` is non-null when `elem_size > 0` and readable for `elem_size` bytes.
+    let status = unsafe { stream.push_batch_raw(data_ptr, 1) };
+    if !status.is_ok() {
+        return status;
     }
     world.shared.msg_send_calls.fetch_add(1, Ordering::Relaxed);
     FfiResult::OK
@@ -2601,20 +2894,15 @@ unsafe extern "C" fn host_msg_write_batch(
         return FfiResult::NULL_POINTER;
     }
     // SAFETY: `messages` is accessed exclusively here on the active system thread.
-    let stream = unsafe { (*world.messages.get()).entry(term.component).or_default() };
-    for i in 0..count {
-        let mut entry = vec![MaybeUninit::uninit(); elem_size];
-        if elem_size > 0 {
-            // SAFETY: Caller guarantees `in_buf` covers `count * elem_size` readable bytes.
-            unsafe {
-                core::ptr::copy_nonoverlapping(
-                    in_buf.add(i * elem_size).cast::<MaybeUninit<u8>>(),
-                    entry.as_mut_ptr(),
-                    elem_size,
-                );
-            }
-        }
-        stream.push(entry);
+    let stream = unsafe {
+        (*world.messages.get())
+            .entry(term.component)
+            .or_insert_with(|| MessageQueue::new(elem_size))
+    };
+    // SAFETY: `in_buf` is non-null when `elem_size > 0` and readable for `count * elem_size` bytes.
+    let status = unsafe { stream.push_batch_raw(in_buf, count) };
+    if !status.is_ok() {
+        return status;
     }
     world
         .shared

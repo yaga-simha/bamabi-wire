@@ -8,26 +8,6 @@ use crate::{
     iter::{Chunk, ChunkIter},
 };
 
-/// Verifies that `term_index` on `iter` is a `REMOVED_READ` entity component stream matching
-/// `T`'s `(size, align)` and manifest-aware [`ComponentUuid`](bamabi_sys::ComponentUuid).
-fn validate_removed_term<T: GuestComponent>(
-    iter: &ChunkIter<'_>,
-    term_index: usize,
-) -> Result<(), FfiResult> {
-    let info = iter.column_info(term_index)?;
-    if info.mode != AccessMode::REMOVED_READ || info.is_resource() || info.is_message() {
-        return Err(FfiResult::TYPE_MISMATCH);
-    }
-    if info.size != core::mem::size_of::<T>() || info.align != core::mem::align_of::<T>() {
-        return Err(FfiResult::TYPE_MISMATCH);
-    }
-    let filter = guest_uuid_filter::<T>(iter.inner.base_host().manifest_name());
-    if !filter.matches(info.uuid) {
-        return Err(FfiResult::TYPE_MISMATCH);
-    }
-    Ok(())
-}
-
 impl<'iter, 'ctx> Chunk<'iter, 'ctx> {
     /// Returns the archetypal presence boolean (`Has<T>`) for `T: GuestComponent` at column
     /// `col` in the active chunk, validating `T`'s layout and UUID.
@@ -96,8 +76,9 @@ impl<'a> ChunkIter<'a> {
         &mut self,
         term_index: usize,
     ) -> Result<Vec<FfiEntity>, FfiResult> {
-        validate_removed_term::<T>(self, term_index)?;
-        self.inner.drain_removed(term_index)
+        let filter = guest_uuid_filter::<T>(self.inner.base_host().manifest_name());
+        self.inner
+            .drain_removed_checked::<T>(term_index, Some(filter))
     }
 
     /// Reads up to `out_entities.len()` `RemovedComponents<T>` entity IDs for `T: GuestComponent`
@@ -108,8 +89,9 @@ impl<'a> ChunkIter<'a> {
         term_index: usize,
         out_entities: &mut [FfiEntity],
     ) -> Result<usize, FfiResult> {
-        validate_removed_term::<T>(self, term_index)?;
-        self.inner.read_removed_batch(term_index, out_entities)
+        let filter = guest_uuid_filter::<T>(self.inner.base_host().manifest_name());
+        self.inner
+            .read_removed_batch_checked::<T>(term_index, Some(filter), out_entities)
     }
 }
 
@@ -125,8 +107,8 @@ impl<'a> SystemContext<'a> {
     ) -> Result<Vec<FfiEntity>, FfiResult> {
         let mut res_err = None;
         if let Some(res_q) = self.resource_query_mut() {
-            match validate_removed_term::<T>(res_q, term_index) {
-                Ok(()) => return res_q.drain_removed(term_index),
+            match res_q.read_removed::<T>(term_index) {
+                Ok(removed) => return Ok(removed),
                 Err(err) => res_err = Some(err),
             }
         }
@@ -154,8 +136,8 @@ impl<'a> SystemContext<'a> {
     ) -> Result<usize, FfiResult> {
         let mut res_err = None;
         if let Some(res_q) = self.resource_query_mut() {
-            match validate_removed_term::<T>(res_q, term_index) {
-                Ok(()) => return res_q.read_removed_batch(term_index, out_entities),
+            match res_q.read_removed_batch_typed::<T>(term_index, out_entities) {
+                Ok(n) => return Ok(n),
                 Err(err) => res_err = Some(err),
             }
         }

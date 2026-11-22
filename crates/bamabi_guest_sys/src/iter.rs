@@ -12,8 +12,9 @@ use core::{
 use std::ffi::CString;
 
 use bamabi_sys::{
-    AbiPod, AccessMode, BamChangeTicks, BamColumnInfo, BamComponent, BamIter, ComponentUuid,
-    FfiBool, FfiEntity, FfiResult, FfiSlice, MAX_TERMS_PER_QUERY, ModComponent, StrView,
+    AbiPod, AccessMode, BamChangeTicks, BamColumnInfo, BamComponent, BamIter, BamIterReadRemovedFn,
+    BamMsgReadBatchFn, ComponentUuid, FfiBool, FfiEntity, FfiResult, FfiSlice, MAX_TERMS_PER_QUERY,
+    ModComponent, StrView,
 };
 
 use crate::{
@@ -1108,6 +1109,163 @@ struct BatchColPtrBuf([MaybeUninit<*mut u8>; INLINE_BATCH_COL_CAP]);
 // fresh `ValidatedIter` with `scratch_batch_epoch = 0` (`!= batch_epoch`) is created on each tick.
 unsafe impl Send for BatchColPtrBuf {}
 
+/// Byte capacity of the stack scratch buffer used for zero-allocation message probing.
+///
+/// Kept strictly at `512` bytes (`align(16)`) so hot guest stack frames never trigger
+/// `___chkstk_darwin` probes.
+const MSG_STACK_SCRATCH_BYTES: usize = 512;
+
+/// Maximum number of non-POD message `*const c_void` pointers probed on the stack without
+/// falling back to a heap `Vec` (`64 * 8 = 512 B` on 64-bit targets).
+const NON_POD_STACK_PTR_CAP: usize = 64;
+
+/// 16-byte-aligned 512-byte stack scratch buffer for probing POD message batches without heap
+/// allocation.
+#[repr(C, align(16))]
+pub(crate) struct RawMsgStackScratch([MaybeUninit<u8>; MSG_STACK_SCRATCH_BYTES]);
+
+const _: () = {
+    assert!(core::mem::size_of::<RawMsgStackScratch>() == 512);
+    assert!(core::mem::align_of::<RawMsgStackScratch>() == 16);
+    assert!(NON_POD_STACK_PTR_CAP * core::mem::size_of::<*const c_void>() <= 512);
+};
+
+impl RawMsgStackScratch {
+    /// Returns an uninitialized 512-byte, 16-byte-aligned stack buffer without zero-filling.
+    #[inline(always)]
+    pub(crate) const fn uninit() -> Self {
+        Self([const { MaybeUninit::uninit() }; MSG_STACK_SCRATCH_BYTES])
+    }
+
+    /// Returns the maximum element count of `elem_size` bytes fitting inside `512` bytes, clamped
+    /// to `requested` (returns `requested` for ZSTs and `0` when `elem_size > 512`).
+    #[inline(always)]
+    pub(crate) const fn probe_cap_for_size(elem_size: usize, requested: usize) -> usize {
+        if elem_size == 0 {
+            requested
+        } else if elem_size > MSG_STACK_SCRATCH_BYTES {
+            0
+        } else {
+            let max_fit = MSG_STACK_SCRATCH_BYTES / elem_size;
+            if requested < max_fit {
+                requested
+            } else {
+                max_fit
+            }
+        }
+    }
+
+    /// Validates a host-reported `actual` element count against `(elem_size, probe_cap)` and the
+    /// `512`-byte buffer limit, failing closed with [`FfiResult::INTERNAL_ERROR`] on overflow.
+    #[inline(always)]
+    pub(crate) const fn validate_probe_count(
+        elem_size: usize,
+        probe_cap: usize,
+        actual: usize,
+    ) -> Result<usize, FfiResult> {
+        if actual > probe_cap {
+            return Err(FfiResult::INTERNAL_ERROR);
+        }
+        match actual.checked_mul(elem_size) {
+            Some(bytes) if bytes <= MSG_STACK_SCRATCH_BYTES => Ok(actual),
+            _ => Err(FfiResult::INTERNAL_ERROR),
+        }
+    }
+
+    /// Returns a mutable byte pointer to the start of the 512-byte scratch buffer.
+    #[inline(always)]
+    pub(crate) fn as_mut_u8_ptr(&mut self) -> *mut u8 {
+        self.0.as_mut_ptr().cast::<u8>()
+    }
+
+    /// Reads an initialized `M: AbiPod` element at logical slot `index` via `read_unaligned`.
+    ///
+    /// # Safety
+    /// - Either `size_of::<M>() == 0`, or `(index + 1) * size_of::<M>() <= 512` without overflow
+    ///   and the byte range `index * size_of::<M>() .. (index + 1) * size_of::<M>()` inside `self`
+    ///   must have been initialized with a valid `M` representation.
+    #[inline(always)]
+    pub(crate) unsafe fn read_elem<M: AbiPod>(&self, index: usize) -> M {
+        if core::mem::size_of::<M>() == 0 {
+            // SAFETY: `core::mem::size_of::<M>() == 0` is verified above and `M: AbiPod` has zero
+            // uninitialized padding or invariants.
+            return unsafe { zst_pod_value::<M>() };
+        }
+        // SAFETY: Caller guarantees `index * size_of::<M>() + size_of::<M>() <= 512` and that
+        // those bytes inside `self.0` are initialized for `M: AbiPod`.
+        unsafe {
+            core::ptr::read_unaligned(
+                self.0
+                    .as_ptr()
+                    .cast::<u8>()
+                    .add(index * core::mem::size_of::<M>())
+                    .cast::<M>(),
+            )
+        }
+    }
+}
+
+/// Constructs a zero-sized `AbiPod` value without calling `write_bytes` on a 0-byte stack slot.
+///
+/// # Safety
+///
+/// Caller must ensure `core::mem::size_of::<M>() == 0`.
+#[inline(always)]
+unsafe fn zst_pod_value<M: AbiPod>() -> M {
+    // SAFETY: Caller ensures `size_of::<M>() == 0`; `NonNull::<M>::dangling()` is properly
+    // aligned and a zero-sized `ptr::read` accesses zero bytes.
+    unsafe { core::ptr::read(core::ptr::NonNull::<M>::dangling().as_ptr()) }
+}
+
+/// Batch-sizing policy controlling exponential ramp behavior when draining buffered messages into a
+/// `Vec`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DrainOptions {
+    /// Initial batch size probed on the stack (or initial spare-capacity request) per drain.
+    pub initial_batch: usize,
+    /// Maximum batch size ceiling when ramping exponentially across large message bursts.
+    pub max_batch: usize,
+}
+
+impl Default for DrainOptions {
+    /// Returns the default drain policy (`initial_batch: 64`, `max_batch: 1024`).
+    #[inline]
+    fn default() -> Self {
+        Self {
+            initial_batch: 64,
+            max_batch: 1024,
+        }
+    }
+}
+
+impl DrainOptions {
+    /// Creates a [`DrainOptions`] with explicit `initial_batch` and `max_batch` parameters.
+    #[inline]
+    pub const fn new(initial_batch: usize, max_batch: usize) -> Self {
+        Self {
+            initial_batch,
+            max_batch,
+        }
+    }
+
+    /// Normalizes `(initial_batch, max_batch)` so `initial_batch >= 1` and
+    /// `max_batch >= initial_batch`.
+    #[inline]
+    pub const fn normalized(self) -> (usize, usize) {
+        let initial = if self.initial_batch == 0 {
+            1
+        } else {
+            self.initial_batch
+        };
+        let max = if self.max_batch < initial {
+            initial
+        } else {
+            self.max_batch
+        };
+        (initial, max)
+    }
+}
+
 /// Classification of a cached term validation entry inside [`QuerySlotScratch`].
 #[derive(Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
@@ -1124,6 +1282,11 @@ enum CachedTermKind {
     HasUntyped = 9,
     ResourceRead = 10,
     ResourceWrite = 11,
+    MessageRead = 12,
+    MessageReadNonPod = 13,
+    MessageWrite = 14,
+    MessageWriteNonPod = 15,
+    RemovedRead = 16,
 }
 
 /// Cached metadata produced after validating a term descriptor `(term_index, kind, TypeId,
@@ -2271,6 +2434,282 @@ impl<'a> ValidatedIter<'a> {
         Ok(())
     }
 
+    /// Validates a readable POD message stream (`MESSAGE_READ` or `MESSAGE_WRITE`) matching
+    /// `M: AbiPod` via the persistent term cache.
+    #[inline]
+    fn validate_message_read_term<M: AbiPod>(
+        &self,
+        term_index: usize,
+        expected_uuid: Option<UuidFilter>,
+    ) -> Result<(), FfiResult> {
+        if self
+            .cached_term_entry::<M>(
+                term_index,
+                CachedTermKind::MessageRead,
+                AccessMode::MESSAGE_READ,
+                expected_uuid,
+            )
+            .is_some()
+        {
+            return Ok(());
+        }
+        let info = self.column_info(term_index)?;
+        if !validate_message_read_info::<M>(&info, expected_uuid) {
+            return Err(FfiResult::TYPE_MISMATCH);
+        }
+        self.store_cached_term(
+            term_index,
+            CachedTermEntry {
+                type_id: core::any::TypeId::of::<M>(),
+                expected_uuid,
+                expected_mode: AccessMode::MESSAGE_READ,
+                info_mode: info.mode,
+                component: info.component,
+                kind: CachedTermKind::MessageRead,
+            },
+        );
+        Ok(())
+    }
+
+    /// Validates a writable POD message stream (`MESSAGE_WRITE`) matching `M: AbiPod` via the
+    /// persistent term cache.
+    #[inline]
+    fn validate_message_write_term<M: AbiPod>(
+        &self,
+        term_index: usize,
+        expected_uuid: Option<UuidFilter>,
+    ) -> Result<(), FfiResult> {
+        if self
+            .cached_term_entry::<M>(
+                term_index,
+                CachedTermKind::MessageWrite,
+                AccessMode::MESSAGE_WRITE,
+                expected_uuid,
+            )
+            .is_some()
+        {
+            return Ok(());
+        }
+        let info = self.column_info(term_index)?;
+        if !validate_message_write_info::<M>(&info, expected_uuid) {
+            return Err(FfiResult::TYPE_MISMATCH);
+        }
+        self.store_cached_term(
+            term_index,
+            CachedTermEntry {
+                type_id: core::any::TypeId::of::<M>(),
+                expected_uuid,
+                expected_mode: AccessMode::MESSAGE_WRITE,
+                info_mode: info.mode,
+                component: info.component,
+                kind: CachedTermKind::MessageWrite,
+            },
+        );
+        Ok(())
+    }
+
+    /// Validates a readable VTable-backed non-POD message stream (`M: ModComponent`) via the
+    /// persistent term cache, checking both `validate_non_pod_message_info_for::<M>` and
+    /// `verify_non_pod_message_marker::<M>` on cache miss.
+    #[inline]
+    fn validate_message_read_non_pod_term<M: ModComponent>(
+        &self,
+        term_index: usize,
+        effective_uuid: UuidFilter,
+    ) -> Result<(), FfiResult> {
+        if self
+            .cached_term_entry::<M>(
+                term_index,
+                CachedTermKind::MessageReadNonPod,
+                AccessMode::MESSAGE_READ,
+                Some(effective_uuid),
+            )
+            .is_some()
+        {
+            return Ok(());
+        }
+        let info = self.column_info(term_index)?;
+        if !validate_non_pod_message_info_for::<M>(
+            &info,
+            self.host.manifest_name(),
+            Some(effective_uuid),
+            false,
+        ) {
+            return Err(FfiResult::TYPE_MISMATCH);
+        }
+        self.verify_non_pod_message_marker::<M>()?;
+        self.store_cached_term(
+            term_index,
+            CachedTermEntry {
+                type_id: core::any::TypeId::of::<M>(),
+                expected_uuid: Some(effective_uuid),
+                expected_mode: AccessMode::MESSAGE_READ,
+                info_mode: info.mode,
+                component: info.component,
+                kind: CachedTermKind::MessageReadNonPod,
+            },
+        );
+        Ok(())
+    }
+
+    /// Validates a readable raw non-POD message pointer stream (`*const c_void`) via the
+    /// persistent term cache.
+    #[inline]
+    fn validate_message_read_non_pod_ptrs_term(
+        &self,
+        term_index: usize,
+        expected_uuid: Option<UuidFilter>,
+    ) -> Result<(), FfiResult> {
+        if self
+            .cached_term_entry::<*const c_void>(
+                term_index,
+                CachedTermKind::MessageReadNonPod,
+                AccessMode::MESSAGE_READ,
+                expected_uuid,
+            )
+            .is_some()
+        {
+            return Ok(());
+        }
+        let info = self.column_info(term_index)?;
+        if !validate_non_pod_message_info(&info, expected_uuid, false) {
+            return Err(FfiResult::TYPE_MISMATCH);
+        }
+        self.store_cached_term(
+            term_index,
+            CachedTermEntry {
+                type_id: core::any::TypeId::of::<*const c_void>(),
+                expected_uuid,
+                expected_mode: AccessMode::MESSAGE_READ,
+                info_mode: info.mode,
+                component: info.component,
+                kind: CachedTermKind::MessageReadNonPod,
+            },
+        );
+        Ok(())
+    }
+
+    /// Validates a writable VTable-backed non-POD message stream (`M: ModComponent`) via the
+    /// persistent term cache, checking both `validate_non_pod_message_info_for::<M>` and
+    /// `verify_non_pod_message_marker::<M>` on cache miss.
+    #[inline]
+    fn validate_message_write_non_pod_term<M: ModComponent>(
+        &self,
+        term_index: usize,
+        effective_uuid: UuidFilter,
+    ) -> Result<(), FfiResult> {
+        if self
+            .cached_term_entry::<M>(
+                term_index,
+                CachedTermKind::MessageWriteNonPod,
+                AccessMode::MESSAGE_WRITE,
+                Some(effective_uuid),
+            )
+            .is_some()
+        {
+            return Ok(());
+        }
+        let info = self.column_info(term_index)?;
+        if !validate_non_pod_message_info_for::<M>(
+            &info,
+            self.host.manifest_name(),
+            Some(effective_uuid),
+            true,
+        ) {
+            return Err(FfiResult::TYPE_MISMATCH);
+        }
+        self.verify_non_pod_message_marker::<M>()?;
+        self.store_cached_term(
+            term_index,
+            CachedTermEntry {
+                type_id: core::any::TypeId::of::<M>(),
+                expected_uuid: Some(effective_uuid),
+                expected_mode: AccessMode::MESSAGE_WRITE,
+                info_mode: info.mode,
+                component: info.component,
+                kind: CachedTermKind::MessageWriteNonPod,
+            },
+        );
+        Ok(())
+    }
+
+    /// Validates an untyped `AccessMode::REMOVED_READ` stream via the persistent term cache.
+    #[inline]
+    fn validate_removed_read_term(&self, term_index: usize) -> Result<(), FfiResult> {
+        if self
+            .cached_term_entry::<()>(
+                term_index,
+                CachedTermKind::RemovedRead,
+                AccessMode::REMOVED_READ,
+                None,
+            )
+            .is_some()
+        {
+            return Ok(());
+        }
+        let info = self.column_info(term_index)?;
+        if info.mode != AccessMode::REMOVED_READ || info.is_resource() || info.is_message() {
+            return Err(FfiResult::TYPE_MISMATCH);
+        }
+        self.store_cached_term(
+            term_index,
+            CachedTermEntry {
+                type_id: core::any::TypeId::of::<()>(),
+                expected_uuid: None,
+                expected_mode: AccessMode::REMOVED_READ,
+                info_mode: info.mode,
+                component: info.component,
+                kind: CachedTermKind::RemovedRead,
+            },
+        );
+        Ok(())
+    }
+
+    /// Validates a typed `AccessMode::REMOVED_READ` stream matching `T: AbiPod` (`size`, `align`,
+    /// and optional `expected_uuid`) via the persistent term cache.
+    #[inline]
+    fn validate_removed_read_term_typed<T: AbiPod>(
+        &self,
+        term_index: usize,
+        expected_uuid: Option<UuidFilter>,
+    ) -> Result<(), FfiResult> {
+        if self
+            .cached_term_entry::<T>(
+                term_index,
+                CachedTermKind::RemovedRead,
+                AccessMode::REMOVED_READ,
+                expected_uuid,
+            )
+            .is_some()
+        {
+            return Ok(());
+        }
+        let info = self.column_info(term_index)?;
+        if info.mode != AccessMode::REMOVED_READ || info.is_resource() || info.is_message() {
+            return Err(FfiResult::TYPE_MISMATCH);
+        }
+        if info.size != core::mem::size_of::<T>() || info.align != core::mem::align_of::<T>() {
+            return Err(FfiResult::TYPE_MISMATCH);
+        }
+        if let Some(filter) = expected_uuid
+            && !filter.matches(info.uuid)
+        {
+            return Err(FfiResult::TYPE_MISMATCH);
+        }
+        self.store_cached_term(
+            term_index,
+            CachedTermEntry {
+                type_id: core::any::TypeId::of::<T>(),
+                expected_uuid,
+                expected_mode: AccessMode::REMOVED_READ,
+                info_mode: info.mode,
+                component: info.component,
+                kind: CachedTermKind::RemovedRead,
+            },
+        );
+        Ok(())
+    }
+
     /// Borrows the `[FfiEntity; current_len]` slice for the active chunk (`&[]` if empty or unavailable).
     #[inline]
     pub fn entities(&self) -> &[FfiEntity] {
@@ -3244,8 +3683,118 @@ impl<'a> ValidatedIter<'a> {
         Ok(Some((owner, unsafe { &*ptr.cast::<T>() })))
     }
 
+    /// Reads up to `out.len()` unread POD messages from `term_index` (`MESSAGE_READ` or
+    /// `MESSAGE_WRITE`) directly into `out`, advancing the running system's per-term message cursor.
+    ///
+    /// Performs **zero heap allocations**. Rejects hostile `read_count > out.len()` responses with
+    /// [`FfiResult::INTERNAL_ERROR`].
+    pub fn read_messages_into_uninit_checked<M: AbiPod>(
+        &mut self,
+        term_index: usize,
+        expected_uuid: Option<UuidFilter>,
+        out: &mut [MaybeUninit<M>],
+    ) -> Result<usize, FfiResult> {
+        if self.raw.is_null() {
+            return Err(FfiResult::NULL_POINTER);
+        }
+        let read_fn = host_slot!(self.host.api(), msg_read_batch).ok_or(FfiResult::UNSUPPORTED)?;
+        self.validate_message_read_term::<M>(term_index, expected_uuid)?;
+        if out.is_empty() {
+            return Ok(0);
+        }
+        let out_ptr = if core::mem::size_of::<M>() == 0 {
+            core::ptr::NonNull::<u8>::dangling().as_ptr()
+        } else {
+            out.as_mut_ptr().cast::<u8>()
+        };
+        let mut read_count = 0usize;
+        // SAFETY: `self.raw` is active, `validate_message_read_term` confirmed `M`'s layout,
+        // and `out` provides `out.len()` writable `MaybeUninit<M>` elements.
+        let status = unsafe { read_fn(self.raw, term_index, out_ptr, out.len(), &mut read_count) };
+        if !status.is_ok() {
+            return Err(status);
+        }
+        if read_count > out.len() {
+            return Err(FfiResult::INTERNAL_ERROR);
+        }
+        Ok(read_count)
+    }
+
+    /// Reads up to `out.len()` unread POD messages from `term_index` (`MESSAGE_READ` or
+    /// `MESSAGE_WRITE`) directly into initialized slice `out`, returning the number of messages
+    /// written (`0..=out.len()`).
+    ///
+    /// Performs **zero heap allocations**.
+    #[inline]
+    pub fn read_messages_into_checked<M: AbiPod>(
+        &mut self,
+        term_index: usize,
+        expected_uuid: Option<UuidFilter>,
+        out: &mut [M],
+    ) -> Result<usize, FfiResult> {
+        // SAFETY: `M: AbiPod` is `Copy` with no drop glue, and `MaybeUninit<M>` has identical size
+        // and alignment as `M`. `read_messages_into_uninit_checked` only writes valid initialized
+        // `M` elements into `..read_count` and never writes uninitialized bytes into `out`.
+        let uninit_out = unsafe {
+            core::slice::from_raw_parts_mut(out.as_mut_ptr().cast::<MaybeUninit<M>>(), out.len())
+        };
+        self.read_messages_into_uninit_checked::<M>(term_index, expected_uuid, uninit_out)
+    }
+
+    /// Appends up to `max_count` unread POD messages from `term_index` directly into `out`,
+    /// reusing existing spare capacity (`0` heap allocations when `out.capacity() - out.len() >=
+    /// max_count`, at most `1` reservation otherwise).
+    pub fn read_messages_into_vec_checked<M: AbiPod>(
+        &mut self,
+        term_index: usize,
+        expected_uuid: Option<UuidFilter>,
+        out: &mut Vec<M>,
+        max_count: usize,
+    ) -> Result<usize, FfiResult> {
+        if self.raw.is_null() {
+            return Err(FfiResult::NULL_POINTER);
+        }
+        let read_fn = host_slot!(self.host.api(), msg_read_batch).ok_or(FfiResult::UNSUPPORTED)?;
+        self.validate_message_read_term::<M>(term_index, expected_uuid)?;
+        if max_count == 0 {
+            return Ok(0);
+        }
+        let elem_size = core::mem::size_of::<M>();
+        if elem_size > 0 && max_count > (isize::MAX as usize) / elem_size {
+            return Err(FfiResult::CAPACITY_EXCEEDED);
+        }
+        out.try_reserve(max_count)
+            .map_err(|_| FfiResult::CAPACITY_EXCEEDED)?;
+        let old_len = out.len();
+        let out_ptr = if elem_size == 0 {
+            core::ptr::NonNull::<u8>::dangling().as_ptr()
+        } else {
+            out.spare_capacity_mut()[..max_count]
+                .as_mut_ptr()
+                .cast::<u8>()
+        };
+        let mut read_count = 0usize;
+        // SAFETY: `self.raw` is active, `validate_message_read_term` verified `M`'s layout, and
+        // `out.spare_capacity_mut()[..max_count]` provides `max_count` writable `MaybeUninit<M>` slots.
+        let status = unsafe { read_fn(self.raw, term_index, out_ptr, max_count, &mut read_count) };
+        if !status.is_ok() {
+            return Err(status);
+        }
+        if read_count > max_count {
+            return Err(FfiResult::INTERNAL_ERROR);
+        }
+        // SAFETY: Host initialized `read_count <= max_count` elements in `out.spare_capacity_mut()[..read_count]`.
+        unsafe {
+            out.set_len(old_len + read_count);
+        }
+        Ok(read_count)
+    }
+
     /// Reads up to `max_count` unread POD messages from `term_index` (`MESSAGE_READ` or
     /// `MESSAGE_WRITE`), advancing the running system's per-term message cursor.
+    ///
+    /// Probes small batches on a 512-byte stack buffer (`0` heap allocations when idle) and reads
+    /// larger batches directly into the returned `Vec<M>`.
     pub fn read_messages_batch_checked<M: AbiPod>(
         &mut self,
         term_index: usize,
@@ -3256,57 +3805,359 @@ impl<'a> ValidatedIter<'a> {
             return Err(FfiResult::NULL_POINTER);
         }
         let read_fn = host_slot!(self.host.api(), msg_read_batch).ok_or(FfiResult::UNSUPPORTED)?;
-        let info = self.column_info(term_index)?;
-        if !validate_message_read_info::<M>(&info, expected_uuid) {
-            return Err(FfiResult::TYPE_MISMATCH);
-        }
+        self.validate_message_read_term::<M>(term_index, expected_uuid)?;
         if max_count == 0 {
             return Ok(Vec::new());
         }
-        let mut scratch: Vec<MaybeUninit<M>> = Vec::with_capacity(max_count);
-        let out_ptr = if core::mem::size_of::<M>() == 0 {
-            core::ptr::NonNull::<u8>::dangling().as_ptr()
-        } else {
-            scratch.as_mut_ptr().cast::<u8>()
-        };
+        let elem_size = core::mem::size_of::<M>();
+        if elem_size == 0 {
+            // SAFETY: `elem_size == 0` is verified above for `M: AbiPod`.
+            let zst: M = unsafe { zst_pod_value::<M>() };
+            let mut read_count = 0usize;
+            // SAFETY: `self.raw` is active and `M` is zero-sized so `dangling()` is valid.
+            let status = unsafe {
+                read_fn(
+                    self.raw,
+                    term_index,
+                    core::ptr::NonNull::<u8>::dangling().as_ptr(),
+                    max_count,
+                    &mut read_count,
+                )
+            };
+            if !status.is_ok() {
+                return Err(status);
+            }
+            let actual = read_count.min(max_count);
+            return Ok(vec![zst; actual]);
+        }
+        if elem_size <= MSG_STACK_SCRATCH_BYTES
+            && core::mem::align_of::<M>() <= 16
+            && max_count
+                .checked_mul(elem_size)
+                .is_some_and(|bytes| bytes <= MSG_STACK_SCRATCH_BYTES)
+        {
+            let mut scratch = RawMsgStackScratch::uninit();
+            let mut read_count = 0usize;
+            // SAFETY: `self.raw` is active and `scratch` provides `max_count * elem_size <= 512`
+            // writable bytes aligned to 16.
+            let status = unsafe {
+                read_fn(
+                    self.raw,
+                    term_index,
+                    scratch.as_mut_u8_ptr(),
+                    max_count,
+                    &mut read_count,
+                )
+            };
+            if !status.is_ok() {
+                return Err(status);
+            }
+            let actual = read_count.min(max_count);
+            if actual == 0 {
+                return Ok(Vec::new());
+            }
+            let mut out = Vec::new();
+            out.try_reserve_exact(actual)
+                .map_err(|_| FfiResult::CAPACITY_EXCEEDED)?;
+            let spare = &mut out.spare_capacity_mut()[..actual];
+            for (i, slot) in spare.iter_mut().enumerate() {
+                // SAFETY: `actual <= max_count` and `max_count * elem_size <= 512`, and `read_fn`
+                // initialized `actual` elements of `M: AbiPod` into `scratch`.
+                slot.write(unsafe { scratch.read_elem::<M>(i) });
+            }
+            // SAFETY: Every element in `out[..actual]` was initialized above.
+            unsafe {
+                out.set_len(actual);
+            }
+            return Ok(out);
+        }
+        if max_count > (isize::MAX as usize) / elem_size {
+            return Err(FfiResult::CAPACITY_EXCEEDED);
+        }
+        let mut out: Vec<M> = Vec::new();
+        out.try_reserve_exact(max_count)
+            .map_err(|_| FfiResult::CAPACITY_EXCEEDED)?;
+        let out_ptr = out.spare_capacity_mut()[..max_count]
+            .as_mut_ptr()
+            .cast::<u8>();
         let mut read_count = 0usize;
-        // SAFETY: `self.raw` is active, `validate_message_read_info` confirmed element size and
-        // alignment match `M`, and `scratch` has capacity for `max_count` elements of `M`.
+        // SAFETY: `self.raw` is active, `validate_message_read_term` verified `M`'s layout, and
+        // `out.spare_capacity_mut()[..max_count]` holds `max_count` writable `MaybeUninit<M>` slots.
         let status = unsafe { read_fn(self.raw, term_index, out_ptr, max_count, &mut read_count) };
         if !status.is_ok() {
             return Err(status);
         }
         let actual = read_count.min(max_count);
-        // SAFETY: Host copied `actual` initialized elements of `M` into `scratch[..actual]`.
+        // SAFETY: Host initialized `actual <= max_count` elements of `M` into `out`.
         unsafe {
-            scratch.set_len(actual);
-        }
-        let mut out = Vec::with_capacity(actual);
-        for slot in scratch {
-            // SAFETY: Every element in `scratch[..actual]` was initialized by `msg_read_batch`.
-            out.push(unsafe { slot.assume_init() });
+            out.set_len(actual);
         }
         Ok(out)
     }
 
+    /// Drains all currently unread POD messages from `term_index` directly into `out`, returning
+    /// the number of newly appended messages.
+    ///
+    /// When `out` has zero spare capacity, probes up to `512` bytes on the stack first (`0` heap
+    /// allocations when idle). When `out` is pre-reserved, fills existing spare capacity directly
+    /// and probes the stack before growing so exact-fit `Vec` buffers perform `0` reallocations.
+    pub fn drain_messages_into_vec_checked<M: AbiPod>(
+        &mut self,
+        term_index: usize,
+        expected_uuid: Option<UuidFilter>,
+        out: &mut Vec<M>,
+        opts: DrainOptions,
+    ) -> Result<usize, FfiResult> {
+        if self.raw.is_null() {
+            return Err(FfiResult::NULL_POINTER);
+        }
+        let read_fn = host_slot!(self.host.api(), msg_read_batch).ok_or(FfiResult::UNSUPPORTED)?;
+        self.validate_message_read_term::<M>(term_index, expected_uuid)?;
+        let (initial_batch, max_batch) = opts.normalized();
+        let elem_size = core::mem::size_of::<M>();
+        let elem_align = core::mem::align_of::<M>();
+        let mut total = 0usize;
+
+        if elem_size == 0 {
+            let mut batch = initial_batch;
+            loop {
+                let req = batch.min(usize::MAX - out.len());
+                if req == 0 {
+                    return Err(FfiResult::CAPACITY_EXCEEDED);
+                }
+                let mut read_count = 0usize;
+                // SAFETY: `self.raw` is active and `M: AbiPod` is zero-sized so `dangling()` is valid.
+                let status = unsafe {
+                    read_fn(
+                        self.raw,
+                        term_index,
+                        core::ptr::NonNull::<u8>::dangling().as_ptr(),
+                        req,
+                        &mut read_count,
+                    )
+                };
+                if !status.is_ok() {
+                    return Err(status);
+                }
+                if read_count > req {
+                    return Err(FfiResult::INTERNAL_ERROR);
+                }
+                out.try_reserve(read_count)
+                    .map_err(|_| FfiResult::CAPACITY_EXCEEDED)?;
+                let old_len = out.len();
+                // SAFETY: `M: AbiPod` is zero-sized (`Copy`, zero bytes) and `try_reserve`
+                // confirmed `old_len + read_count` fits within `usize::MAX`.
+                unsafe {
+                    out.set_len(old_len + read_count);
+                }
+                total = total
+                    .checked_add(read_count)
+                    .ok_or(FfiResult::CAPACITY_EXCEEDED)?;
+                if read_count < req {
+                    break;
+                }
+                batch = batch.saturating_mul(2).min(max_batch);
+            }
+            return Ok(total);
+        }
+
+        // Phase 1: Drain directly into pre-existing spare capacity without allocating.
+        while out.capacity() > out.len() {
+            let req = (out.capacity() - out.len()).min(max_batch);
+            let old_len = out.len();
+            let mut read_count = 0usize;
+            // SAFETY: `self.raw` is active, `validate_message_read_term` verified `M`, and
+            // `out.spare_capacity_mut()[..req]` provides `req` writable `MaybeUninit<M>` slots.
+            let status = unsafe {
+                read_fn(
+                    self.raw,
+                    term_index,
+                    out.spare_capacity_mut().as_mut_ptr().cast::<u8>(),
+                    req,
+                    &mut read_count,
+                )
+            };
+            if !status.is_ok() {
+                return Err(status);
+            }
+            if read_count > req {
+                return Err(FfiResult::INTERNAL_ERROR);
+            }
+            // SAFETY: Host initialized `read_count <= req` elements in `out.spare_capacity_mut()[..read_count]`.
+            unsafe {
+                out.set_len(old_len + read_count);
+            }
+            total = total
+                .checked_add(read_count)
+                .ok_or(FfiResult::CAPACITY_EXCEEDED)?;
+            if read_count < req {
+                return Ok(total);
+            }
+        }
+
+        // Phase 2: One-shot 512B stack probe now that `out` has zero spare capacity.
+        let mut batch = initial_batch;
+        if elem_size <= MSG_STACK_SCRATCH_BYTES && elem_align <= 16 {
+            let probe_cap = RawMsgStackScratch::probe_cap_for_size(elem_size, initial_batch);
+            if probe_cap >= 1 {
+                let actual = probe_messages_stack_into_vec::<M>(
+                    self.raw, read_fn, term_index, probe_cap, out,
+                )?;
+                total = total
+                    .checked_add(actual)
+                    .ok_or(FfiResult::CAPACITY_EXCEEDED)?;
+                if actual < probe_cap {
+                    return Ok(total);
+                }
+                batch = probe_cap.saturating_mul(2).min(max_batch).max(1);
+            }
+        }
+
+        // Phase 3: Exponential-ramp heap drain into `out.spare_capacity_mut()`.
+        let max_elems_isize = (isize::MAX as usize) / elem_size;
+        loop {
+            let avail = out.capacity() - out.len();
+            let req = if avail >= batch {
+                avail.min(max_batch)
+            } else {
+                if batch > max_elems_isize {
+                    return Err(FfiResult::CAPACITY_EXCEEDED);
+                }
+                out.try_reserve(batch)
+                    .map_err(|_| FfiResult::CAPACITY_EXCEEDED)?;
+                batch
+            };
+
+            let old_len = out.len();
+            let out_ptr = out.spare_capacity_mut().as_mut_ptr().cast::<u8>();
+            let mut read_count = 0usize;
+            // SAFETY: `self.raw` is active, `validate_message_read_term` verified `M`, and
+            // `out.spare_capacity_mut()[..req]` provides `req` writable `MaybeUninit<M>` slots.
+            let status = unsafe { read_fn(self.raw, term_index, out_ptr, req, &mut read_count) };
+            if !status.is_ok() {
+                return Err(status);
+            }
+            if read_count > req {
+                return Err(FfiResult::INTERNAL_ERROR);
+            }
+            // SAFETY: Host initialized `read_count <= req` elements in `out.spare_capacity_mut()[..read_count]`.
+            unsafe {
+                out.set_len(old_len + read_count);
+            }
+            total = total
+                .checked_add(read_count)
+                .ok_or(FfiResult::CAPACITY_EXCEEDED)?;
+            if read_count < req {
+                break;
+            }
+            batch = batch.saturating_mul(2).min(max_batch);
+        }
+
+        Ok(total)
+    }
+
+    /// Drains all currently unread POD messages from `term_index` using custom [`DrainOptions`].
+    #[inline]
+    pub fn drain_messages_with_options_checked<M: AbiPod>(
+        &mut self,
+        term_index: usize,
+        expected_uuid: Option<UuidFilter>,
+        opts: DrainOptions,
+    ) -> Result<Vec<M>, FfiResult> {
+        let mut out = Vec::new();
+        self.drain_messages_into_vec_checked::<M>(term_index, expected_uuid, &mut out, opts)?;
+        Ok(out)
+    }
+
     /// Drains all currently unread POD messages from `term_index`.
+    #[inline]
     pub fn drain_messages_checked<M: AbiPod>(
         &mut self,
         term_index: usize,
         expected_uuid: Option<UuidFilter>,
     ) -> Result<Vec<M>, FfiResult> {
-        const BATCH_SIZE: usize = 64;
-        let mut all = Vec::new();
-        loop {
-            let batch =
-                self.read_messages_batch_checked::<M>(term_index, expected_uuid, BATCH_SIZE)?;
-            let count = batch.len();
-            all.extend(batch);
-            if count < BATCH_SIZE {
-                break;
-            }
+        self.drain_messages_with_options_checked::<M>(
+            term_index,
+            expected_uuid,
+            DrainOptions::default(),
+        )
+    }
+
+    /// Drains the unread message cursor on `term_index` completely without allocating heap memory,
+    /// returning the count of drained messages.
+    pub fn drain_messages_count_checked<M: AbiPod>(
+        &mut self,
+        term_index: usize,
+        expected_uuid: Option<UuidFilter>,
+    ) -> Result<usize, FfiResult> {
+        if self.raw.is_null() {
+            return Err(FfiResult::NULL_POINTER);
         }
-        Ok(all)
+        let read_fn = host_slot!(self.host.api(), msg_read_batch).ok_or(FfiResult::UNSUPPORTED)?;
+        self.validate_message_read_term::<M>(term_index, expected_uuid)?;
+        let elem_size = core::mem::size_of::<M>();
+        if elem_size == 0 {
+            const ZST_COUNT_BATCH: usize = 1024;
+            let mut total = 0usize;
+            loop {
+                let mut read_count = 0usize;
+                // SAFETY: `self.raw` is active and `M` is zero-sized so `dangling()` is valid.
+                let status = unsafe {
+                    read_fn(
+                        self.raw,
+                        term_index,
+                        core::ptr::NonNull::<u8>::dangling().as_ptr(),
+                        ZST_COUNT_BATCH,
+                        &mut read_count,
+                    )
+                };
+                if !status.is_ok() {
+                    return Err(status);
+                }
+                if read_count > ZST_COUNT_BATCH {
+                    return Err(FfiResult::INTERNAL_ERROR);
+                }
+                total = total
+                    .checked_add(read_count)
+                    .ok_or(FfiResult::CAPACITY_EXCEEDED)?;
+                if read_count < ZST_COUNT_BATCH {
+                    break;
+                }
+            }
+            return Ok(total);
+        }
+        if elem_size <= MSG_STACK_SCRATCH_BYTES && core::mem::align_of::<M>() <= 16 {
+            let probe_cap = MSG_STACK_SCRATCH_BYTES / elem_size;
+            let mut scratch = RawMsgStackScratch::uninit();
+            let mut total = 0usize;
+            loop {
+                let mut read_count = 0usize;
+                // SAFETY: `self.raw` is active and `scratch` provides `probe_cap * elem_size <= 512`
+                // writable bytes aligned to 16.
+                let status = unsafe {
+                    read_fn(
+                        self.raw,
+                        term_index,
+                        scratch.as_mut_u8_ptr(),
+                        probe_cap,
+                        &mut read_count,
+                    )
+                };
+                if !status.is_ok() {
+                    return Err(status);
+                }
+                let actual =
+                    RawMsgStackScratch::validate_probe_count(elem_size, probe_cap, read_count)?;
+                total = total
+                    .checked_add(actual)
+                    .ok_or(FfiResult::CAPACITY_EXCEEDED)?;
+                if actual < probe_cap {
+                    break;
+                }
+            }
+            return Ok(total);
+        }
+        drain_messages_count_large::<M>(self.raw, read_fn, term_index)
     }
 
     /// Appends a POD message `msg` to the Bevy `Messages<M>` stream declared with `MESSAGE_WRITE`
@@ -3323,19 +4174,15 @@ impl<'a> ValidatedIter<'a> {
         let Some(send_fn) = host_slot!(self.host.api(), msg_send) else {
             return FfiResult::UNSUPPORTED;
         };
-        let info = match self.column_info(term_index) {
-            Ok(i) => i,
-            Err(err) => return err,
-        };
-        if !validate_message_write_info::<M>(&info, expected_uuid) {
-            return FfiResult::TYPE_MISMATCH;
+        if let Err(err) = self.validate_message_write_term::<M>(term_index, expected_uuid) {
+            return err;
         }
         let data_ptr = if core::mem::size_of::<M>() == 0 {
             core::ptr::NonNull::<u8>::dangling().as_ptr().cast_const()
         } else {
             core::ptr::from_ref(msg).cast::<u8>()
         };
-        // SAFETY: `self.raw` is active, `validate_message_write_info` verified `M`'s exact layout
+        // SAFETY: `self.raw` is active, `validate_message_write_term` verified `M`'s exact layout
         // and `MESSAGE_WRITE` permission, and `data_ptr` points to `size_of::<M>()` readable bytes.
         unsafe { send_fn(self.raw, term_index, data_ptr, core::mem::size_of::<M>()) }
     }
@@ -3354,12 +4201,8 @@ impl<'a> ValidatedIter<'a> {
         let Some(write_fn) = host_slot!(self.host.api(), msg_write_batch) else {
             return FfiResult::UNSUPPORTED;
         };
-        let info = match self.column_info(term_index) {
-            Ok(i) => i,
-            Err(err) => return err,
-        };
-        if !validate_message_write_info::<M>(&info, expected_uuid) {
-            return FfiResult::TYPE_MISMATCH;
+        if let Err(err) = self.validate_message_write_term::<M>(term_index, expected_uuid) {
+            return err;
         }
         if messages.is_empty() {
             return FfiResult::OK;
@@ -3369,9 +4212,39 @@ impl<'a> ValidatedIter<'a> {
         } else {
             messages.as_ptr().cast::<u8>()
         };
-        // SAFETY: `self.raw` is active, `validate_message_write_info` confirmed layout and
+        // SAFETY: `self.raw` is active, `validate_message_write_term` confirmed layout and
         // `MESSAGE_WRITE`, and `data_ptr` covers `messages.len() * size_of::<M>()` initialized bytes.
         unsafe { write_fn(self.raw, term_index, data_ptr, messages.len()) }
+    }
+
+    /// Reads up to `out_ptrs.len()` raw non-POD message pointers from `term_index` without
+    /// modifying the persistent term validation cache.
+    #[inline]
+    fn read_non_pod_message_ptrs_raw(
+        &mut self,
+        read_fn: BamMsgReadBatchFn,
+        term_index: usize,
+        out_ptrs: &mut [*const c_void],
+    ) -> Result<usize, FfiResult> {
+        if out_ptrs.is_empty() {
+            return Ok(0);
+        }
+        let mut read_count = 0usize;
+        // SAFETY: `self.raw` is active, caller validated `term_index` for non-POD pointers,
+        // and `out_ptrs` provides `out_ptrs.len()` writable pointer slots.
+        let status = unsafe {
+            read_fn(
+                self.raw,
+                term_index,
+                out_ptrs.as_mut_ptr().cast::<u8>(),
+                out_ptrs.len(),
+                &mut read_count,
+            )
+        };
+        if !status.is_ok() {
+            return Err(status);
+        }
+        Ok(read_count.min(out_ptrs.len()))
     }
 
     /// Reads up to `out_ptrs.len()` unread non-POD message pointers (`*const c_void` referencing
@@ -3394,29 +4267,8 @@ impl<'a> ValidatedIter<'a> {
             return Err(FfiResult::NULL_POINTER);
         }
         let read_fn = host_slot!(self.host.api(), msg_read_batch).ok_or(FfiResult::UNSUPPORTED)?;
-        let info = self.column_info(term_index)?;
-        if !validate_non_pod_message_info(&info, expected_uuid, false) {
-            return Err(FfiResult::TYPE_MISMATCH);
-        }
-        if out_ptrs.is_empty() {
-            return Ok(0);
-        }
-        let mut read_count = 0usize;
-        // SAFETY: `self.raw` is active, `out_ptrs` provides `out_ptrs.len()` writable
-        // `usize`/`*const c_void` slots, and `validate_non_pod_message_info` verified `term_index`.
-        let status = unsafe {
-            read_fn(
-                self.raw,
-                term_index,
-                out_ptrs.as_mut_ptr().cast::<u8>(),
-                out_ptrs.len(),
-                &mut read_count,
-            )
-        };
-        if !status.is_ok() {
-            return Err(status);
-        }
-        Ok(read_count.min(out_ptrs.len()))
+        self.validate_message_read_non_pod_ptrs_term(term_index, expected_uuid)?;
+        self.read_non_pod_message_ptrs_raw(read_fn, term_index, out_ptrs)
     }
 
     /// Verifies that the host registered the `"bam.v0.<M>.non_pod_message"` custom symbol for `M`,
@@ -3429,6 +4281,27 @@ impl<'a> ValidatedIter<'a> {
                 crate::host::symbol_cache_kind::NON_POD_MESSAGE_MARKER,
             ),
             || {
+                const PREFIX: &[u8] = b"bam.v0.";
+                const SUFFIX: &[u8] = b".non_pod_message\0";
+                let name_bytes = M::CANONICAL_NAME.as_bytes();
+                if !name_bytes.contains(&0)
+                    && let Some(total) = PREFIX
+                        .len()
+                        .checked_add(name_bytes.len())
+                        .and_then(|n| n.checked_add(SUFFIX.len()))
+                    && total <= 256
+                {
+                    let mut buf = [0u8; 256];
+                    buf[..PREFIX.len()].copy_from_slice(PREFIX);
+                    let mid_end = PREFIX.len() + name_bytes.len();
+                    buf[PREFIX.len()..mid_end].copy_from_slice(name_bytes);
+                    buf[mid_end..total].copy_from_slice(SUFFIX);
+                    if let Ok(sym) = core::ffi::CStr::from_bytes_with_nul(&buf[..total]) {
+                        return host
+                            .resolve_custom_symbol(sym)
+                            .map_err(|_| FfiResult::TYPE_MISMATCH);
+                    }
+                }
                 let marker_sym =
                     CString::new(format!("bam.v0.{}.non_pod_message", M::CANONICAL_NAME))
                         .map_err(|_| FfiResult::TYPE_MISMATCH)?;
@@ -3444,50 +4317,11 @@ impl<'a> ValidatedIter<'a> {
         Ok(())
     }
 
-    /// Reads up to `max_count` unread VTable-backed non-POD messages (`M: ModComponent + Default`)
-    /// from `term_index`, reconstructing each host `M` into guest memory via the host's
-    /// `"bam.v0.<M>.export_fields"` witness symbol and guest's `"bam.v0.<M>.import_field"`.
-    pub fn read_non_pod_messages_checked<M: ModComponent + Default>(
-        &mut self,
-        term_index: usize,
-        expected_uuid: Option<UuidFilter>,
-        max_count: usize,
-    ) -> Result<Vec<M>, FfiResult> {
-        let info = self.column_info(term_index)?;
-        let effective_uuid = expected_uuid.unwrap_or_else(|| UuidFilter::exact(M::UUID));
-        if !validate_non_pod_message_info_for::<M>(
-            &info,
-            self.host.manifest_name(),
-            Some(effective_uuid),
-            false,
-        ) {
-            return Err(FfiResult::TYPE_MISMATCH);
-        }
-        self.verify_non_pod_message_marker::<M>()?;
-        if max_count == 0 {
-            return Ok(Vec::new());
-        }
-
-        let mut ptrs = vec![core::ptr::null::<c_void>(); max_count];
-        let actual =
-            self.read_non_pod_message_ptrs_checked(term_index, Some(effective_uuid), &mut ptrs)?;
-        if actual == 0 {
-            return Ok(Vec::new());
-        }
-
-        type ExportFieldsFn = unsafe extern "C" fn(
-            src_ptr: *const c_void,
-            sink: Option<
-                unsafe extern "C" fn(
-                    sink_ctx: *mut c_void,
-                    field_name: StrView,
-                    type_tag: StrView,
-                    payload: FfiSlice<u8>,
-                ) -> FfiResult,
-            >,
-            sink_ctx: *mut c_void,
-        ) -> FfiResult;
-
+    /// Resolves and caches the host `"bam.v0.<M>.export_fields"` and guest
+    /// `"bam.v0.<M>.import_field"` witness function pointers for `M`.
+    fn resolve_non_pod_witness_fns<M: ModComponent>(
+        &self,
+    ) -> Result<(ExportFieldsFn, WitnessImportFieldFn), FfiResult> {
         let host = self.host();
         let host_export_ptr = host.cached_symbol_lookup(
             (
@@ -3523,9 +4357,19 @@ impl<'a> ValidatedIter<'a> {
         // SAFETY: `M::symbols()` exports `"bam.v0.<M>.import_field"` with `WitnessImportFieldFn` ABI.
         let guest_import_fn: WitnessImportFieldFn =
             unsafe { core::mem::transmute(guest_import_ptr) };
+        Ok((host_export_fn, guest_import_fn))
+    }
 
-        let mut out = Vec::with_capacity(actual);
-        for &host_msg_ptr in &ptrs[..actual] {
+    /// Reconstructs non-POD `M` instances from `ptrs` and appends them into `out`.
+    fn decode_non_pod_message_ptrs<M: ModComponent + Default>(
+        ptrs: &[*const c_void],
+        host_export_fn: ExportFieldsFn,
+        guest_import_fn: WitnessImportFieldFn,
+        out: &mut Vec<M>,
+    ) -> Result<(), FfiResult> {
+        out.try_reserve(ptrs.len())
+            .map_err(|_| FfiResult::CAPACITY_EXCEEDED)?;
+        for &host_msg_ptr in ptrs {
             if host_msg_ptr.is_null() {
                 return Err(FfiResult::NULL_POINTER);
             }
@@ -3548,28 +4392,165 @@ impl<'a> ValidatedIter<'a> {
             }
             out.push(guest_msg);
         }
+        Ok(())
+    }
+
+    /// Reads up to `max_count` unread VTable-backed non-POD messages (`M: ModComponent + Default`)
+    /// from `term_index`, reconstructing each host `M` into guest memory via the host's
+    /// `"bam.v0.<M>.export_fields"` witness symbol and guest's `"bam.v0.<M>.import_field"`.
+    pub fn read_non_pod_messages_checked<M: ModComponent + Default>(
+        &mut self,
+        term_index: usize,
+        expected_uuid: Option<UuidFilter>,
+        max_count: usize,
+    ) -> Result<Vec<M>, FfiResult> {
+        if self.raw.is_null() {
+            return Err(FfiResult::NULL_POINTER);
+        }
+        let effective_uuid = expected_uuid.unwrap_or_else(|| UuidFilter::exact(M::UUID));
+        self.validate_message_read_non_pod_term::<M>(term_index, effective_uuid)?;
+        if max_count == 0 {
+            return Ok(Vec::new());
+        }
+        let read_fn = host_slot!(self.host.api(), msg_read_batch).ok_or(FfiResult::UNSUPPORTED)?;
+
+        let mut out = Vec::new();
+        if max_count <= NON_POD_STACK_PTR_CAP {
+            let mut stack_ptrs = [core::ptr::null::<c_void>(); NON_POD_STACK_PTR_CAP];
+            let actual = self.read_non_pod_message_ptrs_raw(
+                read_fn,
+                term_index,
+                &mut stack_ptrs[..max_count],
+            )?;
+            if actual == 0 {
+                return Ok(out);
+            }
+            let (host_export_fn, guest_import_fn) = self.resolve_non_pod_witness_fns::<M>()?;
+            Self::decode_non_pod_message_ptrs(
+                &stack_ptrs[..actual],
+                host_export_fn,
+                guest_import_fn,
+                &mut out,
+            )?;
+        } else {
+            if max_count > (isize::MAX as usize) / core::mem::size_of::<*const c_void>() {
+                return Err(FfiResult::CAPACITY_EXCEEDED);
+            }
+            let mut heap_ptrs = Vec::new();
+            heap_ptrs
+                .try_reserve_exact(max_count)
+                .map_err(|_| FfiResult::CAPACITY_EXCEEDED)?;
+            heap_ptrs.resize(max_count, core::ptr::null::<c_void>());
+            let actual = self.read_non_pod_message_ptrs_raw(read_fn, term_index, &mut heap_ptrs)?;
+            if actual == 0 {
+                return Ok(out);
+            }
+            let (host_export_fn, guest_import_fn) = self.resolve_non_pod_witness_fns::<M>()?;
+            Self::decode_non_pod_message_ptrs(
+                &heap_ptrs[..actual],
+                host_export_fn,
+                guest_import_fn,
+                &mut out,
+            )?;
+        }
         Ok(out)
     }
 
     /// Drains all currently unread VTable-backed non-POD messages (`M: ModComponent + Default`)
+    /// from `term_index` using custom [`DrainOptions`].
+    ///
+    /// Probes up to `64` pointers on the stack first so idle ticks (`N == 0`) perform **zero heap
+    /// allocations**.
+    pub fn drain_non_pod_messages_with_options_checked<M: ModComponent + Default>(
+        &mut self,
+        term_index: usize,
+        expected_uuid: Option<UuidFilter>,
+        opts: DrainOptions,
+    ) -> Result<Vec<M>, FfiResult> {
+        if self.raw.is_null() {
+            return Err(FfiResult::NULL_POINTER);
+        }
+        let read_fn = host_slot!(self.host.api(), msg_read_batch).ok_or(FfiResult::UNSUPPORTED)?;
+        let effective_uuid = expected_uuid.unwrap_or_else(|| UuidFilter::exact(M::UUID));
+        self.validate_message_read_non_pod_term::<M>(term_index, effective_uuid)?;
+
+        let (initial_batch, max_batch) = opts.normalized();
+        let mut all = Vec::new();
+        let mut stack_ptrs = [core::ptr::null::<c_void>(); NON_POD_STACK_PTR_CAP];
+        let first_req = initial_batch.min(NON_POD_STACK_PTR_CAP);
+        let first_actual =
+            self.read_non_pod_message_ptrs_raw(read_fn, term_index, &mut stack_ptrs[..first_req])?;
+        if first_actual == 0 {
+            return Ok(all);
+        }
+        let witness_fns = self.resolve_non_pod_witness_fns::<M>()?;
+        Self::decode_non_pod_message_ptrs(
+            &stack_ptrs[..first_actual],
+            witness_fns.0,
+            witness_fns.1,
+            &mut all,
+        )?;
+        if first_actual < first_req {
+            return Ok(all);
+        }
+
+        let mut req = if initial_batch > NON_POD_STACK_PTR_CAP {
+            initial_batch
+        } else {
+            first_req.saturating_mul(2)
+        }
+        .min(max_batch);
+        let mut heap_ptrs: Vec<*const c_void> = Vec::new();
+        let max_ptrs_isize = (isize::MAX as usize) / core::mem::size_of::<*const c_void>();
+        loop {
+            let actual = if req <= NON_POD_STACK_PTR_CAP {
+                self.read_non_pod_message_ptrs_raw(read_fn, term_index, &mut stack_ptrs[..req])?
+            } else {
+                if req > max_ptrs_isize {
+                    return Err(FfiResult::CAPACITY_EXCEEDED);
+                }
+                if heap_ptrs.len() < req {
+                    heap_ptrs
+                        .try_reserve(req - heap_ptrs.len())
+                        .map_err(|_| FfiResult::CAPACITY_EXCEEDED)?;
+                    heap_ptrs.resize(req, core::ptr::null::<c_void>());
+                }
+                self.read_non_pod_message_ptrs_raw(read_fn, term_index, &mut heap_ptrs[..req])?
+            };
+            if actual > 0 {
+                let ptr_slice = if req <= NON_POD_STACK_PTR_CAP {
+                    &stack_ptrs[..actual]
+                } else {
+                    &heap_ptrs[..actual]
+                };
+                Self::decode_non_pod_message_ptrs(
+                    ptr_slice,
+                    witness_fns.0,
+                    witness_fns.1,
+                    &mut all,
+                )?;
+            }
+            if actual < req {
+                break;
+            }
+            req = req.saturating_mul(2).min(max_batch);
+        }
+        Ok(all)
+    }
+
+    /// Drains all currently unread VTable-backed non-POD messages (`M: ModComponent + Default`)
     /// from `term_index`.
+    #[inline]
     pub fn drain_non_pod_messages_checked<M: ModComponent + Default>(
         &mut self,
         term_index: usize,
         expected_uuid: Option<UuidFilter>,
     ) -> Result<Vec<M>, FfiResult> {
-        const BATCH_SIZE: usize = 64;
-        let mut all = Vec::new();
-        loop {
-            let batch =
-                self.read_non_pod_messages_checked::<M>(term_index, expected_uuid, BATCH_SIZE)?;
-            let count = batch.len();
-            all.extend(batch);
-            if count < BATCH_SIZE {
-                break;
-            }
-        }
-        Ok(all)
+        self.drain_non_pod_messages_with_options_checked::<M>(
+            term_index,
+            expected_uuid,
+            DrainOptions::default(),
+        )
     }
 
     /// Encodes a non-POD message `msg` (`M: ModComponent`) via `"bam.v0.<M>.export_fields"` into
@@ -3587,35 +4568,11 @@ impl<'a> ValidatedIter<'a> {
         let Some(send_fn) = host_slot!(self.host.api(), msg_send) else {
             return FfiResult::UNSUPPORTED;
         };
-        let info = match self.column_info(term_index) {
-            Ok(i) => i,
-            Err(err) => return err,
-        };
         let effective_uuid = expected_uuid.unwrap_or_else(|| UuidFilter::exact(M::UUID));
-        if !validate_non_pod_message_info_for::<M>(
-            &info,
-            self.host.manifest_name(),
-            Some(effective_uuid),
-            true,
-        ) {
-            return FfiResult::TYPE_MISMATCH;
-        }
-        if let Err(err) = self.verify_non_pod_message_marker::<M>() {
+        if let Err(err) = self.validate_message_write_non_pod_term::<M>(term_index, effective_uuid)
+        {
             return err;
         }
-
-        type ExportFieldsFn = unsafe extern "C" fn(
-            src_ptr: *const c_void,
-            sink: Option<
-                unsafe extern "C" fn(
-                    sink_ctx: *mut c_void,
-                    field_name: StrView,
-                    type_tag: StrView,
-                    payload: FfiSlice<u8>,
-                ) -> FfiResult,
-            >,
-            sink_ctx: *mut c_void,
-        ) -> FfiResult;
 
         let host = self.host();
         let export_ptr = match host.cached_symbol_lookup(
@@ -3679,22 +4636,14 @@ impl<'a> ValidatedIter<'a> {
         self.has_column_raw(term_index)
     }
 
-    /// Reads up to `out_entities.len()` entity IDs from a `RemovedComponents<T>` stream declared
-    /// with [`AccessMode::REMOVED_READ`] at `term_index` via `BamHostApi::iter_read_removed`.
-    pub fn read_removed_batch(
+    /// Shared batch reader for `RemovedComponents` after term validation.
+    #[inline]
+    fn read_removed_batch_raw(
         &mut self,
+        read_fn: BamIterReadRemovedFn,
         term_index: usize,
         out_entities: &mut [FfiEntity],
     ) -> Result<usize, FfiResult> {
-        if self.raw.is_null() {
-            return Err(FfiResult::NULL_POINTER);
-        }
-        let read_fn =
-            host_slot!(self.host.api(), iter_read_removed).ok_or(FfiResult::UNSUPPORTED)?;
-        let info = self.column_info(term_index)?;
-        if info.mode != AccessMode::REMOVED_READ || info.is_resource() || info.is_message() {
-            return Err(FfiResult::TYPE_MISMATCH);
-        }
         if out_entities.is_empty() {
             return Ok(0);
         }
@@ -3717,19 +4666,87 @@ impl<'a> ValidatedIter<'a> {
         }
     }
 
-    /// Drains all unread `RemovedComponents<T>` entity IDs from `term_index` (`REMOVED_READ`).
-    pub fn drain_removed(&mut self, term_index: usize) -> Result<Vec<FfiEntity>, FfiResult> {
+    /// Shared drain loop for `RemovedComponents` after term validation.
+    fn drain_removed_raw(
+        &mut self,
+        read_fn: BamIterReadRemovedFn,
+        term_index: usize,
+    ) -> Result<Vec<FfiEntity>, FfiResult> {
         const BATCH_SIZE: usize = 64;
         let mut all = Vec::new();
         let mut batch = [FfiEntity::NULL; BATCH_SIZE];
         loop {
-            let count = self.read_removed_batch(term_index, &mut batch)?;
-            all.extend_from_slice(&batch[..count]);
+            let count = self.read_removed_batch_raw(read_fn, term_index, &mut batch)?;
+            if count > 0 {
+                all.extend_from_slice(&batch[..count]);
+            }
             if count < BATCH_SIZE {
                 break;
             }
         }
         Ok(all)
+    }
+
+    /// Reads up to `out_entities.len()` entity IDs from a `RemovedComponents<T>` stream declared
+    /// with [`AccessMode::REMOVED_READ`] at `term_index` via `BamHostApi::iter_read_removed`.
+    pub fn read_removed_batch(
+        &mut self,
+        term_index: usize,
+        out_entities: &mut [FfiEntity],
+    ) -> Result<usize, FfiResult> {
+        if self.raw.is_null() {
+            return Err(FfiResult::NULL_POINTER);
+        }
+        let read_fn =
+            host_slot!(self.host.api(), iter_read_removed).ok_or(FfiResult::UNSUPPORTED)?;
+        self.validate_removed_read_term(term_index)?;
+        self.read_removed_batch_raw(read_fn, term_index, out_entities)
+    }
+
+    /// Drains all unread `RemovedComponents<T>` entity IDs from `term_index` (`REMOVED_READ`).
+    pub fn drain_removed(&mut self, term_index: usize) -> Result<Vec<FfiEntity>, FfiResult> {
+        if self.raw.is_null() {
+            return Err(FfiResult::NULL_POINTER);
+        }
+        let read_fn =
+            host_slot!(self.host.api(), iter_read_removed).ok_or(FfiResult::UNSUPPORTED)?;
+        self.validate_removed_read_term(term_index)?;
+        self.drain_removed_raw(read_fn, term_index)
+    }
+
+    /// Reads up to `out_entities.len()` entity IDs from a typed `RemovedComponents<T>` stream at
+    /// `term_index`, validating `T`'s `(size, align)` and optional `expected_uuid` via the
+    /// persistent [`QuerySlotScratch`] term cache.
+    pub fn read_removed_batch_checked<T: AbiPod>(
+        &mut self,
+        term_index: usize,
+        expected_uuid: Option<UuidFilter>,
+        out_entities: &mut [FfiEntity],
+    ) -> Result<usize, FfiResult> {
+        if self.raw.is_null() {
+            return Err(FfiResult::NULL_POINTER);
+        }
+        let read_fn =
+            host_slot!(self.host.api(), iter_read_removed).ok_or(FfiResult::UNSUPPORTED)?;
+        self.validate_removed_read_term_typed::<T>(term_index, expected_uuid)?;
+        self.read_removed_batch_raw(read_fn, term_index, out_entities)
+    }
+
+    /// Drains all unread entity IDs from a typed `RemovedComponents<T>` stream at `term_index`,
+    /// validating `T`'s `(size, align)` and optional `expected_uuid` via the persistent
+    /// [`QuerySlotScratch`] term cache.
+    pub fn drain_removed_checked<T: AbiPod>(
+        &mut self,
+        term_index: usize,
+        expected_uuid: Option<UuidFilter>,
+    ) -> Result<Vec<FfiEntity>, FfiResult> {
+        if self.raw.is_null() {
+            return Err(FfiResult::NULL_POINTER);
+        }
+        let read_fn =
+            host_slot!(self.host.api(), iter_read_removed).ok_or(FfiResult::UNSUPPORTED)?;
+        self.validate_removed_read_term_typed::<T>(term_index, expected_uuid)?;
+        self.drain_removed_raw(read_fn, term_index)
     }
 
     /// Validates that `term_index` points to a readable (or writable when `require_write` is true)
@@ -4448,6 +5465,112 @@ fn validate_non_pod_message_info_for<M: ModComponent>(
     }
     qualify_mod_component_identity::<M>(manifest_name)
         .is_ok_and(|(_, qualified_uuid)| info.uuid == qualified_uuid)
+}
+
+/// Witness C-ABI callback exporting all fields of a host/guest `ModComponent` into a sink.
+type ExportFieldsFn = unsafe extern "C" fn(
+    src_ptr: *const c_void,
+    sink: Option<
+        unsafe extern "C" fn(
+            sink_ctx: *mut c_void,
+            field_name: StrView,
+            type_tag: StrView,
+            payload: FfiSlice<u8>,
+        ) -> FfiResult,
+    >,
+    sink_ctx: *mut c_void,
+) -> FfiResult;
+
+/// Probes up to `probe_cap` POD messages into a 512-byte [`RawMsgStackScratch`] buffer and appends
+/// any read elements to `out` (avoiding heap allocation entirely when `actual == 0`).
+#[inline]
+fn probe_messages_stack_into_vec<M: AbiPod>(
+    raw: *mut BamIter,
+    read_fn: BamMsgReadBatchFn,
+    term_index: usize,
+    probe_cap: usize,
+    out: &mut Vec<M>,
+) -> Result<usize, FfiResult> {
+    let mut scratch = RawMsgStackScratch::uninit();
+    let mut read_count = 0usize;
+    // SAFETY: `raw` is an active `BamIter`, caller validated `M`'s layout for `term_index`, and
+    // `scratch` provides `probe_cap * size_of::<M>() <= 512` writable bytes aligned to 16.
+    let status = unsafe {
+        read_fn(
+            raw,
+            term_index,
+            scratch.as_mut_u8_ptr(),
+            probe_cap,
+            &mut read_count,
+        )
+    };
+    if !status.is_ok() {
+        return Err(status);
+    }
+    let actual =
+        RawMsgStackScratch::validate_probe_count(core::mem::size_of::<M>(), probe_cap, read_count)?;
+    if actual == 0 {
+        return Ok(0);
+    }
+    if out.is_empty() && actual < probe_cap {
+        out.try_reserve_exact(actual)
+            .map_err(|_| FfiResult::CAPACITY_EXCEEDED)?;
+    } else {
+        out.try_reserve(actual)
+            .map_err(|_| FfiResult::CAPACITY_EXCEEDED)?;
+    }
+    let old_len = out.len();
+    let spare = out.spare_capacity_mut();
+    for (i, slot) in spare[..actual].iter_mut().enumerate() {
+        // SAFETY: `i < actual <= probe_cap`, so `read_fn` initialized `actual` elements
+        // inside `scratch` (`actual * size_of::<M>() <= 512`), and `try_reserve*` ensured
+        // `spare.len() >= actual`.
+        slot.write(unsafe { scratch.read_elem::<M>(i) });
+    }
+    // SAFETY: All `actual` elements in `out.spare_capacity_mut()[..actual]` were written above.
+    unsafe {
+        out.set_len(old_len + actual);
+    }
+    Ok(actual)
+}
+
+/// Cold out-of-line message drain counter for oversized or over-aligned POD message types
+/// (`size_of::<M>() > 512 || align_of::<M>() > 16`), reading one element per call into a
+/// `MaybeUninit<M>` slot so normal message hot paths never trigger `___chkstk_darwin`.
+#[cold]
+#[inline(never)]
+fn drain_messages_count_large<M: AbiPod>(
+    raw: *mut BamIter,
+    read_fn: BamMsgReadBatchFn,
+    term_index: usize,
+) -> Result<usize, FfiResult> {
+    let mut total = 0usize;
+    let mut slot = MaybeUninit::<M>::uninit();
+    loop {
+        let mut read_count = 0usize;
+        // SAFETY: `raw` is an active `BamIter`, caller validated `M`'s layout for `term_index`,
+        // and `slot` provides writable storage for `1` element of `M`.
+        let status = unsafe {
+            read_fn(
+                raw,
+                term_index,
+                slot.as_mut_ptr().cast::<u8>(),
+                1,
+                &mut read_count,
+            )
+        };
+        if !status.is_ok() {
+            return Err(status);
+        }
+        if read_count > 1 {
+            return Err(FfiResult::INTERNAL_ERROR);
+        }
+        if read_count == 0 {
+            break;
+        }
+        total = total.checked_add(1).ok_or(FfiResult::CAPACITY_EXCEEDED)?;
+    }
+    Ok(total)
 }
 
 /// Record of a single column borrow dispensed from [`ChunkColumnDispenser`], used to enforce
@@ -5472,5 +6595,753 @@ mod tests {
         }
         assert_eq!(st.legacy_ro_calls, 1);
         assert_eq!(st.legacy_rw_calls, 1);
+    }
+
+    #[test]
+    fn cached_term_kind_message_and_removed_zero_steady_state_col_info() {
+        use bamabi_sys::{BAM_STORAGE_FLAG_MESSAGE, FfiEntity, ModComponent, SymbolEntry};
+        use core::ffi::CStr;
+        use core::sync::atomic::{AtomicUsize, Ordering};
+
+        #[derive(Default, Debug, PartialEq, Eq)]
+        struct TestDynMsg {
+            tag: u32,
+        }
+
+        unsafe extern "C" fn test_export_fields(
+            src_ptr: *const c_void,
+            sink: Option<
+                unsafe extern "C" fn(
+                    sink_ctx: *mut c_void,
+                    field_name: StrView,
+                    type_tag: StrView,
+                    payload: FfiSlice<u8>,
+                ) -> FfiResult,
+            >,
+            sink_ctx: *mut c_void,
+        ) -> FfiResult {
+            // SAFETY: `src_ptr` points to a live `TestDynMsg`.
+            let msg = unsafe { &*src_ptr.cast::<TestDynMsg>() };
+            let Some(sink_fn) = sink else {
+                return FfiResult::NULL_POINTER;
+            };
+            let bytes = msg.tag.to_le_bytes();
+            // SAFETY: Forwarding stack slice for synchronous callback.
+            unsafe {
+                sink_fn(
+                    sink_ctx,
+                    StrView::from_str("tag"),
+                    StrView::from_str("u32"),
+                    FfiSlice::from_slice(&bytes),
+                )
+            }
+        }
+
+        unsafe extern "C" fn test_import_field(
+            dst_ptr: *mut c_void,
+            field_name: StrView,
+            _type_tag: StrView,
+            payload: FfiSlice<u8>,
+        ) -> FfiResult {
+            // SAFETY: `dst_ptr` points to a live `TestDynMsg`.
+            let dst = unsafe { &mut *dst_ptr.cast::<TestDynMsg>() };
+            // SAFETY: Valid synchronous slices from `forward_field`.
+            let Ok(name) = (unsafe { field_name.try_as_str() }) else {
+                return FfiResult::INVALID_UTF8;
+            };
+            // SAFETY: Valid synchronous slice from `forward_field`.
+            let Ok(bytes) = (unsafe { payload.try_as_slice() }) else {
+                return FfiResult::NULL_POINTER;
+            };
+            if name == "tag" && bytes.len() == 4 {
+                dst.tag = u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
+                return FfiResult::OK;
+            }
+            FfiResult::INVALID_ARGUMENT
+        }
+
+        static TEST_DYN_SYMS: [SymbolEntry; 2] = [
+            SymbolEntry {
+                name: "bam.v0.cache::TestDynMsg.export_fields",
+                ptr: test_export_fields as *const c_void,
+            },
+            SymbolEntry {
+                name: "bam.v0.cache::TestDynMsg.import_field",
+                ptr: test_import_field as *const c_void,
+            },
+        ];
+
+        impl ModComponent for TestDynMsg {
+            const CANONICAL_NAME: &'static str = "cache::TestDynMsg";
+            const COMPONENT_CSTR: &'static CStr = c"cache::TestDynMsg";
+            const UUID: ComponentUuid = ComponentUuid::from_parts("cache::TestDynMsg", 4, 4, 1);
+            type VTable = ();
+
+            fn vtable() -> &'static Self::VTable {
+                &()
+            }
+
+            fn symbols() -> &'static [SymbolEntry] {
+                &TEST_DYN_SYMS
+            }
+        }
+
+        struct CacheIterWorld {
+            col_info_calls: AtomicUsize,
+            pod_msgs: Vec<u64>,
+            pod_cursor: usize,
+            pod_sent: Vec<u64>,
+            dyn_msgs: Vec<TestDynMsg>,
+            dyn_cursor: usize,
+            dyn_sent: Vec<Vec<u8>>,
+            removed: Vec<FfiEntity>,
+            removed_cursor: usize,
+        }
+
+        unsafe extern "C" fn cache_get_proc(
+            _ctx: *const BamHostCtx,
+            sym: *const c_char,
+        ) -> *const c_void {
+            // SAFETY: Caller passes NUL-terminated `sym`.
+            let name = unsafe { CStr::from_ptr(sym) };
+            match name.to_bytes() {
+                b"bam.v0.cache::TestDynMsg.export_fields" => test_export_fields as *const c_void,
+                b"bam.v0.cache::TestDynMsg.non_pod_message" => cache_col_info as *const c_void,
+                _ => core::ptr::null(),
+            }
+        }
+
+        unsafe extern "C" fn cache_col_info(
+            iter: *const BamIter,
+            term_index: usize,
+            out: *mut BamColumnInfo,
+        ) -> FfiResult {
+            // SAFETY: `iter` points to `CacheIterWorld`.
+            let world = unsafe { &*iter.cast::<CacheIterWorld>() };
+            world.col_info_calls.fetch_add(1, Ordering::Relaxed);
+            let info = match term_index {
+                0 => BamColumnInfo {
+                    component: BamComponent::from_raw(1),
+                    uuid: ComponentUuid::from_parts("cache::PodRead", 8, 8, 0),
+                    size: 8,
+                    align: 8,
+                    mode: AccessMode::MESSAGE_READ,
+                    storage_flags: BAM_STORAGE_FLAG_MESSAGE,
+                    reserved0: 0,
+                },
+                1 => BamColumnInfo {
+                    component: BamComponent::from_raw(2),
+                    uuid: ComponentUuid::from_parts("cache::PodWrite", 8, 8, 0),
+                    size: 8,
+                    align: 8,
+                    mode: AccessMode::MESSAGE_WRITE,
+                    storage_flags: BAM_STORAGE_FLAG_MESSAGE,
+                    reserved0: 0,
+                },
+                2 => BamColumnInfo {
+                    component: BamComponent::from_raw(3),
+                    uuid: TestDynMsg::UUID,
+                    size: core::mem::size_of::<*const c_void>(),
+                    align: core::mem::align_of::<*const c_void>(),
+                    mode: AccessMode::MESSAGE_READ,
+                    storage_flags: BAM_STORAGE_FLAG_MESSAGE,
+                    reserved0: 0,
+                },
+                3 => BamColumnInfo {
+                    component: BamComponent::from_raw(4),
+                    uuid: TestDynMsg::UUID,
+                    size: core::mem::size_of::<*const c_void>(),
+                    align: core::mem::align_of::<*const c_void>(),
+                    mode: AccessMode::MESSAGE_WRITE,
+                    storage_flags: BAM_STORAGE_FLAG_MESSAGE,
+                    reserved0: 0,
+                },
+                4 => BamColumnInfo {
+                    component: BamComponent::from_raw(5),
+                    uuid: ComponentUuid::from_parts("cache::RemovedU32", 4, 4, 0),
+                    size: 4,
+                    align: 4,
+                    mode: AccessMode::REMOVED_READ,
+                    storage_flags: 0,
+                    reserved0: 0,
+                },
+                _ => return FfiResult::OUT_OF_RANGE,
+            };
+            // SAFETY: Caller passed aligned writable `out`.
+            unsafe { *out = info };
+            FfiResult::OK
+        }
+
+        unsafe extern "C" fn cache_msg_read_batch(
+            iter: *mut BamIter,
+            term_index: usize,
+            out_buf: *mut u8,
+            max_count: usize,
+            out_read: *mut usize,
+        ) -> FfiResult {
+            // SAFETY: `iter` points to `CacheIterWorld`.
+            let world = unsafe { &mut *iter.cast::<CacheIterWorld>() };
+            match term_index {
+                0 | 1 => {
+                    let avail = world.pod_msgs.len().saturating_sub(world.pod_cursor);
+                    let take = avail.min(max_count);
+                    for i in 0..take {
+                        let val = world.pod_msgs[world.pod_cursor + i];
+                        // SAFETY: `out_buf` is writable for `take * 8` bytes.
+                        unsafe {
+                            core::ptr::write_unaligned(out_buf.add(i * 8).cast::<u64>(), val);
+                        }
+                    }
+                    world.pod_cursor += take;
+                    // SAFETY: `out_read` is writable.
+                    unsafe { *out_read = take };
+                    FfiResult::OK
+                }
+                2 | 3 => {
+                    let avail = world.dyn_msgs.len().saturating_sub(world.dyn_cursor);
+                    let take = avail.min(max_count);
+                    for i in 0..take {
+                        let ptr = core::ptr::from_ref(&world.dyn_msgs[world.dyn_cursor + i])
+                            .cast::<c_void>();
+                        // SAFETY: `out_buf` has `take * size_of::<*const c_void>()` writable bytes.
+                        unsafe {
+                            core::ptr::write_unaligned(
+                                out_buf
+                                    .add(i * core::mem::size_of::<*const c_void>())
+                                    .cast::<*const c_void>(),
+                                ptr,
+                            );
+                        }
+                    }
+                    world.dyn_cursor += take;
+                    // SAFETY: `out_read` is writable.
+                    unsafe { *out_read = take };
+                    FfiResult::OK
+                }
+                _ => FfiResult::OUT_OF_RANGE,
+            }
+        }
+
+        unsafe extern "C" fn cache_msg_send(
+            iter: *mut BamIter,
+            term_index: usize,
+            data_ptr: *const u8,
+            data_len: usize,
+        ) -> FfiResult {
+            // SAFETY: `iter` points to `CacheIterWorld`.
+            let world = unsafe { &mut *iter.cast::<CacheIterWorld>() };
+            match term_index {
+                1 => {
+                    // SAFETY: `data_ptr` holds `8` readable bytes of `u64`.
+                    let val = unsafe { core::ptr::read_unaligned(data_ptr.cast::<u64>()) };
+                    world.pod_sent.push(val);
+                    FfiResult::OK
+                }
+                3 => {
+                    // SAFETY: `data_ptr` covers `data_len` bytes.
+                    let pkt = unsafe { core::slice::from_raw_parts(data_ptr, data_len) }.to_vec();
+                    world.dyn_sent.push(pkt);
+                    FfiResult::OK
+                }
+                _ => FfiResult::PERMISSION_DENIED,
+            }
+        }
+
+        unsafe extern "C" fn cache_msg_write_batch(
+            iter: *mut BamIter,
+            term_index: usize,
+            data_ptr: *const u8,
+            count: usize,
+        ) -> FfiResult {
+            // SAFETY: `iter` points to `CacheIterWorld`.
+            let world = unsafe { &mut *iter.cast::<CacheIterWorld>() };
+            if term_index != 1 {
+                return FfiResult::PERMISSION_DENIED;
+            }
+            for i in 0..count {
+                // SAFETY: `data_ptr` holds `count` readable `u64`s.
+                let val = unsafe { core::ptr::read_unaligned(data_ptr.add(i * 8).cast::<u64>()) };
+                world.pod_sent.push(val);
+            }
+            FfiResult::OK
+        }
+
+        unsafe extern "C" fn cache_read_removed(
+            iter: *mut BamIter,
+            term_index: usize,
+            out_entities: *mut FfiEntity,
+            max_count: usize,
+            out_read: *mut usize,
+        ) -> FfiResult {
+            // SAFETY: `iter` points to `CacheIterWorld`.
+            let world = unsafe { &mut *iter.cast::<CacheIterWorld>() };
+            if term_index != 4 {
+                return FfiResult::OUT_OF_RANGE;
+            }
+            let avail = world.removed.len().saturating_sub(world.removed_cursor);
+            let take = avail.min(max_count);
+            for i in 0..take {
+                // SAFETY: `out_entities` is writable for `take` entities.
+                unsafe {
+                    *out_entities.add(i) = world.removed[world.removed_cursor + i];
+                }
+            }
+            world.removed_cursor += take;
+            // SAFETY: `out_read` is writable.
+            unsafe { *out_read = take };
+            FfiResult::OK
+        }
+
+        let mut api = make_epoch_api();
+        api.get_proc_address = Some(cache_get_proc);
+        api.iter_column_info = Some(cache_col_info);
+        api.msg_read_batch = Some(cache_msg_read_batch);
+        api.msg_send = Some(cache_msg_send);
+        api.msg_write_batch = Some(cache_msg_write_batch);
+        api.iter_read_removed = Some(cache_read_removed);
+
+        let mut world = CacheIterWorld {
+            col_info_calls: AtomicUsize::new(0),
+            pod_msgs: (0..200).collect(),
+            pod_cursor: 0,
+            pod_sent: Vec::new(),
+            dyn_msgs: (0..100).map(|tag| TestDynMsg { tag }).collect(),
+            dyn_cursor: 0,
+            dyn_sent: Vec::new(),
+            removed: (1..=140).map(FfiEntity::from_bits).collect(),
+            removed_cursor: 0,
+        };
+        let dummy_ctx = 0u64;
+        // SAFETY: `api` and `dummy_ctx` outlive `host`.
+        let host = unsafe { Host::from_raw(&api, (&raw const dummy_ctx).cast()) }.unwrap();
+        let scratch = QuerySlotScratch::new();
+
+        // Tick 1: cold miss on each of the 5 terms -> exactly 5 `iter_column_info` calls total,
+        // even across multi-batch drains!
+        {
+            scratch.reset_per_tick();
+            // SAFETY: `world` and `scratch` outlive `iter`.
+            let mut iter = unsafe {
+                ValidatedIter::from_raw_with_parts(
+                    (&raw mut world).cast::<BamIter>(),
+                    &host,
+                    None,
+                    Some(&scratch),
+                )
+            };
+
+            let got_pod = iter
+                .drain_messages_with_options_checked::<u64>(0, None, DrainOptions::new(8, 32))
+                .unwrap();
+            assert_eq!(got_pod, (0..200).collect::<Vec<_>>());
+            assert_eq!(world.col_info_calls.load(Ordering::Relaxed), 1);
+
+            assert_eq!(
+                iter.send_message_checked::<u64>(1, None, &11),
+                FfiResult::OK
+            );
+            assert_eq!(
+                iter.send_messages_batch_checked::<u64>(1, None, &[22, 33]),
+                FfiResult::OK
+            );
+            assert_eq!(world.col_info_calls.load(Ordering::Relaxed), 2);
+
+            let got_dyn = iter
+                .drain_non_pod_messages_with_options_checked::<TestDynMsg>(
+                    2,
+                    None,
+                    DrainOptions::new(8, 16),
+                )
+                .unwrap();
+            assert_eq!(got_dyn.len(), 100);
+            assert_eq!(got_dyn[99].tag, 99);
+            assert_eq!(world.col_info_calls.load(Ordering::Relaxed), 3);
+
+            assert_eq!(
+                iter.send_non_pod_message_checked::<TestDynMsg>(3, None, &TestDynMsg { tag: 7 }),
+                FfiResult::OK
+            );
+            assert_eq!(
+                iter.send_non_pod_message_checked::<TestDynMsg>(3, None, &TestDynMsg { tag: 8 }),
+                FfiResult::OK
+            );
+            assert_eq!(world.col_info_calls.load(Ordering::Relaxed), 4);
+
+            let got_rem = iter.drain_removed_checked::<u32>(4, None).unwrap();
+            assert_eq!(got_rem.len(), 140);
+            assert_eq!(world.col_info_calls.load(Ordering::Relaxed), 5);
+        }
+
+        // Ticks 2..=5: refill queues and verify ZERO additional `iter_column_info` calls!
+        for tick in 2..=5u64 {
+            world.pod_msgs = (0..130).map(|i| tick * 1000 + i).collect();
+            world.pod_cursor = 0;
+            world.dyn_msgs = (0..70)
+                .map(|i| TestDynMsg {
+                    tag: (tick as u32) * 100 + i,
+                })
+                .collect();
+            world.dyn_cursor = 0;
+            world.removed = (1..=80).map(FfiEntity::from_bits).collect();
+            world.removed_cursor = 0;
+
+            scratch.reset_per_tick();
+            // SAFETY: `world` and `scratch` outlive `iter`.
+            let mut iter = unsafe {
+                ValidatedIter::from_raw_with_parts(
+                    (&raw mut world).cast::<BamIter>(),
+                    &host,
+                    None,
+                    Some(&scratch),
+                )
+            };
+
+            let pod = iter.drain_messages_checked::<u64>(0, None).unwrap();
+            assert_eq!(pod.len(), 130);
+            assert_eq!(
+                iter.send_message_checked::<u64>(1, None, &tick),
+                FfiResult::OK
+            );
+            let dyn_got = iter
+                .drain_non_pod_messages_checked::<TestDynMsg>(2, None)
+                .unwrap();
+            assert_eq!(dyn_got.len(), 70);
+            assert_eq!(
+                iter.send_non_pod_message_checked::<TestDynMsg>(
+                    3,
+                    None,
+                    &TestDynMsg { tag: tick as u32 },
+                ),
+                FfiResult::OK
+            );
+            let rem = iter.drain_removed_checked::<u32>(4, None).unwrap();
+            assert_eq!(rem.len(), 80);
+
+            assert_eq!(
+                world.col_info_calls.load(Ordering::Relaxed),
+                5,
+                "tick {tick} must perform 0 extra iter_column_info calls"
+            );
+        }
+    }
+
+    #[test]
+    fn pod_message_drain_conservation_zst_align16_and_large_count() {
+        use bamabi_sys::{BAM_STORAGE_FLAG_MESSAGE, RawInsertable};
+
+        #[repr(C, align(16))]
+        #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+        struct Align16Msg {
+            seq: u64,
+            pad: u64,
+        }
+        // SAFETY: `#[repr(C, align(16))]` with two `u64` fields has no drop glue or padding.
+        unsafe impl RawInsertable for Align16Msg {}
+        // SAFETY: Identical deterministic C99 layout across targets.
+        unsafe impl AbiPod for Align16Msg {}
+
+        type LargeMsg = [u64; 80]; // 640 bytes (> 512 B)
+        type ZstMsg = [u8; 0];
+
+        struct SeqHostState {
+            elem_size: usize,
+            elem_align: usize,
+            total_items: usize,
+            cursor: usize,
+            hostile_override: Option<usize>,
+        }
+
+        unsafe extern "C" fn seq_col_info(
+            iter: *const BamIter,
+            term_index: usize,
+            out: *mut BamColumnInfo,
+        ) -> FfiResult {
+            if term_index != 0 {
+                return FfiResult::OUT_OF_RANGE;
+            }
+            // SAFETY: `iter` points to `SeqHostState`.
+            let st = unsafe { &*iter.cast::<SeqHostState>() };
+            // SAFETY: `out` is aligned writable storage.
+            unsafe {
+                *out = BamColumnInfo {
+                    component: BamComponent::from_raw(1),
+                    uuid: ComponentUuid::from_parts("seq::Msg", st.elem_size, st.elem_align, 0),
+                    size: st.elem_size,
+                    align: st.elem_align,
+                    mode: AccessMode::MESSAGE_READ,
+                    storage_flags: BAM_STORAGE_FLAG_MESSAGE,
+                    reserved0: 0,
+                };
+            }
+            FfiResult::OK
+        }
+
+        unsafe extern "C" fn seq_msg_read_batch(
+            iter: *mut BamIter,
+            term_index: usize,
+            out_buf: *mut u8,
+            max_count: usize,
+            out_read: *mut usize,
+        ) -> FfiResult {
+            if term_index != 0 {
+                return FfiResult::OUT_OF_RANGE;
+            }
+            // SAFETY: `iter` points to `SeqHostState`.
+            let st = unsafe { &mut *iter.cast::<SeqHostState>() };
+            if let Some(hostile) = st.hostile_override {
+                // SAFETY: `out_read` is writable.
+                unsafe { *out_read = hostile };
+                return FfiResult::OK;
+            }
+            let avail = st.total_items.saturating_sub(st.cursor);
+            let take = avail.min(max_count);
+            for i in 0..take {
+                let seq = (st.cursor + i) as u64;
+                if st.elem_size == 8 {
+                    // SAFETY: `out_buf` has `take * 8` writable bytes.
+                    unsafe { core::ptr::write_unaligned(out_buf.add(i * 8).cast::<u64>(), seq) };
+                } else if st.elem_size == 16 {
+                    let msg = Align16Msg {
+                        seq,
+                        pad: seq ^ 0xA5A5,
+                    };
+                    // SAFETY: `out_buf` has `take * 16` writable bytes.
+                    unsafe {
+                        core::ptr::write_unaligned(out_buf.add(i * 16).cast::<Align16Msg>(), msg);
+                    }
+                } else if st.elem_size == 640 {
+                    let mut large = [0u64; 80];
+                    large[0] = seq;
+                    large[79] = seq.wrapping_add(1);
+                    // SAFETY: `out_buf` has `take * 640` writable bytes.
+                    unsafe {
+                        core::ptr::write_unaligned(out_buf.add(i * 640).cast::<LargeMsg>(), large);
+                    }
+                }
+            }
+            st.cursor += take;
+            // SAFETY: `out_read` is writable.
+            unsafe { *out_read = take };
+            FfiResult::OK
+        }
+
+        assert_eq!(DrainOptions::default(), DrainOptions::new(64, 1024));
+        assert_eq!(DrainOptions::new(0, 0).normalized(), (1, 1));
+        assert_eq!(DrainOptions::new(32, 8).normalized(), (32, 32));
+        assert_eq!(DrainOptions::new(0, 128).normalized(), (1, 128));
+
+        let mut api = make_epoch_api();
+        api.iter_column_info = Some(seq_col_info);
+        api.msg_read_batch = Some(seq_msg_read_batch);
+        let dummy_ctx = 0u64;
+        // SAFETY: `api` and `dummy_ctx` outlive `host`.
+        let host = unsafe { Host::from_raw(&api, (&raw const dummy_ctx).cast()) }.unwrap();
+
+        let counts = [0usize, 1, 31, 32, 33, 64, 65, 128, 129, 256];
+        for &n in &counts {
+            // 1. Align(16) 16B messages via drain_messages_checked & drain_messages_into_vec_checked
+            for pre_cap in [0usize, n, n / 2] {
+                let mut st = SeqHostState {
+                    elem_size: 16,
+                    elem_align: 16,
+                    total_items: n,
+                    cursor: 0,
+                    hostile_override: None,
+                };
+                // SAFETY: `st` outlives `iter`.
+                let mut iter =
+                    unsafe { ValidatedIter::from_raw((&raw mut st).cast::<BamIter>(), &host) };
+                let mut out = Vec::with_capacity(pre_cap);
+                let drained = iter
+                    .drain_messages_into_vec_checked::<Align16Msg>(
+                        0,
+                        None,
+                        &mut out,
+                        DrainOptions::default(),
+                    )
+                    .unwrap();
+                assert_eq!(drained, n);
+                assert_eq!(out.len(), n);
+                for (i, item) in out.iter().enumerate() {
+                    assert_eq!(
+                        *item,
+                        Align16Msg {
+                            seq: i as u64,
+                            pad: (i as u64) ^ 0xA5A5,
+                        }
+                    );
+                }
+            }
+
+            // 2. read_messages_into_checked & read_messages_into_vec_checked & read_messages_batch_checked
+            {
+                let mut st = SeqHostState {
+                    elem_size: 8,
+                    elem_align: 8,
+                    total_items: n,
+                    cursor: 0,
+                    hostile_override: None,
+                };
+                // SAFETY: `st` outlives `iter`.
+                let mut iter =
+                    unsafe { ValidatedIter::from_raw((&raw mut st).cast::<BamIter>(), &host) };
+                let mut slice_buf = [0u64; 32];
+                let r1 = iter
+                    .read_messages_into_checked(0, None, &mut slice_buf)
+                    .unwrap();
+                assert_eq!(r1, n.min(32));
+                for (i, &val) in slice_buf[..r1].iter().enumerate() {
+                    assert_eq!(val, i as u64);
+                }
+                let mut vec_buf = Vec::<u64>::with_capacity(100);
+                let r2 = iter
+                    .read_messages_into_vec_checked(0, None, &mut vec_buf, 100)
+                    .unwrap();
+                assert_eq!(r2, n.saturating_sub(32).min(100));
+                let r3 = iter
+                    .read_messages_batch_checked::<u64>(0, None, 200)
+                    .unwrap();
+                assert_eq!(r1 + r2 + r3.len(), n);
+            }
+
+            // 3. ZST messages
+            {
+                let mut st = SeqHostState {
+                    elem_size: 0,
+                    elem_align: 1,
+                    total_items: n,
+                    cursor: 0,
+                    hostile_override: None,
+                };
+                {
+                    // SAFETY: `st` outlives `iter`.
+                    let mut iter =
+                        unsafe { ValidatedIter::from_raw((&raw mut st).cast::<BamIter>(), &host) };
+                    let z = iter
+                        .drain_messages_with_options_checked::<ZstMsg>(
+                            0,
+                            None,
+                            DrainOptions::new(4, 32),
+                        )
+                        .unwrap();
+                    assert_eq!(z.len(), n);
+                }
+
+                st.cursor = 0;
+                // SAFETY: `st` outlives `iter`.
+                let mut iter =
+                    unsafe { ValidatedIter::from_raw((&raw mut st).cast::<BamIter>(), &host) };
+                assert_eq!(iter.drain_messages_count_checked::<ZstMsg>(0, None), Ok(n));
+            }
+
+            // 4. drain_messages_count_checked for <= 512 B (16 B) and > 512 B (640 B)
+            {
+                let mut st = SeqHostState {
+                    elem_size: 16,
+                    elem_align: 16,
+                    total_items: n,
+                    cursor: 0,
+                    hostile_override: None,
+                };
+                // SAFETY: `st` outlives `iter`.
+                let mut iter =
+                    unsafe { ValidatedIter::from_raw((&raw mut st).cast::<BamIter>(), &host) };
+                assert_eq!(
+                    iter.drain_messages_count_checked::<Align16Msg>(0, None),
+                    Ok(n)
+                );
+
+                let mut st_large = SeqHostState {
+                    elem_size: 640,
+                    elem_align: 8,
+                    total_items: n,
+                    cursor: 0,
+                    hostile_override: None,
+                };
+                // SAFETY: `st_large` outlives `iter_large`.
+                let mut iter_large = unsafe {
+                    ValidatedIter::from_raw((&raw mut st_large).cast::<BamIter>(), &host)
+                };
+                assert_eq!(
+                    iter_large.drain_messages_count_checked::<LargeMsg>(0, None),
+                    Ok(n)
+                );
+            }
+        }
+
+        // 5. Large (> 512 B) drain_messages_checked sequence conservation and hostile read_count rejection
+        {
+            let mut st_large = SeqHostState {
+                elem_size: 640,
+                elem_align: 8,
+                total_items: 5,
+                cursor: 0,
+                hostile_override: None,
+            };
+            {
+                // SAFETY: `st_large` outlives `iter`.
+                let mut iter = unsafe {
+                    ValidatedIter::from_raw((&raw mut st_large).cast::<BamIter>(), &host)
+                };
+                let got = iter
+                    .drain_messages_with_options_checked::<LargeMsg>(
+                        0,
+                        None,
+                        DrainOptions::new(2, 4),
+                    )
+                    .unwrap();
+                assert_eq!(got.len(), 5);
+                for (i, item) in got.iter().enumerate() {
+                    assert_eq!(item[0], i as u64);
+                    assert_eq!(item[79], (i as u64) + 1);
+                }
+            }
+
+            st_large.hostile_override = Some(999);
+            // SAFETY: `st_large` outlives `iter`.
+            let mut iter =
+                unsafe { ValidatedIter::from_raw((&raw mut st_large).cast::<BamIter>(), &host) };
+            let mut slice_uninit = [MaybeUninit::<LargeMsg>::uninit(); 2];
+            assert_eq!(
+                iter.read_messages_into_uninit_checked(0, None, &mut slice_uninit),
+                Err(FfiResult::INTERNAL_ERROR)
+            );
+            let mut v = Vec::<LargeMsg>::new();
+            assert_eq!(
+                iter.read_messages_into_vec_checked(0, None, &mut v, 2),
+                Err(FfiResult::INTERNAL_ERROR)
+            );
+            assert_eq!(
+                iter.drain_messages_into_vec_checked(0, None, &mut v, DrainOptions::default()),
+                Err(FfiResult::INTERNAL_ERROR)
+            );
+            assert_eq!(
+                iter.drain_messages_count_checked::<LargeMsg>(0, None),
+                Err(FfiResult::INTERNAL_ERROR)
+            );
+        }
+
+        // Hostile read_count > probe_cap on <= 512 B types fails closed in drain_messages_count & drain_messages_into_vec
+        {
+            let mut st = SeqHostState {
+                elem_size: 16,
+                elem_align: 16,
+                total_items: 0,
+                cursor: 0,
+                hostile_override: Some(100),
+            };
+            // SAFETY: `st` outlives `iter`.
+            let mut iter =
+                unsafe { ValidatedIter::from_raw((&raw mut st).cast::<BamIter>(), &host) };
+            assert_eq!(
+                iter.drain_messages_count_checked::<Align16Msg>(0, None),
+                Err(FfiResult::INTERNAL_ERROR)
+            );
+            let mut out = Vec::<Align16Msg>::new();
+            assert_eq!(
+                iter.drain_messages_into_vec_checked(0, None, &mut out, DrainOptions::default()),
+                Err(FfiResult::INTERNAL_ERROR)
+            );
+        }
     }
 }

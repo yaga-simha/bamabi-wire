@@ -1,9 +1,12 @@
 //! Unified system execution context (`SystemContext`) and run-condition context (`RunConditionContext`).
 
-use core::ffi::{CStr, c_void};
+use core::{
+    ffi::{CStr, c_void},
+    mem::MaybeUninit,
+};
 
 use bamabi_guest_sys::{
-    Host, LazyCommands, TypedComponent, ValidatedCommands, ValidatedIter,
+    DrainOptions, Host, LazyCommands, TypedComponent, ValidatedCommands, ValidatedIter,
     ValidatedSystemInvocation, ValidatedSystemRef, ValidatedSystemSlice, resolve_component,
 };
 use bamabi_sys::{
@@ -174,12 +177,271 @@ impl<'a> RunConditionSystemContext<'a> {
         query.read_messages::<M>(decl_index)
     }
 
-    /// Returns `true` iff at least one unread message `M: GuestComponent` is queued at
+    /// Drains unread POD messages (`M: AbiPod`) from `decl_index` in `run_if_query`.
+    #[inline]
+    pub fn read_pod_messages<M: AbiPod>(&mut self, decl_index: usize) -> Result<Vec<M>, FfiResult> {
+        let Some(query) = self.query.as_mut() else {
+            return Err(FfiResult::NOT_FOUND);
+        };
+        query.read_pod_messages::<M>(decl_index)
+    }
+
+    /// Reads up to `out.len()` unread messages (`M: GuestComponent`) from `decl_index` in
+    /// `run_if_query` directly into uninitialized slice `out` with zero heap allocations.
+    #[inline]
+    pub fn read_messages_into_uninit<M: GuestComponent>(
+        &mut self,
+        decl_index: usize,
+        out: &mut [MaybeUninit<M>],
+    ) -> Result<usize, FfiResult> {
+        let Some(query) = self.query.as_mut() else {
+            return Err(FfiResult::NOT_FOUND);
+        };
+        query.read_messages_into_uninit::<M>(decl_index, out)
+    }
+
+    /// Reads up to `out.len()` unread POD messages (`M: AbiPod`) from `decl_index` in
+    /// `run_if_query` directly into uninitialized slice `out` with zero heap allocations.
+    #[inline]
+    pub fn read_pod_messages_into_uninit<M: AbiPod>(
+        &mut self,
+        decl_index: usize,
+        out: &mut [MaybeUninit<M>],
+    ) -> Result<usize, FfiResult> {
+        let Some(query) = self.query.as_mut() else {
+            return Err(FfiResult::NOT_FOUND);
+        };
+        query.read_pod_messages_into_uninit::<M>(decl_index, out)
+    }
+
+    /// Reads up to `out.len()` unread messages (`M: GuestComponent`) from `decl_index` in
+    /// `run_if_query` directly into `out` with zero heap allocations.
+    #[inline]
+    pub fn read_messages_into<M: GuestComponent>(
+        &mut self,
+        decl_index: usize,
+        out: &mut [M],
+    ) -> Result<usize, FfiResult> {
+        let Some(query) = self.query.as_mut() else {
+            return Err(FfiResult::NOT_FOUND);
+        };
+        query.read_messages_into::<M>(decl_index, out)
+    }
+
+    /// Reads up to `out.len()` unread POD messages (`M: AbiPod`) from `decl_index` in
+    /// `run_if_query` directly into `out` with zero heap allocations.
+    #[inline]
+    pub fn read_pod_messages_into<M: AbiPod>(
+        &mut self,
+        decl_index: usize,
+        out: &mut [M],
+    ) -> Result<usize, FfiResult> {
+        let Some(query) = self.query.as_mut() else {
+            return Err(FfiResult::NOT_FOUND);
+        };
+        query.read_pod_messages_into::<M>(decl_index, out)
+    }
+
+    /// Appends up to `max_count` unread messages (`M: GuestComponent`) from `decl_index` in
+    /// `run_if_query` directly into `out`.
+    #[inline]
+    pub fn read_messages_into_vec<M: GuestComponent>(
+        &mut self,
+        decl_index: usize,
+        out: &mut Vec<M>,
+        max_count: usize,
+    ) -> Result<usize, FfiResult> {
+        let Some(query) = self.query.as_mut() else {
+            return Err(FfiResult::NOT_FOUND);
+        };
+        query.read_messages_into_vec::<M>(decl_index, out, max_count)
+    }
+
+    /// Appends up to `max_count` unread POD messages (`M: AbiPod`) from `decl_index` in
+    /// `run_if_query` directly into `out`.
+    #[inline]
+    pub fn read_pod_messages_into_vec<M: AbiPod>(
+        &mut self,
+        decl_index: usize,
+        out: &mut Vec<M>,
+        max_count: usize,
+    ) -> Result<usize, FfiResult> {
+        let Some(query) = self.query.as_mut() else {
+            return Err(FfiResult::NOT_FOUND);
+        };
+        query.read_pod_messages_into_vec::<M>(decl_index, out, max_count)
+    }
+
+    /// Reads up to `max_count` unread messages (`M: GuestComponent`) from `decl_index` in
+    /// `run_if_query`.
+    #[inline]
+    pub fn read_messages_batch<M: GuestComponent>(
+        &mut self,
+        decl_index: usize,
+        max_count: usize,
+    ) -> Result<Vec<M>, FfiResult> {
+        let Some(query) = self.query.as_mut() else {
+            return Err(FfiResult::NOT_FOUND);
+        };
+        query.read_messages_batch::<M>(decl_index, max_count)
+    }
+
+    /// Reads up to `max_count` unread POD messages (`M: AbiPod`) from `decl_index` in
+    /// `run_if_query`.
+    #[inline]
+    pub fn read_pod_messages_batch<M: AbiPod>(
+        &mut self,
+        decl_index: usize,
+        max_count: usize,
+    ) -> Result<Vec<M>, FfiResult> {
+        let Some(query) = self.query.as_mut() else {
+            return Err(FfiResult::NOT_FOUND);
+        };
+        query.read_pod_messages_batch::<M>(decl_index, max_count)
+    }
+
+    /// Drains all unread messages (`M: GuestComponent`) from `decl_index` in `run_if_query`
+    /// using custom [`DrainOptions`].
+    #[inline]
+    pub fn drain_messages_with_options<M: GuestComponent>(
+        &mut self,
+        decl_index: usize,
+        opts: DrainOptions,
+    ) -> Result<Vec<M>, FfiResult> {
+        let Some(query) = self.query.as_mut() else {
+            return Err(FfiResult::NOT_FOUND);
+        };
+        query.drain_messages_with_options::<M>(decl_index, opts)
+    }
+
+    /// Drains all unread POD messages (`M: AbiPod`) from `decl_index` in `run_if_query` using
+    /// custom [`DrainOptions`].
+    #[inline]
+    pub fn drain_pod_messages_with_options<M: AbiPod>(
+        &mut self,
+        decl_index: usize,
+        opts: DrainOptions,
+    ) -> Result<Vec<M>, FfiResult> {
+        let Some(query) = self.query.as_mut() else {
+            return Err(FfiResult::NOT_FOUND);
+        };
+        query.drain_pod_messages_with_options::<M>(decl_index, opts)
+    }
+
+    /// Drains all unread messages (`M: GuestComponent`) from `decl_index` in `run_if_query`
+    /// directly into `out`, returning the number of appended messages.
+    #[inline]
+    pub fn drain_messages_into_vec<M: GuestComponent>(
+        &mut self,
+        decl_index: usize,
+        out: &mut Vec<M>,
+        opts: DrainOptions,
+    ) -> Result<usize, FfiResult> {
+        let Some(query) = self.query.as_mut() else {
+            return Err(FfiResult::NOT_FOUND);
+        };
+        query.drain_messages_into_vec::<M>(decl_index, out, opts)
+    }
+
+    /// Drains all unread POD messages (`M: AbiPod`) from `decl_index` in `run_if_query`
+    /// directly into `out`, returning the number of appended messages.
+    #[inline]
+    pub fn drain_pod_messages_into_vec<M: AbiPod>(
+        &mut self,
+        decl_index: usize,
+        out: &mut Vec<M>,
+        opts: DrainOptions,
+    ) -> Result<usize, FfiResult> {
+        let Some(query) = self.query.as_mut() else {
+            return Err(FfiResult::NOT_FOUND);
+        };
+        query.drain_pod_messages_into_vec::<M>(decl_index, out, opts)
+    }
+
+    /// Drains the unread message cursor (`M: GuestComponent`) at `decl_index` in `run_if_query`
+    /// with zero heap allocations, returning the drained message count.
+    #[inline]
+    pub fn drain_messages_count<M: GuestComponent>(
+        &mut self,
+        decl_index: usize,
+    ) -> Result<usize, FfiResult> {
+        let Some(query) = self.query.as_mut() else {
+            return Err(FfiResult::NOT_FOUND);
+        };
+        query.drain_messages_count::<M>(decl_index)
+    }
+
+    /// Drains the unread POD message cursor (`M: AbiPod`) at `decl_index` in `run_if_query` with
+    /// zero heap allocations, returning the drained message count.
+    #[inline]
+    pub fn drain_pod_messages_count<M: AbiPod>(
+        &mut self,
+        decl_index: usize,
+    ) -> Result<usize, FfiResult> {
+        let Some(query) = self.query.as_mut() else {
+            return Err(FfiResult::NOT_FOUND);
+        };
+        query.drain_pod_messages_count::<M>(decl_index)
+    }
+
+    /// Drains unread VTable-backed non-POD messages (`M: ModComponent + Default`) from
     /// `decl_index` in `run_if_query`.
     #[inline]
+    pub fn read_non_pod_messages<M: ModComponent + Default>(
+        &mut self,
+        decl_index: usize,
+    ) -> Result<Vec<M>, FfiResult> {
+        let Some(query) = self.query.as_mut() else {
+            return Err(FfiResult::NOT_FOUND);
+        };
+        query.read_non_pod_messages::<M>(decl_index)
+    }
+
+    /// Reads up to `max_count` unread VTable-backed non-POD messages (`M: ModComponent + Default`)
+    /// from `decl_index` in `run_if_query`.
+    #[inline]
+    pub fn read_non_pod_messages_batch<M: ModComponent + Default>(
+        &mut self,
+        decl_index: usize,
+        max_count: usize,
+    ) -> Result<Vec<M>, FfiResult> {
+        let Some(query) = self.query.as_mut() else {
+            return Err(FfiResult::NOT_FOUND);
+        };
+        query.read_non_pod_messages_batch::<M>(decl_index, max_count)
+    }
+
+    /// Drains unread VTable-backed non-POD messages (`M: ModComponent + Default`) from
+    /// `decl_index` in `run_if_query` using custom [`DrainOptions`].
+    #[inline]
+    pub fn drain_non_pod_messages_with_options<M: ModComponent + Default>(
+        &mut self,
+        decl_index: usize,
+        opts: DrainOptions,
+    ) -> Result<Vec<M>, FfiResult> {
+        let Some(query) = self.query.as_mut() else {
+            return Err(FfiResult::NOT_FOUND);
+        };
+        query.drain_non_pod_messages_with_options::<M>(decl_index, opts)
+    }
+
+    /// Returns `true` iff at least one unread message `M: GuestComponent` is queued at
+    /// `decl_index` in `run_if_query`, draining the cursor completely with zero heap allocations.
+    #[inline]
     pub fn has_messages<M: GuestComponent>(&mut self, decl_index: usize) -> bool {
-        self.read_messages::<M>(decl_index)
-            .is_ok_and(|msgs| !msgs.is_empty())
+        self.query
+            .as_mut()
+            .is_some_and(|q| q.drain_messages_count::<M>(decl_index).is_ok_and(|n| n > 0))
+    }
+
+    /// Returns `true` iff at least one unread POD message `M: AbiPod` is queued at `decl_index`
+    /// in `run_if_query`, draining the cursor completely with zero heap allocations.
+    #[inline]
+    pub fn has_pod_messages<M: AbiPod>(&mut self, decl_index: usize) -> bool {
+        self.query.as_mut().is_some_and(|q| {
+            q.drain_pod_messages_count::<M>(decl_index)
+                .is_ok_and(|n| n > 0)
+        })
     }
 
     /// Non-destructively counts matching entities in `run_if_query` via `iter_count` (slot 57).
@@ -1040,6 +1302,189 @@ impl<'a> SystemContext<'a> {
             .read_pod_messages::<M>(decl_index)
     }
 
+    /// Reads up to `out.len()` unread messages (`M: GuestComponent`) declared at `decl_index`
+    /// directly into uninitialized slice `out` with zero heap allocations, validating `M`'s UUID.
+    #[inline]
+    pub fn read_messages_into_uninit<M: GuestComponent>(
+        &mut self,
+        decl_index: usize,
+        out: &mut [MaybeUninit<M>],
+    ) -> Result<usize, FfiResult> {
+        self.resource_iter_mut()
+            .ok_or(FfiResult::OUT_OF_RANGE)?
+            .read_messages_into_uninit::<M>(decl_index, out)
+    }
+
+    /// Reads up to `out.len()` unread POD messages (`M: AbiPod`) declared at `decl_index` directly
+    /// into uninitialized slice `out` with zero heap allocations.
+    #[inline]
+    pub fn read_pod_messages_into_uninit<M: AbiPod>(
+        &mut self,
+        decl_index: usize,
+        out: &mut [MaybeUninit<M>],
+    ) -> Result<usize, FfiResult> {
+        self.resource_iter_mut()
+            .ok_or(FfiResult::OUT_OF_RANGE)?
+            .read_pod_messages_into_uninit::<M>(decl_index, out)
+    }
+
+    /// Reads up to `out.len()` unread messages (`M: GuestComponent`) declared at `decl_index`
+    /// directly into `out` with zero heap allocations, validating `M`'s UUID.
+    #[inline]
+    pub fn read_messages_into<M: GuestComponent>(
+        &mut self,
+        decl_index: usize,
+        out: &mut [M],
+    ) -> Result<usize, FfiResult> {
+        self.resource_iter_mut()
+            .ok_or(FfiResult::OUT_OF_RANGE)?
+            .read_messages_into::<M>(decl_index, out)
+    }
+
+    /// Reads up to `out.len()` unread POD messages (`M: AbiPod`) declared at `decl_index` directly
+    /// into `out` with zero heap allocations.
+    #[inline]
+    pub fn read_pod_messages_into<M: AbiPod>(
+        &mut self,
+        decl_index: usize,
+        out: &mut [M],
+    ) -> Result<usize, FfiResult> {
+        self.resource_iter_mut()
+            .ok_or(FfiResult::OUT_OF_RANGE)?
+            .read_pod_messages_into::<M>(decl_index, out)
+    }
+
+    /// Appends up to `max_count` unread messages (`M: GuestComponent`) declared at `decl_index`
+    /// into `out`, reusing spare capacity when available and validating `M`'s UUID.
+    #[inline]
+    pub fn read_messages_into_vec<M: GuestComponent>(
+        &mut self,
+        decl_index: usize,
+        out: &mut Vec<M>,
+        max_count: usize,
+    ) -> Result<usize, FfiResult> {
+        self.resource_iter_mut()
+            .ok_or(FfiResult::OUT_OF_RANGE)?
+            .read_messages_into_vec::<M>(decl_index, out, max_count)
+    }
+
+    /// Appends up to `max_count` unread POD messages (`M: AbiPod`) declared at `decl_index` into
+    /// `out`, reusing spare capacity when available.
+    #[inline]
+    pub fn read_pod_messages_into_vec<M: AbiPod>(
+        &mut self,
+        decl_index: usize,
+        out: &mut Vec<M>,
+        max_count: usize,
+    ) -> Result<usize, FfiResult> {
+        self.resource_iter_mut()
+            .ok_or(FfiResult::OUT_OF_RANGE)?
+            .read_pod_messages_into_vec::<M>(decl_index, out, max_count)
+    }
+
+    /// Reads up to `max_count` unread messages (`M: GuestComponent`) declared at `decl_index`,
+    /// validating `M`'s UUID.
+    #[inline]
+    pub fn read_messages_batch<M: GuestComponent>(
+        &mut self,
+        decl_index: usize,
+        max_count: usize,
+    ) -> Result<Vec<M>, FfiResult> {
+        self.resource_iter_mut()
+            .ok_or(FfiResult::OUT_OF_RANGE)?
+            .read_messages_batch::<M>(decl_index, max_count)
+    }
+
+    /// Reads up to `max_count` unread POD messages (`M: AbiPod`) declared at `decl_index`.
+    #[inline]
+    pub fn read_pod_messages_batch<M: AbiPod>(
+        &mut self,
+        decl_index: usize,
+        max_count: usize,
+    ) -> Result<Vec<M>, FfiResult> {
+        self.resource_iter_mut()
+            .ok_or(FfiResult::OUT_OF_RANGE)?
+            .read_pod_messages_batch::<M>(decl_index, max_count)
+    }
+
+    /// Drains all unread messages (`M: GuestComponent`) declared at `decl_index` using custom
+    /// [`DrainOptions`], validating `M`'s UUID.
+    #[inline]
+    pub fn drain_messages_with_options<M: GuestComponent>(
+        &mut self,
+        decl_index: usize,
+        opts: DrainOptions,
+    ) -> Result<Vec<M>, FfiResult> {
+        self.resource_iter_mut()
+            .ok_or(FfiResult::OUT_OF_RANGE)?
+            .drain_messages_with_options::<M>(decl_index, opts)
+    }
+
+    /// Drains all unread POD messages (`M: AbiPod`) declared at `decl_index` using custom
+    /// [`DrainOptions`].
+    #[inline]
+    pub fn drain_pod_messages_with_options<M: AbiPod>(
+        &mut self,
+        decl_index: usize,
+        opts: DrainOptions,
+    ) -> Result<Vec<M>, FfiResult> {
+        self.resource_iter_mut()
+            .ok_or(FfiResult::OUT_OF_RANGE)?
+            .drain_pod_messages_with_options::<M>(decl_index, opts)
+    }
+
+    /// Drains all unread messages (`M: GuestComponent`) declared at `decl_index` directly into
+    /// `out`, validating `M`'s UUID and returning the number of appended messages.
+    #[inline]
+    pub fn drain_messages_into_vec<M: GuestComponent>(
+        &mut self,
+        decl_index: usize,
+        out: &mut Vec<M>,
+        opts: DrainOptions,
+    ) -> Result<usize, FfiResult> {
+        self.resource_iter_mut()
+            .ok_or(FfiResult::OUT_OF_RANGE)?
+            .drain_messages_into_vec::<M>(decl_index, out, opts)
+    }
+
+    /// Drains all unread POD messages (`M: AbiPod`) declared at `decl_index` directly into `out`,
+    /// returning the number of appended messages.
+    #[inline]
+    pub fn drain_pod_messages_into_vec<M: AbiPod>(
+        &mut self,
+        decl_index: usize,
+        out: &mut Vec<M>,
+        opts: DrainOptions,
+    ) -> Result<usize, FfiResult> {
+        self.resource_iter_mut()
+            .ok_or(FfiResult::OUT_OF_RANGE)?
+            .drain_pod_messages_into_vec::<M>(decl_index, out, opts)
+    }
+
+    /// Drains the unread message cursor (`M: GuestComponent`) declared at `decl_index` with zero
+    /// heap allocations, validating `M`'s UUID and returning the drained message count.
+    #[inline]
+    pub fn drain_messages_count<M: GuestComponent>(
+        &mut self,
+        decl_index: usize,
+    ) -> Result<usize, FfiResult> {
+        self.resource_iter_mut()
+            .ok_or(FfiResult::OUT_OF_RANGE)?
+            .drain_messages_count::<M>(decl_index)
+    }
+
+    /// Drains the unread POD message cursor (`M: AbiPod`) declared at `decl_index` with zero heap
+    /// allocations, returning the drained message count.
+    #[inline]
+    pub fn drain_pod_messages_count<M: AbiPod>(
+        &mut self,
+        decl_index: usize,
+    ) -> Result<usize, FfiResult> {
+        self.resource_iter_mut()
+            .ok_or(FfiResult::OUT_OF_RANGE)?
+            .drain_pod_messages_count::<M>(decl_index)
+    }
+
     /// Appends a message (`M: GuestComponent`) to the stream declared with `MESSAGE_WRITE` at
     /// `decl_index`, validating `M`'s UUID.
     #[inline]
@@ -1096,6 +1541,19 @@ impl<'a> SystemContext<'a> {
         self.resource_iter_mut()
             .ok_or(FfiResult::OUT_OF_RANGE)?
             .read_non_pod_messages::<M>(decl_index)
+    }
+
+    /// Drains unread VTable-backed non-POD messages (`M: ModComponent + Default`) declared at
+    /// `decl_index` using custom [`DrainOptions`].
+    #[inline]
+    pub fn drain_non_pod_messages_with_options<M: ModComponent + Default>(
+        &mut self,
+        decl_index: usize,
+        opts: DrainOptions,
+    ) -> Result<Vec<M>, FfiResult> {
+        self.resource_iter_mut()
+            .ok_or(FfiResult::OUT_OF_RANGE)?
+            .drain_non_pod_messages_with_options::<M>(decl_index, opts)
     }
 
     /// Reads up to `max_count` unread VTable-backed non-POD messages (`M: ModComponent + Default`)

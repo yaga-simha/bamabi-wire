@@ -430,10 +430,10 @@ pub use component::{GuestComponent, GuestComponentHooks, guest_component_uuid};
 pub use entity_commands::{GuestChildSpawner, GuestEntityCommands};
 pub use iter::{
     Added, AddedMut, Allow, Changed, ChangedMut, Chunk, ChunkIter, ChunkSlice, ChunkSliceMut,
-    CopyableQueryTerm, CopyableQueryTuple, Has, Mut, MutSlice, Or, Or2, Or3, OrFilterTerm,
-    OrFilterTuple, PairwiseQueryTerm, PairwiseQueryTuple, QuerySingleError, QueryTerm, QueryTuple,
-    Ref, RefSlice, SparseRows, SparseRowsIter, SparseRowsMut, TypedChunkIter, With, WithAdded,
-    WithChanged, Without,
+    CopyableQueryTerm, CopyableQueryTuple, DrainOptions, Has, Mut, MutSlice, Or, Or2, Or3,
+    OrFilterTerm, OrFilterTuple, PairwiseQueryTerm, PairwiseQueryTuple, QuerySingleError,
+    QueryTerm, QueryTuple, Ref, RefSlice, SparseRows, SparseRowsIter, SparseRowsMut,
+    TypedChunkIter, With, WithAdded, WithChanged, Without,
 };
 pub use lifecycle::{GuestPlugin, build_guest_fn, build_guest_plugin};
 
