@@ -204,7 +204,7 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v6
 
-      - name: Verify `bamabi_sys` (PO-W1..PO-W8) & `bamabi_guest_sys` (PO-G1..PO-G9) with Kani
+      - name: Verify `bamabi_sys` (PO-W1..PO-W8) & `bamabi_guest_sys` (PO-G1..PO-G10, parallel) with Kani
         uses: model-checking/kani-github-action@69d357bade1eb7b32bc3fc3d5c3d173c5bfa5237 # v1
         with:
           kani-version: '0.68.0'
@@ -214,6 +214,22 @@ jobs:
             --harness-timeout 15m
             --output-format terse
             -j
+            --harness po_
+            --harness kani_proof_raw_msg_stack_scratch_alignment_and_bounds
+            --harness kani_proof_drain_messages_conservation_and_ramp
+
+      # `kani_proof_drain_messages_small_batch_ramp` (~7.5 GB RSS) and
+      # `kani_proof_drain_messages_pre_reserved_exact_fit` (~9.4 GB RSS) exceed
+      # 16 GB GitHub runner RAM if verified concurrently under `-j`.
+      - name: Verify memory-heavy PO-G10 drain harnesses serially
+        run: >-
+          cargo kani
+          -p bamabi_guest_sys
+          -Z unstable-options
+          --harness-timeout 15m
+          --output-format terse
+          --harness kani_proof_drain_messages_small_batch_ramp
+          --harness kani_proof_drain_messages_pre_reserved_exact_fit
 
   benchmarks:
     name: Polyglot Benchmarks (Rust, C99, C++17, Zig)

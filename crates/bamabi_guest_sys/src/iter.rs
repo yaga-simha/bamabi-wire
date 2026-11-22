@@ -1540,6 +1540,8 @@ impl Default for BatchColCache<'_> {
 }
 
 /// Validated query chunk and singleton resource accessor wrapping `*mut BamIter`.
+// Fixed C field layout keeps `size_of::<ValidatedIter<'_>>() <= 64` valid under `-Zrandomize-layout`.
+#[repr(C)]
 pub struct ValidatedIter<'a> {
     raw: *mut BamIter,
     host: &'a Host,
