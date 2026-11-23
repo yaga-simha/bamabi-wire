@@ -112,7 +112,7 @@ pub use lifecycle::{
     STATE_ABSENT_DISCRIMINANT, SYSTEM_TELEMETRY_DIGEST_SIZE, SYSTEM_TELEMETRY_DIGEST_VERSION,
     SYSTEM_TELEMETRY_MAGIC, SystemTelemetryDigest64, TELEMETRY_FLAG_BUDGET_BREACHED,
     TELEMETRY_FLAG_FAULTED, TELEMETRY_FLAG_QUARANTINED, TELEMETRY_FLAG_SUMMARY_TICK_ACTIVE,
-    TelemetryFrameError, fnv1a_64_hash_system,
+    TelemetryFrameError, TelemetrySliceError, fnv1a_64_hash_system,
 };
 pub use picking::{
     FfiEntityCursor, FfiPointerButton, FfiPointerClick, FfiPointerDrag, FfiPointerKind,

@@ -43,10 +43,13 @@ use crate::{
     ComponentDesc, ComponentHookFn, ComponentUuid, ExtensibleStruct, FfiAssetHandle,
     FfiAssetLoadState, FfiBool, FfiChildOf, FfiDisabled, FfiEntity, FfiOption, FfiResult, FfiSlice,
     MAX_QUERIES_PER_SYSTEM, MAX_TERMS_PER_QUERY, ModComponent, SIPHASH_KEY_0, SIPHASH_KEY_1,
-    ScheduleId, StrView, SymbolEntry, VTableHeader, abi_version_is_compatible, abi_version_major,
-    abi_version_minor, abi_version_patch, assert_abi_pod, assert_raw_insertable, fnv1a_64_init,
-    fnv1a_64_str, fnv1a_64_update_bytes, pack_abi_version, read_descriptor, read_extensible_struct,
-    siphash24_128, unpack_abi_version,
+    SYSTEM_TELEMETRY_DIGEST_SIZE, SYSTEM_TELEMETRY_DIGEST_VERSION, SYSTEM_TELEMETRY_MAGIC,
+    ScheduleId, StrView, SymbolEntry, SystemTelemetryDigest64, TELEMETRY_FLAG_BUDGET_BREACHED,
+    TELEMETRY_FLAG_FAULTED, TELEMETRY_FLAG_QUARANTINED, TELEMETRY_FLAG_SUMMARY_TICK_ACTIVE,
+    TelemetryFrameError, TelemetrySliceError, VTableHeader, abi_version_is_compatible,
+    abi_version_major, abi_version_minor, abi_version_patch, assert_abi_pod, assert_raw_insertable,
+    fnv1a_64_hash_system, fnv1a_64_init, fnv1a_64_str, fnv1a_64_update_bytes, pack_abi_version,
+    read_descriptor, read_extensible_struct, siphash24_128, unpack_abi_version,
 };
 
 /// Fixed-capacity stack UTF-8 formatting buffer for `#![no_std]` `Display` tests.
@@ -1955,4 +1958,151 @@ fn bevy_020_additive_sys_helpers_and_validators() {
     assert!(layout.is_summary_tick());
     assert!(layout.matches_layout(expected_uuid, 12, 4));
     assert!(!layout.matches_layout(expected_uuid, 16, 4));
+}
+
+#[test]
+fn system_telemetry_digest64_layout_roundtrip_and_errors() {
+    use core::error::Error as _;
+
+    assert_abi_pod::<SystemTelemetryDigest64>();
+    assert_raw_insertable::<SystemTelemetryDigest64>();
+
+    assert_eq!(size_of::<SystemTelemetryDigest64>(), 64);
+    assert_eq!(
+        size_of::<SystemTelemetryDigest64>(),
+        SYSTEM_TELEMETRY_DIGEST_SIZE
+    );
+    assert_eq!(align_of::<SystemTelemetryDigest64>(), 8);
+    assert_eq!(offset_of!(SystemTelemetryDigest64, magic), 0);
+    assert_eq!(offset_of!(SystemTelemetryDigest64, version), 4);
+    assert_eq!(offset_of!(SystemTelemetryDigest64, flags), 6);
+    assert_eq!(offset_of!(SystemTelemetryDigest64, mod_id), 8);
+    assert_eq!(offset_of!(SystemTelemetryDigest64, system_hash), 16);
+    assert_eq!(offset_of!(SystemTelemetryDigest64, frame_seq), 24);
+    assert_eq!(offset_of!(SystemTelemetryDigest64, matched_entities), 32);
+    assert_eq!(offset_of!(SystemTelemetryDigest64, matched_tables), 36);
+    assert_eq!(
+        offset_of!(SystemTelemetryDigest64, skipped_summary_tick_tables),
+        40
+    );
+    assert_eq!(offset_of!(SystemTelemetryDigest64, chunks), 44);
+    assert_eq!(offset_of!(SystemTelemetryDigest64, p50_us), 48);
+    assert_eq!(offset_of!(SystemTelemetryDigest64, p99_us), 52);
+    assert_eq!(offset_of!(SystemTelemetryDigest64, commands_queued), 56);
+    assert_eq!(offset_of!(SystemTelemetryDigest64, reserved), 60);
+
+    let default_digest = SystemTelemetryDigest64::default();
+    assert_eq!(default_digest.magic, SYSTEM_TELEMETRY_MAGIC);
+    assert_eq!(default_digest.magic, *b"BAMT");
+    assert_eq!(default_digest.version, SYSTEM_TELEMETRY_DIGEST_VERSION);
+    assert_eq!(default_digest.version, 1);
+    assert_eq!(default_digest.flags, 0);
+    assert_eq!(default_digest.mod_id, 0);
+    assert_eq!(default_digest.system_hash, 0);
+    assert_eq!(default_digest.frame_seq, 0);
+    assert_eq!(default_digest.matched_entities, 0);
+    assert_eq!(default_digest.matched_tables, 0);
+    assert_eq!(default_digest.skipped_summary_tick_tables, 0);
+    assert_eq!(default_digest.chunks, 0);
+    assert_eq!(default_digest.p50_us, 0);
+    assert_eq!(default_digest.p99_us, 0);
+    assert_eq!(default_digest.commands_queued, 0);
+    assert_eq!(default_digest.reserved, 0);
+
+    // Const evaluation & parity of fnv1a_64_hash_system against "{mod_name}::{system_name}".
+    const CONST_HASH: u64 = fnv1a_64_hash_system("combat_mod", "tick");
+    assert_eq!(CONST_HASH, fnv1a_64_str("combat_mod::tick"));
+    assert_eq!(fnv1a_64_hash_system("", ""), fnv1a_64_str("::"));
+    assert_eq!(
+        fnv1a_64_hash_system("alpha::beta", "gamma"),
+        fnv1a_64_str("alpha::beta::gamma")
+    );
+    assert_ne!(SystemTelemetryDigest64::FIELD_SCHEMA_HASH, 0);
+
+    // BRP method constants.
+    assert_eq!(crate::BRP_METHOD_BAM_LIST_MODS, "bam/list_mods");
+    assert_eq!(crate::BRP_METHOD_BAM_SYSTEM_METRICS, "bam/system_metrics");
+    assert_eq!(
+        crate::BRP_METHOD_BAM_COMPONENT_SCHEMAS,
+        "bam/component_schemas"
+    );
+    assert_eq!(crate::BRP_METHOD_BAM_HOT_RELOAD, "bam/hot_reload");
+
+    // Roundtrip via both fixed-array and slice codecs (including const evaluation).
+    const DIGEST: SystemTelemetryDigest64 = SystemTelemetryDigest64 {
+        magic: SYSTEM_TELEMETRY_MAGIC,
+        version: SYSTEM_TELEMETRY_DIGEST_VERSION,
+        flags: TELEMETRY_FLAG_QUARANTINED
+            | TELEMETRY_FLAG_FAULTED
+            | TELEMETRY_FLAG_SUMMARY_TICK_ACTIVE
+            | TELEMETRY_FLAG_BUDGET_BREACHED,
+        mod_id: 0x0102_0304_0506_0708,
+        system_hash: CONST_HASH,
+        frame_seq: 987_654_321_012_345,
+        matched_entities: 12_345,
+        matched_tables: 67,
+        skipped_summary_tick_tables: 23,
+        chunks: 89,
+        p50_us: 111,
+        p99_us: 2_222,
+        commands_queued: 44,
+        reserved: 0,
+    };
+    const WIRE: [u8; 64] = DIGEST.to_le_bytes();
+    const DECODED_CONST: Result<SystemTelemetryDigest64, TelemetryFrameError> =
+        SystemTelemetryDigest64::from_le_bytes(&WIRE);
+    assert_eq!(DECODED_CONST, Ok(DIGEST));
+    assert_eq!(SystemTelemetryDigest64::from_le_slice(&WIRE), Ok(DIGEST));
+    assert_eq!(&WIRE[0..4], b"BAMT");
+    assert_eq!(&WIRE[4..6], &1u16.to_le_bytes());
+    assert_eq!(&WIRE[6..8], &0x000Fu16.to_le_bytes());
+    assert_eq!(&WIRE[8..16], &0x0102_0304_0506_0708u64.to_le_bytes());
+    assert_eq!(&WIRE[16..24], &CONST_HASH.to_le_bytes());
+    assert_eq!(&WIRE[24..32], &987_654_321_012_345u64.to_le_bytes());
+    assert_eq!(&WIRE[32..36], &12_345u32.to_le_bytes());
+    assert_eq!(&WIRE[36..40], &67u32.to_le_bytes());
+    assert_eq!(&WIRE[40..44], &23u32.to_le_bytes());
+    assert_eq!(&WIRE[44..48], &89u32.to_le_bytes());
+    assert_eq!(&WIRE[48..52], &111u32.to_le_bytes());
+    assert_eq!(&WIRE[52..56], &2_222u32.to_le_bytes());
+    assert_eq!(&WIRE[56..60], &44u32.to_le_bytes());
+    assert_eq!(&WIRE[60..64], &0u32.to_le_bytes());
+
+    // Error paths: InvalidMagic, UnsupportedVersion, InvalidLength, Display, and core::error::Error.
+    let mut bad_magic = WIRE;
+    bad_magic[0] = b'X';
+    let magic_err = SystemTelemetryDigest64::from_le_bytes(&bad_magic).unwrap_err();
+    assert_eq!(magic_err, TelemetryFrameError::InvalidMagic(*b"XAMT"));
+    assert_eq!(
+        SystemTelemetryDigest64::from_le_slice(&bad_magic),
+        Err(TelemetrySliceError::Frame(magic_err.clone()))
+    );
+    let mut msg_buf = StackFmtBuf::<128>::new();
+    core::fmt::write(&mut msg_buf, format_args!("{magic_err}")).unwrap();
+    assert!(msg_buf.as_str().contains("BAMT"));
+
+    let mut bad_ver = WIRE;
+    bad_ver[4..6].copy_from_slice(&99u16.to_le_bytes());
+    let ver_err = SystemTelemetryDigest64::from_le_bytes(&bad_ver).unwrap_err();
+    assert_eq!(ver_err, TelemetryFrameError::UnsupportedVersion(99));
+    let slice_ver_err: TelemetrySliceError = ver_err.clone().into();
+    assert_eq!(
+        SystemTelemetryDigest64::from_le_slice(&bad_ver),
+        Err(slice_ver_err.clone())
+    );
+    assert!(slice_ver_err.source().is_some());
+
+    let mut ver_buf = StackFmtBuf::<128>::new();
+    core::fmt::write(&mut ver_buf, format_args!("{ver_err}")).unwrap();
+    assert!(ver_buf.as_str().contains("99"));
+
+    for bad_len in [0usize, 1, 63, 65] {
+        let buf = [0u8; 65];
+        let err = SystemTelemetryDigest64::from_le_slice(&buf[..bad_len]).unwrap_err();
+        assert_eq!(err, TelemetrySliceError::InvalidLength(bad_len));
+        assert!(err.source().is_none());
+        let mut len_buf = StackFmtBuf::<128>::new();
+        core::fmt::write(&mut len_buf, format_args!("{err}")).unwrap();
+        assert!(len_buf.as_str().contains("64"));
+    }
 }

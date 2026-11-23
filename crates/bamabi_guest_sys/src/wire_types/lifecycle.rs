@@ -2,8 +2,7 @@
 //! telemetry frame (`bamabi_reflect::telemetry`), plus host-opt-in `bevy_window`, `AppExit`,
 //! `AssetEvent`, `StateTransitionEvent`, and `bevy_gizmos` wire projection types.
 
-use bamabi_sys::{FNV1A_64_OFFSET_BASIS, FNV1A_64_PRIME, FfiAssetHandle, FfiBool, FfiEntity};
-use core::fmt;
+use bamabi_sys::{FfiAssetHandle, FfiBool, FfiEntity};
 
 use super::std_types::FfiColor;
 
@@ -278,211 +277,15 @@ impl ModDespawnOnEnter {
 }
 
 // ============================================================================
-// `bamabi_reflect::telemetry` — Fixed 64-Byte Telemetry Frame
+// `bamabi_reflect::telemetry` — Fixed 64-Byte Telemetry Frame (from `bamabi_sys`)
 // ============================================================================
 
-/// 4-byte wire magic prefix for [`SystemTelemetryDigest64`] frames (`"BAMT"`).
-pub const SYSTEM_TELEMETRY_MAGIC: [u8; 4] = *b"BAMT";
-
-/// Wire schema version for [`SystemTelemetryDigest64`].
-pub const SYSTEM_TELEMETRY_DIGEST_VERSION: u16 = 1;
-
-/// Exact byte length of one serialized [`SystemTelemetryDigest64`] frame (`64` bytes).
-pub const SYSTEM_TELEMETRY_DIGEST_SIZE: usize = 64;
-
-/// Flag bit indicating the guest system is currently quarantined (`1 << 0`).
-pub const TELEMETRY_FLAG_QUARANTINED: u16 = 1 << 0;
-/// Flag bit indicating the guest system faulted on its latest sample (`1 << 1`).
-pub const TELEMETRY_FLAG_FAULTED: u16 = 1 << 1;
-/// Flag bit indicating Bevy `0.20` `summary_tick` table skipping occurred (`1 << 2`).
-pub const TELEMETRY_FLAG_SUMMARY_TICK_ACTIVE: u16 = 1 << 2;
-/// Flag bit indicating a per-mod budget watchdog breach was reported (`1 << 3`).
-pub const TELEMETRY_FLAG_BUDGET_BREACHED: u16 = 1 << 3;
-
-/// Computes the deterministic 64-bit FNV-1a system identifier hash streamed in
-/// [`SystemTelemetryDigest64::system_hash`] (`"{mod_name}::{system_name}"`).
-pub fn fnv1a_64_hash_system(mod_name: &str, system_name: &str) -> u64 {
-    let mut hash = FNV1A_64_OFFSET_BASIS;
-    for &b in mod_name.as_bytes() {
-        hash ^= u64::from(b);
-        hash = hash.wrapping_mul(FNV1A_64_PRIME);
-    }
-    for &b in b"::" {
-        hash ^= u64::from(b);
-        hash = hash.wrapping_mul(FNV1A_64_PRIME);
-    }
-    for &b in system_name.as_bytes() {
-        hash ^= u64::from(b);
-        hash = hash.wrapping_mul(FNV1A_64_PRIME);
-    }
-    hash
-}
-
-/// Errors returned when decoding a 64-byte [`SystemTelemetryDigest64`] wire frame.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum TelemetryFrameError {
-    /// Leading 4-byte magic did not match [`SYSTEM_TELEMETRY_MAGIC`] (`"BAMT"`).
-    InvalidMagic([u8; 4]),
-    /// Frame wire version is unsupported.
-    UnsupportedVersion(u16),
-}
-
-impl fmt::Display for TelemetryFrameError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::InvalidMagic(m) => {
-                write!(
-                    f,
-                    "invalid telemetry frame magic {m:?} (expected b\"BAMT\")"
-                )
-            }
-            Self::UnsupportedVersion(v) => write!(
-                f,
-                "unsupported telemetry frame version {v} (expected {SYSTEM_TELEMETRY_DIGEST_VERSION})"
-            ),
-        }
-    }
-}
-
-impl std::error::Error for TelemetryFrameError {}
-
-/// Fixed **64-byte** little-endian binary telemetry digest frame matching
-/// `bamabi_reflect::telemetry::SystemTelemetryDigest64` byte-for-byte.
-#[repr(C)]
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct SystemTelemetryDigest64 {
-    /// Wire magic prefix (`b"BAMT"`).
-    pub magic: [u8; 4],
-    /// Wire schema version (`SYSTEM_TELEMETRY_DIGEST_VERSION` = `1`).
-    pub version: u16,
-    /// Status bitflags (`TELEMETRY_FLAG_*`).
-    pub flags: u16,
-    /// Owning `ModId.0` (`0` for unscoped / host-owned systems).
-    pub mod_id: u64,
-    /// Deterministic 64-bit FNV-1a hash of `"{mod_name}::{system_name}"`.
-    pub system_hash: u64,
-    /// Monotonic frame sequence number.
-    pub frame_seq: u64,
-    /// Number of entities matched/visited by the system on the latest sample.
-    pub matched_entities: u32,
-    /// Number of ECS tables matched by the system's query.
-    pub matched_tables: u32,
-    /// Number of matched ECS tables skipped via Bevy `0.20` `summary_tick` acceleration.
-    pub skipped_summary_tick_tables: u32,
-    /// Number of contiguous chunk iterations executed by the system.
-    pub chunks: u32,
-    /// Rolling median (`p50`) wall-clock execution duration in microseconds.
-    pub p50_us: u32,
-    /// Rolling 99th-percentile (`p99`) wall-clock execution duration in microseconds.
-    pub p99_us: u32,
-    /// Number of deferred host commands queued on the latest sample.
-    pub commands_queued: u32,
-    /// Reserved zero word for 64-byte wire alignment.
-    pub reserved: u32,
-}
-
-impl_wire_abi_pod!(
-    SystemTelemetryDigest64,
-    size = SYSTEM_TELEMETRY_DIGEST_SIZE,
-    align = core::mem::align_of::<u64>(),
-    schema = [
-        magic: [u8; 4] => "[u8;4]",
-        version: u16 => "u16",
-        flags: u16 => "u16",
-        mod_id: u64 => "u64",
-        system_hash: u64 => "u64",
-        frame_seq: u64 => "u64",
-        matched_entities: u32 => "u32",
-        matched_tables: u32 => "u32",
-        skipped_summary_tick_tables: u32 => "u32",
-        chunks: u32 => "u32",
-        p50_us: u32 => "u32",
-        p99_us: u32 => "u32",
-        commands_queued: u32 => "u32",
-        reserved: u32 => "u32",
-    ]
-);
-
-impl Default for SystemTelemetryDigest64 {
-    #[inline]
-    fn default() -> Self {
-        Self {
-            magic: SYSTEM_TELEMETRY_MAGIC,
-            version: SYSTEM_TELEMETRY_DIGEST_VERSION,
-            flags: 0,
-            mod_id: 0,
-            system_hash: 0,
-            frame_seq: 0,
-            matched_entities: 0,
-            matched_tables: 0,
-            skipped_summary_tick_tables: 0,
-            chunks: 0,
-            p50_us: 0,
-            p99_us: 0,
-            commands_queued: 0,
-            reserved: 0,
-        }
-    }
-}
-
-impl SystemTelemetryDigest64 {
-    /// Encodes this digest into a canonical 64-byte little-endian wire buffer.
-    #[must_use]
-    pub fn to_le_bytes(&self) -> [u8; SYSTEM_TELEMETRY_DIGEST_SIZE] {
-        let mut buf = [0u8; SYSTEM_TELEMETRY_DIGEST_SIZE];
-        buf[0..4].copy_from_slice(&self.magic);
-        buf[4..6].copy_from_slice(&self.version.to_le_bytes());
-        buf[6..8].copy_from_slice(&self.flags.to_le_bytes());
-        buf[8..16].copy_from_slice(&self.mod_id.to_le_bytes());
-        buf[16..24].copy_from_slice(&self.system_hash.to_le_bytes());
-        buf[24..32].copy_from_slice(&self.frame_seq.to_le_bytes());
-        buf[32..36].copy_from_slice(&self.matched_entities.to_le_bytes());
-        buf[36..40].copy_from_slice(&self.matched_tables.to_le_bytes());
-        buf[40..44].copy_from_slice(&self.skipped_summary_tick_tables.to_le_bytes());
-        buf[44..48].copy_from_slice(&self.chunks.to_le_bytes());
-        buf[48..52].copy_from_slice(&self.p50_us.to_le_bytes());
-        buf[52..56].copy_from_slice(&self.p99_us.to_le_bytes());
-        buf[56..60].copy_from_slice(&self.commands_queued.to_le_bytes());
-        buf[60..64].copy_from_slice(&self.reserved.to_le_bytes());
-        buf
-    }
-
-    /// Decodes and validates a 64-byte little-endian wire buffer into [`SystemTelemetryDigest64`].
-    pub fn from_le_bytes(
-        buf: &[u8; SYSTEM_TELEMETRY_DIGEST_SIZE],
-    ) -> Result<Self, TelemetryFrameError> {
-        let magic = [buf[0], buf[1], buf[2], buf[3]];
-        if magic != SYSTEM_TELEMETRY_MAGIC {
-            return Err(TelemetryFrameError::InvalidMagic(magic));
-        }
-        let version = u16::from_le_bytes([buf[4], buf[5]]);
-        if version != SYSTEM_TELEMETRY_DIGEST_VERSION {
-            return Err(TelemetryFrameError::UnsupportedVersion(version));
-        }
-        Ok(Self {
-            magic,
-            version,
-            flags: u16::from_le_bytes([buf[6], buf[7]]),
-            mod_id: u64::from_le_bytes([
-                buf[8], buf[9], buf[10], buf[11], buf[12], buf[13], buf[14], buf[15],
-            ]),
-            system_hash: u64::from_le_bytes([
-                buf[16], buf[17], buf[18], buf[19], buf[20], buf[21], buf[22], buf[23],
-            ]),
-            frame_seq: u64::from_le_bytes([
-                buf[24], buf[25], buf[26], buf[27], buf[28], buf[29], buf[30], buf[31],
-            ]),
-            matched_entities: u32::from_le_bytes([buf[32], buf[33], buf[34], buf[35]]),
-            matched_tables: u32::from_le_bytes([buf[36], buf[37], buf[38], buf[39]]),
-            skipped_summary_tick_tables: u32::from_le_bytes([buf[40], buf[41], buf[42], buf[43]]),
-            chunks: u32::from_le_bytes([buf[44], buf[45], buf[46], buf[47]]),
-            p50_us: u32::from_le_bytes([buf[48], buf[49], buf[50], buf[51]]),
-            p99_us: u32::from_le_bytes([buf[52], buf[53], buf[54], buf[55]]),
-            commands_queued: u32::from_le_bytes([buf[56], buf[57], buf[58], buf[59]]),
-            reserved: u32::from_le_bytes([buf[60], buf[61], buf[62], buf[63]]),
-        })
-    }
-}
+pub use bamabi_sys::{
+    SYSTEM_TELEMETRY_DIGEST_SIZE, SYSTEM_TELEMETRY_DIGEST_VERSION, SYSTEM_TELEMETRY_MAGIC,
+    SystemTelemetryDigest64, TELEMETRY_FLAG_BUDGET_BREACHED, TELEMETRY_FLAG_FAULTED,
+    TELEMETRY_FLAG_QUARANTINED, TELEMETRY_FLAG_SUMMARY_TICK_ACTIVE, TelemetryFrameError,
+    TelemetrySliceError, fnv1a_64_hash_system,
+};
 
 // ============================================================================
 // Host-Opt-In Convention Wire Types (Window, AppExit, AssetEvent, Gizmos)

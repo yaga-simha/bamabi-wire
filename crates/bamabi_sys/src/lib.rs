@@ -198,6 +198,7 @@ pub mod host_api;
 mod iter;
 mod primitives;
 mod system;
+mod telemetry;
 mod traits;
 mod version;
 
@@ -285,6 +286,13 @@ pub use system::{
     BAM_QUERY_KNOWN_FLAGS, BAM_SYSTEM_FLAG_AMBIGUOUS_WITH_ALL, BAM_SYSTEM_FLAG_MAIN_THREAD,
     BAM_SYSTEM_KNOWN_FLAGS, BamEventKind, BamHostCtx, BamLoadCtx, BamObserverDesc, BamObserverFn,
     BamObserverMutFn, BamQueryDesc, BamRunIfFn, BamSystemCtx, BamSystemDesc, BamSystemFn,
+};
+pub use telemetry::{
+    BRP_METHOD_BAM_COMPONENT_SCHEMAS, BRP_METHOD_BAM_HOT_RELOAD, BRP_METHOD_BAM_LIST_MODS,
+    BRP_METHOD_BAM_SYSTEM_METRICS, SYSTEM_TELEMETRY_DIGEST_SIZE, SYSTEM_TELEMETRY_DIGEST_VERSION,
+    SYSTEM_TELEMETRY_MAGIC, SystemTelemetryDigest64, TELEMETRY_FLAG_BUDGET_BREACHED,
+    TELEMETRY_FLAG_FAULTED, TELEMETRY_FLAG_QUARANTINED, TELEMETRY_FLAG_SUMMARY_TICK_ACTIVE,
+    TelemetryFrameError, TelemetrySliceError, fnv1a_64_hash_system,
 };
 pub use traits::{
     AbiPod, ModComponent, RawInsertable, SymbolEntry, assert_abi_pod, assert_raw_insertable,

@@ -68,8 +68,8 @@ pub use reflect::{
     BRP_METHOD_WORLD_REMOVE_RESOURCES, BRP_METHOD_WORLD_SPAWN_ENTITY, SYSTEM_TELEMETRY_DIGEST_SIZE,
     SYSTEM_TELEMETRY_DIGEST_VERSION, SYSTEM_TELEMETRY_MAGIC, SystemTelemetryDigest64,
     TELEMETRY_FLAG_BUDGET_BREACHED, TELEMETRY_FLAG_FAULTED, TELEMETRY_FLAG_QUARANTINED,
-    TELEMETRY_FLAG_SUMMARY_TICK_ACTIVE, TelemetryFrameError, fnv1a_64_hash_system,
-    resolve_reflected_handle, resolve_settings_handle,
+    TELEMETRY_FLAG_SUMMARY_TICK_ACTIVE, TelemetryFrameError, TelemetrySliceError,
+    fnv1a_64_hash_system, resolve_reflected_handle, resolve_settings_handle,
 };
 pub use render::{
     FfiMesh2d, FfiMesh3d, FfiSprite, FfiSpriteMaterialSpec, FfiStandardMaterial,

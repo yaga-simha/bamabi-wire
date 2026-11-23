@@ -7,11 +7,12 @@ use bamabi_sys::{BamComponent, ComponentUuid, FfiResult};
 use core::ffi::CStr;
 use std::ffi::CString;
 
-pub use bamabi_guest_sys::wire_types::{
-    SYSTEM_TELEMETRY_DIGEST_SIZE, SYSTEM_TELEMETRY_DIGEST_VERSION, SYSTEM_TELEMETRY_MAGIC,
-    SystemTelemetryDigest64, TELEMETRY_FLAG_BUDGET_BREACHED, TELEMETRY_FLAG_FAULTED,
-    TELEMETRY_FLAG_QUARANTINED, TELEMETRY_FLAG_SUMMARY_TICK_ACTIVE, TelemetryFrameError,
-    fnv1a_64_hash_system,
+pub use bamabi_sys::{
+    BRP_METHOD_BAM_COMPONENT_SCHEMAS, BRP_METHOD_BAM_HOT_RELOAD, BRP_METHOD_BAM_LIST_MODS,
+    BRP_METHOD_BAM_SYSTEM_METRICS, SYSTEM_TELEMETRY_DIGEST_SIZE, SYSTEM_TELEMETRY_DIGEST_VERSION,
+    SYSTEM_TELEMETRY_MAGIC, SystemTelemetryDigest64, TELEMETRY_FLAG_BUDGET_BREACHED,
+    TELEMETRY_FLAG_FAULTED, TELEMETRY_FLAG_QUARANTINED, TELEMETRY_FLAG_SUMMARY_TICK_ACTIVE,
+    TelemetryFrameError, TelemetrySliceError, fnv1a_64_hash_system,
 };
 
 use crate::component::GuestComponent;
@@ -28,15 +29,6 @@ pub const BRP_METHOD_INSERT_COMPONENTS: &str = "bamabi/insert_components";
 pub const BRP_METHOD_GET_RESOURCES: &str = "bamabi/get_resources";
 /// BRP method path mutating a mod-registered singleton resource.
 pub const BRP_METHOD_MUTATE_RESOURCES: &str = "bamabi/mutate_resources";
-
-/// Telemetry BRP method listing loaded mods, versions, and health states (`bamabi_reflect::telemetry`).
-pub const BRP_METHOD_BAM_LIST_MODS: &str = "bam/list_mods";
-/// Telemetry BRP method returning per-system latency/fault digests (`bamabi_reflect::telemetry`).
-pub const BRP_METHOD_BAM_SYSTEM_METRICS: &str = "bam/system_metrics";
-/// Telemetry BRP method listing registered ABI `0.3` component schemas and fingerprints.
-pub const BRP_METHOD_BAM_COMPONENT_SCHEMAS: &str = "bam/component_schemas";
-/// Control BRP method triggering live hot-reload of a loaded mod.
-pub const BRP_METHOD_BAM_HOT_RELOAD: &str = "bam/hot_reload";
 
 /// Standard Bevy `0.20` BRP method fetching reflected components on an entity.
 pub const BRP_METHOD_WORLD_GET_COMPONENTS: &str = "world.get_components";

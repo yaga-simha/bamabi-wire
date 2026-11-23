@@ -420,10 +420,10 @@ pub use bridges::{
     TONEMAPPING_NONE, TONEMAPPING_REINHARD, TONEMAPPING_REINHARD_LUMINANCE,
     TONEMAPPING_SOMEWHAT_BORING_DISPLAY_TRANSFORM, TONEMAPPING_TONY_MC_MAPFACE,
     TRANSMISSION_QUALITY_HIGH, TRANSMISSION_QUALITY_LOW, TRANSMISSION_QUALITY_MEDIUM,
-    TRANSMISSION_QUALITY_ULTRA, TelemetryFrameError, TypedAssetHandle, VOLUME_DECIBELS,
-    VOLUME_LINEAR, fnv1a_64_hash_system, mod_asset_path, mod_overlay_path, on_enter_schedule,
-    on_exit_schedule, on_transition_schedule, resolve_audio_source_type, resolve_reflected_handle,
-    resolve_scene_patch_type, resolve_settings_handle, state_set_name,
+    TRANSMISSION_QUALITY_ULTRA, TelemetryFrameError, TelemetrySliceError, TypedAssetHandle,
+    VOLUME_DECIBELS, VOLUME_LINEAR, fnv1a_64_hash_system, mod_asset_path, mod_overlay_path,
+    on_enter_schedule, on_exit_schedule, on_transition_schedule, resolve_audio_source_type,
+    resolve_reflected_handle, resolve_scene_patch_type, resolve_settings_handle, state_set_name,
 };
 pub use commands::{GuestCommands, GuestTransaction};
 pub use component::{GuestComponent, GuestComponentHooks, guest_component_uuid};

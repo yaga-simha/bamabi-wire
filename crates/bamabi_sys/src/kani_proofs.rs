@@ -19,7 +19,9 @@ use crate::{
     BamHostApi, BamLayoutInfo, BamManifest, BamObserverDesc, BamQueryDesc, BamRelationDesc,
     BamRequiredComponent, BamScheduleSetDesc, BamSymbol, BamSystem, BamSystemDesc, BamSystemSet,
     BamTriggerDesc, ComponentDesc, ComponentUuid, ExtensibleStruct, FfiAssetHandle,
-    FfiAssetLoadState, FfiBool, FfiEntity, FfiOption, FfiResult, FfiSlice, ScheduleId, StrView,
+    FfiAssetLoadState, FfiBool, FfiEntity, FfiOption, FfiResult, FfiSlice,
+    SYSTEM_TELEMETRY_DIGEST_SIZE, SYSTEM_TELEMETRY_DIGEST_VERSION, SYSTEM_TELEMETRY_MAGIC,
+    ScheduleId, StrView, SystemTelemetryDigest64, TelemetryFrameError, TelemetrySliceError,
     VTableHeader, abi_version_is_compatible, abi_version_major, abi_version_minor,
     abi_version_patch, pack_abi_version, read_descriptor, read_extensible_struct,
     unpack_abi_version,
@@ -829,4 +831,74 @@ fn po_w8_component_uuid_bijection_and_hex_parser() {
     // Wrong lengths always return None.
     assert!(ComponentUuid::try_parse_hex("").is_none());
     assert!(ComponentUuid::try_parse_hex("0123456789abcdef").is_none());
+}
+
+// ============================================================================
+// PO-W9: `SystemTelemetryDigest64` Wire Codec Totality & Lossless Roundtrip
+// ============================================================================
+
+/// PO-W9: `SystemTelemetryDigest64::to_le_bytes`, `from_le_bytes`, and `from_le_slice` are
+/// panic-free over arbitrary 64-byte buffers and variable slice lengths, reject invalid magic or
+/// unsupported versions, and form a lossless roundtrip for all valid v1 `"BAMT"` frames.
+#[kani::proof]
+#[kani::unwind(66)]
+fn po_w9_telemetry_digest64_roundtrip() {
+    let flags: u16 = kani::any();
+    let mod_id: u64 = kani::any();
+    let system_hash: u64 = kani::any();
+    let frame_seq: u64 = kani::any();
+    let matched_entities: u32 = kani::any();
+    let matched_tables: u32 = kani::any();
+    let skipped_summary_tick_tables: u32 = kani::any();
+    let chunks: u32 = kani::any();
+    let p50_us: u32 = kani::any();
+    let p99_us: u32 = kani::any();
+    let commands_queued: u32 = kani::any();
+    let reserved: u32 = kani::any();
+
+    let digest = SystemTelemetryDigest64 {
+        magic: SYSTEM_TELEMETRY_MAGIC,
+        version: SYSTEM_TELEMETRY_DIGEST_VERSION,
+        flags,
+        mod_id,
+        system_hash,
+        frame_seq,
+        matched_entities,
+        matched_tables,
+        skipped_summary_tick_tables,
+        chunks,
+        p50_us,
+        p99_us,
+        commands_queued,
+        reserved,
+    };
+    let encoded = digest.to_le_bytes();
+    assert_eq!(SystemTelemetryDigest64::from_le_bytes(&encoded), Ok(digest));
+    assert_eq!(SystemTelemetryDigest64::from_le_slice(&encoded), Ok(digest));
+
+    // Arbitrary 64-byte input: total, panic-free, exact magic/version validation.
+    let raw: [u8; SYSTEM_TELEMETRY_DIGEST_SIZE] = kani::any();
+    let raw_magic = [raw[0], raw[1], raw[2], raw[3]];
+    let raw_ver = u16::from_le_bytes([raw[4], raw[5]]);
+    let decoded = SystemTelemetryDigest64::from_le_bytes(&raw);
+    if raw_magic != SYSTEM_TELEMETRY_MAGIC {
+        assert_eq!(decoded, Err(TelemetryFrameError::InvalidMagic(raw_magic)));
+    } else if raw_ver != SYSTEM_TELEMETRY_DIGEST_VERSION {
+        assert_eq!(
+            decoded,
+            Err(TelemetryFrameError::UnsupportedVersion(raw_ver))
+        );
+    } else {
+        let d = decoded.expect("valid magic and version must decode");
+        assert_eq!(d.to_le_bytes(), raw);
+    }
+
+    // Variable-length slice length check.
+    let buf: [u8; 66] = kani::any();
+    let len: usize = kani::any();
+    kani::assume(len <= buf.len());
+    let slice_res = SystemTelemetryDigest64::from_le_slice(&buf[..len]);
+    if len != SYSTEM_TELEMETRY_DIGEST_SIZE {
+        assert_eq!(slice_res, Err(TelemetrySliceError::InvalidLength(len)));
+    }
 }
