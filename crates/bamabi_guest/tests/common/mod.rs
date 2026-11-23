@@ -336,15 +336,31 @@ impl TestHost {
             (sys.callback, sys.user_data, sys.queries.clone())
         };
         let world_ptr = self.raw;
-        let iters = queries
-            .into_iter()
+        let iters = Self::build_mock_iters(world_ptr, sys_idx, &queries);
+        let mut frame = MockSystemFrame {
+            world: world_ptr,
+            sys_idx,
+            iters,
+        };
+        let sys_ctx = (&raw mut frame).cast::<BamSystemCtx>();
+        unsafe { callback(sys_ctx, user_data) }
+    }
+
+    /// Constructs a [`MockIterState`] vector for each query clause in `queries`.
+    fn build_mock_iters(
+        world_ptr: *mut MockHostWorld,
+        sys_idx: usize,
+        queries: &[Vec<BamTermDesc>],
+    ) -> Vec<Box<MockIterState>> {
+        queries
+            .iter()
             .enumerate()
             .map(|(q_idx, terms)| {
                 Box::new(MockIterState {
                     world: world_ptr,
                     sys_idx,
                     query_idx: q_idx,
-                    terms,
+                    terms: terms.clone(),
                     next_chunk_idx: 0,
                     end_chunk_idx: None,
                     active_chunk_idx: None,
@@ -353,14 +369,24 @@ impl TestHost {
                     mut_rows_scratch: Vec::new(),
                 })
             })
-            .collect();
+            .collect()
+    }
+
+    /// Evaluates `f` with a stack-scoped `MockSystemFrame` backing `*mut BamSystemCtx` over `queries`.
+    pub fn with_mock_system_frame<R>(
+        &self,
+        queries: &[Vec<BamTermDesc>],
+        f: impl FnOnce(*mut BamSystemCtx) -> R,
+    ) -> R {
+        let world_ptr = self.raw;
+        let iters = Self::build_mock_iters(world_ptr, 0, queries);
         let mut frame = MockSystemFrame {
             world: world_ptr,
-            sys_idx,
+            sys_idx: 0,
             iters,
         };
         let sys_ctx = (&raw mut frame).cast::<BamSystemCtx>();
-        unsafe { callback(sys_ctx, user_data) }
+        f(sys_ctx)
     }
 }
 

@@ -10,7 +10,8 @@ use bamabi_sys::{
 use crate::{
     host::Host,
     trampoline::{
-        LazyInvocationHost, allocate_runtime_lifecycle_observer_desc,
+        LazyInvocationHost, ObserverCtxRegistrationConfig, ValidatedSystemSlice,
+        allocate_runtime_lifecycle_observer_desc, allocate_runtime_observer_ctx_slice_desc,
         allocate_runtime_observer_desc, allocate_runtime_observer_mut_desc,
     },
 };
@@ -1273,6 +1274,26 @@ impl<'a> ValidatedCommands<'a> {
             callback,
         )?;
         // SAFETY: `desc`'s closure state, `name`, and `watched_components` were pinned in `GuestInstance`.
+        unsafe { self.observe_raw(&desc) }
+    }
+
+    /// Spawns a runtime context-aware custom event observer (`BamObserverCtxFn` +
+    /// `BamObserverDesc::queries`) backed by `observer_ctx_slice_trampoline<N, E, F>` via
+    /// `BamHostApi::cmd_observe`, tracking all owned descriptor buffers and closure state inside
+    /// the owning [`crate::GuestInstance`].
+    pub fn observe_ctx_slice<const N: usize, E, F>(
+        &mut self,
+        config: &ObserverCtxRegistrationConfig<'_>,
+        callback: F,
+    ) -> Result<FfiEntity, FfiResult>
+    where
+        E: AbiPod,
+        F: FnMut(FfiEntity, &E, &mut ValidatedSystemSlice<'_>) -> FfiResult + Send + 'static,
+    {
+        let desc =
+            allocate_runtime_observer_ctx_slice_desc::<N, E, F>(self.host, config, callback)?;
+        // SAFETY: `desc`'s closure state, `name`, `watched_components`, and `queries` were pinned in
+        // `GuestInstance` via `Host::track_runtime_allocation`.
         unsafe { self.observe_raw(&desc) }
     }
 

@@ -500,9 +500,9 @@ fn wire_struct_specs() -> Vec<StructLayoutSpec> {
         StructLayoutSpec {
             c_name: "BamObserverDesc",
             assert_stem: "bam_observer_desc",
-            size_64: 88,
+            size_64: 112,
             align_64: 8,
-            size_32: 64,
+            size_32: 76,
             align_32: Align32::Fixed(4),
             rust_host_size: size_of::<BamObserverDesc>(),
             rust_host_align: align_of::<BamObserverDesc>(),
@@ -602,6 +602,24 @@ fn wire_struct_specs() -> Vec<StructLayoutSpec> {
                     offset_64: 84,
                     offset_32: 60,
                     rust_host_offset: offset_of!(BamObserverDesc, reserved2),
+                },
+                FieldLayoutSpec {
+                    c_name: "ctx_callback",
+                    offset_64: 88,
+                    offset_32: 64,
+                    rust_host_offset: offset_of!(BamObserverDesc, ctx_callback),
+                },
+                FieldLayoutSpec {
+                    c_name: "queries",
+                    offset_64: 96,
+                    offset_32: 68,
+                    rust_host_offset: offset_of!(BamObserverDesc, queries),
+                },
+                FieldLayoutSpec {
+                    c_name: "query_count",
+                    offset_64: 104,
+                    offset_32: 72,
+                    rust_host_offset: offset_of!(BamObserverDesc, query_count),
                 },
             ],
         },
@@ -2287,7 +2305,8 @@ pub fn render_c99_header() -> Result<String, String> {
          typedef BamResult (*BamSystemFn)(BamSystemCtx* sys_ctx, void* user_data);\n\
          typedef BamBool   (*BamRunIfFn)(void* user_data);\n\
          typedef BamResult (*BamObserverFn)(BamEntity entity, const void* event_data, BamCommands* commands, void* user_data);\n\
-         typedef BamResult (*BamObserverMutFn)(BamEntity entity, uint8_t* event_data, BamBool* propagate, BamCommands* commands, void* user_data);\n\n\
+         typedef BamResult (*BamObserverMutFn)(BamEntity entity, uint8_t* event_data, BamBool* propagate, BamCommands* commands, void* user_data);\n\
+         typedef BamResult (*BamObserverCtxFn)(BamEntity entity, const void* event_data, BamSystemCtx* ctx, void* user_data);\n\n\
          typedef struct BamTermDesc {{\n\
              BamComponent  component;\n\
              BamAccessMode mode;\n\
@@ -2368,6 +2387,9 @@ pub fn render_c99_header() -> Result<String, String> {
              BamObserverMutFn    mut_callback            = nullptr;\n\
              BamComponent        propagate_relationship  = BAM_COMPONENT_INVALID;\n\
              uint32_t            reserved2               = 0;\n\
+             BamObserverCtxFn    ctx_callback            = nullptr;\n\
+             const BamQueryDesc* queries                 = nullptr;\n\
+             size_t              query_count             = 0;\n\
          #else\n\
              BamEventKind        event_kind;\n\
              uint32_t            reserved1;\n\
@@ -2376,6 +2398,9 @@ pub fn render_c99_header() -> Result<String, String> {
              BamObserverMutFn    mut_callback;\n\
              BamComponent        propagate_relationship;\n\
              uint32_t            reserved2;\n\
+             BamObserverCtxFn    ctx_callback;\n\
+             const BamQueryDesc* queries;\n\
+             size_t              query_count;\n\
          #endif\n\
          }} BamObserverDesc;\n\n\
          typedef struct BamTriggerDesc {{\n\
@@ -3136,6 +3161,23 @@ pub fn render_c99_header() -> Result<String, String> {
              d.mut_callback = NULL;\n\
              d.propagate_relationship = BAM_COMPONENT_INVALID;\n\
              d.reserved2 = 0u;\n\
+             d.ctx_callback = NULL;\n\
+             d.queries = NULL;\n\
+             d.query_count = 0u;\n\
+             return d;\n\
+         }\n\n\
+         static BAM_UNUSED inline BamObserverDesc bam_observer_desc_ctx(\n\
+             BamComponent event,\n\
+             BamEntity entity,\n\
+             BamObserverCtxFn ctx_callback,\n\
+             const BamQueryDesc* queries,\n\
+             size_t query_count,\n\
+             void* user_data\n\
+         ) {\n\
+             BamObserverDesc d = bam_observer_desc(event, entity, NULL, user_data);\n\
+             d.ctx_callback = ctx_callback;\n\
+             d.queries = queries;\n\
+             d.query_count = query_count;\n\
              return d;\n\
          }\n\n\
          static BAM_UNUSED inline BamTriggerDesc bam_trigger_desc(\n\

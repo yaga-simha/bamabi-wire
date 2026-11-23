@@ -25,9 +25,9 @@ pub use bamabi_macros::{AbiPod, GuestComponent, ModComponent};
 pub use crate::{
     app::{
         BevySchedules, EcsRunCondition, GuestApp, GuestComponentOptions, GuestRes, GuestResMut,
-        ObserverBuilder, ParamSetBuilder, QueryBuilder, RelationDescBuilder, RunConditionContext,
-        RunConditionSystemContext, ScheduleSetBuilder, SystemBuilder, SystemContext,
-        TypedObserverBuilder, conditions,
+        ObserverBuilder, ObserverParamSetBuilder, ParamSetBuilder, QueryBuilder,
+        RelationDescBuilder, RunConditionContext, RunConditionSystemContext, ScheduleSetBuilder,
+        SystemBuilder, SystemContext, TypedObserverBuilder, conditions,
     },
     bridges::{
         ACTIVATE_EVENT_UUID, APPLY_EAR_POSITIONS, APPLY_EMITTER_POS, APPLY_SPEED, APPLY_VOLUME,

@@ -284,8 +284,9 @@ pub use primitives::{
 pub use system::{
     BAM_OBSERVER_FLAG_PROPAGATE, BAM_OBSERVER_KNOWN_FLAGS, BAM_QUERY_FLAG_PARAM_SET,
     BAM_QUERY_KNOWN_FLAGS, BAM_SYSTEM_FLAG_AMBIGUOUS_WITH_ALL, BAM_SYSTEM_FLAG_MAIN_THREAD,
-    BAM_SYSTEM_KNOWN_FLAGS, BamEventKind, BamHostCtx, BamLoadCtx, BamObserverDesc, BamObserverFn,
-    BamObserverMutFn, BamQueryDesc, BamRunIfFn, BamSystemCtx, BamSystemDesc, BamSystemFn,
+    BAM_SYSTEM_KNOWN_FLAGS, BamEventKind, BamHostCtx, BamLoadCtx, BamObserverCtxFn,
+    BamObserverDesc, BamObserverFn, BamObserverMutFn, BamQueryDesc, BamRunIfFn, BamSystemCtx,
+    BamSystemDesc, BamSystemFn,
 };
 pub use telemetry::{
     BRP_METHOD_BAM_COMPONENT_SCHEMAS, BRP_METHOD_BAM_HOT_RELOAD, BRP_METHOD_BAM_LIST_MODS,

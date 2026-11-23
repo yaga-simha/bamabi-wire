@@ -352,6 +352,7 @@ typedef BamResult (*BamSystemFn)(BamSystemCtx* sys_ctx, void* user_data);
 typedef BamBool   (*BamRunIfFn)(void* user_data);
 typedef BamResult (*BamObserverFn)(BamEntity entity, const void* event_data, BamCommands* commands, void* user_data);
 typedef BamResult (*BamObserverMutFn)(BamEntity entity, uint8_t* event_data, BamBool* propagate, BamCommands* commands, void* user_data);
+typedef BamResult (*BamObserverCtxFn)(BamEntity entity, const void* event_data, BamSystemCtx* ctx, void* user_data);
 
 typedef struct BamTermDesc {
 BamComponent  component;
@@ -436,6 +437,9 @@ size_t              watched_component_count = 0;
 BamObserverMutFn    mut_callback            = nullptr;
 BamComponent        propagate_relationship  = BAM_COMPONENT_INVALID;
 uint32_t            reserved2               = 0;
+BamObserverCtxFn    ctx_callback            = nullptr;
+const BamQueryDesc* queries                 = nullptr;
+size_t              query_count             = 0;
 #else
 BamEventKind        event_kind;
 uint32_t            reserved1;
@@ -444,6 +448,9 @@ size_t              watched_component_count;
 BamObserverMutFn    mut_callback;
 BamComponent        propagate_relationship;
 uint32_t            reserved2;
+BamObserverCtxFn    ctx_callback;
+const BamQueryDesc* queries;
+size_t              query_count;
 #endif
 } BamObserverDesc;
 
@@ -1334,6 +1341,24 @@ d.watched_component_count = 0u;
 d.mut_callback = NULL;
 d.propagate_relationship = BAM_COMPONENT_INVALID;
 d.reserved2 = 0u;
+d.ctx_callback = NULL;
+d.queries = NULL;
+d.query_count = 0u;
+return d;
+}
+
+static BAM_UNUSED inline BamObserverDesc bam_observer_desc_ctx(
+BamComponent event,
+BamEntity entity,
+BamObserverCtxFn ctx_callback,
+const BamQueryDesc* queries,
+size_t query_count,
+void* user_data
+) {
+BamObserverDesc d = bam_observer_desc(event, entity, NULL, user_data);
+d.ctx_callback = ctx_callback;
+d.queries = queries;
+d.query_count = query_count;
 return d;
 }
 
@@ -1458,7 +1483,7 @@ BAM_STATIC_ASSERT(offsetof(BamSystemDesc, ambiguous_with_count) == 160u, bam_sys
 BAM_STATIC_ASSERT(offsetof(BamSystemDesc, run_if_ctx) == 168u, bam_system_desc_off_run_if_ctx_64);
 BAM_STATIC_ASSERT(offsetof(BamSystemDesc, run_if_query) == 176u, bam_system_desc_off_run_if_query_64);
 BAM_STATIC_ASSERT(offsetof(BamSystemDesc, run_if_ctx_user_data) == 184u, bam_system_desc_off_run_if_ctx_user_data_64);
-BAM_STATIC_ASSERT(sizeof(BamObserverDesc) == 88u, bam_observer_desc_size_64);
+BAM_STATIC_ASSERT(sizeof(BamObserverDesc) == 112u, bam_observer_desc_size_64);
 BAM_STATIC_ASSERT(BAM_ALIGNOF(BamObserverDesc) == 8u, bam_observer_desc_align_64);
 BAM_STATIC_ASSERT(offsetof(BamObserverDesc, struct_size) == 0u, bam_observer_desc_off_struct_size_64);
 BAM_STATIC_ASSERT(offsetof(BamObserverDesc, flags) == 4u, bam_observer_desc_off_flags_64);
@@ -1476,6 +1501,9 @@ BAM_STATIC_ASSERT(offsetof(BamObserverDesc, watched_component_count) == 64u, bam
 BAM_STATIC_ASSERT(offsetof(BamObserverDesc, mut_callback) == 72u, bam_observer_desc_off_mut_callback_64);
 BAM_STATIC_ASSERT(offsetof(BamObserverDesc, propagate_relationship) == 80u, bam_observer_desc_off_propagate_relationship_64);
 BAM_STATIC_ASSERT(offsetof(BamObserverDesc, reserved2) == 84u, bam_observer_desc_off_reserved2_64);
+BAM_STATIC_ASSERT(offsetof(BamObserverDesc, ctx_callback) == 88u, bam_observer_desc_off_ctx_callback_64);
+BAM_STATIC_ASSERT(offsetof(BamObserverDesc, queries) == 96u, bam_observer_desc_off_queries_64);
+BAM_STATIC_ASSERT(offsetof(BamObserverDesc, query_count) == 104u, bam_observer_desc_off_query_count_64);
 BAM_STATIC_ASSERT(sizeof(BamTriggerDesc) == 64u, bam_trigger_desc_size_64);
 BAM_STATIC_ASSERT(BAM_ALIGNOF(BamTriggerDesc) == 8u, bam_trigger_desc_align_64);
 BAM_STATIC_ASSERT(offsetof(BamTriggerDesc, struct_size) == 0u, bam_trigger_desc_off_struct_size_64);
@@ -1754,7 +1782,7 @@ BAM_STATIC_ASSERT(offsetof(BamSystemDesc, ambiguous_with_count) == 88u, bam_syst
 BAM_STATIC_ASSERT(offsetof(BamSystemDesc, run_if_ctx) == 92u, bam_system_desc_off_run_if_ctx_32);
 BAM_STATIC_ASSERT(offsetof(BamSystemDesc, run_if_query) == 96u, bam_system_desc_off_run_if_query_32);
 BAM_STATIC_ASSERT(offsetof(BamSystemDesc, run_if_ctx_user_data) == 100u, bam_system_desc_off_run_if_ctx_user_data_32);
-BAM_STATIC_ASSERT(sizeof(BamObserverDesc) == 64u, bam_observer_desc_size_32);
+BAM_STATIC_ASSERT(sizeof(BamObserverDesc) == 76u, bam_observer_desc_size_32);
 BAM_STATIC_ASSERT(BAM_ALIGNOF(BamObserverDesc) == 4u, bam_observer_desc_align_32);
 BAM_STATIC_ASSERT(offsetof(BamObserverDesc, struct_size) == 0u, bam_observer_desc_off_struct_size_32);
 BAM_STATIC_ASSERT(offsetof(BamObserverDesc, flags) == 4u, bam_observer_desc_off_flags_32);
@@ -1772,6 +1800,9 @@ BAM_STATIC_ASSERT(offsetof(BamObserverDesc, watched_component_count) == 48u, bam
 BAM_STATIC_ASSERT(offsetof(BamObserverDesc, mut_callback) == 52u, bam_observer_desc_off_mut_callback_32);
 BAM_STATIC_ASSERT(offsetof(BamObserverDesc, propagate_relationship) == 56u, bam_observer_desc_off_propagate_relationship_32);
 BAM_STATIC_ASSERT(offsetof(BamObserverDesc, reserved2) == 60u, bam_observer_desc_off_reserved2_32);
+BAM_STATIC_ASSERT(offsetof(BamObserverDesc, ctx_callback) == 64u, bam_observer_desc_off_ctx_callback_32);
+BAM_STATIC_ASSERT(offsetof(BamObserverDesc, queries) == 68u, bam_observer_desc_off_queries_32);
+BAM_STATIC_ASSERT(offsetof(BamObserverDesc, query_count) == 72u, bam_observer_desc_off_query_count_32);
 BAM_STATIC_ASSERT(sizeof(BamTriggerDesc) == 48u, bam_trigger_desc_size_32);
 BAM_STATIC_ASSERT(BAM_ALIGNOF(BamTriggerDesc) == 4u, bam_trigger_desc_align_32);
 BAM_STATIC_ASSERT(offsetof(BamTriggerDesc, struct_size) == 0u, bam_trigger_desc_off_struct_size_32);

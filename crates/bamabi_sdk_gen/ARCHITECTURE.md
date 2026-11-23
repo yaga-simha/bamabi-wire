@@ -57,7 +57,7 @@ Before formatting any C99 text, `render_c99_header()` builds `wire_struct_specs(
 | `BamTermDesc` | `BamTermDesc` | 12 / 4 | 12 / `Fixed(4)` | — |
 | `BamQueryDesc` | `BamQueryDesc` | 32 / 8 | 24 / `Fixed(4)` | 24 / 16 (`v0.2`) |
 | `BamSystemDesc` | `BamSystemDesc` | 192 / 8 | 104 / `Fixed(4)` | 104 / 60 (`v0.2`) |
-| `BamObserverDesc` | `BamObserverDesc` | 88 / 8 | 64 / `Fixed(4)` | 48 / 36 (`v0.2`) |
+| `BamObserverDesc` | `BamObserverDesc` | 112 / 8 | 76 / `Fixed(4)` | 48 / 36 (`v0.2`) |
 | `BamTriggerDesc` | `BamTriggerDesc` | 64 / 8 | 48 / `Fixed(4)` | 64 / 48 (`v0.2`) |
 | `BamChangeTicks` | `BamChangeTicks` | 16 / 4 | 16 / `Fixed(4)` | — |
 | `BamFieldDesc` | `BamFieldDesc` | 64 / 8 | 36 / `Fixed(4)` | 64 / 36 (`v0.3`) |

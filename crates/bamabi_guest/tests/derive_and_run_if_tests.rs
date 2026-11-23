@@ -18,17 +18,24 @@ use std::sync::{
 
 use bamabi_guest::prelude::*;
 use bamabi_guest::raw::{
-    BamCommands, BamLoadCtx, BamObserverDesc, BamObserverFn, BamObserverMutFn,
+    BAM_STORAGE_FLAG_RESOURCE, BamCommands, BamLoadCtx, BamObserverCtxFn, BamObserverDesc,
+    BamObserverFn, BamObserverMutFn, BamTermDesc,
 };
 use common::MockHostWorld;
 
 /// Snapshot of a host-registered `BamObserverDesc` captured by [`stub_register_observer`].
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 struct CapturedObserver {
+    name: Option<String>,
     event_kind: BamEventKind,
     flags: u32,
+    watched_components: Vec<BamComponent>,
+    queries: Vec<Vec<BamTermDesc>>,
+    query_count: usize,
+    param_set_groups: Vec<u32>,
     callback: Option<BamObserverFn>,
     mut_callback: Option<BamObserverMutFn>,
+    ctx_callback: Option<BamObserverCtxFn>,
     user_data: *mut c_void,
 }
 
@@ -36,6 +43,7 @@ struct CapturedObserver {
 unsafe impl Send for CapturedObserver {}
 
 static CAPTURED_OBSERVERS: OnceLock<Mutex<Vec<CapturedObserver>>> = OnceLock::new();
+static OBSERVER_CAPTURE_TEST_LOCK: Mutex<()> = Mutex::new(());
 
 /// Returns the global mutex-protected list of observers captured during observer tests.
 fn captured_observers() -> &'static Mutex<Vec<CapturedObserver>> {
@@ -51,14 +59,54 @@ unsafe extern "C" fn stub_register_observer(
         return FfiResult::NULL_POINTER;
     }
     let d = unsafe { *desc };
+    let val = d.validate();
+    if !val.is_ok() {
+        return val;
+    }
+    let name = if d.name.is_null() {
+        None
+    } else {
+        Some(
+            unsafe { core::ffi::CStr::from_ptr(d.name) }
+                .to_str()
+                .unwrap()
+                .to_owned(),
+        )
+    };
+    let watched_components = if d.watched_component_count == 0 {
+        Vec::new()
+    } else {
+        unsafe { core::slice::from_raw_parts(d.watched_components, d.watched_component_count) }
+            .to_vec()
+    };
+    let mut queries = Vec::with_capacity(d.query_count);
+    let mut param_set_groups = Vec::with_capacity(d.query_count);
+    if d.query_count > 0 {
+        let qs = unsafe { core::slice::from_raw_parts(d.queries, d.query_count) };
+        for q in qs {
+            param_set_groups.push(q.param_set_group);
+            let terms = if q.term_count == 0 {
+                Vec::new()
+            } else {
+                unsafe { core::slice::from_raw_parts(q.terms, q.term_count) }.to_vec()
+            };
+            queries.push(terms);
+        }
+    }
     captured_observers()
         .lock()
         .unwrap_or_else(|p| p.into_inner())
         .push(CapturedObserver {
+            name,
             event_kind: d.event_kind,
             flags: d.flags,
+            watched_components,
+            queries,
+            query_count: d.query_count,
+            param_set_groups,
             callback: d.callback,
             mut_callback: d.mut_callback,
+            ctx_callback: d.ctx_callback,
             user_data: d.user_data,
         });
     FfiResult::OK
@@ -173,8 +221,9 @@ fn system_builder_chained_run_if_composes_and_drops_cleanly() {
 /// propagation, and (3) that a panicking predicate is contained as `FfiResult::PANIC_CAUGHT`.
 #[test]
 fn observer_builder_run_if_chains_controls_propagation_and_catches_panics() {
-    static TEST_LOCK: Mutex<()> = Mutex::new(());
-    let _guard = TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    let _guard = OBSERVER_CAPTURE_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
     captured_observers()
         .lock()
         .unwrap_or_else(|p| p.into_inner())
@@ -572,4 +621,160 @@ mod derive_guest_component_tests {
 
         world.unload_instance(instance);
     }
+}
+
+/// Scenario: Verifies `TypedObserverBuilder` context-aware observers (`.with_watched_handle`,
+/// `.query`, `.param_set`, `.resource_read_handle`, `.run_if_fn`, `.build_with_ctx`), fail-closed
+/// rejection when `.build` / `.build_mut` is called with declared queries or resources, and
+/// `watched_components` forwarding through `.build(...)` and `.build_with_ctx(...)`.
+#[test]
+fn typed_observer_builder_ctx_queries_watched_and_validation_guards() {
+    let _guard = OBSERVER_CAPTURE_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
+    captured_observers()
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .clear();
+
+    #[repr(C)]
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    struct TestEvt(u64);
+    // SAFETY: `TestEvt` is a `u64` with zero padding.
+    unsafe impl RawInsertable for TestEvt {}
+    // SAFETY: `TestEvt` has fixed C layout and `AbiPod` inner field.
+    unsafe impl AbiPod for TestEvt {}
+
+    let mut world = MockHostWorld::new();
+    let comp_a = world.expose_component::<u32>(
+        "obs_ctx::CompA",
+        ComponentUuid::from_canonical_name("obs_ctx::CompA"),
+        0,
+        false,
+    );
+    let comp_b = world.expose_component::<u32>(
+        "obs_ctx::CompB",
+        ComponentUuid::from_canonical_name("obs_ctx::CompB"),
+        0,
+        false,
+    );
+    let res_h = world.expose_component::<u32>(
+        "obs_ctx::Res",
+        ComponentUuid::from_canonical_name("obs_ctx::Res"),
+        BAM_STORAGE_FLAG_RESOURCE,
+        false,
+    );
+    world.insert_resource(
+        "obs_ctx::Res",
+        ComponentUuid::from_canonical_name("obs_ctx::Res"),
+        99u32,
+    );
+    let ev_h = world.expose_component::<TestEvt>(
+        "obs_ctx::TestEvt",
+        ComponentUuid::from_canonical_name("obs_ctx::TestEvt"),
+        0,
+        false,
+    );
+    world.api.register_observer = Some(stub_register_observer);
+
+    let gate = Arc::new(AtomicBool::new(true));
+    let gate_clone = Arc::clone(&gate);
+    let calls = Arc::new(AtomicUsize::new(0));
+    let calls_clone = Arc::clone(&calls);
+
+    let instance = world
+        .load_fn(c"typed_obs_ctx_mod", move |app| {
+            // 1. `.query(...)` + `.build(...)` must fail closed with `INVALID_ARGUMENT`.
+            let err_ro = app
+                .observe_event_handle::<TestEvt>("bad_ro", ev_h)
+                .query(|q| q.read_handle(comp_a))
+                .build(|_tgt, _ev, _cmds| {});
+            assert_eq!(err_ro.err(), Some(FfiResult::INVALID_ARGUMENT));
+
+            // 2. `.resource_read_handle(...)` + `.build_mut(...)` must fail closed with `INVALID_ARGUMENT`.
+            let err_mut = app
+                .observe_event_handle::<TestEvt>("bad_mut", ev_h)
+                .resource_read_handle(res_h)
+                .build_mut(|_tgt, _ev, _prop, _cmds| {});
+            assert_eq!(err_mut.err(), Some(FfiResult::INVALID_ARGUMENT));
+
+            // 3. `.with_watched_handle` on `.build(...)` forwards watched handle cleanly.
+            if let Err(err) = app
+                .observe_event_handle::<TestEvt>("ro_watched", ev_h)
+                .with_watched_handle(comp_a)
+                .build(|_tgt, _ev, _cmds| {})
+            {
+                return err;
+            }
+
+            // 4. Full `.build_with_ctx(...)` with watched handle, param_set (2 queries) + res (slot 2 -> bucket 4).
+            let ctx_calls = Arc::clone(&calls_clone);
+            let ctx_gate = Arc::clone(&gate_clone);
+            if let Err(err) = app
+                .observe_event_handle::<TestEvt>("ctx_watched_ps", ev_h)
+                .with_watched_components(&[comp_a, comp_b, comp_a])
+                .param_set(|ps| {
+                    ps.query(|q| q.read_handle(comp_a))
+                        .query(|q| q.write_handle(comp_a));
+                })
+                .resource_read_handle(res_h)
+                .run_if_fn(move || ctx_gate.load(Ordering::SeqCst))
+                .build_with_ctx(move |tgt, ev, ctx| {
+                    assert_eq!(tgt, FfiEntity::from_bits(55));
+                    assert_eq!(ctx.query_count(), 2);
+                    assert_eq!(ctx.resource::<u32>(0), Some(&99u32));
+                    ctx_calls.fetch_add(ev.0 as usize, Ordering::SeqCst);
+                })
+            {
+                return err;
+            }
+
+            FfiResult::OK
+        })
+        .expect("register typed ctx observers");
+
+    let observers = captured_observers()
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .clone();
+    assert_eq!(observers.len(), 2);
+    assert_eq!(observers[0].name.as_deref(), Some("ro_watched"));
+    assert_eq!(observers[0].watched_components, vec![comp_a]);
+    assert!(observers[0].callback.is_some());
+    assert!(observers[0].ctx_callback.is_none());
+
+    assert_eq!(observers[1].name.as_deref(), Some("ctx_watched_ps"));
+    assert_eq!(observers[1].watched_components, vec![comp_a, comp_b]);
+    assert!(observers[1].callback.is_none());
+    assert!(observers[1].mut_callback.is_none());
+    assert_eq!(observers[1].query_count, 3);
+    assert_eq!(observers[1].param_set_groups, vec![1, 1, 0]);
+    let ctx_cb = observers[1].ctx_callback.expect("ctx_callback populated");
+
+    let ev = TestEvt(12);
+    let rc = world.with_mock_system_frame(&observers[1].queries, |sys_ptr| unsafe {
+        ctx_cb(
+            FfiEntity::from_bits(55),
+            (&raw const ev).cast::<c_void>(),
+            sys_ptr,
+            observers[1].user_data,
+        )
+    });
+    assert_eq!(rc, FfiResult::OK);
+    assert_eq!(calls.load(Ordering::SeqCst), 12);
+
+    // Gate off -> run_if skips body without error.
+    gate.store(false, Ordering::SeqCst);
+    let rc2 = world.with_mock_system_frame(&observers[1].queries, |sys_ptr| unsafe {
+        ctx_cb(
+            FfiEntity::from_bits(55),
+            (&raw const ev).cast::<c_void>(),
+            sys_ptr,
+            observers[1].user_data,
+        )
+    });
+    assert_eq!(rc2, FfiResult::OK);
+    assert_eq!(calls.load(Ordering::SeqCst), 12);
+
+    world.unload_instance(instance);
 }

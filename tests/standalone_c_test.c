@@ -918,6 +918,14 @@ static BamResult mock_observer_cb(BamEntity target_entity, const void* event_dat
     return BAM_RESULT_OK;
 }
 
+static BamResult mock_observer_ctx_cb(BamEntity target_entity, const void* event_data, BamSystemCtx* ctx, void* user_data) {
+    (void)target_entity;
+    (void)event_data;
+    (void)ctx;
+    (void)user_data;
+    return BAM_RESULT_OK;
+}
+
 /* Scenario: Verifies `BamChildOf` layout/UUID, `BamChangeTicks` wraparound detection, dynamic
  * layout registration helper, 64-bit entity packing in `BamObserverDesc`, and `SystemDesc.in_sets`.
  *
@@ -1126,6 +1134,23 @@ static void test_extended_wire_descriptors(void) {
     obs_desc.mut_callback = mock_mut_observer_cb;
     obs_desc.propagate_relationship = 5u;
     assert(obs_desc.reserved1 == 0u && obs_desc.reserved2 == 0u);
+    assert(obs_desc.ctx_callback == NULL && obs_desc.queries == NULL && obs_desc.query_count == 0u);
+    {
+        BamTermDesc ctx_terms[1];
+        BamQueryDesc ctx_queries[1];
+        BamObserverDesc ctx_obs;
+        ctx_terms[0] = bam_term_desc(11u, BAM_ACCESS_READ, 0u);
+        memset(&ctx_queries[0], 0, sizeof(ctx_queries[0]));
+        ctx_queries[0].struct_size = (uint32_t)sizeof(BamQueryDesc);
+        ctx_queries[0].terms = ctx_terms;
+        ctx_queries[0].term_count = 1u;
+        ctx_obs = bam_observer_desc_ctx(11u, BAM_ENTITY_NULL, mock_observer_ctx_cb, ctx_queries, 1u, NULL);
+        assert(ctx_obs.struct_size == (uint32_t)sizeof(BamObserverDesc));
+        assert(ctx_obs.callback == NULL);
+        assert(ctx_obs.ctx_callback == mock_observer_ctx_cb);
+        assert(ctx_obs.queries == ctx_queries && ctx_obs.query_count == 1u);
+        assert((size_t)BAM_OBSERVER_DESC_MIN_V0_2_SIZE <= sizeof(BamObserverDesc));
+    }
 
     trig_desc = bam_trigger_desc(11u, 99ull, (uint8_t*)&trig_payload, sizeof(trig_payload));
     trig_desc.flags = BAM_TRIGGER_FLAG_PROPAGATE;

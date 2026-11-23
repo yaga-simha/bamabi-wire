@@ -20,10 +20,12 @@ use crate::{
     },
     instance::{GuestInstance, RuntimeAllocTracker},
     trampoline::{
-        PreparedRunIf, SystemRegistrationConfig, ValidatedSystemInvocation, ValidatedSystemSlice,
-        configure_schedule_set, configure_schedule_set_raw, mount_system_in_schedule,
-        register_lifecycle_observer_closure, register_observer_closure,
-        register_observer_closure_with_options, register_observer_mut_closure,
+        ObserverCtxRegistrationConfig, PreparedRunIf, SystemRegistrationConfig,
+        ValidatedSystemInvocation, ValidatedSystemSlice, configure_schedule_set,
+        configure_schedule_set_raw, mount_system_in_schedule, register_lifecycle_observer_closure,
+        register_observer_closure, register_observer_closure_with_options,
+        register_observer_closure_with_watched, register_observer_ctx_slice_closure,
+        register_observer_mut_closure, register_observer_mut_closure_with_watched,
         register_system_closure, register_system_handle_closure,
         register_system_handle_slice_closure, register_system_slice_closure,
     },
@@ -979,6 +981,70 @@ impl<'a> ValidatedLoadCtx<'a> {
         }
     }
 
+    /// Registers a custom [`BamObserverDesc`](bamabi_sys::BamObserverDesc) callback with
+    /// explicit `watched_components` filters, propagation flags, and optional
+    /// `propagate_relationship` component handle.
+    #[inline]
+    #[allow(clippy::too_many_arguments)]
+    pub fn register_observer_with_watched<E, F>(
+        &self,
+        instance: &mut GuestInstance,
+        name: &str,
+        event: BamComponent,
+        watched_components: &[BamComponent],
+        target: bamabi_sys::FfiEntity,
+        flags: u32,
+        propagate_relationship: BamComponent,
+        callback: F,
+    ) -> FfiResult
+    where
+        E: AbiPod,
+        F: FnMut(
+                bamabi_sys::FfiEntity,
+                &E,
+                &mut crate::commands::ValidatedCommands<'_>,
+            ) -> FfiResult
+            + Send
+            + 'static,
+    {
+        // SAFETY: `self.raw` was validated as an active `BamLoadCtx` in `ValidatedLoadCtx::from_raw`.
+        unsafe {
+            register_observer_closure_with_watched::<E, F>(
+                instance,
+                self.raw,
+                name,
+                event,
+                watched_components,
+                target,
+                flags,
+                propagate_relationship,
+                callback,
+            )
+        }
+    }
+
+    /// Registers a context-aware [`BamObserverDesc`](bamabi_sys::BamObserverDesc) callback
+    /// (`BamObserverCtxFn` + `BamObserverDesc::queries`) backed by a const-bucketed
+    /// `observer_ctx_slice_trampoline<N, E, F>` on this validated load context.
+    #[inline]
+    pub fn register_observer_ctx_slice<const N: usize, E, F>(
+        &self,
+        instance: &mut GuestInstance,
+        config: &ObserverCtxRegistrationConfig<'_>,
+        callback: F,
+    ) -> FfiResult
+    where
+        E: AbiPod,
+        F: FnMut(bamabi_sys::FfiEntity, &E, &mut ValidatedSystemSlice<'_>) -> FfiResult
+            + Send
+            + 'static,
+    {
+        // SAFETY: `self.raw` was validated as an active `BamLoadCtx` in `ValidatedLoadCtx::from_raw`.
+        unsafe {
+            register_observer_ctx_slice_closure::<N, E, F>(instance, self.raw, config, callback)
+        }
+    }
+
     /// Registers a mutable [`BamObserverDesc`](bamabi_sys::BamObserverDesc) callback (`&mut E`
     /// plus `&mut bool` propagation flag) on this validated load context.
     #[inline]
@@ -1011,6 +1077,49 @@ impl<'a> ValidatedLoadCtx<'a> {
                 self.raw,
                 name,
                 event,
+                target,
+                flags,
+                propagate_relationship,
+                callback,
+            )
+        }
+    }
+
+    /// Registers a mutable [`BamObserverDesc`](bamabi_sys::BamObserverDesc) callback (`&mut E`
+    /// plus `&mut bool` propagation flag) with explicit `watched_components` filters on this
+    /// validated load context.
+    #[inline]
+    #[allow(clippy::too_many_arguments)]
+    pub fn register_observer_mut_with_watched<E, F>(
+        &self,
+        instance: &mut GuestInstance,
+        name: &str,
+        event: BamComponent,
+        watched_components: &[BamComponent],
+        target: bamabi_sys::FfiEntity,
+        flags: u32,
+        propagate_relationship: BamComponent,
+        callback: F,
+    ) -> FfiResult
+    where
+        E: AbiPod,
+        F: FnMut(
+                bamabi_sys::FfiEntity,
+                &mut E,
+                &mut bool,
+                &mut crate::commands::ValidatedCommands<'_>,
+            ) -> FfiResult
+            + Send
+            + 'static,
+    {
+        // SAFETY: `self.raw` was validated as an active `BamLoadCtx` in `ValidatedLoadCtx::from_raw`.
+        unsafe {
+            register_observer_mut_closure_with_watched::<E, F>(
+                instance,
+                self.raw,
+                name,
+                event,
+                watched_components,
                 target,
                 flags,
                 propagate_relationship,

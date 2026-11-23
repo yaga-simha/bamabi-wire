@@ -3,16 +3,24 @@
 
 use core::{ffi::CStr, marker::PhantomData};
 
-use bamabi_guest_sys::{ValidatedCommands, resolve_component};
+use bamabi_guest_sys::{
+    ObserverCtxRegistrationConfig, ValidatedCommands, ValidatedSystemSlice, resolve_component,
+    resolve_mod_component,
+};
 use bamabi_sys::{
-    AbiPod, BAM_OBSERVER_FLAG_PROPAGATE, BAM_TRIGGER_FLAG_PROPAGATE, BamComponent, BamEventKind,
-    FfiEntity, FfiResult,
+    AbiPod, AccessMode, BAM_OBSERVER_FLAG_PROPAGATE, BAM_TRIGGER_FLAG_PROPAGATE, BamComponent,
+    BamEventKind, BamTermDesc, FfiEntity, FfiResult, MAX_QUERIES_PER_SYSTEM, MAX_TERMS_PER_QUERY,
+    ModComponent,
 };
 
 use crate::{
-    app::{builder::GuestApp, context::RunConditionContext},
+    app::{
+        builder::{GuestApp, IntoSystemResult, QueryBuilder},
+        context::{RunConditionContext, SystemContext},
+    },
     commands::GuestCommands,
     component::{GuestComponent, resolve_guest_component},
+    iter::{ChunkIter, QueryTuple},
 };
 
 pub(crate) type RunIfPredicate = Box<dyn FnMut(&RunConditionContext<'_>) -> bool + Send + 'static>;
@@ -864,20 +872,80 @@ impl<'app, 'a> ObserverBuilder<'app, 'a> {
     }
 }
 
+/// Shared non-`N`-generic helper evaluating chained `.run_if(...)` predicates and invoking a
+/// context-aware observer callback.
+fn invoke_observer_ctx_callback<E, F, R>(
+    conditions: &mut [RunIfPredicate],
+    callback: &mut F,
+    target: FfiEntity,
+    event: &E,
+    ctx: &mut SystemContext<'_>,
+) -> FfiResult
+where
+    E: AbiPod,
+    F: FnMut(FfiEntity, &E, &mut SystemContext<'_>) -> R,
+    R: IntoSystemResult,
+{
+    if !conditions.is_empty() {
+        let cond_ctx = RunConditionContext::new(ctx.host());
+        if !conditions.iter_mut().all(|pred| pred(&cond_ctx)) {
+            return FfiResult::OK;
+        }
+    }
+    callback(target, event, ctx).into_ffi_result()
+}
+
+/// Scoped builder returned inside [`TypedObserverBuilder::param_set`] for grouping mutually
+/// exclusive queries under a shared non-zero `param_set_group` ID.
+pub struct ObserverParamSetBuilder<'p, 'app, 'a, E: AbiPod> {
+    builder: &'p mut TypedObserverBuilder<'app, 'a, E>,
+    group_id: u32,
+}
+
+impl<'app, 'a, E: AbiPod> ObserverParamSetBuilder<'_, 'app, 'a, E> {
+    /// Returns the shared non-zero `param_set_group` ID assigned to every query added in this scope.
+    #[inline]
+    pub const fn group_id(&self) -> u32 {
+        self.group_id
+    }
+
+    /// Appends a [`QueryBuilder`]-configured query clause belonging to this `ParamSet` group.
+    pub fn query<F>(&mut self, configure: F) -> &mut Self
+    where
+        F: for<'q> FnOnce(QueryBuilder<'q>) -> QueryBuilder<'q>,
+    {
+        self.builder.push_query_with_group(configure, self.group_id);
+        self
+    }
+
+    /// Appends a typed [`QueryTuple`] query clause belonging to this `ParamSet` group.
+    pub fn query_typed<Q: QueryTuple>(&mut self) -> &mut Self {
+        self.builder.push_query_typed_with_group::<Q>(self.group_id);
+        self
+    }
+}
+
 /// Fluent `#![forbid(unsafe_code)]` builder for custom `Event` / `EntityEvent` observers carrying
 /// payload `E: AbiPod` (including Bevy `0.20` flattened `Pointer*` events).
 ///
 /// Created via [`GuestApp::observe_event`] or [`GuestApp::observe_event_handle`]. Supports entity
-/// scoping (`.with_target`), upward relationship propagation (`.with_propagate` /
-/// `.with_relationship`), composable `.run_if(...)` predicates, and read-only ([`Self::build`]) or
-/// mutable/stoppable ([`Self::build_mut`]) callbacks.
+/// scoping (`.with_target`), archetypal component filtering (`.with_watched_component` /
+/// `.with_watched_handle`), upward relationship propagation (`.with_propagate` /
+/// `.with_relationship`), composable `.run_if(...)` predicates, ECS queries/resources
+/// (`.query` / `.param_set` / `.resource_*` + [`Self::build_with_ctx`]), and read-only
+/// ([`Self::build`]) or mutable/stoppable ([`Self::build_mut`]) callbacks.
 pub struct TypedObserverBuilder<'app, 'a, E: AbiPod> {
     app: &'app mut GuestApp<'a>,
     name: String,
     event: BamComponent,
+    watched_components: Vec<BamComponent>,
     target: FfiEntity,
     flags: u32,
     propagate_relationship: BamComponent,
+    queries: Vec<Vec<BamTermDesc>>,
+    query_param_set_groups: Vec<u32>,
+    next_param_set_group: u32,
+    system_resources: Vec<BamTermDesc>,
     conditions: Vec<RunIfPredicate>,
     first_error: Option<FfiResult>,
     _marker: PhantomData<fn() -> E>,
@@ -895,9 +963,14 @@ impl<'app, 'a, E: AbiPod> TypedObserverBuilder<'app, 'a, E> {
             app,
             name: name.into(),
             event,
+            watched_components: Vec::new(),
             target: FfiEntity::NULL,
             flags: 0,
             propagate_relationship: BamComponent::INVALID,
+            queries: Vec::new(),
+            query_param_set_groups: Vec::new(),
+            next_param_set_group: 1,
+            system_resources: Vec::new(),
             conditions: Vec::new(),
             first_error: None,
             _marker: PhantomData,
@@ -915,12 +988,25 @@ impl<'app, 'a, E: AbiPod> TypedObserverBuilder<'app, 'a, E> {
             app,
             name: name.into(),
             event: BamComponent::INVALID,
+            watched_components: Vec::new(),
             target: FfiEntity::NULL,
             flags: 0,
             propagate_relationship: BamComponent::INVALID,
+            queries: Vec::new(),
+            query_param_set_groups: Vec::new(),
+            next_param_set_group: 1,
+            system_resources: Vec::new(),
             conditions: Vec::new(),
             first_error: Some(err),
             _marker: PhantomData,
+        }
+    }
+
+    /// Latches the first resolution, handle, or capacity error encountered during building.
+    #[inline]
+    fn record_error(&mut self, err: FfiResult) {
+        if self.first_error.is_none() {
+            self.first_error = Some(err);
         }
     }
 
@@ -928,6 +1014,36 @@ impl<'app, 'a, E: AbiPod> TypedObserverBuilder<'app, 'a, E> {
     #[inline]
     pub const fn with_target(mut self, target: FfiEntity) -> Self {
         self.target = target;
+        self
+    }
+
+    /// Appends a pre-resolved watched component handle filter (deduplicated).
+    #[inline]
+    pub fn with_watched_handle(mut self, component: BamComponent) -> Self {
+        if !component.is_valid() {
+            self.record_error(FfiResult::INVALID_COMPONENT);
+            return self;
+        }
+        if !self.watched_components.contains(&component) {
+            self.watched_components.push(component);
+        }
+        self
+    }
+
+    /// Appends pre-resolved watched component handle filters (deduplicated).
+    pub fn with_watched_components(mut self, components: &[BamComponent]) -> Self {
+        for &comp in components {
+            self = self.with_watched_handle(comp);
+        }
+        self
+    }
+
+    /// Resolves `C: GuestComponent` and appends it to the watched component filter list.
+    pub fn with_watched_component<C: GuestComponent>(mut self) -> Self {
+        match self.app.resolve_component::<C>() {
+            Ok(comp) => self = self.with_watched_handle(comp),
+            Err(err) => self.record_error(err),
+        }
         self
     }
 
@@ -945,8 +1061,8 @@ impl<'app, 'a, E: AbiPod> TypedObserverBuilder<'app, 'a, E> {
     /// Configures propagation along pre-resolved relationship handle `relationship`.
     #[inline]
     pub fn with_relationship_handle(mut self, relationship: BamComponent) -> Self {
-        if !relationship.is_valid() && self.first_error.is_none() {
-            self.first_error = Some(FfiResult::INVALID_COMPONENT);
+        if !relationship.is_valid() {
+            self.record_error(FfiResult::INVALID_COMPONENT);
         }
         self.propagate_relationship = relationship;
         self.flags |= BAM_OBSERVER_FLAG_PROPAGATE;
@@ -960,9 +1076,206 @@ impl<'app, 'a, E: AbiPod> TypedObserverBuilder<'app, 'a, E> {
                 self.propagate_relationship = rel;
                 self.flags |= BAM_OBSERVER_FLAG_PROPAGATE;
             }
-            Err(err) if self.first_error.is_none() => self.first_error = Some(err),
-            Err(_) => {}
+            Err(err) => self.record_error(err),
         }
+        self
+    }
+
+    /// Internal helper appending a `QueryBuilder` query with `param_set_group` (`0` = standalone).
+    fn push_query_with_group<F>(&mut self, configure: F, param_set_group: u32)
+    where
+        F: for<'q> FnOnce(QueryBuilder<'q>) -> QueryBuilder<'q>,
+    {
+        if self.queries.len() >= MAX_QUERIES_PER_SYSTEM {
+            self.record_error(FfiResult::CAPACITY_EXCEEDED);
+            return;
+        }
+        let host = *self.app.host();
+        let qb = QueryBuilder {
+            host: &host,
+            manifest_name: host.manifest_name(),
+            terms: Vec::new(),
+            first_error: None,
+        };
+        let finished = configure(qb);
+        if let Some(err) = finished.first_error {
+            self.record_error(err);
+        } else {
+            self.queries.push(finished.terms);
+            self.query_param_set_groups.push(param_set_group);
+        }
+    }
+
+    /// Internal helper appending a typed `QueryTuple` query with `param_set_group`.
+    fn push_query_typed_with_group<Q: QueryTuple>(&mut self, param_set_group: u32) {
+        if self.queries.len() >= MAX_QUERIES_PER_SYSTEM {
+            self.record_error(FfiResult::CAPACITY_EXCEEDED);
+            return;
+        }
+        let host = *self.app.host();
+        match Q::collect_descs(&host, host.manifest_name()) {
+            Ok(terms) => {
+                self.queries.push(terms);
+                self.query_param_set_groups.push(param_set_group);
+            }
+            Err(err) => self.record_error(err),
+        }
+    }
+
+    /// Validates `component` and capacity before appending an observer-level resource/message/removed term.
+    #[inline]
+    fn push_system_resource_handle(&mut self, component: BamComponent, mode: AccessMode) {
+        if !component.is_valid() {
+            self.record_error(FfiResult::INVALID_COMPONENT);
+            return;
+        }
+        if self.system_resources.len() >= MAX_TERMS_PER_QUERY {
+            self.record_error(FfiResult::CAPACITY_EXCEEDED);
+            return;
+        }
+        self.system_resources
+            .push(BamTermDesc::new(component, mode));
+    }
+
+    /// Resolves `T: GuestComponent` and appends an observer-level resource/message/removed term.
+    #[inline]
+    fn push_guest_resource<T: GuestComponent>(mut self, mode: AccessMode) -> Self {
+        match self.app.resolve_component::<T>() {
+            Ok(comp) => self.push_system_resource_handle(comp, mode),
+            Err(err) => self.record_error(err),
+        }
+        self
+    }
+
+    /// Resolves `T: ModComponent` and appends an observer-level dynamic resource/message term.
+    #[inline]
+    fn push_dynamic_resource<T: ModComponent>(mut self, mode: AccessMode) -> Self {
+        match resolve_mod_component::<T>(self.app.host()) {
+            Ok(comp) => self.push_system_resource_handle(comp, mode),
+            Err(err) => self.record_error(err),
+        }
+        self
+    }
+
+    /// Appends a query clause (`0..=MAX_QUERIES_PER_SYSTEM`) configured via [`QueryBuilder`].
+    pub fn query<F>(mut self, configure: F) -> Self
+    where
+        F: for<'q> FnOnce(QueryBuilder<'q>) -> QueryBuilder<'q>,
+    {
+        self.push_query_with_group(configure, 0);
+        self
+    }
+
+    /// Appends a typed query clause derived from [`QueryTuple`] `Q`.
+    pub fn query_typed<Q: QueryTuple>(mut self) -> Self {
+        self.push_query_typed_with_group::<Q>(0);
+        self
+    }
+
+    /// Groups mutually exclusive queries declared inside `f` under a shared non-zero
+    /// `param_set_group` ID (mirroring [`SystemBuilder::param_set`](crate::app::SystemBuilder::param_set)).
+    pub fn param_set(
+        mut self,
+        f: impl FnOnce(&mut ObserverParamSetBuilder<'_, 'app, 'a, E>),
+    ) -> Self {
+        let group_id = self.next_param_set_group;
+        let Some(next) = self.next_param_set_group.checked_add(1) else {
+            self.record_error(FfiResult::CAPACITY_EXCEEDED);
+            return self;
+        };
+        self.next_param_set_group = next;
+        let mut ps = ObserverParamSetBuilder {
+            builder: &mut self,
+            group_id,
+        };
+        f(&mut ps);
+        self
+    }
+
+    /// Returns the `param_set_group` ID assigned to each declared query.
+    #[inline]
+    pub fn param_set_groups(&self) -> &[u32] {
+        &self.query_param_set_groups
+    }
+
+    /// Declares a shared singleton resource read (`Res<R>`) accessible inside [`Self::build_with_ctx`].
+    pub fn resource_read<R: GuestComponent>(self) -> Self {
+        self.push_guest_resource::<R>(AccessMode::RESOURCE_READ)
+    }
+
+    /// Declares an exclusive singleton resource write (`ResMut<R>`) accessible inside [`Self::build_with_ctx`].
+    pub fn resource_write<R: GuestComponent>(self) -> Self {
+        self.push_guest_resource::<R>(AccessMode::RESOURCE_WRITE)
+    }
+
+    /// Declares a shared singleton resource read using a pre-resolved [`BamComponent`] handle.
+    #[inline]
+    pub fn resource_read_handle(mut self, component: BamComponent) -> Self {
+        self.push_system_resource_handle(component, AccessMode::RESOURCE_READ);
+        self
+    }
+
+    /// Declares an exclusive singleton resource write using a pre-resolved [`BamComponent`] handle.
+    #[inline]
+    pub fn resource_write_handle(mut self, component: BamComponent) -> Self {
+        self.push_system_resource_handle(component, AccessMode::RESOURCE_WRITE);
+        self
+    }
+
+    /// Declares a buffered message stream reader (`MessageReader<M>`) accessible inside [`Self::build_with_ctx`].
+    pub fn message_read<M: GuestComponent>(self) -> Self {
+        self.push_guest_resource::<M>(AccessMode::MESSAGE_READ)
+    }
+
+    /// Declares a buffered message stream writer (`MessageWriter<M>`) accessible inside [`Self::build_with_ctx`].
+    pub fn message_write<M: GuestComponent>(self) -> Self {
+        self.push_guest_resource::<M>(AccessMode::MESSAGE_WRITE)
+    }
+
+    /// Declares a buffered message stream reader using a pre-resolved [`BamComponent`] handle.
+    #[inline]
+    pub fn message_read_handle(mut self, component: BamComponent) -> Self {
+        self.push_system_resource_handle(component, AccessMode::MESSAGE_READ);
+        self
+    }
+
+    /// Declares a buffered message stream writer using a pre-resolved [`BamComponent`] handle.
+    #[inline]
+    pub fn message_write_handle(mut self, component: BamComponent) -> Self {
+        self.push_system_resource_handle(component, AccessMode::MESSAGE_WRITE);
+        self
+    }
+
+    /// Declares a shared singleton resource read (`Res<R>`) for a dynamic [`ModComponent`] `R`.
+    pub fn resource_read_dynamic<R: ModComponent>(self) -> Self {
+        self.push_dynamic_resource::<R>(AccessMode::RESOURCE_READ)
+    }
+
+    /// Declares an exclusive singleton resource write (`ResMut<R>`) for a dynamic [`ModComponent`] `R`.
+    pub fn resource_write_dynamic<R: ModComponent>(self) -> Self {
+        self.push_dynamic_resource::<R>(AccessMode::RESOURCE_WRITE)
+    }
+
+    /// Declares a buffered message stream reader for a dynamic [`ModComponent`] `M`.
+    pub fn message_read_dynamic<M: ModComponent>(self) -> Self {
+        self.push_dynamic_resource::<M>(AccessMode::MESSAGE_READ)
+    }
+
+    /// Declares a buffered message stream writer for a dynamic [`ModComponent`] `M`.
+    pub fn message_write_dynamic<M: ModComponent>(self) -> Self {
+        self.push_dynamic_resource::<M>(AccessMode::MESSAGE_WRITE)
+    }
+
+    /// Declares a `RemovedComponents<T>` stream accessible via [`SystemContext::read_removed`]
+    /// inside [`Self::build_with_ctx`].
+    pub fn removed<T: GuestComponent>(self) -> Self {
+        self.push_guest_resource::<T>(AccessMode::REMOVED_READ)
+    }
+
+    /// Declares a `RemovedComponents` stream using a pre-resolved [`BamComponent`] handle.
+    #[inline]
+    pub fn removed_handle(mut self, component: BamComponent) -> Self {
+        self.push_system_resource_handle(component, AccessMode::REMOVED_READ);
         self
     }
 
@@ -985,7 +1298,72 @@ impl<'app, 'a, E: AbiPod> TypedObserverBuilder<'app, 'a, E> {
         self.run_if(move |_ctx| predicate())
     }
 
+    /// Registers a context-aware `(target, &E, &mut SystemContext<'_>) -> R` observer backed by
+    /// `BamObserverCtxFn` and declared `queries` / singleton resources.
+    pub fn build_with_ctx<F, R>(self, mut callback: F) -> Result<&'app mut GuestApp<'a>, FfiResult>
+    where
+        F: FnMut(FfiEntity, &E, &mut SystemContext<'_>) -> R + Send + 'static,
+        R: IntoSystemResult,
+    {
+        if let Some(err) = self.first_error {
+            return Err(err);
+        }
+        let query_slices: Vec<&[BamTermDesc]> = self.queries.iter().map(Vec::as_slice).collect();
+        let config = ObserverCtxRegistrationConfig {
+            name: (!self.name.is_empty()).then_some(self.name.as_str()),
+            event: self.event,
+            watched_components: &self.watched_components,
+            target: self.target,
+            flags: self.flags,
+            propagate_relationship: self.propagate_relationship,
+            user_queries: &query_slices,
+            user_query_param_set_groups: &self.query_param_set_groups,
+            system_resources: &self.system_resources,
+        };
+        let total_query_count =
+            config.user_queries.len() + usize::from(!config.system_resources.is_empty());
+
+        macro_rules! dispatch_ctx_bucket {
+            ($n:expr, $init:expr) => {{
+                let mut conditions = self.conditions;
+                self.app.load_ctx.register_observer_ctx_slice::<$n, E, _>(
+                    self.app.instance,
+                    &config,
+                    move |tgt: FfiEntity, ev: &E, inv: &mut ValidatedSystemSlice<'_>| {
+                        let mut slots: [Option<ChunkIter<'_>>; $n] = $init;
+                        let mut ctx = SystemContext::from_slice_invocation(inv, &mut slots);
+                        invoke_observer_ctx_callback(
+                            &mut conditions,
+                            &mut callback,
+                            tgt,
+                            ev,
+                            &mut ctx,
+                        )
+                    },
+                )
+            }};
+        }
+
+        let status = match total_query_count {
+            0 => dispatch_ctx_bucket!(0, []),
+            1 => dispatch_ctx_bucket!(1, [None]),
+            2..=4 => dispatch_ctx_bucket!(4, [const { None }; 4]),
+            _ => dispatch_ctx_bucket!(
+                MAX_QUERIES_PER_SYSTEM,
+                [const { None }; MAX_QUERIES_PER_SYSTEM]
+            ),
+        };
+        if status.is_ok() {
+            Ok(self.app)
+        } else {
+            Err(status)
+        }
+    }
+
     /// Registers a read-only `(target, &E, &mut GuestCommands<'_>)` observer.
+    ///
+    /// Returns [`FfiResult::INVALID_ARGUMENT`] if queries, resources, messages, or removed streams
+    /// were declared (use [`Self::build_with_ctx`] for context-aware observers).
     pub fn build<F>(self, mut callback: F) -> Result<&'app mut GuestApp<'a>, FfiResult>
     where
         F: FnMut(FfiEntity, &E, &mut GuestCommands<'_>) + Send + 'static,
@@ -993,11 +1371,15 @@ impl<'app, 'a, E: AbiPod> TypedObserverBuilder<'app, 'a, E> {
         if let Some(err) = self.first_error {
             return Err(err);
         }
+        if !self.queries.is_empty() || !self.system_resources.is_empty() {
+            return Err(FfiResult::INVALID_ARGUMENT);
+        }
         let mut conditions = self.conditions;
-        let status = self.app.load_ctx.register_observer_with_options::<E, _>(
+        let status = self.app.load_ctx.register_observer_with_watched::<E, _>(
             self.app.instance,
             &self.name,
             self.event,
+            &self.watched_components,
             self.target,
             self.flags,
             self.propagate_relationship,
@@ -1021,6 +1403,9 @@ impl<'app, 'a, E: AbiPod> TypedObserverBuilder<'app, 'a, E> {
 
     /// Registers a mutable `(target, &mut E, &mut bool, &mut GuestCommands<'_>)` observer
     /// supporting in-place payload mutation and propagation stopping (`*propagate = false`).
+    ///
+    /// Returns [`FfiResult::INVALID_ARGUMENT`] if queries, resources, messages, or removed streams
+    /// were declared (use [`Self::build_with_ctx`] for context-aware observers).
     pub fn build_mut<F>(self, mut callback: F) -> Result<&'app mut GuestApp<'a>, FfiResult>
     where
         F: FnMut(FfiEntity, &mut E, &mut bool, &mut GuestCommands<'_>) + Send + 'static,
@@ -1028,24 +1413,37 @@ impl<'app, 'a, E: AbiPod> TypedObserverBuilder<'app, 'a, E> {
         if let Some(err) = self.first_error {
             return Err(err);
         }
+        if !self.queries.is_empty() || !self.system_resources.is_empty() {
+            return Err(FfiResult::INVALID_ARGUMENT);
+        }
         let mut conditions = self.conditions;
-        self.app.observe_mut_handle::<E, _>(
-            &self.name,
-            self.event,
-            self.target,
-            self.flags,
-            self.propagate_relationship,
-            move |tgt, ev, prop, cmds| {
-                if !conditions.is_empty() {
-                    let cond_ctx = RunConditionContext::new(cmds.host());
-                    if !conditions.iter_mut().all(|pred| pred(&cond_ctx)) {
-                        return;
+        let status = self
+            .app
+            .load_ctx
+            .register_observer_mut_with_watched::<E, _>(
+                self.app.instance,
+                &self.name,
+                self.event,
+                &self.watched_components,
+                self.target,
+                self.flags,
+                self.propagate_relationship,
+                move |tgt, ev, prop, validated_cmds| {
+                    if !conditions.is_empty() {
+                        let cond_ctx = RunConditionContext::new(validated_cmds.host());
+                        if !conditions.iter_mut().all(|pred| pred(&cond_ctx)) {
+                            return FfiResult::OK;
+                        }
                     }
-                }
-                callback(tgt, ev, prop, cmds);
-            },
-        )?;
-        Ok(self.app)
+                    with_guest_commands(validated_cmds, |cmds| callback(tgt, ev, prop, cmds));
+                    FfiResult::OK
+                },
+            );
+        if status.is_ok() {
+            Ok(self.app)
+        } else {
+            Err(status)
+        }
     }
 }
 

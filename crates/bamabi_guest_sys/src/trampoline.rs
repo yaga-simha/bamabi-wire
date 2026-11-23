@@ -1814,6 +1814,42 @@ where
     })
 }
 
+/// Resets per-tick query scratch slots and clamps query/resource indices for const-bucketed slice
+/// trampolines (`N ∈ {0, 1, 4, 16}`).
+///
+/// # Safety
+/// Caller must hold `state.closure.try_with_mut` exclusive access for this invocation.
+#[inline]
+unsafe fn prepare_slice_scratches<F>(
+    bucket: usize,
+    state: &SystemClosureState<F>,
+) -> (usize, usize, Option<usize>, &[QuerySlotScratch]) {
+    if bucket == 0 {
+        (0, 0, None, &[])
+    } else {
+        // SAFETY: Caller holds `state.closure.try_with_mut` exclusive access for this invocation.
+        let scratch_slice = unsafe { state.slot_scratches.borrow_locked() };
+        let mut idx = 0usize;
+        while idx < bucket {
+            let Some(scratch) = scratch_slice.get(idx) else {
+                break;
+            };
+            // Retain `col_info_mask`/`term_cache_mask` across ticks under the single-system
+            // `BamIterColumnInfoFn` invariance contract (vs `reset_all()` in
+            // `ValidatedIter::from_raw_with_scratch`).
+            scratch.reset_per_tick();
+            idx += 1;
+        }
+        let total = state
+            .total_query_count
+            .min(bucket)
+            .min(MAX_QUERIES_PER_SYSTEM);
+        let user = state.user_query_count.min(total);
+        let res = state.resource_query_index.filter(|&idx| idx < total);
+        (total, user, res, scratch_slice)
+    }
+}
+
 /// Const-bucketed panic-safe, re-entrancy-guarded `extern "C"` [`BamSystemFn`] trampoline passing
 /// a zero-array [`ValidatedSystemSlice`] (`N ∈ {0, 1, 4, 16}`).
 ///
@@ -1841,32 +1877,9 @@ where
         let base_host = unsafe { state.host.as_ref() };
         let Some(result) = state.closure.try_with_mut(|func| {
             let lazy_host = LazyInvocationHost::new(base_host, sys_ctx, &state.host_scratch.0);
-            let (clamped_total, clamped_user, clamped_res, scratches): (
-                usize,
-                usize,
-                Option<usize>,
-                &[QuerySlotScratch],
-            ) = if N == 0 {
-                (0, 0, None, &[])
-            } else {
-                // SAFETY: `state.closure.try_with_mut` holds exclusive access for this tick.
-                let scratch_slice = unsafe { state.slot_scratches.borrow_locked() };
-                let mut idx = 0usize;
-                while idx < N {
-                    let Some(scratch) = scratch_slice.get(idx) else {
-                        break;
-                    };
-                    // Retain `col_info_mask`/`term_cache_mask` across ticks under the single-system
-                    // `BamIterColumnInfoFn` invariance contract (vs `reset_all()` in
-                    // `ValidatedIter::from_raw_with_scratch`).
-                    scratch.reset_per_tick();
-                    idx += 1;
-                }
-                let total = state.total_query_count.min(N).min(MAX_QUERIES_PER_SYSTEM);
-                let user = state.user_query_count.min(total);
-                let res = state.resource_query_index.filter(|&idx| idx < total);
-                (total, user, res, scratch_slice)
-            };
+            // SAFETY: `state.closure.try_with_mut` holds exclusive access for this tick.
+            let (clamped_total, clamped_user, clamped_res, scratches) =
+                unsafe { prepare_slice_scratches(N, state) };
             // SAFETY: `sys_ctx` is non-null and active for the duration of this `BamSystemFn` call.
             let mut slice = unsafe {
                 ValidatedSystemSlice::from_raw_with_lazy_host(
@@ -2168,6 +2181,15 @@ impl OwnedRawCString {
         Self(CString::from(s).into_raw())
     }
 
+    /// Validates non-empty, interior-NUL-free `s` and clones it into an owned raw C string.
+    fn from_str(s: &str) -> Result<Self, FfiResult> {
+        if s.is_empty() {
+            return Err(FfiResult::INVALID_ARGUMENT);
+        }
+        let cstr = CString::new(s).map_err(|_| FfiResult::INVALID_ARGUMENT)?;
+        Ok(Self(cstr.into_raw()))
+    }
+
     /// Returns the stable `*const c_char` pointer for descriptor fields.
     #[inline]
     const fn as_ptr(&self) -> *const c_char {
@@ -2270,6 +2292,87 @@ struct PinnedSystemDescParts {
     ambiguous_with_ptr: *const *const c_char,
 }
 
+/// Validated and heap-allocated query term slices plus descriptor array shared between systems
+/// and context-aware observers.
+struct BuiltQueryDescs {
+    term_vecs: Vec<OwnedRawTermSlice>,
+    queries: Box<[BamQueryDesc]>,
+    total_query_count: usize,
+    user_query_count: usize,
+    resource_query_index: Option<usize>,
+}
+
+/// Validates `user_queries` and `system_resources` limits/terms and materializes pinned
+/// [`OwnedRawTermSlice`] buffers alongside their [`BamQueryDesc`] headers.
+fn validate_and_build_query_descs(
+    user_queries: &[&[BamTermDesc]],
+    user_query_param_set_groups: &[u32],
+    system_resources: &[BamTermDesc],
+) -> Result<BuiltQueryDescs, FfiResult> {
+    let has_sys_resources = !system_resources.is_empty();
+    let total_query_count = user_queries.len() + usize::from(has_sys_resources);
+    if total_query_count > MAX_QUERIES_PER_SYSTEM {
+        return Err(FfiResult::CAPACITY_EXCEEDED);
+    }
+    if system_resources.len() > MAX_TERMS_PER_QUERY {
+        return Err(FfiResult::CAPACITY_EXCEEDED);
+    }
+
+    for terms in user_queries {
+        if terms.len() > MAX_TERMS_PER_QUERY {
+            return Err(FfiResult::CAPACITY_EXCEEDED);
+        }
+        for term in *terms {
+            let status = term.validate();
+            if !status.is_ok() {
+                return Err(status);
+            }
+        }
+    }
+    for term in system_resources {
+        let status = term.validate();
+        if !status.is_ok() {
+            return Err(status);
+        }
+    }
+
+    let mut term_vecs: Vec<OwnedRawTermSlice> = Vec::with_capacity(total_query_count);
+    let mut query_descs: Vec<BamQueryDesc> = Vec::with_capacity(total_query_count);
+    for (q_idx, terms) in user_queries.iter().enumerate() {
+        let group = user_query_param_set_groups.get(q_idx).copied().unwrap_or(0);
+        let desc = if terms.is_empty() {
+            BamQueryDesc::empty()
+        } else {
+            let raw_terms = OwnedRawTermSlice::from_slice(terms);
+            let ptr = raw_terms.as_ptr();
+            let len = raw_terms.len;
+            term_vecs.push(raw_terms);
+            BamQueryDesc::new(ptr, len)
+        };
+        query_descs.push(desc.with_param_set_group(group));
+    }
+
+    let resource_query_index = if has_sys_resources {
+        let idx = query_descs.len();
+        let raw_res = OwnedRawTermSlice::from_slice(system_resources);
+        let ptr = raw_res.as_ptr();
+        let len = raw_res.len;
+        term_vecs.push(raw_res);
+        query_descs.push(BamQueryDesc::new(ptr, len));
+        Some(idx)
+    } else {
+        None
+    };
+
+    Ok(BuiltQueryDescs {
+        term_vecs,
+        queries: query_descs.into_boxed_slice(),
+        total_query_count,
+        user_query_count: user_queries.len(),
+        resource_query_index,
+    })
+}
+
 /// Validates `config` and pins all owned descriptor strings and query term slices inside
 /// `instance` (non-generic to avoid monomorphizing descriptor setup across `N` or `F`).
 fn pin_system_descriptor_storage(
@@ -2289,32 +2392,12 @@ fn pin_system_descriptor_storage(
         return Err(FfiResult::UNSUPPORTED);
     }
 
-    let has_sys_resources = !config.system_resources.is_empty();
-    let total_query_count = config.user_queries.len() + usize::from(has_sys_resources);
-    if total_query_count > MAX_QUERIES_PER_SYSTEM {
-        return Err(FfiResult::CAPACITY_EXCEEDED);
-    }
-    if config.system_resources.len() > MAX_TERMS_PER_QUERY {
-        return Err(FfiResult::CAPACITY_EXCEEDED);
-    }
+    let built_queries = validate_and_build_query_descs(
+        config.user_queries,
+        config.user_query_param_set_groups,
+        config.system_resources,
+    )?;
 
-    for terms in config.user_queries {
-        if terms.len() > MAX_TERMS_PER_QUERY {
-            return Err(FfiResult::CAPACITY_EXCEEDED);
-        }
-        for term in *terms {
-            let status = term.validate();
-            if !status.is_ok() {
-                return Err(status);
-            }
-        }
-    }
-    for term in config.system_resources {
-        let status = term.validate();
-        if !status.is_ok() {
-            return Err(status);
-        }
-    }
     for set_name in config
         .after
         .iter()
@@ -2332,37 +2415,10 @@ fn pin_system_descriptor_storage(
         }
     }
 
-    let mut term_vecs: Vec<OwnedRawTermSlice> = Vec::with_capacity(total_query_count);
-    let mut query_descs: Vec<BamQueryDesc> = Vec::with_capacity(total_query_count);
-    for (q_idx, terms) in config.user_queries.iter().enumerate() {
-        let group = config
-            .user_query_param_set_groups
-            .get(q_idx)
-            .copied()
-            .unwrap_or(0);
-        let desc = if terms.is_empty() {
-            BamQueryDesc::empty()
-        } else {
-            let raw_terms = OwnedRawTermSlice::from_slice(terms);
-            let ptr = raw_terms.as_ptr();
-            let len = raw_terms.len;
-            term_vecs.push(raw_terms);
-            BamQueryDesc::new(ptr, len)
-        };
-        query_descs.push(desc.with_param_set_group(group));
-    }
-
-    let resource_query_index = if has_sys_resources {
-        let idx = query_descs.len();
-        let raw_res = OwnedRawTermSlice::from_slice(config.system_resources);
-        let ptr = raw_res.as_ptr();
-        let len = raw_res.len;
-        term_vecs.push(raw_res);
-        query_descs.push(BamQueryDesc::new(ptr, len));
-        Some(idx)
-    } else {
-        None
-    };
+    let term_vecs = built_queries.term_vecs;
+    let total_query_count = built_queries.total_query_count;
+    let user_query_count = built_queries.user_query_count;
+    let resource_query_index = built_queries.resource_query_index;
 
     /// Clones a slice of `&CStr` set names into owned raw C strings plus a parallel pointer array.
     fn collect_cstrings(names: &[&CStr]) -> (Vec<OwnedRawCString>, Box<[*const c_char]>) {
@@ -2386,7 +2442,7 @@ fn pin_system_descriptor_storage(
     let storage = OwnedDescriptorStorage {
         name: OwnedRawCString::from_cstr(config.name),
         _term_vecs: term_vecs,
-        queries: query_descs.into_boxed_slice(),
+        queries: built_queries.queries,
         _after_names: after_names,
         after_ptrs,
         _before_names: before_names,
@@ -2413,7 +2469,7 @@ fn pin_system_descriptor_storage(
     };
     Ok(PinnedSystemDescParts {
         total_query_count,
-        user_query_count: config.user_queries.len(),
+        user_query_count,
         resource_query_index,
         name_ptr: storage_ref.name.as_ptr(),
         queries_ptr: if storage_ref.queries.is_empty() {
@@ -2937,9 +2993,11 @@ fn build_observer_desc<F: Send + 'static>(
     let mut desc = match kind {
         ObserverKind::CustomRead(event, cb) => {
             BamObserverDesc::new(event, cb, raw_state.cast::<c_void>())
+                .with_watched_components(watched_ptr, watched_len)
         }
         ObserverKind::CustomMut(event, cb) => {
             BamObserverDesc::new_mut(event, cb, raw_state.cast::<c_void>())
+                .with_watched_components(watched_ptr, watched_len)
         }
         ObserverKind::Lifecycle(event_kind, cb) => BamObserverDesc::new_lifecycle(
             event_kind,
@@ -3159,6 +3217,45 @@ where
     E: AbiPod,
     F: FnMut(FfiEntity, &E, &mut ValidatedCommands<'_>) -> FfiResult + Send + 'static,
 {
+    // SAFETY: Forwarding identical `load_ctx` invariant to `register_observer_closure_with_watched`.
+    unsafe {
+        register_observer_closure_with_watched::<E, F>(
+            instance,
+            load_ctx,
+            name,
+            event,
+            &[],
+            target,
+            flags,
+            propagate_relationship,
+            callback,
+        )
+    }
+}
+
+/// Validates and registers a custom [`BamObserverDesc`] closure with explicit
+/// `watched_components` filters, propagation flags, and optional `propagate_relationship` on
+/// `load_ctx`.
+///
+/// # Safety
+/// `load_ctx` must be a non-null, active [`BamLoadCtx`] belonging to `instance` during
+/// `bamabi_init`.
+#[allow(clippy::too_many_arguments)]
+pub unsafe fn register_observer_closure_with_watched<E, F>(
+    instance: &mut GuestInstance,
+    load_ctx: *mut BamLoadCtx,
+    name: &str,
+    event: BamComponent,
+    watched_components: &[BamComponent],
+    target: FfiEntity,
+    flags: u32,
+    propagate_relationship: BamComponent,
+    callback: F,
+) -> FfiResult
+where
+    E: AbiPod,
+    F: FnMut(FfiEntity, &E, &mut ValidatedCommands<'_>) -> FfiResult + Send + 'static,
+{
     // SAFETY: Caller guarantees `load_ctx` is an active `BamLoadCtx` belonging to `instance`.
     unsafe {
         submit_init_observer(
@@ -3166,7 +3263,7 @@ where
             load_ctx,
             name,
             ObserverKind::CustomRead(event, observer_closure_trampoline::<E, F>),
-            &[],
+            watched_components,
             target,
             flags,
             propagate_relationship,
@@ -3198,13 +3295,13 @@ where
         + Send
         + 'static,
 {
-    // SAFETY: Caller guarantees `load_ctx` is an active `BamLoadCtx` belonging to `instance`.
+    // SAFETY: Forwarding identical `load_ctx` invariant to `register_observer_mut_closure_with_watched`.
     unsafe {
-        submit_init_observer(
+        register_observer_mut_closure_with_watched::<E, F>(
             instance,
             load_ctx,
             name,
-            ObserverKind::CustomMut(event, observer_mut_closure_trampoline::<E, F>),
+            event,
             &[],
             target,
             flags,
@@ -3212,6 +3309,336 @@ where
             callback,
         )
     }
+}
+
+/// Validates and registers a mutable [`BamObserverDesc`] closure (`&mut E` + `&mut bool` propagate)
+/// with explicit `watched_components` filters on `load_ctx`.
+///
+/// # Safety
+/// `load_ctx` must be a non-null, active [`BamLoadCtx`] belonging to `instance` during
+/// `bamabi_init`.
+#[allow(clippy::too_many_arguments)]
+pub unsafe fn register_observer_mut_closure_with_watched<E, F>(
+    instance: &mut GuestInstance,
+    load_ctx: *mut BamLoadCtx,
+    name: &str,
+    event: BamComponent,
+    watched_components: &[BamComponent],
+    target: FfiEntity,
+    flags: u32,
+    propagate_relationship: BamComponent,
+    callback: F,
+) -> FfiResult
+where
+    E: AbiPod,
+    F: FnMut(FfiEntity, &mut E, &mut bool, &mut ValidatedCommands<'_>) -> FfiResult
+        + Send
+        + 'static,
+{
+    // SAFETY: Caller guarantees `load_ctx` is an active `BamLoadCtx` belonging to `instance`.
+    unsafe {
+        submit_init_observer(
+            instance,
+            load_ctx,
+            name,
+            ObserverKind::CustomMut(event, observer_mut_closure_trampoline::<E, F>),
+            watched_components,
+            target,
+            flags,
+            propagate_relationship,
+            callback,
+        )
+    }
+}
+
+/// Descriptor assembly configuration for ECS-context-aware custom observers
+/// ([`bamabi_sys::BamObserverCtxFn`] + [`BamObserverDesc::queries`]).
+#[derive(Clone, Copy, Debug)]
+pub struct ObserverCtxRegistrationConfig<'a> {
+    /// Optional UTF-8 diagnostic observer name (`None` leaves `BamObserverDesc::name` null).
+    pub name: Option<&'a str>,
+    /// Pre-resolved [`BamComponent`] event handle observed by this observer.
+    pub event: BamComponent,
+    /// Optional archetypal component filters checked against triggered target entities.
+    pub watched_components: &'a [BamComponent],
+    /// Optional target entity (`FfiEntity::NULL` observes globally / all targets).
+    pub target: FfiEntity,
+    /// `BAM_OBSERVER_FLAG_*` bitmask.
+    pub flags: u32,
+    /// Optional relationship component handle for propagation (`BamComponent::INVALID` -> `ChildOf`).
+    pub propagate_relationship: BamComponent,
+    /// User-declared entity/resource query clauses (`<= MAX_QUERIES_PER_SYSTEM`).
+    pub user_queries: &'a [&'a [BamTermDesc]],
+    /// Optional per-query `ParamSet` group IDs (`0` = independent query) parallel to `user_queries`.
+    pub user_query_param_set_groups: &'a [u32],
+    /// Optional observer-level singleton resource/message/removed terms (`RESOURCE_*` / `MESSAGE_*` / `REMOVED_READ`).
+    pub system_resources: &'a [BamTermDesc],
+}
+
+impl Default for ObserverCtxRegistrationConfig<'_> {
+    #[inline]
+    fn default() -> Self {
+        Self {
+            name: None,
+            event: BamComponent::INVALID,
+            watched_components: &[],
+            target: FfiEntity::NULL,
+            flags: 0,
+            propagate_relationship: BamComponent::INVALID,
+            user_queries: &[],
+            user_query_param_set_groups: &[],
+            system_resources: &[],
+        }
+    }
+}
+
+/// Consolidated owner for heap strings, watched-component handles, query descriptors, and term
+/// slices referenced by a context-aware [`BamObserverDesc`], tracked inside [`GuestInstance`]
+/// (or its [`RuntimeAllocTracker`]).
+struct OwnedObserverCtxDescriptorStorage {
+    name: Option<OwnedRawCString>,
+    watched: Box<[BamComponent]>,
+    _term_vecs: Vec<OwnedRawTermSlice>,
+    queries: Box<[BamQueryDesc]>,
+}
+
+// SAFETY: Every raw pointer inside `queries` and `name` points exclusively into heap-allocated
+// `OwnedRawTermSlice` and `OwnedRawCString` buffers owned by the same struct and never mutated
+// after construction (nor retagged on move); `watched` and `queries` pointers are read only after
+// this struct is pinned via `ObserverAllocTarget::track`.
+unsafe impl Send for OwnedObserverCtxDescriptorStorage {}
+
+/// Pinned descriptor pointers and query layout counts extracted by non-generic
+/// [`pin_observer_ctx_descriptor_storage`].
+struct PinnedObserverCtxParts {
+    total_query_count: usize,
+    user_query_count: usize,
+    resource_query_index: Option<usize>,
+    name_ptr: *const c_char,
+    watched_ptr: *const BamComponent,
+    watched_len: usize,
+    queries_ptr: *const BamQueryDesc,
+}
+
+/// Validates `config` and pins all owned descriptor buffers inside `alloc` (non-generic to avoid
+/// monomorphizing descriptor setup across `N`, `E`, or `F`).
+fn pin_observer_ctx_descriptor_storage(
+    alloc: &mut ObserverAllocTarget<'_>,
+    config: &ObserverCtxRegistrationConfig<'_>,
+) -> Result<PinnedObserverCtxParts, FfiResult> {
+    if !config.event.is_valid() {
+        return Err(FfiResult::INVALID_COMPONENT);
+    }
+    let name = match config.name {
+        Some(s) => Some(OwnedRawCString::from_str(s)?),
+        None => None,
+    };
+    let built_queries = validate_and_build_query_descs(
+        config.user_queries,
+        config.user_query_param_set_groups,
+        config.system_resources,
+    )?;
+
+    let storage = OwnedObserverCtxDescriptorStorage {
+        name,
+        watched: config.watched_components.into(),
+        _term_vecs: built_queries.term_vecs,
+        queries: built_queries.queries,
+    };
+    let raw_storage = alloc.track(Box::new(storage))?;
+    // SAFETY: `raw_storage` was just pinned by `alloc.track` inside `GuestInstance` or
+    // `RuntimeAllocTracker` and will not move again before `bamabi_shutdown`.
+    let storage_ref = unsafe { &*raw_storage };
+    let name_ptr = storage_ref
+        .name
+        .as_ref()
+        .map_or(core::ptr::null(), OwnedRawCString::as_ptr);
+    let (watched_ptr, watched_len) = if storage_ref.watched.is_empty() {
+        (core::ptr::null(), 0)
+    } else {
+        (storage_ref.watched.as_ptr(), storage_ref.watched.len())
+    };
+    let queries_ptr = if storage_ref.queries.is_empty() {
+        core::ptr::null()
+    } else {
+        storage_ref.queries.as_ptr()
+    };
+
+    Ok(PinnedObserverCtxParts {
+        total_query_count: built_queries.total_query_count,
+        user_query_count: built_queries.user_query_count,
+        resource_query_index: built_queries.resource_query_index,
+        name_ptr,
+        watched_ptr,
+        watched_len,
+        queries_ptr,
+    })
+}
+
+/// Const-bucketed panic-safe, re-entrancy-guarded `extern "C"` [`bamabi_sys::BamObserverCtxFn`] trampoline
+/// passing a zero-array [`ValidatedSystemSlice`] (`N ∈ {0, 1, 4, 16}`).
+pub(crate) unsafe extern "C" fn observer_ctx_slice_trampoline<const N: usize, E, F>(
+    target: FfiEntity,
+    event_data: *const c_void,
+    sys_ctx: *mut BamSystemCtx,
+    user_data: *mut c_void,
+) -> FfiResult
+where
+    E: AbiPod,
+    F: FnMut(FfiEntity, &E, &mut ValidatedSystemSlice<'_>) -> FfiResult + Send + 'static,
+{
+    catch_guest_result(|| {
+        if sys_ctx.is_null() || user_data.is_null() {
+            return FfiResult::NULL_POINTER;
+        }
+        if !(user_data as usize).is_multiple_of(core::mem::align_of::<SystemClosureState<F>>()) {
+            return FfiResult::INVALID_ARGUMENT;
+        }
+        if core::mem::size_of::<E>() > 0
+            && (event_data.is_null()
+                || !(event_data as usize).is_multiple_of(core::mem::align_of::<E>()))
+        {
+            return FfiResult::INVALID_ARGUMENT;
+        }
+        // SAFETY: `user_data` is non-null, aligned, and points to `SystemClosureState<F>` owned
+        // by `GuestInstance` (or its `RuntimeAllocTracker`).
+        let state = unsafe { &*user_data.cast::<SystemClosureState<F>>() };
+        // SAFETY: `state.host` points to `GuestInstance`'s heap-pinned `Host` outliving `state`.
+        let base_host = unsafe { state.host.as_ref() };
+        let Some(result) = state.closure.try_with_mut(|func| {
+            let event_ref: &E = if core::mem::size_of::<E>() == 0 {
+                // SAFETY: Zero-sized `E: AbiPod` may be referenced via `NonNull::dangling()`.
+                unsafe { core::ptr::NonNull::<E>::dangling().as_ref() }
+            } else {
+                // SAFETY: Verified non-null and aligned above; `try_with_mut` excludes re-entrant
+                // execution and host guarantees `event_data` points to initialized `E`.
+                unsafe { &*event_data.cast::<E>() }
+            };
+            let lazy_host = LazyInvocationHost::new(base_host, sys_ctx, &state.host_scratch.0);
+            // SAFETY: `state.closure.try_with_mut` holds exclusive access for this invocation.
+            let (clamped_total, clamped_user, clamped_res, scratches) =
+                unsafe { prepare_slice_scratches(N, state) };
+            // SAFETY: `sys_ctx` is non-null and active for the duration of this `BamObserverCtxFn` call.
+            let mut slice = unsafe {
+                ValidatedSystemSlice::from_raw_with_lazy_host(
+                    sys_ctx,
+                    &lazy_host,
+                    scratches,
+                    clamped_total,
+                    clamped_user,
+                    clamped_res,
+                )
+            };
+            func(target, event_ref, &mut slice)
+        }) else {
+            return FfiResult::ACCESS_CONFLICT;
+        };
+        result
+    })
+}
+
+/// Validates `config`, pins descriptor buffers and [`SystemClosureState`] via `alloc`, and returns
+/// a validated [`BamObserverDesc`] configured for `ctx_callback`.
+fn build_observer_ctx_slice_desc<const N: usize, E, F>(
+    mut alloc: ObserverAllocTarget<'_>,
+    config: &ObserverCtxRegistrationConfig<'_>,
+    callback: F,
+) -> Result<BamObserverDesc, FfiResult>
+where
+    E: AbiPod,
+    F: FnMut(FfiEntity, &E, &mut ValidatedSystemSlice<'_>) -> FfiResult + Send + 'static,
+{
+    let parts = pin_observer_ctx_descriptor_storage(&mut alloc, config)?;
+    let host = alloc.pinned_host_ptr()?;
+    let scratch_len = if N == 0 {
+        0
+    } else {
+        parts.total_query_count.min(N).min(MAX_QUERIES_PER_SYSTEM)
+    };
+    let raw_state = alloc.track(Box::new(SystemClosureState {
+        host,
+        total_query_count: parts.total_query_count,
+        user_query_count: parts.user_query_count,
+        resource_query_index: parts.resource_query_index,
+        host_scratch: InvocationHostScratch::new(),
+        slot_scratches: SlotScratchesCell::with_len(scratch_len),
+        closure: ReentrantCell::new(callback),
+    }))?;
+
+    let mut desc = BamObserverDesc::new_with_ctx(
+        config.event,
+        observer_ctx_slice_trampoline::<N, E, F>,
+        parts.queries_ptr,
+        parts.total_query_count,
+        raw_state.cast::<c_void>(),
+    )
+    .with_entity(config.target)
+    .with_flags(config.flags)
+    .with_watched_components(parts.watched_ptr, parts.watched_len);
+
+    if !parts.name_ptr.is_null() {
+        desc = desc.with_name(parts.name_ptr);
+    }
+    if config.propagate_relationship.is_valid() {
+        desc = desc.with_propagate(config.propagate_relationship);
+    }
+
+    let validation = desc.validate();
+    if !validation.is_ok() {
+        return Err(validation);
+    }
+    Ok(desc)
+}
+
+/// Validates and registers a context-aware [`BamObserverDesc`] backed by a const-bucketed
+/// `observer_ctx_slice_trampoline<N, E, F>` (`BamObserverCtxFn` + `BamObserverDesc::queries`) on
+/// `load_ctx`, tracking all closure state and owned descriptor buffers inside `instance`.
+///
+/// # Safety
+/// `load_ctx` must be a non-null, active [`BamLoadCtx`] belonging to `instance` during
+/// `bamabi_init`.
+pub unsafe fn register_observer_ctx_slice_closure<const N: usize, E, F>(
+    instance: &mut GuestInstance,
+    load_ctx: *mut BamLoadCtx,
+    config: &ObserverCtxRegistrationConfig<'_>,
+    callback: F,
+) -> FfiResult
+where
+    E: AbiPod,
+    F: FnMut(FfiEntity, &E, &mut ValidatedSystemSlice<'_>) -> FfiResult + Send + 'static,
+{
+    if load_ctx.is_null() {
+        return FfiResult::NULL_POINTER;
+    }
+    let Some(register_fn) = host_slot!(instance.host().api(), register_observer) else {
+        return FfiResult::UNSUPPORTED;
+    };
+    let desc = match build_observer_ctx_slice_desc::<N, E, F>(
+        ObserverAllocTarget::Init(instance),
+        config,
+        callback,
+    ) {
+        Ok(d) => d,
+        Err(err) => return err,
+    };
+    // SAFETY: `load_ctx` is active per caller contract and `desc` passed full validation with all
+    // pointed-to strings, watched component handles, query buffers, and closures owned by `instance`.
+    unsafe { register_fn(load_ctx, &desc) }
+}
+
+/// Allocates a runtime context-aware [`BamObserverDesc`] backed by
+/// `observer_ctx_slice_trampoline<N, E, F>` and tracked in `host`'s [`RuntimeAllocTracker`] for
+/// [`ValidatedCommands::observe_ctx_slice`].
+pub(crate) fn allocate_runtime_observer_ctx_slice_desc<const N: usize, E, F>(
+    host: &Host,
+    config: &ObserverCtxRegistrationConfig<'_>,
+    callback: F,
+) -> Result<BamObserverDesc, FfiResult>
+where
+    E: AbiPod,
+    F: FnMut(FfiEntity, &E, &mut ValidatedSystemSlice<'_>) -> FfiResult + Send + 'static,
+{
+    build_observer_ctx_slice_desc::<N, E, F>(ObserverAllocTarget::Runtime(host), config, callback)
 }
 
 /// Validates and registers a component lifecycle or `Ready` [`BamObserverDesc`] closure on

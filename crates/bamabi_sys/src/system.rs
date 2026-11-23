@@ -677,6 +677,22 @@ pub type BamObserverMutFn = unsafe extern "C" fn(
     user_data: *mut c_void,
 ) -> FfiResult;
 
+/// System-context-aware guest observer callback receiving an active [`BamSystemCtx`]
+/// (`typedef BamResult (*BamObserverCtxFn)(BamEntity entity, const void* event_data, BamSystemCtx* ctx, void* user_data);`).
+///
+/// # Safety
+/// - `event_data` points to the triggered event payload valid strictly for the duration of the
+///   call (or null for zero-sized / lifecycle events).
+/// - `ctx` points to an active [`BamSystemCtx`] backed by this observer's declared
+///   `queries[0..query_count]` and per-observer deferred command queue.
+/// - Must never unwind across the `extern "C"` boundary.
+pub type BamObserverCtxFn = unsafe extern "C" fn(
+    entity: FfiEntity,
+    event_data: *const c_void,
+    ctx: *mut BamSystemCtx,
+    user_data: *mut c_void,
+) -> FfiResult;
+
 /// Enable relationship-hierarchy propagation control on [`BamObserverDesc::flags`].
 pub const BAM_OBSERVER_FLAG_PROPAGATE: u32 = 1 << 0;
 
@@ -686,8 +702,8 @@ pub const BAM_OBSERVER_KNOWN_FLAGS: u32 = BAM_OBSERVER_FLAG_PROPAGATE;
 /// Extensible dynamic observer registration descriptor (`typedef struct BamObserverDesc BamObserverDesc;`).
 ///
 /// Layout:
-/// - 64-bit: `MIN_V0_2_SIZE = 48` bytes (`size_of = 88` bytes with lifecycle/watched/mut/propagate fields), `8`-byte alignment, zero implicit padding.
-/// - 32-bit: `MIN_V0_2_SIZE = 36` bytes (`size_of = 64` bytes with lifecycle/watched/mut/propagate fields), `4`-byte alignment, zero implicit padding.
+/// - 64-bit: `MIN_V0_2_SIZE = 48` bytes (`size_of = 112` bytes with lifecycle/watched/mut/propagate/ctx fields), `8`-byte alignment, zero implicit padding.
+/// - 32-bit: `MIN_V0_2_SIZE = 36` bytes (`size_of = 76` bytes with lifecycle/watched/mut/propagate/ctx fields), `4`-byte alignment, zero implicit padding.
 #[repr(C)]
 #[derive(Debug, Copy, Clone)]
 pub struct BamObserverDesc {
@@ -705,9 +721,9 @@ pub struct BamObserverDesc {
     pub entity_hi: u32,
     /// Explicit zero-reserved field (`must be 0`, `offset 28` / `24`).
     pub reserved0: u32,
-    /// Read-only observer callback (`offset 32` / `28`; at least one of `callback` or `mut_callback` must be `Some`).
+    /// Read-only observer callback (`offset 32` / `28`; at least one of `callback`, `mut_callback`, or `ctx_callback` must be `Some`).
     pub callback: Option<BamObserverFn>,
-    /// Opaque guest-owned state passed to `callback` / `mut_callback` (`offset 40` / `32`).
+    /// Opaque guest-owned state passed to `callback` / `mut_callback` / `ctx_callback` (`offset 40` / `32`).
     pub user_data: *mut c_void,
     /// Observed event kind (`CUSTOM` or lifecycle `ADD`..=`READY`, `offset 48` / `36`).
     pub event_kind: BamEventKind,
@@ -721,8 +737,14 @@ pub struct BamObserverDesc {
     pub mut_callback: Option<BamObserverMutFn>,
     /// Optional relationship component handle for propagation (`BamComponent::INVALID` defaults to `ChildOf`, `offset 80` / `56`).
     pub propagate_relationship: BamComponent,
-    /// Explicit zero-reserved trailing alignment field (`must be 0`, `offset 84` / `60`).
+    /// Explicit zero-reserved alignment field (`must be 0`, `offset 84` / `60`).
     pub reserved2: u32,
+    /// Optional [`BamSystemCtx`]-aware observer callback (`offset 88` / `64`).
+    pub ctx_callback: Option<BamObserverCtxFn>,
+    /// Optional array of [`BamQueryDesc`] clauses declared for `ctx_callback` (`offset 96` / `68`).
+    pub queries: *const BamQueryDesc,
+    /// Number of entries in `queries` (`0..=MAX_QUERIES_PER_SYSTEM`, `offset 104` / `72`).
+    pub query_count: usize,
 }
 
 impl BamObserverDesc {
@@ -750,6 +772,9 @@ impl BamObserverDesc {
             mut_callback: None,
             propagate_relationship: BamComponent::INVALID,
             reserved2: 0,
+            ctx_callback: None,
+            queries: core::ptr::null(),
+            query_count: 0,
         }
     }
 
@@ -777,6 +802,42 @@ impl BamObserverDesc {
             mut_callback: Some(mut_callback),
             propagate_relationship: BamComponent::INVALID,
             reserved2: 0,
+            ctx_callback: None,
+            queries: core::ptr::null(),
+            query_count: 0,
+        }
+    }
+
+    /// Constructs a global custom-event observer descriptor watching `event` with a
+    /// [`BamSystemCtx`]-aware `ctx_callback` and declared `queries[0..query_count]`.
+    #[inline]
+    pub const fn new_with_ctx(
+        event: BamComponent,
+        ctx_callback: BamObserverCtxFn,
+        queries: *const BamQueryDesc,
+        query_count: usize,
+        user_data: *mut c_void,
+    ) -> Self {
+        Self {
+            struct_size: core::mem::size_of::<Self>() as u32,
+            flags: 0,
+            name: core::ptr::null(),
+            event,
+            entity_lo: 0,
+            entity_hi: 0,
+            reserved0: 0,
+            callback: None,
+            user_data,
+            event_kind: BamEventKind::CUSTOM,
+            reserved1: 0,
+            watched_components: core::ptr::null(),
+            watched_component_count: 0,
+            mut_callback: None,
+            propagate_relationship: BamComponent::INVALID,
+            reserved2: 0,
+            ctx_callback: Some(ctx_callback),
+            queries,
+            query_count,
         }
     }
 
@@ -807,6 +868,9 @@ impl BamObserverDesc {
             mut_callback: None,
             propagate_relationship: BamComponent::INVALID,
             reserved2: 0,
+            ctx_callback: None,
+            queries: core::ptr::null(),
+            query_count: 0,
         }
     }
 
@@ -868,6 +932,21 @@ impl BamObserverDesc {
         self
     }
 
+    /// Attaches a [`BamSystemCtx`]-aware [`BamObserverCtxFn`] callback.
+    #[inline]
+    pub const fn with_ctx_callback(mut self, ctx_callback: BamObserverCtxFn) -> Self {
+        self.ctx_callback = Some(ctx_callback);
+        self
+    }
+
+    /// Attaches declared [`BamQueryDesc`] query clauses (`queries[0..query_count]`) for `ctx_callback`.
+    #[inline]
+    pub const fn with_queries(mut self, queries: *const BamQueryDesc, query_count: usize) -> Self {
+        self.queries = queries;
+        self.query_count = query_count;
+        self
+    }
+
     /// Enables relationship propagation (`BAM_OBSERVER_FLAG_PROPAGATE`) over `relationship`
     /// (`BamComponent::INVALID` defaults to `ChildOf`).
     #[inline]
@@ -890,7 +969,7 @@ impl BamObserverDesc {
     }
 
     /// Validates `struct_size`, known `flags`, zero-reserved words, `event_kind`, watched component
-    /// pointer validity, event/lifecycle handle rules, and callback presence.
+    /// pointer validity, declared `queries`, event/lifecycle handle rules, and callback presence.
     #[inline]
     pub const fn validate(&self) -> FfiResult {
         if (self.struct_size as usize) < Self::MIN_V0_2_SIZE {
@@ -908,6 +987,12 @@ impl BamObserverDesc {
         if self.watched_component_count > 0 && self.watched_components.is_null() {
             return FfiResult::NULL_POINTER;
         }
+        if self.query_count > MAX_QUERIES_PER_SYSTEM {
+            return FfiResult::CAPACITY_EXCEEDED;
+        }
+        if self.query_count > 0 && self.queries.is_null() {
+            return FfiResult::NULL_POINTER;
+        }
         if self.event_kind.is_custom() {
             if !self.event.is_valid() {
                 return FfiResult::INVALID_COMPONENT;
@@ -918,8 +1003,11 @@ impl BamObserverDesc {
         {
             return FfiResult::INVALID_COMPONENT;
         }
-        if self.callback.is_none() && self.mut_callback.is_none() {
+        if self.callback.is_none() && self.mut_callback.is_none() && self.ctx_callback.is_none() {
             return FfiResult::NULL_POINTER;
+        }
+        if self.query_count > 0 && self.ctx_callback.is_none() {
+            return FfiResult::INVALID_ARGUMENT;
         }
         FfiResult::OK
     }
@@ -930,7 +1018,7 @@ const _: () = {
     #[cfg(target_pointer_width = "64")]
     {
         assert!(BamObserverDesc::MIN_V0_2_SIZE == 48);
-        assert!(core::mem::size_of::<BamObserverDesc>() == 88);
+        assert!(core::mem::size_of::<BamObserverDesc>() == 112);
         assert!(core::mem::align_of::<BamObserverDesc>() == 8);
         assert!(core::mem::offset_of!(BamObserverDesc, struct_size) == 0);
         assert!(core::mem::offset_of!(BamObserverDesc, flags) == 4);
@@ -948,11 +1036,14 @@ const _: () = {
         assert!(core::mem::offset_of!(BamObserverDesc, mut_callback) == 72);
         assert!(core::mem::offset_of!(BamObserverDesc, propagate_relationship) == 80);
         assert!(core::mem::offset_of!(BamObserverDesc, reserved2) == 84);
+        assert!(core::mem::offset_of!(BamObserverDesc, ctx_callback) == 88);
+        assert!(core::mem::offset_of!(BamObserverDesc, queries) == 96);
+        assert!(core::mem::offset_of!(BamObserverDesc, query_count) == 104);
     }
     #[cfg(target_pointer_width = "32")]
     {
         assert!(BamObserverDesc::MIN_V0_2_SIZE == 36);
-        assert!(core::mem::size_of::<BamObserverDesc>() == 64);
+        assert!(core::mem::size_of::<BamObserverDesc>() == 76);
         assert!(core::mem::align_of::<BamObserverDesc>() == 4);
         assert!(core::mem::offset_of!(BamObserverDesc, struct_size) == 0);
         assert!(core::mem::offset_of!(BamObserverDesc, flags) == 4);
@@ -970,6 +1061,9 @@ const _: () = {
         assert!(core::mem::offset_of!(BamObserverDesc, mut_callback) == 52);
         assert!(core::mem::offset_of!(BamObserverDesc, propagate_relationship) == 56);
         assert!(core::mem::offset_of!(BamObserverDesc, reserved2) == 60);
+        assert!(core::mem::offset_of!(BamObserverDesc, ctx_callback) == 64);
+        assert!(core::mem::offset_of!(BamObserverDesc, queries) == 68);
+        assert!(core::mem::offset_of!(BamObserverDesc, query_count) == 72);
     }
 };
 

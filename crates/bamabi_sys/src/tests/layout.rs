@@ -32,8 +32,8 @@ use crate::{
     BamIterColumnRowsReadonlyFn, BamIterColumnTicksFn, BamIterEntitiesFn,
     BamIterMarkChangedRangeFn, BamIterNextChunkFn, BamIterReadRemovedFn, BamIterResetFn,
     BamLastErrorFn, BamLayoutInfo, BamLoadCtx, BamLoadHostCtxFn, BamManifest, BamManifestFn,
-    BamMsgReadBatchFn, BamMsgSendFn, BamMsgWriteBatchFn, BamObserverDesc, BamObserverFn,
-    BamObserverMutFn, BamParForEachChunkFn, BamQueryDesc, BamRegisterComponentFn,
+    BamMsgReadBatchFn, BamMsgSendFn, BamMsgWriteBatchFn, BamObserverCtxFn, BamObserverDesc,
+    BamObserverFn, BamObserverMutFn, BamParForEachChunkFn, BamQueryDesc, BamRegisterComponentFn,
     BamRegisterObserverFn, BamRegisterSystemFn, BamRelationDesc, BamRequiredComponent,
     BamResMutPtrFn, BamResPtrFn, BamResTicksFn, BamResolveComponentFn, BamRestoreStateFn,
     BamRunIfFn, BamSaveStateFn, BamScheduleSetDesc, BamShutdownFn, BamStateWriterFn, BamSymbol,
@@ -507,6 +507,7 @@ fn abi_v0_2_exact_sizes_alignments_and_offsets() {
     assert_eq!(size_of::<Option<ComponentHookFn>>(), ptr_sz);
     assert_eq!(size_of::<Option<ComponentCloneFn>>(), ptr_sz);
     assert_eq!(size_of::<Option<BamObserverMutFn>>(), ptr_sz);
+    assert_eq!(size_of::<Option<BamObserverCtxFn>>(), ptr_sz);
     assert_eq!(size_of::<Option<BamCmdSpawnBatchFn>>(), ptr_sz);
     assert_eq!(size_of::<Option<BamCmdDespawnAllFn>>(), ptr_sz);
     assert_eq!(size_of::<Option<BamCmdTriggerExFn>>(), ptr_sz);
@@ -532,7 +533,7 @@ fn abi_v0_2_exact_sizes_alignments_and_offsets() {
         assert_eq!(BamQueryDesc::MIN_V0_2_SIZE, 24);
         assert_eq!(size_of::<BamSystemDesc>(), 192);
         assert_eq!(BamSystemDesc::MIN_V0_2_SIZE, 104);
-        assert_eq!(size_of::<BamObserverDesc>(), 88);
+        assert_eq!(size_of::<BamObserverDesc>(), 112);
         assert_eq!(BamObserverDesc::MIN_V0_2_SIZE, 48);
         assert_eq!(size_of::<BamTriggerDesc>(), 64);
         assert_eq!(BamTriggerDesc::MIN_V0_2_SIZE, 64);
@@ -557,7 +558,7 @@ fn abi_v0_2_exact_sizes_alignments_and_offsets() {
         assert_eq!(BamQueryDesc::MIN_V0_2_SIZE, 16);
         assert_eq!(size_of::<BamSystemDesc>(), 104);
         assert_eq!(BamSystemDesc::MIN_V0_2_SIZE, 60);
-        assert_eq!(size_of::<BamObserverDesc>(), 64);
+        assert_eq!(size_of::<BamObserverDesc>(), 76);
         assert_eq!(BamObserverDesc::MIN_V0_2_SIZE, 36);
         assert_eq!(size_of::<BamTriggerDesc>(), 48);
         assert_eq!(BamTriggerDesc::MIN_V0_2_SIZE, 48);
@@ -1500,6 +1501,129 @@ fn ffi_option_asset_handles_triggers_lifecycle_observers_and_modes() {
     assert!(mut_obs.is_propagating());
     assert_eq!(mut_obs.flags, BAM_OBSERVER_FLAG_PROPAGATE);
     assert_eq!(mut_obs.validate(), FfiResult::OK);
+
+    // 4b. System-context-aware BamObserverDesc (`ctx_callback`, `queries`, `query_count`) + guards + prefix zero-extension
+    unsafe extern "C" fn stub_obs_ctx(
+        _entity: FfiEntity,
+        _event_data: *const c_void,
+        _ctx: *mut BamSystemCtx,
+        _user_data: *mut c_void,
+    ) -> FfiResult {
+        FfiResult::OK
+    }
+    let obs_terms = [BamTermDesc::read(asset_ty)];
+    let obs_queries = [BamQueryDesc::new(obs_terms.as_ptr(), obs_terms.len())];
+    let ctx_obs = BamObserverDesc::new_with_ctx(
+        asset_ty,
+        stub_obs_ctx,
+        obs_queries.as_ptr(),
+        obs_queries.len(),
+        core::ptr::null_mut(),
+    )
+    .with_watched_components(watched.as_ptr(), watched.len());
+    assert_eq!(ctx_obs.validate(), FfiResult::OK);
+
+    let mut bad_obs = ctx_obs;
+    bad_obs.query_count = MAX_QUERIES_PER_SYSTEM + 1;
+    assert_eq!(bad_obs.validate(), FfiResult::CAPACITY_EXCEEDED);
+
+    let mut bad_obs = ctx_obs;
+    bad_obs.queries = core::ptr::null();
+    assert_eq!(bad_obs.validate(), FfiResult::NULL_POINTER);
+
+    let mut bad_obs = ctx_obs;
+    bad_obs.ctx_callback = None;
+    assert_eq!(bad_obs.validate(), FfiResult::NULL_POINTER);
+
+    let bad_obs = BamObserverDesc::new(asset_ty, stub_obs_ro, core::ptr::null_mut())
+        .with_queries(obs_queries.as_ptr(), obs_queries.len());
+    assert_eq!(bad_obs.validate(), FfiResult::INVALID_ARGUMENT);
+
+    // Zero-extension from frozen v0.2 (48/36 B) and pre-ctx v0.3 (88/64 B) prefixes
+    #[repr(C)]
+    #[derive(Copy, Clone)]
+    struct MinimalV02ObserverDesc {
+        struct_size: u32,
+        flags: u32,
+        name: *const c_char,
+        event: BamComponent,
+        entity_lo: u32,
+        entity_hi: u32,
+        reserved0: u32,
+        callback: Option<BamObserverFn>,
+        user_data: *mut c_void,
+    }
+    assert_eq!(
+        size_of::<MinimalV02ObserverDesc>(),
+        BamObserverDesc::MIN_V0_2_SIZE
+    );
+    let legacy_obs = MinimalV02ObserverDesc {
+        struct_size: size_of::<MinimalV02ObserverDesc>() as u32,
+        flags: 0,
+        name: c"v02_obs".as_ptr(),
+        event: asset_ty,
+        entity_lo: 0,
+        entity_hi: 0,
+        reserved0: 0,
+        callback: Some(stub_obs_ro),
+        user_data: core::ptr::null_mut(),
+    };
+    // SAFETY: `legacy_obs` is initialized on the stack with `MIN_V0_2_SIZE` bytes.
+    let widened_v02_obs =
+        unsafe { read_descriptor::<BamObserverDesc>((&raw const legacy_obs).cast::<c_void>()) }
+            .expect("MIN_V0_2_SIZE BamObserverDesc must be accepted");
+    assert_eq!(widened_v02_obs.validate(), FfiResult::OK);
+    assert!(widened_v02_obs.ctx_callback.is_none());
+    assert!(widened_v02_obs.queries.is_null());
+    assert_eq!(widened_v02_obs.query_count, 0);
+
+    #[repr(C)]
+    #[derive(Copy, Clone)]
+    struct LegacyV03PreCtxObserverDesc {
+        struct_size: u32,
+        flags: u32,
+        name: *const c_char,
+        event: BamComponent,
+        entity_lo: u32,
+        entity_hi: u32,
+        reserved0: u32,
+        callback: Option<BamObserverFn>,
+        user_data: *mut c_void,
+        event_kind: BamEventKind,
+        reserved1: u32,
+        watched_components: *const BamComponent,
+        watched_component_count: usize,
+        mut_callback: Option<BamObserverMutFn>,
+        propagate_relationship: BamComponent,
+        reserved2: u32,
+    }
+    let pre_ctx_obs = LegacyV03PreCtxObserverDesc {
+        struct_size: size_of::<LegacyV03PreCtxObserverDesc>() as u32,
+        flags: BAM_OBSERVER_FLAG_PROPAGATE,
+        name: c"v03_pre_ctx_obs".as_ptr(),
+        event: asset_ty,
+        entity_lo: 0,
+        entity_hi: 0,
+        reserved0: 0,
+        callback: Some(stub_obs_ro),
+        user_data: core::ptr::null_mut(),
+        event_kind: BamEventKind::CUSTOM,
+        reserved1: 0,
+        watched_components: watched.as_ptr(),
+        watched_component_count: watched.len(),
+        mut_callback: None,
+        propagate_relationship: BamComponent::INVALID,
+        reserved2: 0,
+    };
+    // SAFETY: `pre_ctx_obs` is initialized on the stack with its exact `struct_size`.
+    let widened_v03_obs =
+        unsafe { read_descriptor::<BamObserverDesc>((&raw const pre_ctx_obs).cast::<c_void>()) }
+            .expect("pre-ctx v0.3 BamObserverDesc must be accepted");
+    assert_eq!(widened_v03_obs.validate(), FfiResult::OK);
+    assert!(widened_v03_obs.is_propagating());
+    assert!(widened_v03_obs.ctx_callback.is_none());
+    assert!(widened_v03_obs.queries.is_null());
+    assert_eq!(widened_v03_obs.query_count, 0);
 
     let mut payload = 42u32;
     let trig = BamTriggerDesc::new(asset_ty, (&raw mut payload).cast::<u8>(), size_of::<u32>())

@@ -2627,3 +2627,470 @@ fn s13_hot_reload_column_migration_and_scratch_shrink_soundness() {
         assert_eq!(host_state.col_info_calls.load(Ordering::Relaxed), 1);
     }
 }
+
+// ============================================================================
+// S14: Context-aware observer (`BamObserverCtxFn`), query pinning & re-entrancy
+// ============================================================================
+
+/// Verifies under Miri (`-Zmiri-tree-borrows -Zmiri-strict-provenance`) that:
+/// 1. `register_observer_ctx_slice_closure` validates `ObserverCtxRegistrationConfig` and pins
+///    `name`, `watched_components`, query descriptors (`param_set_group` + `system_resources`),
+///    and trampoline state inside `GuestInstance` with zero `Box` provenance retagging.
+/// 2. `observer_ctx_slice_trampoline` enforces null/alignment checks, ZST event support, panic
+///    containment (`PANIC_CAUGHT`), and lock-free `ReentrantCell` re-entrancy rejection
+///    (`ACCESS_CONFLICT`) before materializing `&E`.
+/// 3. Runtime `ValidatedCommands::observe_ctx_slice` tracks all descriptor buffers inside
+///    `RuntimeAllocTracker` and drops them cleanly in LIFO order on `shutdown_guest_instance`.
+#[test]
+fn s14_observer_ctx_trampoline_reentrancy_guards_and_query_pinning() {
+    use bamabi_sys::{
+        BAM_QUERY_FLAG_PARAM_SET, BamInstance, BamObserverCtxFn, BamObserverDesc, FfiResult,
+        MAX_QUERIES_PER_SYSTEM,
+    };
+    use core::sync::atomic::AtomicBool;
+    use std::sync::{Arc, Mutex};
+
+    #[repr(C)]
+    struct CaptureObsState {
+        last_desc: Option<BamObserverDesc>,
+        last_name: Option<String>,
+        last_watched: Vec<BamComponent>,
+        last_query_groups: Vec<u32>,
+        last_query_term_counts: Vec<usize>,
+        runtime_spawns: usize,
+    }
+
+    unsafe extern "C" fn capture_register_obs(
+        load_ctx: *mut BamLoadCtx,
+        desc: *const BamObserverDesc,
+    ) -> FfiResult {
+        if load_ctx.is_null() || desc.is_null() {
+            return FfiResult::NULL_POINTER;
+        }
+        // SAFETY: `desc` points to a readable `BamObserverDesc`.
+        let d = unsafe { *desc };
+        let val = d.validate();
+        if !val.is_ok() {
+            return val;
+        }
+        // SAFETY: `load_ctx` points to `CaptureObsState`.
+        let cap = unsafe { &mut *load_ctx.cast::<CaptureObsState>() };
+        cap.last_desc = Some(d);
+        cap.last_name = if d.name.is_null() {
+            None
+        } else {
+            // SAFETY: Valid NUL-terminated UTF-8 from guest registration.
+            Some(
+                unsafe { CStr::from_ptr(d.name) }
+                    .to_str()
+                    .unwrap()
+                    .to_owned(),
+            )
+        };
+        cap.last_watched = if d.watched_component_count == 0 {
+            Vec::new()
+        } else {
+            // SAFETY: `watched_components` covers `watched_component_count` entries for this call.
+            unsafe { core::slice::from_raw_parts(d.watched_components, d.watched_component_count) }
+                .to_vec()
+        };
+        cap.last_query_groups.clear();
+        cap.last_query_term_counts.clear();
+        if d.query_count > 0 {
+            // SAFETY: `queries` covers `query_count` entries with valid term slices.
+            let qs = unsafe { core::slice::from_raw_parts(d.queries, d.query_count) };
+            for q in qs {
+                let qv = q.validate();
+                if !qv.is_ok() {
+                    return qv;
+                }
+                cap.last_query_groups.push(q.param_set_group);
+                cap.last_query_term_counts.push(q.term_count);
+                if q.term_count > 0 {
+                    // SAFETY: `q.terms` covers `q.term_count` readable terms.
+                    let terms = unsafe { core::slice::from_raw_parts(q.terms, q.term_count) };
+                    assert!(terms.iter().all(|t| t.validate().is_ok()));
+                }
+            }
+        }
+        FfiResult::OK
+    }
+
+    unsafe extern "C" fn capture_cmd_observe(
+        commands: *mut BamCommands,
+        desc: *const BamObserverDesc,
+        out_entity: *mut FfiEntity,
+    ) -> FfiResult {
+        if commands.is_null() || desc.is_null() {
+            return FfiResult::NULL_POINTER;
+        }
+        // SAFETY: `desc` points to a readable `BamObserverDesc`.
+        let d = unsafe { *desc };
+        let val = d.validate();
+        if !val.is_ok() {
+            return val;
+        }
+        // SAFETY: `commands` points to `CaptureObsState` for this test.
+        let cap = unsafe { &mut *commands.cast::<CaptureObsState>() };
+        cap.runtime_spawns += 1;
+        cap.last_desc = Some(d);
+        if !out_entity.is_null() {
+            // SAFETY: `out_entity` is writable stack storage.
+            unsafe { *out_entity = FfiEntity::from_bits(808) };
+        }
+        FfiResult::OK
+    }
+
+    let mut api = make_mock_api();
+    api.register_observer = Some(capture_register_obs);
+    api.cmd_observe = Some(capture_cmd_observe);
+
+    let dummy_ctx = 0u64;
+    // SAFETY: Stack pointers live for this test.
+    let _host = unsafe { Host::from_raw(&api, (&raw const dummy_ctx).cast()) }.unwrap();
+    let manifest = BamManifest::new(c"s14_ctx_mod".as_ptr(), c"0.3.0".as_ptr());
+
+    let mut cap = CaptureObsState {
+        last_desc: None,
+        last_name: None,
+        last_watched: Vec::new(),
+        last_query_groups: Vec::new(),
+        last_query_term_counts: Vec::new(),
+        runtime_spawns: 0,
+    };
+
+    #[repr(C)]
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    struct PackedCtxEvent {
+        amount: u64,
+        code: u32,
+        tag: u32,
+    }
+    // SAFETY: POD struct with zero padding (`8 + 4 + 4 == 16`).
+    unsafe impl bamabi_sys::RawInsertable for PackedCtxEvent {}
+    // SAFETY: Fixed C layout, all primitive `AbiPod` fields.
+    unsafe impl bamabi_sys::AbiPod for PackedCtxEvent {}
+
+    struct CtxBundle {
+        cb: Option<BamObserverCtxFn>,
+        ud: *mut c_void,
+        ev: *const c_void,
+        sys_ctx: *mut BamSystemCtx,
+    }
+    // SAFETY: Used strictly on the single test thread.
+    unsafe impl Send for CtxBundle {}
+
+    let bundle = Arc::new(Mutex::new(CtxBundle {
+        cb: None,
+        ud: core::ptr::null_mut(),
+        ev: core::ptr::null(),
+        sys_ctx: core::ptr::null_mut(),
+    }));
+    let bundle_clone = Arc::clone(&bundle);
+    let inner_rc = Arc::new(Mutex::new(FfiResult::OK));
+    let inner_rc_clone = Arc::clone(&inner_rc);
+    let seen_amount = Arc::new(AtomicUsize::new(0));
+    let seen_amount_clone = Arc::clone(&seen_amount);
+
+    let q0_terms = [BamTermDesc::read(BamComponent::from_raw(10))];
+    let q1_terms = [BamTermDesc::write(BamComponent::from_raw(10))];
+    let res_terms = [BamTermDesc::new(
+        BamComponent::from_raw(20),
+        AccessMode::RESOURCE_WRITE,
+    )];
+    let watched = [BamComponent::from_raw(30), BamComponent::from_raw(31)];
+
+    let mut raw_inst: *mut BamInstance = core::ptr::null_mut();
+    // SAFETY: Pointers remain live for the duration of `init_guest_instance`.
+    let init_rc = unsafe {
+        init_guest_instance(
+            &api,
+            (&raw mut cap).cast::<BamLoadCtx>(),
+            &raw mut raw_inst,
+            &manifest,
+            move |inst, load| {
+                let user_queries = [&q0_terms[..], &q1_terms[..]];
+                let groups = [1u32, 1u32];
+
+                // Error guards (must not leak or poison init).
+                let bad_ev = ObserverCtxRegistrationConfig {
+                    name: Some("bad_ev"),
+                    event: BamComponent::INVALID,
+                    ..Default::default()
+                };
+                assert_eq!(
+                    load.register_observer_ctx_slice::<0, PackedCtxEvent, _>(
+                        inst,
+                        &bad_ev,
+                        |_tgt, _ev, _inv| FfiResult::OK
+                    ),
+                    FfiResult::INVALID_COMPONENT
+                );
+                let empty_name = ObserverCtxRegistrationConfig {
+                    name: Some(""),
+                    event: BamComponent::from_raw(5),
+                    ..Default::default()
+                };
+                assert_eq!(
+                    load.register_observer_ctx_slice::<0, PackedCtxEvent, _>(
+                        inst,
+                        &empty_name,
+                        |_tgt, _ev, _inv| FfiResult::OK
+                    ),
+                    FfiResult::INVALID_ARGUMENT
+                );
+                let too_many_queries: [&[BamTermDesc]; MAX_QUERIES_PER_SYSTEM] =
+                    [&q0_terms[..]; MAX_QUERIES_PER_SYSTEM];
+                let overflow_cfg = ObserverCtxRegistrationConfig {
+                    name: Some("overflow_obs"),
+                    event: BamComponent::from_raw(5),
+                    user_queries: &too_many_queries,
+                    system_resources: &res_terms,
+                    ..Default::default()
+                };
+                assert_eq!(
+                    load.register_observer_ctx_slice::<MAX_QUERIES_PER_SYSTEM, PackedCtxEvent, _>(
+                        inst,
+                        &overflow_cfg,
+                        |_tgt, _ev, _inv| FfiResult::OK
+                    ),
+                    FfiResult::CAPACITY_EXCEEDED
+                );
+
+                // Valid ctx observer with `watched_components`, param_set queries, and system resource.
+                let cfg = ObserverCtxRegistrationConfig {
+                    name: Some("s14_ctx_obs"),
+                    event: BamComponent::from_raw(5),
+                    watched_components: &watched,
+                    target: FfiEntity::from_bits(77),
+                    user_queries: &user_queries,
+                    user_query_param_set_groups: &groups,
+                    system_resources: &res_terms,
+                    ..Default::default()
+                };
+                load.register_observer_ctx_slice::<4, PackedCtxEvent, _>(
+                    inst,
+                    &cfg,
+                    move |tgt, ev, inv| {
+                        assert_eq!(tgt, FfiEntity::from_bits(77));
+                        seen_amount_clone.store(ev.amount as usize, Ordering::SeqCst);
+                        assert_eq!(inv.query_count(), 2);
+                        assert_eq!(inv.resource_query_index(), Some(2));
+                        let (cb, ud, ev_ptr, sys_ctx) = {
+                            let g = bundle_clone.lock().unwrap();
+                            (g.cb.unwrap(), g.ud, g.ev, g.sys_ctx)
+                        };
+                        // Re-enter with live `ev_ptr` and `sys_ctx`; `ReentrantCell` must reject
+                        // before forming a second `&PackedCtxEvent` or aliasing scratch slots!
+                        // SAFETY: Intentional re-entrancy test under Miri (`#[warn(unused_unsafe)]` clean).
+                        let nested = cb(tgt, ev_ptr, sys_ctx, ud);
+                        *inner_rc_clone.lock().unwrap() = nested;
+                        FfiResult::OK
+                    },
+                )
+            },
+        )
+    };
+    assert_eq!(init_rc, FfiResult::OK);
+    let d = cap.last_desc.take().expect("captured observer desc");
+    assert!(d.callback.is_none());
+    assert!(d.mut_callback.is_none());
+    let ctx_cb = d.ctx_callback.expect("ctx_callback populated");
+    assert_eq!(cap.last_name.as_deref(), Some("s14_ctx_obs"));
+    assert_eq!(cap.last_watched, watched);
+    assert_eq!(d.query_count, 3);
+    assert_eq!(cap.last_query_groups, vec![1, 1, 0]);
+    assert_eq!(cap.last_query_term_counts, vec![1, 1, 1]);
+    // SAFETY: `d.queries` points to 3 descriptors owned by `raw_inst`.
+    let q0_desc = unsafe { *d.queries };
+    assert_eq!(
+        q0_desc.flags & BAM_QUERY_FLAG_PARAM_SET,
+        BAM_QUERY_FLAG_PARAM_SET
+    );
+
+    let ev_val = PackedCtxEvent {
+        amount: 99,
+        code: 3,
+        tag: 4,
+    };
+    let mut mock_sys = 0u64;
+    let mock_sys_ptr = (&raw mut mock_sys).cast::<BamSystemCtx>();
+
+    // Pointer & alignment fail-closed checks on `observer_ctx_slice_trampoline`.
+    // SAFETY: Deliberately passing invalid/null pointers to exercise validation guards.
+    unsafe {
+        assert_eq!(
+            ctx_cb(
+                FfiEntity::from_bits(77),
+                (&raw const ev_val).cast(),
+                core::ptr::null_mut(),
+                d.user_data
+            ),
+            FfiResult::NULL_POINTER
+        );
+        assert_eq!(
+            ctx_cb(
+                FfiEntity::from_bits(77),
+                (&raw const ev_val).cast(),
+                mock_sys_ptr,
+                core::ptr::null_mut()
+            ),
+            FfiResult::NULL_POINTER
+        );
+        let mut misaligned_buf = [0u64; 4];
+        let misaligned_ptr = misaligned_buf.as_mut_ptr().cast::<u8>().add(1);
+        assert_eq!(
+            ctx_cb(
+                FfiEntity::from_bits(77),
+                (&raw const ev_val).cast(),
+                mock_sys_ptr,
+                misaligned_ptr.cast::<c_void>()
+            ),
+            FfiResult::INVALID_ARGUMENT
+        );
+        assert_eq!(
+            ctx_cb(
+                FfiEntity::from_bits(77),
+                misaligned_ptr.cast::<c_void>(),
+                mock_sys_ptr,
+                d.user_data
+            ),
+            FfiResult::INVALID_ARGUMENT
+        );
+    }
+
+    {
+        let mut g = bundle.lock().unwrap();
+        g.cb = Some(ctx_cb);
+        g.ud = d.user_data;
+        g.ev = (&raw const ev_val).cast::<c_void>();
+        g.sys_ctx = mock_sys_ptr;
+    }
+    // SAFETY: Valid live `ev_val`, `mock_sys_ptr`, and `d.user_data` inside `raw_inst`.
+    let rc = unsafe {
+        ctx_cb(
+            FfiEntity::from_bits(77),
+            (&raw const ev_val).cast::<c_void>(),
+            mock_sys_ptr,
+            d.user_data,
+        )
+    };
+    assert_eq!(rc, FfiResult::OK);
+    assert_eq!(seen_amount.load(Ordering::SeqCst), 99);
+    assert_eq!(*inner_rc.lock().unwrap(), FfiResult::ACCESS_CONFLICT);
+    // Clear raw pointers inside `bundle` before `ev_val`/`mock_sys` go out of scope.
+    {
+        let mut g = bundle.lock().unwrap();
+        g.ev = core::ptr::null();
+        g.sys_ctx = core::ptr::null_mut();
+    }
+
+    #[repr(C)]
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    struct ZstCtxEvt;
+    // SAFETY: Zero-sized marker struct with no padding.
+    unsafe impl bamabi_sys::RawInsertable for ZstCtxEvt {}
+    // SAFETY: Zero-sized marker struct implements `AbiPod`.
+    unsafe impl bamabi_sys::AbiPod for ZstCtxEvt {}
+
+    // ZST event + panic containment + runtime `ValidatedCommands::observe_ctx_slice`.
+    let panicking = Arc::new(AtomicBool::new(false));
+    let panicking_clone = Arc::clone(&panicking);
+    // SAFETY: Reclaiming `raw_inst`.
+    unsafe { shutdown_guest_instance(raw_inst) };
+
+    let mut raw_zst_inst: *mut BamInstance = core::ptr::null_mut();
+    let mut cmd_cap = CaptureObsState {
+        last_desc: None,
+        last_name: None,
+        last_watched: Vec::new(),
+        last_query_groups: Vec::new(),
+        last_query_term_counts: Vec::new(),
+        runtime_spawns: 0,
+    };
+    let runtime_cap_ptr = (&raw mut cmd_cap).cast::<BamCommands>();
+    // SAFETY: `cap` (init `load_ctx`) and `cmd_cap` (`runtime_cap_ptr`) are disjoint locals live for this test.
+    let zst_init = unsafe {
+        init_guest_instance(
+            &api,
+            (&raw mut cap).cast::<BamLoadCtx>(),
+            &raw mut raw_zst_inst,
+            &manifest,
+            move |inst, load| {
+                let zst_cfg = ObserverCtxRegistrationConfig {
+                    name: Some("s14_zst_ctx"),
+                    event: BamComponent::from_raw(9),
+                    ..Default::default()
+                };
+                let p_flag = Arc::clone(&panicking_clone);
+                let rc = load.register_observer_ctx_slice::<0, ZstCtxEvt, _>(
+                    inst,
+                    &zst_cfg,
+                    move |_tgt, _zst, inv| {
+                        let _host_ref = inv.base_host();
+                        if p_flag.load(Ordering::SeqCst) {
+                            panic!("s14 observer panic");
+                        }
+                        FfiResult::OK
+                    },
+                );
+                assert_eq!(rc, FfiResult::OK);
+
+                // Runtime `observe_ctx_slice` via `ValidatedCommands`:
+                let host_ref = inst.host();
+                let mut cmds = ValidatedCommands::from_raw(runtime_cap_ptr, host_ref);
+                let rt_cfg = ObserverCtxRegistrationConfig {
+                    name: Some("s14_runtime_ctx"),
+                    event: BamComponent::from_raw(12),
+                    watched_components: &watched[..1],
+                    ..Default::default()
+                };
+                let ent = cmds
+                    .observe_ctx_slice::<0, ZstCtxEvt, _>(&rt_cfg, |_tgt, _zst, _inv| FfiResult::OK)
+                    .expect("runtime observe_ctx_slice");
+                assert_eq!(ent, FfiEntity::from_bits(808));
+                FfiResult::OK
+            },
+        )
+    };
+    assert_eq!(zst_init, FfiResult::OK);
+    assert_eq!(cmd_cap.runtime_spawns, 1);
+    let rt_d = cmd_cap.last_desc.take().expect("captured runtime ctx desc");
+    let rt_cb = rt_d.ctx_callback.unwrap();
+    // SAFETY: Null event_data is allowed for ZST `ZstCtxEvt`, `mock_sys_ptr` and `rt_d.user_data` are live.
+    let rt_rc = unsafe {
+        rt_cb(
+            FfiEntity::NULL,
+            core::ptr::null(),
+            mock_sys_ptr,
+            rt_d.user_data,
+        )
+    };
+    assert_eq!(rt_rc, FfiResult::OK);
+
+    let zst_d = cap.last_desc.take().expect("captured init zst ctx desc");
+    let zst_cb = zst_d.ctx_callback.unwrap();
+    // SAFETY: Null event_data is valid for ZST `ZstCtxEvt`; returns `OK` when not panicking.
+    let zst_ok_rc = unsafe {
+        zst_cb(
+            FfiEntity::NULL,
+            core::ptr::null(),
+            mock_sys_ptr,
+            zst_d.user_data,
+        )
+    };
+    assert_eq!(zst_ok_rc, FfiResult::OK);
+    panicking.store(true, Ordering::SeqCst);
+    // SAFETY: Guest panic is caught cleanly on the guest heap and mapped to `PANIC_CAUGHT`.
+    let zst_panic_rc = unsafe {
+        zst_cb(
+            FfiEntity::NULL,
+            core::ptr::null(),
+            mock_sys_ptr,
+            zst_d.user_data,
+        )
+    };
+    assert_eq!(zst_panic_rc, FfiResult::PANIC_CAUGHT);
+    // SAFETY: Reclaiming `raw_zst_inst` (which drops both runtime and init allocations in LIFO order).
+    unsafe { shutdown_guest_instance(raw_zst_inst) };
+}
