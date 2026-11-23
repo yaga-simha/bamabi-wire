@@ -116,7 +116,7 @@ impl From<TelemetryFrameError> for TelemetrySliceError {
 /// Fixed **64-byte** little-endian binary telemetry digest frame emitted by host telemetry and
 /// consumed by guest mods and LSP diagnostics.
 ///
-/// Layout (64 bytes, 8-byte aligned, zero implicit padding):
+/// Layout (`64` bytes, `align_of::<u64>()` — `8` on 64-bit / `wasm32`, `4` on `i686`, zero implicit padding):
 /// - `0..4`: `magic` (`b"BAMT"`)
 /// - `4..6`: `version` (`u16` LE, currently `1`)
 /// - `6..8`: `flags` (`u16` LE bitmask of `TELEMETRY_FLAG_*`)
@@ -176,7 +176,7 @@ const _: () = {
         + core::mem::size_of::<u32>() * 8;
     assert!(core::mem::size_of::<SystemTelemetryDigest64>() == field_sum);
     assert!(core::mem::size_of::<SystemTelemetryDigest64>() == SYSTEM_TELEMETRY_DIGEST_SIZE);
-    assert!(core::mem::align_of::<SystemTelemetryDigest64>() == 8);
+    assert!(core::mem::align_of::<SystemTelemetryDigest64>() == core::mem::align_of::<u64>());
     assert!(core::mem::offset_of!(SystemTelemetryDigest64, magic) == 0);
     assert!(core::mem::offset_of!(SystemTelemetryDigest64, version) == 4);
     assert!(core::mem::offset_of!(SystemTelemetryDigest64, flags) == 6);
@@ -198,7 +198,7 @@ const _: () = {
 unsafe impl RawInsertable for SystemTelemetryDigest64 {}
 
 // SAFETY: All 14 fields satisfy `AbiPod`, layout is deterministic C-ABI with zero implicit
-// padding (`size = 64, align = 8`), verified by compile-time assertions above.
+// padding (`size = 64, align = align_of::<u64>()`), verified by compile-time assertions above.
 unsafe impl AbiPod for SystemTelemetryDigest64 {}
 
 impl Default for SystemTelemetryDigest64 {

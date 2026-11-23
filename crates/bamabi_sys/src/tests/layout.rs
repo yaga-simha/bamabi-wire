@@ -1972,7 +1972,7 @@ fn system_telemetry_digest64_layout_roundtrip_and_errors() {
         size_of::<SystemTelemetryDigest64>(),
         SYSTEM_TELEMETRY_DIGEST_SIZE
     );
-    assert_eq!(align_of::<SystemTelemetryDigest64>(), 8);
+    assert_eq!(align_of::<SystemTelemetryDigest64>(), align_of::<u64>());
     assert_eq!(offset_of!(SystemTelemetryDigest64, magic), 0);
     assert_eq!(offset_of!(SystemTelemetryDigest64, version), 4);
     assert_eq!(offset_of!(SystemTelemetryDigest64, flags), 6);
