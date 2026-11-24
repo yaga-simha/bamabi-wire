@@ -189,8 +189,8 @@ fn sparse_rows_and_padded_commands_sound_under_miri() {
     // SAFETY: `ro_ptrs` points to 3 live `u32` values.
     let rows = unsafe { SparseRows::<u32>::from_raw_parts(ro_ptrs.as_ptr(), 3, false) }.unwrap();
     assert_eq!(rows.len(), 3);
-    assert_eq!(rows[0], 10);
-    assert_eq!(rows[2], 30);
+    assert_eq!(rows.get(0).copied(), Some(10));
+    assert_eq!(rows.get(2).copied(), Some(30));
     let collected: Vec<u32> = rows.iter().copied().collect();
     assert_eq!(collected, vec![10, 20, 30]);
 
@@ -421,18 +421,15 @@ fn runtime_observer_alloc_tracking_and_unsupported_fallbacks() {
                 );
                 let mut cmds = ValidatedCommands::from_raw((&raw mut world).cast(), &host);
                 let guard = ObsDropGuard;
+                let obs_cfg = ObserverRegistrationConfig::custom(
+                    Some("runtime_obs"),
+                    BamComponent::from_raw(3),
+                );
                 let ent = cmds
-                    .observe::<u32, _>(
-                        Some("runtime_obs"),
-                        BamComponent::from_raw(3),
-                        FfiEntity::NULL,
-                        0,
-                        BamComponent::INVALID,
-                        move |_e, _val, _c| {
-                            let _ = &guard;
-                            FfiResult::OK
-                        },
-                    )
+                    .observe::<u32, _>(&obs_cfg, move |_e, _val, _c| {
+                        let _ = &guard;
+                        FfiResult::OK
+                    })
                     .unwrap();
                 assert_eq!(ent.to_bits(), 77);
                 assert_eq!(inst.allocation_count(), 2);
@@ -1818,7 +1815,7 @@ fn command_burst_commands_make_zero_sys_host_ctx_calls_and_intern_symbol_uses_ct
 
     unsafe extern "C" fn counting_intern_symbol(
         host_ctx: *const BamHostCtx,
-        _sym: bamabi_sys::StrView,
+        _sym: *const bamabi_sys::StrView,
         out_sym: *mut bamabi_sys::BamSymbol,
     ) -> FfiResult {
         INTERN_CALLS.fetch_add(1, Ordering::SeqCst);

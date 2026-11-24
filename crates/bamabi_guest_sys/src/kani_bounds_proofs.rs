@@ -27,10 +27,10 @@ use core::{
 };
 
 use bamabi_sys::{
-    ABI_VERSION, AbiPod, AccessMode, BAM_STORAGE_FLAG_IMMUTABLE, BAM_STORAGE_FLAG_MESSAGE,
-    BAM_STORAGE_FLAG_RESOURCE, BamChangeTicks, BamColumnInfo, BamCommands, BamComponent,
-    BamHostApi, BamHostCtx, BamInstance, BamIter, BamLayoutInfo, BamLoadCtx, BamManifest,
-    BamObserverDesc, BamSystemCtx, BamTermDesc, BamTriggerDesc, ComponentDesc, ComponentUuid,
+    ABI_VERSION, AbiPod, AccessMode, BAM_SPAWN_COL_FLAG_SPLAT, BAM_STORAGE_FLAG_IMMUTABLE,
+    BAM_STORAGE_FLAG_MESSAGE, BAM_STORAGE_FLAG_RESOURCE, BamChangeTicks, BamColumnInfo,
+    BamCommands, BamComponent, BamHostApi, BamHostCtx, BamInstance, BamIter, BamLayoutInfo,
+    BamLoadCtx, BamManifest, BamRowRange, BamSystemCtx, BamTimeInfo, ComponentDesc, ComponentUuid,
     FfiBool, FfiEntity, FfiResult, ModComponent, RawInsertable, SymbolEntry, VTableHeader,
 };
 
@@ -259,6 +259,23 @@ fn make_core_api(struct_size: u32, abi_version: u32) -> BamHostApi {
         cmd_clone_entity: None,
         cmd_insert_resource: None,
         cmd_remove_resource: None,
+        register_resource: None,
+        register_message: None,
+        resolve_named_object: None,
+        resolve_symbol_str: None,
+        iter_column_rows_mutable_untracked: None,
+        iter_mark_changed_ranges: None,
+        sys_current_ticks: None,
+        sys_time_info: None,
+        par_for_each_chunk_ex: None,
+        sys_relation_targets: None,
+        sys_relation_sources: None,
+        sys_relation_edge_data: None,
+        cmd_despawn_batch: None,
+        cmd_insert_batch: None,
+        cmd_remove_batch: None,
+        msg_read_slice: None,
+        cmd_spawn_batch_ex: None,
     }
 }
 
@@ -268,16 +285,6 @@ fn make_valid_host(api: BamHostApi, host_ctx: *const BamHostCtx) -> Host {
     assert_eq!(api.validate_for_guest(ABI_VERSION), FfiResult::OK);
     Host::from_api_for_kani(api, host_ctx)
 }
-
-// Unused callback types referenced only to ensure signature compatibility if needed.
-#[allow(dead_code)]
-type _UnusedDespawnAll =
-    unsafe extern "C" fn(*mut BamCommands, *const BamTermDesc, usize) -> FfiResult;
-#[allow(dead_code)]
-type _UnusedTriggerEx = unsafe extern "C" fn(*mut BamCommands, *const BamTriggerDesc) -> FfiResult;
-#[allow(dead_code)]
-type _UnusedObserve =
-    unsafe extern "C" fn(*mut BamCommands, *const BamObserverDesc, *mut FfiEntity) -> FfiResult;
 
 // ============================================================================
 // PO-G9.1: `read_messages_batch_checked` Hostile Count Clamping
@@ -549,6 +556,28 @@ fn po_g9_spawn_batch_column_validation_bounds() {
         FfiResult::OK
     }
 
+    unsafe extern "C" fn mock_spawn_batch_ex(
+        raw_cmds: *mut BamCommands,
+        _cols: *const bamabi_sys::BamSpawnColumnDesc,
+        _col_count: usize,
+        entity_count: usize,
+        out_entities: *mut FfiEntity,
+    ) -> FfiResult {
+        // SAFETY: Test binds `raw_cmds` to `BatchSpy`.
+        let spy = unsafe { &mut *raw_cmds.cast::<BatchSpy>() };
+        spy.batch_called = true;
+        spy.last_entity_count = entity_count;
+        if !out_entities.is_null() {
+            let mut i = 0usize;
+            while i < entity_count {
+                // SAFETY: Caller verified `out_entities` has at least `entity_count` writable slots.
+                unsafe { *out_entities.add(i) = FfiEntity::from_bits((i + 1) as u64) };
+                i += 1;
+            }
+        }
+        FfiResult::OK
+    }
+
     let mut spy = BatchSpy {
         layout_size: size_of::<u64>(),
         layout_align: align_of::<u64>(),
@@ -561,6 +590,7 @@ fn po_g9_spawn_batch_column_validation_bounds() {
     let mut api = make_core_api(size_of::<BamHostApi>() as u32, ABI_VERSION);
     api.component_layout_info = Some(mock_layout_info);
     api.cmd_spawn_batch = Some(mock_spawn_batch);
+    api.cmd_spawn_batch_ex = Some(mock_spawn_batch_ex);
     let host = make_valid_host(api, (&raw const spy).cast::<BamHostCtx>());
 
     let mut v02_api = make_core_api(BamHostApi::MIN_V0_2_SIZE as u32, ABI_VERSION);
@@ -599,10 +629,10 @@ fn po_g9_spawn_batch_column_validation_bounds() {
     );
     assert!(!spy.batch_called);
 
-    // 4. Symbolic failure and success scenarios on `validate_spawn_batch_column` and
-    //    `spawn_batch_columns` (including `validated_typed` fast-path cases 9..=12).
+    // 4. Symbolic failure and success scenarios on `validate_spawn_batch_column`,
+    //    `spawn_batch_columns`, and SPLAT `spawn_batch_ex` (including `validated_typed` cases 9..=12).
     let case_idx: u8 = kani::any();
-    kani::assume(case_idx < 13);
+    kani::assume(case_idx < 14);
 
     let dummy_non_null = (&raw const data).cast::<u8>();
     let (col, entity_count, host_size, host_align) = match case_idx {
@@ -745,7 +775,7 @@ fn po_g9_spawn_batch_column_validation_bounds() {
             64usize,
         ),
         // `validated_typed` still rejects `entity_count * expected_size > isize::MAX`.
-        _ => {
+        12 => {
             let over_half = (isize::MAX as usize / size_of::<u64>()) + 1;
             (
                 // SAFETY: Kani probes `isize::MAX` byte-length overflow rejection on the `validated_typed` fast path.
@@ -764,6 +794,13 @@ fn po_g9_spawn_batch_column_validation_bounds() {
                 64usize,
             )
         }
+        // `BAM_SPAWN_COL_FLAG_SPLAT` needs `required_rows = 1` for `entity_count = 2`.
+        _ => (
+            SpawnBatchColumn::splat(BamComponent::from_raw(1), &data[0]),
+            2usize,
+            size_of::<u64>(),
+            align_of::<u64>(),
+        ),
     };
 
     spy.layout_size = host_size;
@@ -778,6 +815,8 @@ fn po_g9_spawn_batch_column_validation_bounds() {
         cmds.spawn_batch_columns(&[col, marker_col], entity_count, Some(&mut out_entities))
     } else if case_idx == 9 {
         cmds.spawn_batch_columns(&[col], entity_count, Some(&mut out_entities))
+    } else if case_idx == 13 {
+        cmds.spawn_batch_ex(&[col], entity_count, Some(&mut out_entities))
     } else {
         cmds.spawn_batch_columns(&[col], entity_count, None)
     };
@@ -818,9 +857,17 @@ fn po_g9_spawn_batch_column_validation_bounds() {
             assert_eq!(batch_status, FfiResult::NULL_POINTER);
             assert!(!spy.layout_called.get());
         }
-        _ => {
+        12 => {
             assert_eq!(batch_status, FfiResult::OUT_OF_RANGE);
             assert!(!spy.layout_called.get());
+        }
+        _ => {
+            assert_eq!(col.flags(), BAM_SPAWN_COL_FLAG_SPLAT);
+            assert_eq!(batch_status, FfiResult::OK);
+            assert!(spy.batch_called);
+            assert_eq!(spy.last_entity_count, 2);
+            assert_eq!(out_entities[0], FfiEntity::from_bits(1));
+            assert_eq!(out_entities[1], FfiEntity::from_bits(2));
         }
     }
 
@@ -2436,4 +2483,130 @@ fn kani_proof_drain_messages_pre_reserved_exact_fit() {
         n == 2 && max_batch == 1,
         "multi-batch Phase 1 drain reachable"
     );
+}
+
+// ============================================================================
+// PO-G11: `0.4.0` Host Slots, Batch/Splat Guards & `BamTimeInfo` Bounds
+// ============================================================================
+
+/// PO-G11: Verifies fail-closed guards across ABI `0.4.0` `ValidatedCommands` batch/splat APIs
+/// (`despawn_batch`, `insert_batch_splat`, `remove_batch`, `spawn_batch_ex`),
+/// `ValidatedIter::mark_changed_ranges`, `ValidatedSystemRef::{current_ticks, time_info,
+/// relation_targets, relation_sources, relation_edge_data}`, and `Host::{resolve_named_object,
+/// resolve_symbol_str}` when slots are missing or arguments contain null/invalid handles.
+#[kani::proof]
+fn po_g11_batch_col_cache_and_v04_slots() {
+    let dummy_ctx = 1u8;
+    let host_ctx = (&raw const dummy_ctx).cast::<BamHostCtx>();
+    let core_api = make_core_api(size_of::<BamHostApi>() as u32, ABI_VERSION);
+    let host = make_valid_host(core_api, host_ctx);
+
+    let bad_entities = [FfiEntity::from_bits(1), FfiEntity::NULL];
+    let ok_entities = [FfiEntity::from_bits(1), FfiEntity::from_bits(2)];
+    let splat_val = 42u64;
+
+    let mut null_cmds = ValidatedCommands::empty(&host);
+    assert_eq!(
+        null_cmds.despawn_batch(&ok_entities),
+        FfiResult::NULL_POINTER
+    );
+    assert_eq!(
+        null_cmds.insert_batch_splat(&ok_entities, BamComponent::from_raw(1), &splat_val),
+        FfiResult::NULL_POINTER
+    );
+    assert_eq!(
+        null_cmds.remove_batch(&ok_entities, BamComponent::from_raw(1)),
+        FfiResult::NULL_POINTER
+    );
+
+    let mut dummy_cmds = 2u8;
+    // SAFETY: `dummy_cmds` is non-null opaque storage; all calls fail closed before dereferencing it.
+    let mut cmds =
+        unsafe { ValidatedCommands::from_raw((&raw mut dummy_cmds).cast::<BamCommands>(), &host) };
+    assert_eq!(cmds.despawn_batch(&bad_entities), FfiResult::INVALID_ENTITY);
+    assert_eq!(cmds.despawn_batch(&ok_entities), FfiResult::UNSUPPORTED);
+    assert_eq!(
+        cmds.insert_batch_splat(&ok_entities, BamComponent::INVALID, &splat_val),
+        FfiResult::INVALID_COMPONENT
+    );
+    assert_eq!(
+        cmds.insert_batch_splat(&bad_entities, BamComponent::from_raw(1), &splat_val),
+        FfiResult::INVALID_ENTITY
+    );
+    assert_eq!(
+        cmds.insert_batch_splat(&ok_entities, BamComponent::from_raw(1), &splat_val),
+        FfiResult::UNSUPPORTED
+    );
+    assert_eq!(
+        cmds.remove_batch(&ok_entities, BamComponent::INVALID),
+        FfiResult::INVALID_COMPONENT
+    );
+    assert_eq!(
+        cmds.remove_batch(&bad_entities, BamComponent::from_raw(1)),
+        FfiResult::INVALID_ENTITY
+    );
+    assert_eq!(
+        cmds.remove_batch(&ok_entities, BamComponent::from_raw(1)),
+        FfiResult::UNSUPPORTED
+    );
+
+    // Null/unsupported checks on 0.4.0 Host & SystemRef & Iter APIs.
+    assert_eq!(
+        host.resolve_named_object("player"),
+        Err(FfiResult::UNSUPPORTED)
+    );
+    assert_eq!(
+        host.resolve_symbol_str(bamabi_sys::BamSymbol::INVALID),
+        Err(FfiResult::INVALID_ARGUMENT)
+    );
+
+    let sys_ref = ValidatedSystemRef::empty(&host);
+    assert_eq!(sys_ref.current_ticks(), Err(FfiResult::NULL_POINTER));
+    assert_eq!(sys_ref.time_info(), Err(FfiResult::NULL_POINTER));
+
+    let mut dummy_sys = 3u8;
+    // SAFETY: `dummy_sys` is non-null opaque storage; all calls fail closed before dereferencing it.
+    let mut inv = unsafe {
+        ValidatedSystemInvocation::from_raw(
+            (&raw mut dummy_sys).cast::<BamSystemCtx>(),
+            &host,
+            0,
+            0,
+            None,
+        )
+    };
+    let sys_ref_ok = inv.take_system_ref().expect("sys_ref present");
+    assert_eq!(sys_ref_ok.current_ticks(), Err(FfiResult::UNSUPPORTED));
+    assert_eq!(sys_ref_ok.time_info(), Err(FfiResult::UNSUPPORTED));
+    assert_eq!(
+        sys_ref_ok.relation_targets(FfiEntity::NULL, BamComponent::from_raw(1)),
+        Err(FfiResult::INVALID_ENTITY)
+    );
+    assert_eq!(
+        sys_ref_ok.relation_sources(FfiEntity::from_bits(1), BamComponent::INVALID),
+        Err(FfiResult::INVALID_COMPONENT)
+    );
+    assert_eq!(
+        sys_ref_ok.relation_edge_data::<u32>(
+            FfiEntity::from_bits(1),
+            BamComponent::from_raw(1),
+            FfiEntity::NULL,
+        ),
+        Err(FfiResult::INVALID_ENTITY)
+    );
+
+    let mut dummy_iter = 4u8;
+    // SAFETY: `dummy_iter` is non-null opaque storage; `chunk_len = 0` or unsupported slots fail closed before dereferencing it.
+    let mut iter =
+        unsafe { ValidatedIter::from_raw((&raw mut dummy_iter).cast::<BamIter>(), &host) };
+    assert_eq!(iter.mark_changed_ranges(0, &[]), FfiResult::OK);
+    let range = [BamRowRange::new(0, 1)];
+    assert_eq!(iter.mark_changed_ranges(0, &range), FfiResult::OUT_OF_RANGE);
+    assert_eq!(
+        iter.msg_read_slice_checked::<u64>(0, None),
+        Err(FfiResult::UNSUPPORTED)
+    );
+    let mut time_info = BamTimeInfo::default();
+    time_info.delta_secs = 0.016;
+    assert_eq!(time_info.delta_secs, 0.016);
 }

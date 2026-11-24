@@ -20,6 +20,9 @@ use syn::{GenericArgument, PathArguments, Type};
 pub(crate) enum FieldKind {
     /// Skip generating C-ABI accessors for this field (`#[mod_field(skip)]`).
     Skip,
+    /// Explicit zero-padding field (`#[mod_field(pad)]`) included in layout/UUID/fingerprint
+    /// metadata while suppressing VTable getter/setter slots.
+    Pad(Box<Type>),
     /// Rust `bool` field exposed across `extern "C"` as `FfiBool`.
     Bool(Box<Type>),
     /// By-value primitive (`AbiPod + Default` when `is_abi_pod = true`, or `usize`/`isize`
@@ -92,20 +95,37 @@ pub(crate) fn is_128bit_int(ty: &Type) -> bool {
 }
 
 /// Extracts a deterministic, whitespace-normalized field type tag for
-/// `ComponentUuid::hash_field_schema` on `#[repr(C)]` `AbiPod` structs and enums.
+/// `ComponentUuid::hash_field_schema` on `#[repr(C)]` `AbiPod` structs and enums,
+/// delegating canonical rules to `bamabi_schema`.
 pub(crate) fn canonical_field_type_tag(ty: &Type) -> String {
     match ty {
         Type::Path(tp) if tp.qself.is_none() => {
             if let Some(last) = tp.path.segments.last() {
                 if last.arguments.is_empty() {
-                    return last.ident.to_string();
+                    let ident_str = last.ident.to_string();
+                    if let Some(spec) = bamabi_schema::lookup_wire_type(
+                        &ident_str,
+                        bamabi_schema::TargetLayout::HOST,
+                    ) {
+                        return spec.canonical_tag.to_owned();
+                    }
+                    return bamabi_schema::canonical_leaf_ident(&ident_str).to_owned();
                 }
-                if (last.ident == "FfiOption" || last.ident == "Vec")
+                if last.ident == "FfiOption"
                     && let PathArguments::AngleBracketed(args) = &last.arguments
                     && args.args.len() == 1
                     && let Some(GenericArgument::Type(inner)) = args.args.first()
                 {
-                    return format!("{}<{}>", last.ident, canonical_field_type_tag(inner));
+                    return bamabi_schema::canonical_ffi_option_tag(&canonical_field_type_tag(
+                        inner,
+                    ));
+                }
+                if last.ident == "Vec"
+                    && let PathArguments::AngleBracketed(args) = &last.arguments
+                    && args.args.len() == 1
+                    && let Some(GenericArgument::Type(inner)) = args.args.first()
+                {
+                    return bamabi_schema::canonical_vec_tag(&canonical_field_type_tag(inner));
                 }
             }
             quote!(#ty).to_string().replace(' ', "")
@@ -113,8 +133,8 @@ pub(crate) fn canonical_field_type_tag(ty: &Type) -> String {
         Type::Array(arr) => {
             let elem = canonical_field_type_tag(&arr.elem);
             let len_tokens = &arr.len;
-            let len_str = quote!(#len_tokens).to_string().replace(' ', "");
-            format!("[{elem};{len_str}]")
+            let len_str = quote!(#len_tokens).to_string();
+            bamabi_schema::canonical_array_tag(&elem, &len_str)
         }
         _ => quote!(#ty).to_string().replace(' ', ""),
     }
@@ -126,24 +146,58 @@ pub(crate) fn canonical_kind_type_tag(ty: &Type, kind: &FieldKind) -> String {
         FieldKind::Bool(_) => "bool".to_owned(),
         FieldKind::HostString(_) => "String".to_owned(),
         FieldKind::HostVec { elem_ty, .. } => {
-            format!("Vec<{}>", canonical_field_type_tag(elem_ty))
+            bamabi_schema::canonical_vec_tag(&canonical_field_type_tag(elem_ty))
         }
         FieldKind::FfiOption { inner_ty, .. } => {
-            format!("FfiOption<{}>", canonical_field_type_tag(inner_ty))
+            bamabi_schema::canonical_ffi_option_tag(&canonical_field_type_tag(inner_ty))
         }
         FieldKind::Primitive { ty: prim_ty, .. } => canonical_field_type_tag(prim_ty),
+        FieldKind::Pad(pad_ty) => canonical_field_type_tag(pad_ty),
         FieldKind::Nested { ty: nested_ty, .. } => canonical_field_type_tag(nested_ty),
         FieldKind::Skip => canonical_field_type_tag(ty),
     }
 }
 
-/// Classifies a struct field into bool, primitive, string, vector, nested, or skipped representation.
+/// Resolves the canonical `bamabi_sys::BamFieldKind` constant name for a classified field via
+/// `bamabi_schema::lookup_wire_type`, preventing `UNKNOWN(0)` fallthrough on `FfiAssetHandle`,
+/// `FfiChildOf`, `ComponentUuid`, `BamChangeTicks`, and `FfiDisabled`.
+pub(crate) fn canonical_bam_field_kind_ident(kind: &FieldKind, ty: &Type) -> &'static str {
+    match kind {
+        FieldKind::Skip => "OPAQUE",
+        FieldKind::Bool(_) => "BOOL",
+        FieldKind::HostString(_) => "STRING",
+        FieldKind::HostVec { .. } => "VEC",
+        FieldKind::FfiOption { .. } => "FFI_OPTION",
+        FieldKind::Nested { .. } => "NESTED",
+        FieldKind::Pad(pad_ty) => wire_type_kind_ident(pad_ty).unwrap_or("NESTED"),
+        FieldKind::Primitive { ty: prim_ty, .. } => wire_type_kind_ident(prim_ty)
+            .or_else(|| wire_type_kind_ident(ty))
+            .unwrap_or("UNKNOWN"),
+    }
+}
+
+fn wire_type_kind_ident(ty: &Type) -> Option<&'static str> {
+    if let Type::Path(tp) = ty
+        && tp.qself.is_none()
+        && let Some(last) = tp.path.segments.last()
+        && last.arguments.is_empty()
+    {
+        let name = last.ident.to_string();
+        return bamabi_schema::lookup_wire_type(&name, bamabi_schema::TargetLayout::HOST)
+            .map(|spec| spec.kind.name());
+    }
+    None
+}
+
+/// Classifies a struct field into bool, primitive, string, vector, pad, nested, or skipped
+/// representation.
 ///
 /// Explicit `#[mod_field(...)]` overrides always take precedence over syntactic path inspection.
 pub(crate) fn classify_type(ty: &Type, attr_override: FieldAttrOverride) -> syn::Result<FieldKind> {
     let boxed_ty = || Box::new(ty.clone());
     match attr_override {
         FieldAttrOverride::Skip => return Ok(FieldKind::Skip),
+        FieldAttrOverride::Pad => return Ok(FieldKind::Pad(boxed_ty())),
         FieldAttrOverride::Bool => return Ok(FieldKind::Bool(boxed_ty())),
         FieldAttrOverride::Primitive => {
             if is_bool_type(ty) {
@@ -235,21 +289,25 @@ pub(crate) fn classify_type(ty: &Type, attr_override: FieldAttrOverride) -> syn:
             if let Some(last_seg) = type_path.path.segments.last() {
                 let ident_str = last_seg.ident.to_string();
                 match (&last_seg.arguments, ident_str.as_str()) {
-                    (
-                        PathArguments::None,
-                        "f32" | "f64" | "i8" | "i16" | "i32" | "i64" | "u8" | "u16" | "u32" | "u64"
-                        | "FfiBool" | "FfiEntity" | "TargetEntity" | "BamComponent" | "BamSystem"
-                        | "BamSystemSet" | "BamSymbol" | "FfiAssetLoadState" | "BamEventKind"
-                        | "BamFieldKind" | "FfiChildOf" | "FfiAssetHandle" | "BamChangeTicks"
-                        | "ComponentUuid",
-                    ) => {
-                        return Ok(FieldKind::Primitive {
-                            ty: boxed_ty(),
-                            is_abi_pod: true,
-                        });
-                    }
                     (PathArguments::None, "String") => {
                         return Ok(FieldKind::HostString(boxed_ty()));
+                    }
+                    (PathArguments::None, name)
+                        if bamabi_schema::lookup_wire_type(
+                            name,
+                            bamabi_schema::TargetLayout::HOST,
+                        )
+                        .is_some_and(|s| s.size > 0) =>
+                    {
+                        let spec = bamabi_schema::lookup_wire_type(
+                            name,
+                            bamabi_schema::TargetLayout::HOST,
+                        );
+                        let is_abi_pod = spec.is_some_and(|s| s.is_abi_pod);
+                        return Ok(FieldKind::Primitive {
+                            ty: boxed_ty(),
+                            is_abi_pod,
+                        });
                     }
                     (PathArguments::AngleBracketed(args), "Vec") => {
                         if args.args.len() == 1
@@ -279,11 +337,7 @@ pub(crate) fn classify_type(ty: &Type, attr_override: FieldAttrOverride) -> syn:
                             "unsupported `FfiOption` type arguments for `ModComponent`; expected `FfiOption<T>`",
                         ));
                     }
-                    (
-                        _,
-                        "Box" | "Rc" | "Arc" | "Option" | "Result" | "HashMap" | "BTreeMap"
-                        | "HashSet" | "BTreeSet" | "Cow" | "VecDeque",
-                    ) => {
+                    (_, name) if bamabi_schema::is_banned_rust_wire_type(name) => {
                         return Err(syn::Error::new_spanned(
                             ty,
                             format!(

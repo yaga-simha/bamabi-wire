@@ -6,18 +6,19 @@ use core::{
     ffi::c_void,
     marker::PhantomData,
     mem::MaybeUninit,
-    ops::Index,
     sync::atomic::{AtomicU64, Ordering},
 };
 use std::ffi::CString;
 
 use bamabi_sys::{
-    AbiPod, AccessMode, BamChangeTicks, BamColumnInfo, BamComponent, BamIter, BamIterReadRemovedFn,
-    BamMsgReadBatchFn, ComponentUuid, FfiBool, FfiEntity, FfiResult, FfiSlice, MAX_TERMS_PER_QUERY,
-    ModComponent, StrView,
+    AbiPod, AccessMode, BamChangeTicks, BamChunkTaskExFn, BamColumnInfo, BamCommands, BamComponent,
+    BamIter, BamIterMarkChangedRangeFn, BamIterMarkChangedRangesFn, BamIterReadRemovedFn,
+    BamMsgReadBatchFn, BamParOptions, BamRowRange, ComponentUuid, DirtyRunCoalescer, FfiBool,
+    FfiEntity, FfiResult, FfiSlice, MAX_TERMS_PER_QUERY, ModComponent, StrView,
 };
 
 use crate::{
+    commands::ValidatedCommands,
     host::{Host, ValidatedStringVTable, ValidatedWireVTable},
     instance::qualify_mod_component_identity,
     panic::catch_guest_result,
@@ -800,14 +801,19 @@ impl<'a> ValidatedSliceMut<'a> {
     }
 }
 
+enum SparseRowsBacking {
+    Borrowed(*const *const u8),
+    Owned(Box<[*const u8]>),
+}
+
 /// Safe read-only view over an indirect `[ *const u8; chunk_len ]` sparse-set row pointer array.
 pub struct SparseRows<'a, T: AbiPod> {
-    ptrs: *const *const u8,
+    backing: SparseRowsBacking,
     len: usize,
     _marker: PhantomData<&'a [T]>,
 }
 
-// SAFETY: `T: AbiPod` is `Sync`, and `ptrs` points to host-owned read-only row pointers valid for `'a`.
+// SAFETY: `T: AbiPod` is `Sync`, and `backing` points to host-owned read-only row pointers valid for `'a`.
 unsafe impl<T: AbiPod> Send for SparseRows<'_, T> {}
 // SAFETY: Shared access to `SparseRows` only yields `&T` references where `T: Sync`.
 unsafe impl<T: AbiPod> Sync for SparseRows<'_, T> {}
@@ -830,7 +836,9 @@ impl<'a, T: AbiPod> SparseRows<'a, T> {
     ) -> Option<Self> {
         if len == 0 {
             return Some(Self {
-                ptrs: core::ptr::NonNull::<*const u8>::dangling().as_ptr(),
+                backing: SparseRowsBacking::Borrowed(
+                    core::ptr::NonNull::<*const u8>::dangling().as_ptr(),
+                ),
                 len: 0,
                 _marker: PhantomData,
             });
@@ -844,10 +852,53 @@ impl<'a, T: AbiPod> SparseRows<'a, T> {
             return None;
         }
         Some(Self {
-            ptrs,
+            backing: SparseRowsBacking::Borrowed(ptrs),
             len,
             _marker: PhantomData,
         })
+    }
+
+    /// Validates `ptrs` and snapshots the `[ *const u8; len ]` pointer array into an owned
+    /// slice so subsequent `iter_column_rows_readonly` calls on the same `&ValidatedIter` never
+    /// overwrite a previously returned `SparseRows`.
+    ///
+    /// # Safety
+    /// Same safety invariants as [`Self::from_raw_parts`], except `ptrs` only needs to remain
+    /// readable for the duration of this copy while the target row pointers remain valid for `'a`.
+    pub(crate) unsafe fn from_raw_parts_copied(ptrs: *const *const u8, len: usize) -> Option<Self> {
+        if len == 0 {
+            return Some(Self {
+                backing: SparseRowsBacking::Borrowed(
+                    core::ptr::NonNull::<*const u8>::dangling().as_ptr(),
+                ),
+                len: 0,
+                _marker: PhantomData,
+            });
+        }
+        if ptrs.is_null()
+            || !(ptrs as usize).is_multiple_of(core::mem::align_of::<*const u8>())
+            || len
+                .checked_mul(core::mem::size_of::<*const u8>())
+                .is_none_or(|bytes| bytes > isize::MAX as usize)
+        {
+            return None;
+        }
+        // SAFETY: Verified non-null, aligned, and `len * size_of::<*const u8>() <= isize::MAX`;
+        // caller guarantees `ptrs` is readable for `len` pointers.
+        let snapshot: Box<[*const u8]> = unsafe { core::slice::from_raw_parts(ptrs, len) }.into();
+        Some(Self {
+            backing: SparseRowsBacking::Owned(snapshot),
+            len,
+            _marker: PhantomData,
+        })
+    }
+
+    #[inline]
+    fn as_ptr(&self) -> *const *const u8 {
+        match &self.backing {
+            SparseRowsBacking::Borrowed(ptr) => *ptr,
+            SparseRowsBacking::Owned(slice) => slice.as_ptr(),
+        }
     }
 
     /// Number of entity rows in the current chunk.
@@ -869,8 +920,8 @@ impl<'a, T: AbiPod> SparseRows<'a, T> {
         if row >= self.len {
             return None;
         }
-        // SAFETY: `row < self.len`, and `from_raw_parts` verified `self.ptrs` is readable for `self.len`.
-        let row_ptr = unsafe { *self.ptrs.add(row) };
+        // SAFETY: `row < self.len`, and `from_raw_parts*` verified `self.as_ptr()` is readable for `self.len`.
+        let row_ptr = unsafe { *self.as_ptr().add(row) };
         if row_ptr.is_null() {
             return None;
         }
@@ -893,17 +944,6 @@ impl<'a, T: AbiPod> SparseRows<'a, T> {
             rows: self,
             index: 0,
         }
-    }
-}
-
-impl<T: AbiPod> Index<usize> for SparseRows<'_, T> {
-    type Output = T;
-
-    /// Returns `&T` at `index`, panicking if out of bounds or if an optional sparse row is absent.
-    #[inline]
-    fn index(&self, index: usize) -> &Self::Output {
-        self.get(index)
-            .expect("sparse row index out of bounds or absent optional component")
     }
 }
 
@@ -947,13 +987,18 @@ impl<'b, 'a, T: AbiPod> IntoIterator for &'b SparseRows<'a, T> {
     }
 }
 
+enum SparseRowsMutBacking {
+    Borrowed(*const *mut u8),
+    Owned(Box<[*mut u8]>),
+}
+
 /// Safe mutable view over an indirect `[ *mut u8; chunk_len ]` sparse-set row pointer array.
 ///
 /// Mutable row access (`get_mut` and `for_each_mut`) lends at most one `&mut T` at a time tied to
 /// `&mut self`, preventing aliasing mutable borrows even if a faulty host returned duplicate row
 /// pointers.
 pub struct SparseRowsMut<'a, T: AbiPod> {
-    ptrs: *const *mut u8,
+    backing: SparseRowsMutBacking,
     len: usize,
     _marker: PhantomData<&'a mut [T]>,
 }
@@ -982,7 +1027,9 @@ impl<'a, T: AbiPod> SparseRowsMut<'a, T> {
     ) -> Option<Self> {
         if len == 0 {
             return Some(Self {
-                ptrs: core::ptr::NonNull::<*mut u8>::dangling().as_ptr(),
+                backing: SparseRowsMutBacking::Borrowed(
+                    core::ptr::NonNull::<*mut u8>::dangling().as_ptr(),
+                ),
                 len: 0,
                 _marker: PhantomData,
             });
@@ -996,10 +1043,51 @@ impl<'a, T: AbiPod> SparseRowsMut<'a, T> {
             return None;
         }
         Some(Self {
-            ptrs,
+            backing: SparseRowsMutBacking::Borrowed(ptrs),
             len,
             _marker: PhantomData,
         })
+    }
+
+    /// Validates `ptrs` and snapshots the `[ *mut u8; len ]` pointer array into an owned slice so
+    /// subsequent `iter_column_rows_mutable` calls on another column never overwrite `self`.
+    ///
+    /// # Safety
+    /// Same safety invariants as [`Self::from_raw_parts`], except `ptrs` only needs to remain
+    /// readable during this copy while the target row pointers remain exclusively valid for `'a`.
+    pub(crate) unsafe fn from_raw_parts_copied(ptrs: *const *mut u8, len: usize) -> Option<Self> {
+        if len == 0 {
+            return Some(Self {
+                backing: SparseRowsMutBacking::Borrowed(
+                    core::ptr::NonNull::<*mut u8>::dangling().as_ptr(),
+                ),
+                len: 0,
+                _marker: PhantomData,
+            });
+        }
+        if ptrs.is_null()
+            || !(ptrs as usize).is_multiple_of(core::mem::align_of::<*mut u8>())
+            || len
+                .checked_mul(core::mem::size_of::<*mut u8>())
+                .is_none_or(|bytes| bytes > isize::MAX as usize)
+        {
+            return None;
+        }
+        // SAFETY: Verified non-null, aligned, and `len * size_of::<*mut u8>() <= isize::MAX`.
+        let snapshot: Box<[*mut u8]> = unsafe { core::slice::from_raw_parts(ptrs, len) }.into();
+        Some(Self {
+            backing: SparseRowsMutBacking::Owned(snapshot),
+            len,
+            _marker: PhantomData,
+        })
+    }
+
+    #[inline]
+    fn as_ptr(&self) -> *const *mut u8 {
+        match &self.backing {
+            SparseRowsMutBacking::Borrowed(ptr) => *ptr,
+            SparseRowsMutBacking::Owned(slice) => slice.as_ptr(),
+        }
     }
 
     /// Number of entity rows in the current chunk.
@@ -1020,8 +1108,8 @@ impl<'a, T: AbiPod> SparseRowsMut<'a, T> {
         if row >= self.len {
             return None;
         }
-        // SAFETY: `row < self.len`, and `from_raw_parts` verified `self.ptrs` is readable.
-        let row_ptr = unsafe { *self.ptrs.add(row) };
+        // SAFETY: `row < self.len`, and `from_raw_parts*` verified `self.as_ptr()` is readable.
+        let row_ptr = unsafe { *self.as_ptr().add(row) };
         if row_ptr.is_null() {
             return None;
         }
@@ -1043,8 +1131,8 @@ impl<'a, T: AbiPod> SparseRowsMut<'a, T> {
         if row >= self.len {
             return None;
         }
-        // SAFETY: `row < self.len`, and `from_raw_parts` verified `self.ptrs` is readable.
-        let row_ptr = unsafe { *self.ptrs.add(row) };
+        // SAFETY: `row < self.len`, and `from_raw_parts*` verified `self.as_ptr()` is readable.
+        let row_ptr = unsafe { *self.as_ptr().add(row) };
         if row_ptr.is_null() {
             return None;
         }
@@ -1070,6 +1158,238 @@ impl<'a, T: AbiPod> SparseRowsMut<'a, T> {
                 f(row, item);
             }
         }
+    }
+}
+
+/// Inline stack capacity for coalesced dirty row runs in [`SelectiveMutSlice`] before flushing a
+/// bounded batch via `BamHostApi::iter_mark_changed_ranges`.
+const INLINE_DIRTY_RUN_CAP: usize = 16;
+
+/// Selectively tracked mutable dense column view backed by [`DirtyRunCoalescer`] and
+/// `BamHostApi::iter_mark_changed_ranges` (slot 78, falling back to slot 15 on older hosts).
+///
+/// Immutable reads (`as_slice`, `get`) do **not** mark change ticks; only rows mutated through
+/// [`Self::get_mut`], [`Self::set`], [`Self::set_if_changed`], [`Self::mark_changed`], or
+/// [`Self::mark_changed_range`] are recorded into `DirtyRunCoalescer` and flushed in bounded
+/// batches of at most `INLINE_DIRTY_RUN_CAP` runs (when the inline buffer fills, on [`Self::flush`],
+/// or on [`Drop`]) with zero heap allocation.
+pub struct SelectiveMutSlice<'a, T: AbiPod> {
+    slice: &'a mut [T],
+    iter_raw: *mut BamIter,
+    mark_ranges_fn: Option<BamIterMarkChangedRangesFn>,
+    mark_range_fn: Option<BamIterMarkChangedRangeFn>,
+    term_index: usize,
+    coalescer: DirtyRunCoalescer,
+    inline_runs: [BamRowRange; INLINE_DIRTY_RUN_CAP],
+    inline_len: usize,
+    pending_error: FfiResult,
+}
+
+// SAFETY: `T: AbiPod` is `Send + Sync`, and `iter_raw` is only invoked from `flush`/`Drop` on the
+// active worker scope for `'a` while `&'a mut [T]` grants exclusive ownership of the chunk slice.
+unsafe impl<T: AbiPod> Send for SelectiveMutSlice<'_, T> {}
+
+impl<'a, T: AbiPod> SelectiveMutSlice<'a, T> {
+    /// Constructs a [`SelectiveMutSlice`] over an untracked mutable slice `slice`.
+    ///
+    /// # Safety
+    /// `iter_raw` must remain a valid active [`BamIter`] for `'a`, and `term_index` must denote
+    /// the writable column backing `slice`.
+    #[inline]
+    pub(crate) unsafe fn from_raw_parts(
+        slice: &'a mut [T],
+        iter_raw: *mut BamIter,
+        mark_ranges_fn: Option<BamIterMarkChangedRangesFn>,
+        mark_range_fn: Option<BamIterMarkChangedRangeFn>,
+        term_index: usize,
+    ) -> Self {
+        Self {
+            slice,
+            iter_raw,
+            mark_ranges_fn,
+            mark_range_fn,
+            term_index,
+            coalescer: DirtyRunCoalescer::new(),
+            inline_runs: [BamRowRange::new(0, 0); INLINE_DIRTY_RUN_CAP],
+            inline_len: 0,
+            pending_error: FfiResult::OK,
+        }
+    }
+
+    /// Flushes `self.inline_runs[..self.inline_len]` via slot 78 (`iter_mark_changed_ranges`) with
+    /// slot 15 (`iter_mark_changed_range`) fallback on `FfiResult::UNSUPPORTED`, resetting
+    /// `self.inline_len` to `0`.
+    fn flush_inline_runs(&mut self) -> FfiResult {
+        let len = self.inline_len;
+        if len == 0 {
+            return FfiResult::OK;
+        }
+        self.inline_len = 0;
+        if self.iter_raw.is_null() {
+            return FfiResult::NULL_POINTER;
+        }
+        let runs_slice = &self.inline_runs[..len];
+        let mut status = FfiResult::UNSUPPORTED;
+        if let Some(mark_ranges_fn) = self.mark_ranges_fn {
+            // SAFETY: `self.iter_raw` is valid for `'a` and `runs_slice` rows are `< self.slice.len()`.
+            status = unsafe {
+                mark_ranges_fn(
+                    self.iter_raw,
+                    self.term_index,
+                    runs_slice.as_ptr(),
+                    runs_slice.len(),
+                )
+            };
+        }
+        if status == FfiResult::UNSUPPORTED
+            && let Some(mark_range_fn) = self.mark_range_fn
+        {
+            status = FfiResult::OK;
+            for run in runs_slice {
+                if run.row_count == 0 {
+                    continue;
+                }
+                // SAFETY: `self.iter_raw` is valid for `'a` and `run` is bounds-checked.
+                let s = unsafe {
+                    mark_range_fn(self.iter_raw, self.term_index, run.start_row, run.row_count)
+                };
+                if !s.is_ok() {
+                    status = s;
+                    break;
+                }
+            }
+        }
+        status
+    }
+
+    /// Appends a completed [`BamRowRange`] to inline storage, flushing a bounded batch immediately
+    /// when full and latching the first non-OK status into `pending_error`.
+    #[inline]
+    fn push_completed_run(&mut self, run: BamRowRange) {
+        if run.is_empty() {
+            return;
+        }
+        if self.inline_len >= INLINE_DIRTY_RUN_CAP {
+            let status = self.flush_inline_runs();
+            if !status.is_ok() && self.pending_error.is_ok() {
+                self.pending_error = status;
+            }
+        }
+        self.inline_runs[self.inline_len] = run;
+        self.inline_len += 1;
+    }
+
+    /// Returns the number of entity rows in this chunk column.
+    #[inline]
+    pub const fn len(&self) -> usize {
+        self.slice.len()
+    }
+
+    /// Returns `true` if this chunk column contains zero rows.
+    #[inline]
+    pub const fn is_empty(&self) -> bool {
+        self.slice.is_empty()
+    }
+
+    /// Borrows the underlying slice immutably without marking any row changed.
+    #[inline]
+    pub const fn as_slice(&self) -> &[T] {
+        self.slice
+    }
+
+    /// Returns `&T` for `row` (`None` if out of bounds) without marking `row` changed.
+    #[inline]
+    pub fn get(&self, row: usize) -> Option<&T> {
+        self.slice.get(row)
+    }
+
+    /// Marks `row` as changed and returns `&mut T` (`None` if out of bounds).
+    #[inline]
+    pub fn get_mut(&mut self, row: usize) -> Option<&mut T> {
+        if row >= self.slice.len() {
+            return None;
+        }
+        if let Some(done) = self.coalescer.push_row(row) {
+            self.push_completed_run(done);
+        }
+        self.slice.get_mut(row)
+    }
+
+    /// Writes `value` into `row` and marks `row` changed (returns `false` if `row >= len()`).
+    #[inline]
+    pub fn set(&mut self, row: usize, value: T) -> bool {
+        if let Some(slot) = self.get_mut(row) {
+            *slot = value;
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Writes `value` into `row` and marks `row` changed **only if** `self.slice[row] != value`,
+    /// returning `true` iff the value changed.
+    #[inline]
+    pub fn set_if_changed(&mut self, row: usize, value: T) -> bool
+    where
+        T: PartialEq,
+    {
+        let Some(cur) = self.slice.get(row) else {
+            return false;
+        };
+        if *cur == value {
+            return false;
+        }
+        if let Some(slot) = self.get_mut(row) {
+            *slot = value;
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Records `row` as dirty without mutating `self.slice` (no-op if `row >= len()`).
+    #[inline]
+    pub fn mark_changed(&mut self, row: usize) {
+        if row < self.slice.len()
+            && let Some(done) = self.coalescer.push_row(row)
+        {
+            self.push_completed_run(done);
+        }
+    }
+
+    /// Records `start_row..start_row + row_count` as dirty (clamped to `len()`).
+    #[inline]
+    pub fn mark_changed_range(&mut self, start_row: usize, row_count: usize) {
+        let len = self.slice.len();
+        if start_row >= len || row_count == 0 {
+            return;
+        }
+        let clamped_count = row_count.min(len - start_row);
+        if let Some(done) = self
+            .coalescer
+            .push_range(BamRowRange::new(start_row, clamped_count))
+        {
+            self.push_completed_run(done);
+        }
+    }
+
+    /// Flushes all remaining coalesced dirty runs via `BamHostApi::iter_mark_changed_ranges`
+    /// (slot 78, falling back to slot 15 if slot 78 is unsupported) and resets the buffer,
+    /// returning the first latched error from any mid-chunk batch flush or the tail flush.
+    pub fn flush(&mut self) -> FfiResult {
+        if let Some(last) = self.coalescer.finish() {
+            self.push_completed_run(last);
+        }
+        let tail_status = self.flush_inline_runs();
+        let prior = core::mem::replace(&mut self.pending_error, FfiResult::OK);
+        if !prior.is_ok() { prior } else { tail_status }
+    }
+}
+
+impl<T: AbiPod> Drop for SelectiveMutSlice<'_, T> {
+    #[inline]
+    fn drop(&mut self) {
+        let _ = self.flush();
     }
 }
 
@@ -1287,6 +1607,8 @@ enum CachedTermKind {
     MessageWrite = 14,
     MessageWriteNonPod = 15,
     RemovedRead = 16,
+    SparseRead = 17,
+    SparseWrite = 18,
 }
 
 /// Cached metadata produced after validating a term descriptor `(term_index, kind, TypeId,
@@ -1330,14 +1652,14 @@ pub(crate) struct FrozenSlotCache {
 /// or a frozen read-only [`FrozenSlotCache`] snapshot (low bit `1`).
 #[derive(Clone, Copy)]
 struct SlotCacheRef<'a> {
-    tagged_ptr: core::ptr::NonNull<u8>,
+    tagged_ptr: core::ptr::NonNull<c_void>,
     _marker: PhantomData<&'a ()>,
 }
 
 impl<'a> SlotCacheRef<'a> {
     #[inline(always)]
     fn mutable(scratch: &'a QuerySlotScratch) -> Self {
-        let ptr = core::ptr::from_ref(scratch).cast::<u8>().cast_mut();
+        let ptr = core::ptr::from_ref(scratch).cast::<c_void>().cast_mut();
         // SAFETY: `scratch` is a live `&'a QuerySlotScratch` (non-null, aligned >= 2), so bit 0 is `0`.
         let tagged_ptr = unsafe { core::ptr::NonNull::new_unchecked(ptr) };
         Self {
@@ -1351,7 +1673,8 @@ impl<'a> SlotCacheRef<'a> {
         let ptr = core::ptr::from_ref(cache)
             .cast::<u8>()
             .cast_mut()
-            .map_addr(|addr| addr | 1);
+            .map_addr(|addr| addr | 1)
+            .cast::<c_void>();
         // SAFETY: `cache` is a live `&'a FrozenSlotCache` (non-null, aligned >= 2), and `map_addr`
         // preserves strict provenance while setting tag bit `0` to `1`.
         let tagged_ptr = unsafe { core::ptr::NonNull::new_unchecked(ptr) };
@@ -1362,7 +1685,6 @@ impl<'a> SlotCacheRef<'a> {
     }
 
     #[inline(always)]
-    #[allow(clippy::cast_ptr_alignment)]
     fn as_mutable(self) -> Option<&'a QuerySlotScratch> {
         let ptr = self.tagged_ptr.as_ptr();
         if (ptr.addr() & 1) == 0 {
@@ -1375,13 +1697,14 @@ impl<'a> SlotCacheRef<'a> {
     }
 
     #[inline(always)]
-    #[allow(clippy::cast_ptr_alignment)]
     fn as_frozen(self) -> Option<&'a FrozenSlotCache> {
         let ptr = self.tagged_ptr.as_ptr();
         if (ptr.addr() & 1) == 1 {
             let unmasked = ptr
+                .cast::<u8>()
                 .map_addr(|addr| addr & !1)
                 .cast_const()
+                .cast::<c_void>()
                 .cast::<FrozenSlotCache>();
             // SAFETY: Tag bit `0 == 1` is only produced by `Self::frozen` from `&'a FrozenSlotCache`,
             // and clearing bit `0` via `map_addr` restores the exact aligned pointer and provenance.
@@ -1565,6 +1888,12 @@ const _: () = {
 };
 
 impl<'a> ValidatedIter<'a> {
+    /// Zero-cost marker touch confirming exclusive `&mut self` access for borrow-guarded FFI lookups.
+    #[inline(always)]
+    pub(crate) fn touch_exclusive_borrow(&mut self) {
+        self.batch_epoch = self.batch_epoch.wrapping_add(0);
+    }
+
     /// Advances `batch_epoch` monotonically on any chunk transition or reset (`0` marks
     /// uncacheable overflow saturation).
     #[inline]
@@ -2188,6 +2517,76 @@ impl<'a> ValidatedIter<'a> {
                 info_mode: info.mode,
                 component: info.component,
                 kind: CachedTermKind::DenseWrite,
+            },
+        );
+        Ok(info.component)
+    }
+
+    /// Validates a sparse/row-indexed readable term (`READ` or `OPTIONAL_READ`) via the
+    /// persistent term cache.
+    #[inline]
+    fn validate_sparse_read_term<T: AbiPod>(
+        &self,
+        term_index: usize,
+        expected_mode: AccessMode,
+        expected_uuid: Option<UuidFilter>,
+    ) -> Result<BamComponent, FfiResult> {
+        if let Some(entry) = self.cached_term_entry::<T>(
+            term_index,
+            CachedTermKind::SparseRead,
+            expected_mode,
+            expected_uuid,
+        ) {
+            return Ok(entry.component);
+        }
+        let info = self.column_info(term_index)?;
+        if info.mode != expected_mode || !validate_rows_read_info::<T>(&info, expected_uuid) {
+            return Err(FfiResult::TYPE_MISMATCH);
+        }
+        self.store_cached_term(
+            term_index,
+            CachedTermEntry {
+                type_id: core::any::TypeId::of::<T>(),
+                expected_uuid,
+                expected_mode,
+                info_mode: info.mode,
+                component: info.component,
+                kind: CachedTermKind::SparseRead,
+            },
+        );
+        Ok(info.component)
+    }
+
+    /// Validates a sparse/row-indexed writable term (`WRITE` or `OPTIONAL_WRITE`) via the
+    /// persistent term cache.
+    #[inline]
+    fn validate_sparse_write_term<T: AbiPod>(
+        &self,
+        term_index: usize,
+        expected_mode: AccessMode,
+        expected_uuid: Option<UuidFilter>,
+    ) -> Result<BamComponent, FfiResult> {
+        if let Some(entry) = self.cached_term_entry::<T>(
+            term_index,
+            CachedTermKind::SparseWrite,
+            expected_mode,
+            expected_uuid,
+        ) {
+            return Ok(entry.component);
+        }
+        let info = self.column_info(term_index)?;
+        if info.mode != expected_mode || !validate_rows_write_info::<T>(&info, expected_uuid) {
+            return Err(FfiResult::TYPE_MISMATCH);
+        }
+        self.store_cached_term(
+            term_index,
+            CachedTermEntry {
+                type_id: core::any::TypeId::of::<T>(),
+                expected_uuid,
+                expected_mode,
+                info_mode: info.mode,
+                component: info.component,
+                kind: CachedTermKind::SparseWrite,
             },
         );
         Ok(info.component)
@@ -2870,6 +3269,50 @@ impl<'a> ValidatedIter<'a> {
         self.mark_changed_range(term_index, row, 1)
     }
 
+    /// Batch-marks multiple coalesced dirty row ranges on writable column `term_index` via
+    /// `BamHostApi::iter_mark_changed_ranges` (slot 78), falling back cleanly to slot 15
+    /// (`iter_mark_changed_range`) when connected to an ABI `<= 0.3` host.
+    #[inline]
+    pub fn mark_changed_ranges(&self, term_index: usize, ranges: &[BamRowRange]) -> FfiResult {
+        if self.raw.is_null() {
+            return FfiResult::NULL_POINTER;
+        }
+        if ranges.is_empty() {
+            return FfiResult::OK;
+        }
+        for range in ranges {
+            let Some(end_row) = range.start_row.checked_add(range.row_count) else {
+                return FfiResult::OUT_OF_RANGE;
+            };
+            if end_row > self.current_len {
+                return FfiResult::OUT_OF_RANGE;
+            }
+        }
+        if let Some(mark_ranges_fn) = host_slot!(self.host.api(), iter_mark_changed_ranges) {
+            // SAFETY: `self.raw` is active and every `BamRowRange` was bounds-checked against
+            // `current_len`.
+            let status =
+                unsafe { mark_ranges_fn(self.raw, term_index, ranges.as_ptr(), ranges.len()) };
+            if status != FfiResult::UNSUPPORTED {
+                return status;
+            }
+        }
+        let Some(mark_fn) = self.host.api().iter_mark_changed_range else {
+            return FfiResult::UNSUPPORTED;
+        };
+        for range in ranges {
+            if range.row_count == 0 {
+                continue;
+            }
+            // SAFETY: `self.raw` is active and `range` was bounds-checked against `current_len`.
+            let status = unsafe { mark_fn(self.raw, term_index, range.start_row, range.row_count) };
+            if !status.is_ok() {
+                return status;
+            }
+        }
+        FfiResult::OK
+    }
+
     /// Returns a [`ValidatedSlice`] stamped with [`BamColumnInfo`] for dense read column `term_index`.
     #[inline]
     pub fn readonly_slice(&self, term_index: usize) -> ValidatedSlice<'_> {
@@ -3305,10 +3748,10 @@ impl<'a> ValidatedIter<'a> {
     }
 
     /// Materializes indirect read-only sparse-set row pointers `[ *const u8; current_len ]` and
-    /// wraps them in a validated [`SparseRows`] view.
+    /// wraps them in a validated [`SparseRows`] view (safe on `&self`).
     #[inline]
     pub fn rows_checked<T: AbiPod>(
-        &mut self,
+        &self,
         term_index: usize,
         expected_uuid: Option<UuidFilter>,
     ) -> Option<SparseRows<'_, T>> {
@@ -3322,14 +3765,14 @@ impl<'a> ValidatedIter<'a> {
             return unsafe { SparseRows::from_raw_parts(core::ptr::null(), 0, true) };
         }
         let rows_fn = self.host.api().iter_column_rows_readonly?;
-        // SAFETY: `self.raw` is active at a chunk of `len` rows; `&mut self` keeps the host's
-        // scratch row-pointer array alive and unaliased for the returned `SparseRows<'_, T>`.
+        // SAFETY: `self.raw` is active at a chunk of `len` rows; `from_raw_parts_copied` snapshots
+        // the `[ *const u8; len ]` array before returning so subsequent sparse calls never alias.
         let ptrs = unsafe { rows_fn(self.raw, term_index) };
         if ptrs.is_null() {
             return None;
         }
-        // SAFETY: `ptrs` covers `len` row pointers valid until `self` is next used.
-        unsafe { SparseRows::from_raw_parts(ptrs, len, info.mode.is_optional()) }
+        // SAFETY: `ptrs` covers `len` row pointers copied immediately into owned backing.
+        unsafe { SparseRows::from_raw_parts_copied(ptrs, len) }
     }
 
     /// Materializes indirect mutable sparse-set row pointers `[ *mut u8; current_len ]` and wraps
@@ -3350,14 +3793,42 @@ impl<'a> ValidatedIter<'a> {
             return unsafe { SparseRowsMut::from_raw_parts(core::ptr::null(), 0, true) };
         }
         let rows_fn = self.host.api().iter_column_rows_mutable?;
-        // SAFETY: `self.raw` is active at a chunk of `len` rows; `&mut self` keeps the host's
-        // scratch row-pointer array and component borrows exclusive for `'self`.
+        // SAFETY: `self.raw` is active at a chunk of `len` rows; `from_raw_parts_copied` snapshots
+        // the `[ *mut u8; len ]` array immediately under `&mut self`.
         let ptrs = unsafe { rows_fn(self.raw, term_index) };
         if ptrs.is_null() {
             return None;
         }
         // SAFETY: `ptrs` covers `len` writable row pointers valid until `self` is next used.
-        unsafe { SparseRowsMut::from_raw_parts(ptrs, len, info.mode.is_optional()) }
+        unsafe { SparseRowsMut::from_raw_parts_copied(ptrs, len) }
+    }
+
+    /// Materializes indirect mutable sparse-set row pointers **without** marking change ticks
+    /// via `BamHostApi::iter_column_rows_mutable_untracked` (slot 77).
+    #[inline]
+    pub fn rows_mut_untracked_checked<T: AbiPod>(
+        &mut self,
+        term_index: usize,
+        expected_uuid: Option<UuidFilter>,
+    ) -> Option<SparseRowsMut<'_, T>> {
+        let info = self.column_info(term_index).ok()?;
+        if !validate_rows_write_info::<T>(&info, expected_uuid) {
+            return None;
+        }
+        let len = self.current_len;
+        if len == 0 {
+            // SAFETY: Zero-length `SparseRowsMut` does not dereference its pointer.
+            return unsafe { SparseRowsMut::from_raw_parts(core::ptr::null(), 0, true) };
+        }
+        let rows_fn = host_slot!(self.host.api(), iter_column_rows_mutable_untracked)?;
+        // SAFETY: `self.raw` is active at a chunk of `len` rows; `from_raw_parts_copied` snapshots
+        // the `[ *mut u8; len ]` array immediately under `&mut self`.
+        let ptrs = unsafe { rows_fn(self.raw, term_index) };
+        if ptrs.is_null() {
+            return None;
+        }
+        // SAFETY: `ptrs` covers `len` writable row pointers valid until `self` is next used.
+        unsafe { SparseRowsMut::from_raw_parts_copied(ptrs, len) }
     }
 
     /// Returns the raw read-only singleton resource pointer at `term_index` (or null).
@@ -3597,6 +4068,192 @@ impl<'a> ValidatedIter<'a> {
         }
     }
 
+    /// Executes `f` in parallel across disjoint sub-range chunks on the host `ComputeTaskPool`,
+    /// advancing each worker sub-iterator via `BamHostApi::iter_next_chunk_batch` (slot 68) into
+    /// a stack-local [`BatchColCache`].
+    pub fn par_for_each_chunk_batch<F>(
+        &mut self,
+        col_count: usize,
+        needs_entities: bool,
+        mark_changed_mask: u32,
+        f: F,
+    ) -> FfiResult
+    where
+        F: Fn(&mut ValidatedIter<'_>, &BatchColCache<'_>) -> FfiResult + Sync,
+    {
+        if self.raw.is_null() {
+            return FfiResult::OK;
+        }
+        let Some(par_fn) = host_slot!(self.host.api(), par_for_each_chunk) else {
+            return FfiResult::UNSUPPORTED;
+        };
+        self.bump_batch_epoch();
+        self.batch_entities = core::ptr::null();
+        self.current_len = 0;
+        let frozen_cache = self.slot_cache.and_then(|c| match c.as_mutable() {
+            Some(s) => s.snapshot_frozen(),
+            None => c.as_frozen().copied(),
+        });
+        let task_ctx = ParChunkBatchTaskContext {
+            host: self.host(),
+            frozen_cache: frozen_cache.as_ref(),
+            col_count,
+            needs_entities,
+            mark_changed_mask,
+            func: f,
+        };
+        // SAFETY: `self.raw` is an active top-level `BamIter`, `task_ctx` stays live across the
+        // synchronous `par_fn` scope, and `par_chunk_batch_task_trampoline` catches guest panics.
+        unsafe {
+            par_fn(
+                self.raw,
+                Some(par_chunk_batch_task_trampoline::<F>),
+                (&raw const task_ctx).cast_mut().cast::<c_void>(),
+            )
+        }
+    }
+
+    /// Executes `f` in parallel across disjoint read-only sub-range chunks via
+    /// `BamHostApi::par_for_each_chunk_readonly` (slot 59), advancing each worker sub-iterator via
+    /// `BamHostApi::iter_next_chunk_batch` (slot 68) into a stack-local [`BatchColCache`].
+    pub fn par_for_each_chunk_readonly_batch<F>(
+        &mut self,
+        col_count: usize,
+        needs_entities: bool,
+        mark_changed_mask: u32,
+        f: F,
+    ) -> FfiResult
+    where
+        F: Fn(&mut ValidatedIter<'_>, &BatchColCache<'_>) -> FfiResult + Sync,
+    {
+        if self.raw.is_null() {
+            return FfiResult::OK;
+        }
+        let Some(par_fn) = host_slot!(self.host.api(), par_for_each_chunk_readonly) else {
+            return FfiResult::UNSUPPORTED;
+        };
+        self.bump_batch_epoch();
+        self.batch_entities = core::ptr::null();
+        self.current_len = 0;
+        let frozen_cache = self.slot_cache.and_then(|c| match c.as_mutable() {
+            Some(s) => s.snapshot_frozen(),
+            None => c.as_frozen().copied(),
+        });
+        let task_ctx = ParChunkBatchTaskContext {
+            host: self.host(),
+            frozen_cache: frozen_cache.as_ref(),
+            col_count,
+            needs_entities,
+            mark_changed_mask,
+            func: f,
+        };
+        // SAFETY: `self.raw` is an active top-level `BamIter`, `task_ctx` stays live across the
+        // synchronous `par_fn` scope, and `par_chunk_batch_task_trampoline` catches guest panics.
+        unsafe {
+            par_fn(
+                self.raw,
+                Some(par_chunk_batch_task_trampoline::<F>),
+                (&raw const task_ctx).cast_mut().cast::<c_void>(),
+            )
+        }
+    }
+
+    /// Executes `f` in parallel across disjoint sub-range chunks via
+    /// `BamHostApi::par_for_each_chunk_ex` (slot 81) with caller-configured [`BamParOptions`],
+    /// forwarding each partition's [`ValidatedCommands`] and `partition_index`.
+    pub fn par_for_each_chunk_ex<F>(&mut self, options: &BamParOptions, f: F) -> FfiResult
+    where
+        F: Fn(&mut ValidatedIter<'_>, &mut ValidatedCommands<'_>, usize) -> FfiResult + Sync,
+    {
+        if self.raw.is_null() {
+            return FfiResult::OK;
+        }
+        let Some(par_fn) = host_slot!(self.host.api(), par_for_each_chunk_ex) else {
+            return FfiResult::UNSUPPORTED;
+        };
+        let mut opts = *options;
+        if opts.struct_size == 0 {
+            opts.struct_size = core::mem::size_of::<BamParOptions>() as u32;
+        }
+        self.bump_batch_epoch();
+        self.batch_entities = core::ptr::null();
+        self.current_len = 0;
+        let frozen_cache = self.slot_cache.and_then(|c| match c.as_mutable() {
+            Some(s) => s.snapshot_frozen(),
+            None => c.as_frozen().copied(),
+        });
+        let task_ctx = ParChunkExTaskContext {
+            host: self.host(),
+            frozen_cache: frozen_cache.as_ref(),
+            func: f,
+        };
+        // SAFETY: `self.raw` is an active top-level `BamIter`, `opts` and `task_ctx` remain valid
+        // across the synchronous `par_fn` scope, and `par_chunk_ex_task_trampoline` catches panics.
+        unsafe {
+            par_fn(
+                self.raw,
+                Some(par_chunk_ex_task_trampoline::<F> as BamChunkTaskExFn),
+                (&raw const task_ctx).cast_mut().cast::<c_void>(),
+                &opts,
+            )
+        }
+    }
+
+    /// Batch-accelerated (`iter_next_chunk_batch` slot 68) variant of [`Self::par_for_each_chunk_ex`].
+    pub fn par_for_each_chunk_ex_batch<F>(
+        &mut self,
+        options: &BamParOptions,
+        col_count: usize,
+        needs_entities: bool,
+        mark_changed_mask: u32,
+        f: F,
+    ) -> FfiResult
+    where
+        F: Fn(
+                &mut ValidatedIter<'_>,
+                &BatchColCache<'_>,
+                &mut ValidatedCommands<'_>,
+                usize,
+            ) -> FfiResult
+            + Sync,
+    {
+        if self.raw.is_null() {
+            return FfiResult::OK;
+        }
+        let Some(par_fn) = host_slot!(self.host.api(), par_for_each_chunk_ex) else {
+            return FfiResult::UNSUPPORTED;
+        };
+        let mut opts = *options;
+        if opts.struct_size == 0 {
+            opts.struct_size = core::mem::size_of::<BamParOptions>() as u32;
+        }
+        self.bump_batch_epoch();
+        self.batch_entities = core::ptr::null();
+        self.current_len = 0;
+        let frozen_cache = self.slot_cache.and_then(|c| match c.as_mutable() {
+            Some(s) => s.snapshot_frozen(),
+            None => c.as_frozen().copied(),
+        });
+        let task_ctx = ParChunkExBatchTaskContext {
+            host: self.host(),
+            frozen_cache: frozen_cache.as_ref(),
+            col_count,
+            needs_entities,
+            mark_changed_mask,
+            func: f,
+        };
+        // SAFETY: `self.raw` is an active top-level `BamIter`, `opts` and `task_ctx` remain valid
+        // across the synchronous `par_fn` scope, and `par_chunk_ex_batch_task_trampoline` catches panics.
+        unsafe {
+            par_fn(
+                self.raw,
+                Some(par_chunk_ex_batch_task_trampoline::<F> as BamChunkTaskExFn),
+                (&raw const task_ctx).cast_mut().cast::<c_void>(),
+                &opts,
+            )
+        }
+    }
+
     /// Non-destructively counts all matching entities in this query via `BamHostApi::iter_count`
     /// (slot 57) without advancing or resetting the chunk cursor.
     ///
@@ -3741,6 +4398,52 @@ impl<'a> ValidatedIter<'a> {
             core::slice::from_raw_parts_mut(out.as_mut_ptr().cast::<MaybeUninit<M>>(), out.len())
         };
         self.read_messages_into_uninit_checked::<M>(term_index, expected_uuid, uninit_out)
+    }
+
+    /// Borrows a contiguous `&[M]` slice of unread POD messages at `term_index` with zero heap
+    /// allocations and zero per-message copies via `BamHostApi::msg_read_slice` (slot 88).
+    ///
+    /// Returns [`FfiResult::UNSUPPORTED`] when connected to an ABI `<= 0.3` host lacking slot 88.
+    pub fn msg_read_slice_checked<M: AbiPod>(
+        &mut self,
+        term_index: usize,
+        expected_uuid: Option<UuidFilter>,
+    ) -> Result<&[M], FfiResult> {
+        if self.raw.is_null() {
+            return Err(FfiResult::NULL_POINTER);
+        }
+        let read_fn = host_slot!(self.host.api(), msg_read_slice).ok_or(FfiResult::UNSUPPORTED)?;
+        self.validate_message_read_term::<M>(term_index, expected_uuid)?;
+        let mut ptr: *const u8 = core::ptr::null();
+        let mut count: usize = 0;
+        // SAFETY: `self.raw` is active, `validate_message_read_term` confirmed `M`'s layout, and
+        // both out-pointers are aligned writable stack storage.
+        let status = unsafe { read_fn(self.raw, term_index, &mut ptr, &mut count) };
+        if !status.is_ok() {
+            return Err(status);
+        }
+        if count == 0 {
+            return Ok(&[]);
+        }
+        let elem_size = core::mem::size_of::<M>();
+        if elem_size == 0 {
+            // SAFETY: Zero-sized `M: AbiPod` may be sliced via `NonNull::dangling()`.
+            return Ok(unsafe {
+                core::slice::from_raw_parts(core::ptr::NonNull::<M>::dangling().as_ptr(), count)
+            });
+        }
+        let byte_len = count
+            .checked_mul(elem_size)
+            .ok_or(FfiResult::OUT_OF_RANGE)?;
+        if byte_len > isize::MAX as usize {
+            return Err(FfiResult::OUT_OF_RANGE);
+        }
+        if ptr.is_null() || !(ptr as usize).is_multiple_of(core::mem::align_of::<M>()) {
+            return Err(FfiResult::TYPE_MISMATCH);
+        }
+        // SAFETY: Host reported `OK`, `ptr` is non-null, aligned for `M`, `byte_len <= isize::MAX`,
+        // and valid for shared reads tied to `&mut self` for this message cursor advance.
+        Ok(unsafe { core::slice::from_raw_parts(ptr.cast::<M>(), count) })
     }
 
     /// Appends up to `max_count` unread POD messages from `term_index` directly into `out`,
@@ -5113,8 +5816,13 @@ impl<'a> ValidatedIter<'a> {
         else {
             return Ok(None);
         };
-        // SAFETY: `ptr` is valid for the borrow window and `vt_get` returns a borrowed `StrView`.
-        let view: StrView = unsafe { vt_get(ptr) };
+        let mut view = StrView::empty();
+        // SAFETY: `ptr` is valid for the borrow window and `vt_get` writes a borrowed `StrView`
+        // into `&mut view`.
+        let status = unsafe { vt_get(ptr, &mut view) };
+        if !status.is_ok() {
+            return Err(status);
+        }
         // SAFETY: `try_as_str` validates pointer alignment, non-nullness, and UTF-8 before copying.
         let s = unsafe { view.try_as_str() }?;
         Ok(Some(String::from(s)))
@@ -5145,17 +5853,18 @@ impl<'a> ValidatedIter<'a> {
         let Some(ptr) = ptr_opt else {
             return FfiResult::NOT_FOUND;
         };
-        // SAFETY: `ptr` is exclusively borrowed and `StrView::from_str(text)` is valid for this call.
-        unsafe { vt_set(ptr, StrView::from_str(text)) }
+        let view = StrView::from_str(text);
+        // SAFETY: `ptr` is exclusively borrowed and `view` borrows valid UTF-8 for this call.
+        unsafe { vt_set(ptr, &view) }
     }
 }
 
 /// C-ABI `import_field` callback signature used by [`ImportSinkCtx`] and [`forward_field`].
 pub(crate) type WitnessImportFieldFn = unsafe extern "C" fn(
     dst_ptr: *mut c_void,
-    field_name: StrView,
-    type_tag: StrView,
-    payload: FfiSlice<u8>,
+    field_name: *const StrView,
+    type_tag: *const StrView,
+    payload: *const FfiSlice<u8>,
 ) -> FfiResult;
 
 /// Trampoline context forwarding each host-decoded wire field into `M`'s `import_field`.
@@ -5165,21 +5874,32 @@ pub(crate) struct ImportSinkCtx {
 }
 
 /// C-ABI field-sink callback passed to host wire decoding that invokes `import_fn` on `dst_ptr`.
+///
+/// # Safety
+/// - `ctx` must be null or point to a live [`ImportSinkCtx`] whose `dst_ptr` is valid for
+///   `import_fn`.
+/// - `field_name`, `type_tag`, and `payload` must be null or point to valid readable
+///   [`StrView`] / [`FfiSlice`] values for this synchronous callback.
 pub(crate) unsafe extern "C" fn forward_field(
     ctx: *mut c_void,
-    field_name: StrView,
-    type_tag: StrView,
-    payload: FfiSlice<u8>,
+    field_name: *const StrView,
+    type_tag: *const StrView,
+    payload: *const FfiSlice<u8>,
 ) -> FfiResult {
     catch_guest_result(|| {
-        if ctx.is_null() || !(ctx as usize).is_multiple_of(core::mem::align_of::<ImportSinkCtx>()) {
+        if ctx.is_null()
+            || field_name.is_null()
+            || type_tag.is_null()
+            || payload.is_null()
+            || !(ctx as usize).is_multiple_of(core::mem::align_of::<ImportSinkCtx>())
+        {
             return FfiResult::INVALID_ARGUMENT;
         }
         // SAFETY: `ctx` is non-null, aligned, and points to a stack-pinned `ImportSinkCtx`
         // for the duration of `host_export_fn`.
         let sink_ctx = unsafe { &*ctx.cast::<ImportSinkCtx>() };
         // SAFETY: `sink_ctx.dst_ptr` points to a valid initialized `M`, and `field_name`,
-        // `type_tag`, `payload` are valid slices for this synchronous callback.
+        // `type_tag`, `payload` are non-null pointers valid for this synchronous callback.
         unsafe { (sink_ctx.import_fn)(sink_ctx.dst_ptr, field_name, type_tag, payload) }
     })
 }
@@ -5273,30 +5993,38 @@ impl PacketBuilder {
 }
 
 /// C-ABI field-sink callback invoked by `M::export_fields` to append one encoded field to `PacketBuilder`.
+///
+/// # Safety
+/// - `ctx` must be null or point to an exclusively accessible [`PacketBuilder`].
+/// - `field_name`, `type_tag`, and `payload` must be null or point to live readable
+///   [`StrView`] / [`FfiSlice`] values for this synchronous callback.
 pub(crate) unsafe extern "C" fn append_field(
     ctx: *mut c_void,
-    field_name: StrView,
-    type_tag: StrView,
-    payload: FfiSlice<u8>,
+    field_name: *const StrView,
+    type_tag: *const StrView,
+    payload: *const FfiSlice<u8>,
 ) -> FfiResult {
     catch_guest_result(|| {
         if ctx.is_null() || !(ctx as usize).is_multiple_of(core::mem::align_of::<PacketBuilder>()) {
             return FfiResult::INVALID_ARGUMENT;
         }
+        if field_name.is_null() || type_tag.is_null() || payload.is_null() {
+            return FfiResult::NULL_POINTER;
+        }
         // SAFETY: `ctx` is non-null, aligned, and points to an active `PacketBuilder` on
         // the stack for this call.
         let builder = unsafe { &mut *ctx.cast::<PacketBuilder>() };
-        // SAFETY: `field_name`, `type_tag`, and `payload` come directly from `export_fields`
-        // and borrow live slices for this synchronous callback.
-        let Ok(name_bytes) = (unsafe { field_name.try_as_slice() }) else {
+        // SAFETY: `field_name`, `type_tag`, and `payload` are non-null pointers from
+        // `export_fields` borrowing live slices for this synchronous callback.
+        let Ok(name_bytes) = (unsafe { (*field_name).try_as_slice() }) else {
             return FfiResult::NULL_POINTER;
         };
         // SAFETY: Same as above for `type_tag`.
-        let Ok(tag_bytes) = (unsafe { type_tag.try_as_slice() }) else {
+        let Ok(tag_bytes) = (unsafe { (*type_tag).try_as_slice() }) else {
             return FfiResult::NULL_POINTER;
         };
         // SAFETY: Same as above for `payload`.
-        let Ok(val_bytes) = (unsafe { payload.try_as_slice() }) else {
+        let Ok(val_bytes) = (unsafe { (*payload).try_as_slice() }) else {
             return FfiResult::NULL_POINTER;
         };
         let Ok(name_len) = u32::try_from(name_bytes.len()) else {
@@ -5331,6 +6059,12 @@ struct ParChunkTaskContext<'h, F> {
 
 /// Panic-isolated C-ABI trampoline invoked by the host `ComputeTaskPool` for each disjoint sub-chunk
 /// iterator during `par_for_each_chunk` and `par_for_each_chunk_readonly`.
+///
+/// # Safety
+/// - `sub_iter` must be null or point to an isolated per-partition [`BamIter`] active for this
+///   worker task.
+/// - `user_data` must be null or point to a [`ParChunkTaskContext`] pinned on the caller's stack
+///   throughout the synchronous parallel dispatch.
 unsafe extern "C" fn par_chunk_task_trampoline<F>(
     sub_iter: *mut BamIter,
     user_data: *mut c_void,
@@ -5356,6 +6090,198 @@ where
         };
         while task_iter.next_chunk().is_some() {
             let status = (ctx.func)(&mut task_iter);
+            if !status.is_ok() {
+                return status;
+            }
+        }
+        FfiResult::OK
+    })
+}
+
+/// Context passed through `user_data` to [`par_chunk_batch_task_trampoline`].
+struct ParChunkBatchTaskContext<'h, F> {
+    host: &'h Host,
+    frozen_cache: Option<&'h FrozenSlotCache>,
+    col_count: usize,
+    needs_entities: bool,
+    mark_changed_mask: u32,
+    func: F,
+}
+
+/// Panic-isolated batch-accelerated (`iter_next_chunk_batch` slot 68) C-ABI trampoline for
+/// parallel chunk dispatch.
+///
+/// # Safety
+/// - `sub_iter` must be null or point to an isolated per-partition [`BamIter`] active for this
+///   worker task.
+/// - `user_data` must be null or point to a [`ParChunkBatchTaskContext`] pinned on the caller's
+///   stack throughout the synchronous parallel dispatch.
+unsafe extern "C" fn par_chunk_batch_task_trampoline<F>(
+    sub_iter: *mut BamIter,
+    user_data: *mut c_void,
+) -> FfiResult
+where
+    F: Fn(&mut ValidatedIter<'_>, &BatchColCache<'_>) -> FfiResult + Sync,
+{
+    catch_guest_result(|| {
+        if sub_iter.is_null() || user_data.is_null() {
+            return FfiResult::NULL_POINTER;
+        }
+        if !(user_data as usize)
+            .is_multiple_of(core::mem::align_of::<ParChunkBatchTaskContext<'_, F>>())
+        {
+            return FfiResult::INVALID_ARGUMENT;
+        }
+        // SAFETY: `user_data` points to `ParChunkBatchTaskContext<'_, F>` live on the caller's
+        // stack throughout the synchronous parallel dispatch.
+        let ctx = unsafe { &*user_data.cast::<ParChunkBatchTaskContext<'_, F>>() };
+        // SAFETY: `sub_iter` is an isolated sub-range `BamIter` valid on this worker thread.
+        let mut task_iter = unsafe {
+            ValidatedIter::from_raw_with_frozen_cache(sub_iter, ctx.host, ctx.frozen_cache)
+        };
+        let mut batch_cache = BatchColCache::new();
+        while task_iter
+            .advance_batch_into(
+                &mut batch_cache,
+                ctx.col_count,
+                ctx.needs_entities,
+                ctx.mark_changed_mask,
+            )
+            .is_some()
+        {
+            let status = (ctx.func)(&mut task_iter, &batch_cache);
+            if !status.is_ok() {
+                return status;
+            }
+        }
+        FfiResult::OK
+    })
+}
+
+/// Context passed through `user_data` to [`par_chunk_ex_task_trampoline`].
+struct ParChunkExTaskContext<'h, F> {
+    host: &'h Host,
+    frozen_cache: Option<&'h FrozenSlotCache>,
+    func: F,
+}
+
+/// Panic-isolated C-ABI trampoline for `BamHostApi::par_for_each_chunk_ex` (slot 81).
+///
+/// # Safety
+/// - `sub_iter` and `commands` must be null or point to isolated per-partition [`BamIter`] and
+///   [`BamCommands`] handles active for this worker task.
+/// - `user_data` must be null or point to a [`ParChunkExTaskContext`] pinned on the caller's stack
+///   throughout the synchronous parallel dispatch.
+unsafe extern "C" fn par_chunk_ex_task_trampoline<F>(
+    sub_iter: *mut BamIter,
+    commands: *mut BamCommands,
+    partition_index: usize,
+    user_data: *mut c_void,
+) -> FfiResult
+where
+    F: Fn(&mut ValidatedIter<'_>, &mut ValidatedCommands<'_>, usize) -> FfiResult + Sync,
+{
+    catch_guest_result(|| {
+        if sub_iter.is_null() || user_data.is_null() {
+            return FfiResult::NULL_POINTER;
+        }
+        if !(user_data as usize)
+            .is_multiple_of(core::mem::align_of::<ParChunkExTaskContext<'_, F>>())
+        {
+            return FfiResult::INVALID_ARGUMENT;
+        }
+        // SAFETY: `user_data` points to `ParChunkExTaskContext<'_, F>` live on caller's stack.
+        let ctx = unsafe { &*user_data.cast::<ParChunkExTaskContext<'_, F>>() };
+        // SAFETY: `sub_iter` is an isolated sub-range `BamIter` valid on this worker thread.
+        let mut task_iter = unsafe {
+            ValidatedIter::from_raw_with_frozen_cache(sub_iter, ctx.host, ctx.frozen_cache)
+        };
+        let mut task_cmds = if commands.is_null() {
+            ValidatedCommands::empty(ctx.host)
+        } else {
+            // SAFETY: Host provides an isolated per-partition `BamCommands` handle for this task.
+            unsafe { ValidatedCommands::from_raw(commands, ctx.host) }
+        };
+        while task_iter.next_chunk().is_some() {
+            let status = (ctx.func)(&mut task_iter, &mut task_cmds, partition_index);
+            if !status.is_ok() {
+                return status;
+            }
+        }
+        FfiResult::OK
+    })
+}
+
+/// Context passed through `user_data` to [`par_chunk_ex_batch_task_trampoline`].
+struct ParChunkExBatchTaskContext<'h, F> {
+    host: &'h Host,
+    frozen_cache: Option<&'h FrozenSlotCache>,
+    col_count: usize,
+    needs_entities: bool,
+    mark_changed_mask: u32,
+    func: F,
+}
+
+/// Panic-isolated batch-accelerated C-ABI trampoline for `BamHostApi::par_for_each_chunk_ex`
+/// (slot 81).
+///
+/// # Safety
+/// - `sub_iter` and `commands` must be null or point to isolated per-partition [`BamIter`] and
+///   [`BamCommands`] handles active for this worker task.
+/// - `user_data` must be null or point to a [`ParChunkExBatchTaskContext`] pinned on the caller's
+///   stack throughout the synchronous parallel dispatch.
+unsafe extern "C" fn par_chunk_ex_batch_task_trampoline<F>(
+    sub_iter: *mut BamIter,
+    commands: *mut BamCommands,
+    partition_index: usize,
+    user_data: *mut c_void,
+) -> FfiResult
+where
+    F: Fn(
+            &mut ValidatedIter<'_>,
+            &BatchColCache<'_>,
+            &mut ValidatedCommands<'_>,
+            usize,
+        ) -> FfiResult
+        + Sync,
+{
+    catch_guest_result(|| {
+        if sub_iter.is_null() || user_data.is_null() {
+            return FfiResult::NULL_POINTER;
+        }
+        if !(user_data as usize)
+            .is_multiple_of(core::mem::align_of::<ParChunkExBatchTaskContext<'_, F>>())
+        {
+            return FfiResult::INVALID_ARGUMENT;
+        }
+        // SAFETY: `user_data` points to `ParChunkExBatchTaskContext<'_, F>` live on caller's stack.
+        let ctx = unsafe { &*user_data.cast::<ParChunkExBatchTaskContext<'_, F>>() };
+        // SAFETY: `sub_iter` is an isolated sub-range `BamIter` valid on this worker thread.
+        let mut task_iter = unsafe {
+            ValidatedIter::from_raw_with_frozen_cache(sub_iter, ctx.host, ctx.frozen_cache)
+        };
+        let mut task_cmds = if commands.is_null() {
+            ValidatedCommands::empty(ctx.host)
+        } else {
+            // SAFETY: Host provides an isolated per-partition `BamCommands` handle for this task.
+            unsafe { ValidatedCommands::from_raw(commands, ctx.host) }
+        };
+        let mut batch_cache = BatchColCache::new();
+        while task_iter
+            .advance_batch_into(
+                &mut batch_cache,
+                ctx.col_count,
+                ctx.needs_entities,
+                ctx.mark_changed_mask,
+            )
+            .is_some()
+        {
+            let status = (ctx.func)(
+                &mut task_iter,
+                &batch_cache,
+                &mut task_cmds,
+                partition_index,
+            );
             if !status.is_ok() {
                 return status;
             }
@@ -5475,9 +6401,9 @@ type ExportFieldsFn = unsafe extern "C" fn(
     sink: Option<
         unsafe extern "C" fn(
             sink_ctx: *mut c_void,
-            field_name: StrView,
-            type_tag: StrView,
-            payload: FfiSlice<u8>,
+            field_name: *const StrView,
+            type_tag: *const StrView,
+            payload: *const FfiSlice<u8>,
         ) -> FfiResult,
     >,
     sink_ctx: *mut c_void,
@@ -5643,7 +6569,7 @@ impl<'chunk, 'ctx> ChunkColumnDispenser<'chunk, 'ctx> {
     #[inline]
     pub fn new_with_batch(
         iter: &'chunk mut ValidatedIter<'ctx>,
-        cache: &'chunk BatchColCache<'ctx>,
+        cache: &BatchColCache<'_>,
     ) -> Self {
         let valid = iter.iter_id != 0
             && iter.batch_epoch != 0
@@ -6098,6 +7024,134 @@ impl<'chunk, 'ctx> ChunkColumnDispenser<'chunk, 'ctx> {
         }
         // SAFETY: Present optional dense mutable column verified for layout, UUID, alignment, and disjointness.
         unsafe { self.dispense_dense_write::<T>(component, ptr, len) }.map(Some)
+    }
+
+    /// Dispenses the next untracked dense mutable `&'chunk mut [T]` column (`WRITE`) without
+    /// marking change ticks automatically.
+    #[inline]
+    pub fn next_write_untracked<T: AbiPod>(
+        &mut self,
+        expected_uuid: Option<UuidFilter>,
+    ) -> Result<&'chunk mut [T], FfiResult> {
+        let term_index = self.next_term_index;
+        self.next_term_index += 1;
+        let component = self
+            .iter
+            .validate_dense_write_term::<T>(term_index, expected_uuid)?;
+        let len = self.iter.current_len();
+        let ptr = if len == 0 || core::mem::size_of::<T>() == 0 {
+            core::ptr::NonNull::<u8>::dangling().as_ptr()
+        } else if let Some(batch_ptr) = self.batch_col_ptr(term_index) {
+            batch_ptr
+        } else {
+            let col_fn = self
+                .iter
+                .host
+                .api()
+                .iter_column_mutable_untracked
+                .ok_or(FfiResult::NULL_POINTER)?;
+            // SAFETY: `self.iter.raw` is active at a chunk of `len` rows for `'chunk`.
+            unsafe { col_fn(self.iter.raw, term_index) }
+        };
+        // SAFETY: `validate_dense_write_term` verified `WRITE`, non-immutable, layout, and UUID.
+        unsafe { self.dispense_dense_write::<T>(component, ptr, len) }
+    }
+
+    /// Dispenses the next sparse-set read-only [`SparseRows<'chunk, T>`] column (`READ` or
+    /// `OPTIONAL_READ`), validating layout/UUID and recording a shared component borrow.
+    #[inline]
+    pub fn next_sparse_read<T: AbiPod>(
+        &mut self,
+        expected_mode: AccessMode,
+        expected_uuid: Option<UuidFilter>,
+    ) -> Result<SparseRows<'chunk, T>, FfiResult> {
+        let term_index = self.next_term_index;
+        self.next_term_index += 1;
+        let component =
+            self.iter
+                .validate_sparse_read_term::<T>(term_index, expected_mode, expected_uuid)?;
+        self.check_and_record_borrow(component, 0, 0, false)?;
+        let len = self.iter.current_len();
+        if len == 0 {
+            // SAFETY: Zero-length `SparseRows` never dereferences its pointer.
+            return unsafe { SparseRows::from_raw_parts(core::ptr::null(), 0, true) }
+                .ok_or(FfiResult::NULL_POINTER);
+        }
+        let rows_fn = self
+            .iter
+            .host
+            .api()
+            .iter_column_rows_readonly
+            .ok_or(FfiResult::NULL_POINTER)?;
+        // SAFETY: `self.iter.raw` is active at a chunk of `len` rows and pointers are copied
+        // immediately via `from_raw_parts_copied`.
+        let ptrs = unsafe { rows_fn(self.iter.raw, term_index) };
+        if ptrs.is_null() {
+            return Err(FfiResult::NULL_POINTER);
+        }
+        // SAFETY: `ptrs` covers `len` row pointers copied immediately into owned backing.
+        unsafe { SparseRows::from_raw_parts_copied(ptrs, len) }.ok_or(FfiResult::NULL_POINTER)
+    }
+
+    /// Dispenses the next sparse-set mutable [`SparseRowsMut<'chunk, T>`] column (`WRITE` or
+    /// `OPTIONAL_WRITE`), validating layout/UUID and recording an exclusive component borrow.
+    #[inline]
+    pub fn next_sparse_write<T: AbiPod>(
+        &mut self,
+        expected_mode: AccessMode,
+        expected_uuid: Option<UuidFilter>,
+    ) -> Result<SparseRowsMut<'chunk, T>, FfiResult> {
+        let term_index = self.next_term_index;
+        self.next_term_index += 1;
+        let component =
+            self.iter
+                .validate_sparse_write_term::<T>(term_index, expected_mode, expected_uuid)?;
+        self.check_and_record_borrow(component, 0, 0, true)?;
+        let len = self.iter.current_len();
+        if len == 0 {
+            // SAFETY: Zero-length `SparseRowsMut` never dereferences its pointer.
+            return unsafe { SparseRowsMut::from_raw_parts(core::ptr::null(), 0, true) }
+                .ok_or(FfiResult::NULL_POINTER);
+        }
+        let rows_fn = self
+            .iter
+            .host
+            .api()
+            .iter_column_rows_mutable
+            .ok_or(FfiResult::NULL_POINTER)?;
+        // SAFETY: `self.iter.raw` is active at a chunk of `len` rows and pointers are copied
+        // immediately via `from_raw_parts_copied`.
+        let ptrs = unsafe { rows_fn(self.iter.raw, term_index) };
+        if ptrs.is_null() {
+            return Err(FfiResult::NULL_POINTER);
+        }
+        // SAFETY: `ptrs` covers `len` writable row pointers copied immediately into owned backing.
+        unsafe { SparseRowsMut::from_raw_parts_copied(ptrs, len) }.ok_or(FfiResult::NULL_POINTER)
+    }
+
+    /// Dispenses the next selectively tracked mutable [`SelectiveMutSlice<'chunk, T>`] column
+    /// (`WRITE`), borrowing the untracked slice without marking ticks upfront and flushing
+    /// coalesced dirty runs via slot 78 (`iter_mark_changed_ranges`) on drop or `flush()`.
+    #[inline]
+    pub fn next_selective_write<T: AbiPod>(
+        &mut self,
+        expected_uuid: Option<UuidFilter>,
+    ) -> Result<SelectiveMutSlice<'chunk, T>, FfiResult> {
+        let term_index = self.next_term_index;
+        let iter_raw = self.iter.raw;
+        let mark_ranges_fn = host_slot!(self.iter.host.api(), iter_mark_changed_ranges);
+        let mark_range_fn = self.iter.host.api().iter_mark_changed_range;
+        let slice = self.next_write_untracked::<T>(expected_uuid)?;
+        // SAFETY: `iter_raw` remains valid for `'chunk` and `term_index` matches `slice`.
+        Ok(unsafe {
+            SelectiveMutSlice::from_raw_parts(
+                slice,
+                iter_raw,
+                mark_ranges_fn,
+                mark_range_fn,
+                term_index,
+            )
+        })
     }
 
     /// Validates and advances past a pure filter term (`FILTER_ONLY` / `WITHOUT` / `ALLOW`).
@@ -6615,9 +7669,9 @@ mod tests {
             sink: Option<
                 unsafe extern "C" fn(
                     sink_ctx: *mut c_void,
-                    field_name: StrView,
-                    type_tag: StrView,
-                    payload: FfiSlice<u8>,
+                    field_name: *const StrView,
+                    type_tag: *const StrView,
+                    payload: *const FfiSlice<u8>,
                 ) -> FfiResult,
             >,
             sink_ctx: *mut c_void,
@@ -6628,31 +7682,37 @@ mod tests {
                 return FfiResult::NULL_POINTER;
             };
             let bytes = msg.tag.to_le_bytes();
+            let field_name = StrView::from_str("tag");
+            let type_tag = StrView::from_str("u32");
+            let payload = FfiSlice::from_slice(&bytes);
             // SAFETY: Forwarding stack slice for synchronous callback.
             unsafe {
                 sink_fn(
                     sink_ctx,
-                    StrView::from_str("tag"),
-                    StrView::from_str("u32"),
-                    FfiSlice::from_slice(&bytes),
+                    &raw const field_name,
+                    &raw const type_tag,
+                    &raw const payload,
                 )
             }
         }
 
         unsafe extern "C" fn test_import_field(
             dst_ptr: *mut c_void,
-            field_name: StrView,
-            _type_tag: StrView,
-            payload: FfiSlice<u8>,
+            field_name: *const StrView,
+            _type_tag: *const StrView,
+            payload: *const FfiSlice<u8>,
         ) -> FfiResult {
+            if field_name.is_null() || payload.is_null() {
+                return FfiResult::NULL_POINTER;
+            }
             // SAFETY: `dst_ptr` points to a live `TestDynMsg`.
             let dst = unsafe { &mut *dst_ptr.cast::<TestDynMsg>() };
             // SAFETY: Valid synchronous slices from `forward_field`.
-            let Ok(name) = (unsafe { field_name.try_as_str() }) else {
+            let Ok(name) = (unsafe { (*field_name).try_as_str() }) else {
                 return FfiResult::INVALID_UTF8;
             };
             // SAFETY: Valid synchronous slice from `forward_field`.
-            let Ok(bytes) = (unsafe { payload.try_as_slice() }) else {
+            let Ok(bytes) = (unsafe { (*payload).try_as_slice() }) else {
                 return FfiResult::NULL_POINTER;
             };
             if name == "tag" && bytes.len() == 4 {

@@ -1,7 +1,7 @@
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
 
-//! Rust `bamabi_guest` safe-SDK benchmark guest mod (`ABI 0.3.0`).
+//! Rust `bamabi_guest` safe-SDK benchmark guest mod (`ABI 0.4.0`).
 //!
 //! Exports the four shared wire-contract benchmark systems under `ScheduleId::UPDATE`:
 //! - `bench_noop`
@@ -67,13 +67,13 @@ fn resolve_or_register_typed<T: GuestComponent>(
     }
 }
 
-/// Benchmark guest plugin implementing all four ABI `0.3.0` benchmark workloads.
+/// Benchmark guest plugin implementing all four ABI `0.4.0` benchmark workloads.
 #[derive(Default)]
 pub struct BenchGuestRust;
 
 impl GuestPlugin for BenchGuestRust {
     const NAME: &'static CStr = c"bench_guest_rust";
-    const VERSION: &'static CStr = c"0.3.0";
+    const VERSION: &'static CStr = c"0.4.0";
 
     fn build(&mut self, app: &mut GuestApp<'_>) -> FfiResult {
         let pos_comp = match resolve_or_register_typed::<Position>(app) {

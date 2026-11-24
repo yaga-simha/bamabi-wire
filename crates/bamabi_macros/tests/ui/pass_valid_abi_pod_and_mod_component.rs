@@ -12,6 +12,11 @@ pub struct ValidC {
     pub coords: [f32; 3],
     pub flag: FfiBool,
     pub _pad: [u8; 3],
+}
+
+#[repr(C)]
+#[derive(Copy, Clone, ModComponent)]
+pub struct ValidRawWithOption {
     pub maybe_id: FfiOption<u32>,
 }
 
@@ -54,12 +59,16 @@ const _: () = {
     assert!(!<ValidTaggedEnum as ModComponentTrait>::IS_RAW_INSERTABLE);
     assert!(!<ValidVecConsumer as ModComponentTrait>::IS_ABI_POD);
     assert!(!<ValidVecConsumer as ModComponentTrait>::IS_RAW_INSERTABLE);
+    assert!(!<ValidRawWithOption as ModComponentTrait>::IS_ABI_POD);
+    assert!(<ValidRawWithOption as ModComponentTrait>::IS_RAW_INSERTABLE);
 };
 
 fn require_all<T: AbiPodTrait + RawInsertable>() {}
+fn require_raw<T: RawInsertable>() {}
 
 fn main() {
     require_all::<ValidC>();
     require_all::<ValidTransparent>();
     require_all::<ValidPodComp>();
+    require_raw::<ValidRawWithOption>();
 }

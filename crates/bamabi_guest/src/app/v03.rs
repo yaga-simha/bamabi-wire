@@ -9,7 +9,10 @@
 
 use std::ffi::CString;
 
-use bamabi_guest_sys::{Host, qualify_mod_component_identity, resolve_mod_component};
+use bamabi_guest_sys::{
+    Host, PodMigrationConfig, RelationRegistrationConfig, qualify_mod_component_identity,
+    resolve_mod_component,
+};
 use bamabi_sys::{
     AbiPod, BAM_RELATION_FLAG_ACYCLIC, BAM_RELATION_FLAG_CASCADE_DELETE,
     BAM_RELATION_FLAG_CASCADE_DESPAWN, BAM_RELATION_FLAG_CLEANUP_REMOVE,
@@ -23,7 +26,8 @@ use bamabi_sys::{
 use crate::{
     app::{
         builder::{GuestApp, IntoSystemResult},
-        context::{RunConditionContext, SystemContext},
+        conditions::EcsRunCondition,
+        context::{RunConditionContext, RunConditionSystemContext, SystemContext},
     },
     component::{GuestComponent, qualify_component_identity},
     iter::Chunk,
@@ -223,6 +227,7 @@ pub struct ScheduleSetBuilder {
     flags: u32,
     before_sets: Vec<BamSystemSet>,
     after_sets: Vec<BamSystemSet>,
+    parent_sets: Vec<BamSystemSet>,
 }
 
 impl ScheduleSetBuilder {
@@ -235,6 +240,7 @@ impl ScheduleSetBuilder {
             flags: 0,
             before_sets: Vec::new(),
             after_sets: Vec::new(),
+            parent_sets: Vec::new(),
         }
     }
 
@@ -348,6 +354,19 @@ impl ScheduleSetBuilder {
     pub fn after_sets(&self) -> &[BamSystemSet] {
         &self.after_sets
     }
+
+    /// Nests this set inside `parent` (`BamScheduleSetDesc::parent_sets`, ABI `0.4.0`).
+    #[inline]
+    pub fn in_set(mut self, parent: BamSystemSet) -> Self {
+        self.parent_sets.push(parent);
+        self
+    }
+
+    /// Returns the slice of parent [`BamSystemSet`] handles containing this set.
+    #[inline]
+    pub fn parent_sets(&self) -> &[BamSystemSet] {
+        &self.parent_sets
+    }
 }
 
 /// Queries `BamHostApi::component_layout_info` for `component` and checks that `size`, `align`,
@@ -410,15 +429,15 @@ impl<'a> GuestApp<'a> {
                 desc.field_schema_hash,
             )
         });
-        self.load_ctx.register_relation(
-            self.instance,
-            cstr.as_c_str(),
+        let cfg = RelationRegistrationConfig {
+            name: cstr.as_c_str(),
             uuid,
-            desc.flags,
-            desc.data_size,
-            desc.data_align,
-            desc.max_degree,
-        )
+            flags: desc.flags,
+            data_size: desc.data_size,
+            data_align: desc.data_align,
+            max_degree: desc.max_degree,
+        };
+        self.load_ctx.register_relation(self.instance, &cfg)
     }
 
     /// Configures a named schedule system set described by [`ScheduleSetBuilder`] via
@@ -433,13 +452,64 @@ impl<'a> GuestApp<'a> {
         let Ok(cstr) = CString::new(desc.name.as_bytes()) else {
             return Err(FfiResult::INVALID_ARGUMENT);
         };
-        self.load_ctx.configure_schedule_set(
+        if desc.parent_sets.is_empty() {
+            self.load_ctx.configure_schedule_set(
+                self.instance,
+                cstr.as_c_str(),
+                desc.schedule,
+                desc.flags,
+                &desc.before_sets,
+                &desc.after_sets,
+            )
+        } else {
+            let no_cond: Option<(
+                &[bamabi_sys::BamTermDesc],
+                fn(&mut bamabi_guest_sys::ValidatedSystemInvocation<'_>) -> bool,
+            )> = None;
+            self.load_ctx.configure_schedule_set_with_condition(
+                self.instance,
+                cstr.as_c_str(),
+                desc.schedule,
+                desc.flags,
+                &desc.before_sets,
+                &desc.after_sets,
+                &desc.parent_sets,
+                no_cond,
+            )
+        }
+    }
+
+    /// Configures a named schedule system set with parent sets and an ECS-aware [`EcsRunCondition`]
+    /// (`BamScheduleSetDesc::run_if_ctx` + `run_if_query`, ABI `0.4.0`).
+    pub fn configure_schedule_set_with_condition(
+        &mut self,
+        desc: ScheduleSetBuilder,
+        condition: EcsRunCondition,
+    ) -> Result<BamSystemSet, FfiResult> {
+        if desc.name.is_empty() {
+            return Err(FfiResult::INVALID_ARGUMENT);
+        }
+        let Ok(cstr) = CString::new(desc.name.as_bytes()) else {
+            return Err(FfiResult::INVALID_ARGUMENT);
+        };
+        let host = *self.instance.host();
+        let terms = (condition.build_terms)(&host, host.manifest_name())?;
+        let mut eval = condition.eval;
+        self.load_ctx.configure_schedule_set_with_condition(
             self.instance,
             cstr.as_c_str(),
             desc.schedule,
             desc.flags,
             &desc.before_sets,
             &desc.after_sets,
+            &desc.parent_sets,
+            Some((
+                terms.as_slice(),
+                move |inv: &mut bamabi_guest_sys::ValidatedSystemInvocation<'_>| {
+                    let mut ctx = RunConditionSystemContext::from_invocation(inv);
+                    eval(&mut ctx, 0)
+                },
+            )),
         )
     }
 
@@ -550,16 +620,16 @@ impl<'a> GuestApp<'a> {
                 Ok(id) => id,
                 Err(err) => return err,
             };
-        self.load_ctx.migrate_pod_component_column::<Old, New, F>(
-            self.instance,
+        let cfg = PodMigrationConfig {
             component,
             old_fingerprint,
-            qualified_name.as_c_str(),
-            uuid,
-            New::FLAGS,
+            new_name: qualified_name.as_c_str(),
+            new_uuid: uuid,
+            new_flags: New::FLAGS,
             new_fingerprint,
-            migrate,
-        )
+        };
+        self.load_ctx
+            .migrate_pod_component_column::<Old, New, F>(self.instance, &cfg, migrate)
     }
 
     /// Emits a structured guest diagnostic message via `BamHostApi::log_diagnostic` (slot 50).

@@ -413,3 +413,160 @@ pub type BamCmdInsertResourceFn = unsafe extern "C" fn(
 /// `commands` must point to an active [`BamCommands`] belonging to the running system invocation.
 pub type BamCmdRemoveResourceFn =
     unsafe extern "C" fn(commands: *mut BamCommands, resource: BamComponent) -> FfiResult;
+
+/// Column flag indicating `column_ptr` holds a single component value duplicated ("splatted")
+/// across every entity spawned in `cmd_spawn_batch_ex` (`1 << 0`).
+pub const BAM_SPAWN_COL_FLAG_SPLAT: u32 = 1 << 0;
+
+/// Bitmask of recognized [`BamSpawnColumnDesc::flags`] bits in ABI `0.4`.
+pub const BAM_SPAWN_COL_KNOWN_FLAGS: u32 = BAM_SPAWN_COL_FLAG_SPLAT;
+
+/// Column descriptor for extended SoA batch spawning (`BamHostApi::cmd_spawn_batch_ex`,
+/// `typedef struct BamSpawnColumnDesc BamSpawnColumnDesc;`).
+///
+/// Layout:
+/// - 64-bit: `24` bytes, `8`-byte alignment, zero implicit padding.
+/// - 32-bit: `16` bytes, `4`-byte alignment, zero implicit padding.
+#[repr(C)]
+#[derive(Debug, Copy, Clone)]
+pub struct BamSpawnColumnDesc {
+    /// Pre-resolved [`BamComponent`] handle (`offset 0`).
+    pub component: BamComponent,
+    /// Column bitflags (`BAM_SPAWN_COL_FLAG_*`, `offset 4`).
+    pub flags: u32,
+    /// Pointer to `entity_count * elem_size` bytes (or `elem_size` bytes when `SPLAT`, `offset 8`).
+    pub column_ptr: *const u8,
+    /// Element byte size (`offset 16` / `12`).
+    pub elem_size: usize,
+}
+
+impl BamSpawnColumnDesc {
+    /// Constructs a dense per-entity column descriptor for `component`.
+    #[inline]
+    #[must_use]
+    pub const fn dense(component: BamComponent, column_ptr: *const u8, elem_size: usize) -> Self {
+        Self {
+            component,
+            flags: 0,
+            column_ptr,
+            elem_size,
+        }
+    }
+
+    /// Constructs a single-value splat column descriptor duplicated across all spawned entities.
+    #[inline]
+    #[must_use]
+    pub const fn splat(component: BamComponent, value_ptr: *const u8, elem_size: usize) -> Self {
+        Self {
+            component,
+            flags: BAM_SPAWN_COL_FLAG_SPLAT,
+            column_ptr: value_ptr,
+            elem_size,
+        }
+    }
+
+    /// Returns `true` if [`BAM_SPAWN_COL_FLAG_SPLAT`] is set.
+    #[inline]
+    #[must_use]
+    pub const fn is_splat(&self) -> bool {
+        (self.flags & BAM_SPAWN_COL_FLAG_SPLAT) != 0
+    }
+
+    /// Validates component handle validity, recognized `flags`, and non-null `column_ptr` when
+    /// `elem_size > 0` and `entity_count > 0`.
+    #[inline]
+    #[must_use]
+    pub const fn validate(&self, entity_count: usize) -> FfiResult {
+        if !self.component.is_valid() {
+            return FfiResult::INVALID_COMPONENT;
+        }
+        if (self.flags & !BAM_SPAWN_COL_KNOWN_FLAGS) != 0 {
+            return FfiResult::UNSUPPORTED;
+        }
+        if entity_count > 0 && self.elem_size > 0 && self.column_ptr.is_null() {
+            return FfiResult::NULL_POINTER;
+        }
+        FfiResult::OK
+    }
+}
+
+const _: () = {
+    #[cfg(target_pointer_width = "64")]
+    {
+        assert!(core::mem::size_of::<BamSpawnColumnDesc>() == 24);
+        assert!(core::mem::align_of::<BamSpawnColumnDesc>() == 8);
+        assert!(core::mem::offset_of!(BamSpawnColumnDesc, component) == 0);
+        assert!(core::mem::offset_of!(BamSpawnColumnDesc, flags) == 4);
+        assert!(core::mem::offset_of!(BamSpawnColumnDesc, column_ptr) == 8);
+        assert!(core::mem::offset_of!(BamSpawnColumnDesc, elem_size) == 16);
+    }
+    #[cfg(target_pointer_width = "32")]
+    {
+        assert!(core::mem::size_of::<BamSpawnColumnDesc>() == 16);
+        assert!(core::mem::align_of::<BamSpawnColumnDesc>() == 4);
+        assert!(core::mem::offset_of!(BamSpawnColumnDesc, component) == 0);
+        assert!(core::mem::offset_of!(BamSpawnColumnDesc, flags) == 4);
+        assert!(core::mem::offset_of!(BamSpawnColumnDesc, column_ptr) == 8);
+        assert!(core::mem::offset_of!(BamSpawnColumnDesc, elem_size) == 12);
+    }
+};
+
+/// Queues deferred despawning for `entities[0..count]`
+/// (`typedef BamResult (*BamCmdDespawnBatchFn)(BamCommands*, const BamEntity*, size_t);`).
+///
+/// # Safety
+/// - `commands` must point to an active [`BamCommands`] belonging to the running system invocation.
+/// - If `count > 0`, `entities` must point to `count` readable [`FfiEntity`] entries.
+pub type BamCmdDespawnBatchFn = unsafe extern "C" fn(
+    commands: *mut BamCommands,
+    entities: *const FfiEntity,
+    count: usize,
+) -> FfiResult;
+
+/// Queues deferred batch insertion of `component` across `entities[0..entity_count]`
+/// (`typedef BamResult (*BamCmdInsertBatchFn)(BamCommands*, const BamEntity*, size_t, BamComponent, const uint8_t*, size_t, uint32_t);`).
+///
+/// # Safety
+/// - `commands` must point to an active [`BamCommands`] belonging to the running system invocation.
+/// - If `entity_count > 0`, `entities` must point to `entity_count` readable [`FfiEntity`] entries,
+///   and when `elem_size > 0`, `data_ptr` must cover `entity_count * elem_size` readable bytes
+///   (or `elem_size` bytes when splat flags are set).
+pub type BamCmdInsertBatchFn = unsafe extern "C" fn(
+    commands: *mut BamCommands,
+    entities: *const FfiEntity,
+    entity_count: usize,
+    component: BamComponent,
+    data_ptr: *const u8,
+    elem_size: usize,
+    flags: u32,
+) -> FfiResult;
+
+/// Queues deferred batch removal of `component` from `entities[0..entity_count]`
+/// (`typedef BamResult (*BamCmdRemoveBatchFn)(BamCommands*, const BamEntity*, size_t, BamComponent);`).
+///
+/// # Safety
+/// - `commands` must point to an active [`BamCommands`] belonging to the running system invocation.
+/// - If `entity_count > 0`, `entities` must point to `entity_count` readable [`FfiEntity`] entries.
+pub type BamCmdRemoveBatchFn = unsafe extern "C" fn(
+    commands: *mut BamCommands,
+    entities: *const FfiEntity,
+    entity_count: usize,
+    component: BamComponent,
+) -> FfiResult;
+
+/// Queues extended SoA batch spawning supporting dense and splat columns via [`BamSpawnColumnDesc`]
+/// (`typedef BamResult (*BamCmdSpawnBatchExFn)(BamCommands*, const BamSpawnColumnDesc*, size_t, size_t, BamEntity*);`).
+///
+/// # Safety
+/// - `commands` must point to an active [`BamCommands`] belonging to the running system invocation.
+/// - If `column_count > 0`, `columns` must point to `column_count` readable [`BamSpawnColumnDesc`]
+///   entries with valid `column_ptr` spans.
+/// - If `out_entities` is non-null and `entity_count > 0`, `out_entities` must point to at least
+///   `entity_count` writable [`FfiEntity`] slots.
+pub type BamCmdSpawnBatchExFn = unsafe extern "C" fn(
+    commands: *mut BamCommands,
+    columns: *const BamSpawnColumnDesc,
+    column_count: usize,
+    entity_count: usize,
+    out_entities: *mut FfiEntity,
+) -> FfiResult;

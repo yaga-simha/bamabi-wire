@@ -4,8 +4,8 @@
 use core::{ffi::CStr, marker::PhantomData};
 
 use bamabi_guest_sys::{
-    ObserverCtxRegistrationConfig, ValidatedCommands, ValidatedSystemSlice, resolve_component,
-    resolve_mod_component,
+    ObserverCtxRegistrationConfig, ObserverRegistrationConfig, ValidatedCommands,
+    ValidatedSystemSlice, resolve_component, resolve_mod_component,
 };
 use bamabi_sys::{
     AbiPod, AccessMode, BAM_OBSERVER_FLAG_PROPAGATE, BAM_TRIGGER_FLAG_PROPAGATE, BamComponent,
@@ -16,7 +16,8 @@ use bamabi_sys::{
 use crate::{
     app::{
         builder::{GuestApp, IntoSystemResult, QueryBuilder},
-        context::{RunConditionContext, SystemContext},
+        conditions::EcsRunCondition,
+        context::{RunConditionContext, RunConditionSystemContext, SystemContext},
     },
     commands::GuestCommands,
     component::{GuestComponent, resolve_guest_component},
@@ -24,6 +25,10 @@ use crate::{
 };
 
 pub(crate) type RunIfPredicate = Box<dyn FnMut(&RunConditionContext<'_>) -> bool + Send + 'static>;
+type ObserverRunIfCtxPredicate = (
+    usize,
+    Box<dyn FnMut(&mut RunConditionSystemContext<'_>, usize) -> bool + Send + 'static>,
+);
 
 const READY_CANONICAL_CSTR: &CStr = c"bevy_scene::Ready";
 const READY_ALIAS_CSTR: &CStr = c"Ready";
@@ -75,14 +80,11 @@ impl<'a> GuestApp<'a> {
     where
         F: FnMut(FfiEntity, &mut GuestCommands<'_>) + Send + 'static,
     {
+        let cfg = ObserverRegistrationConfig::lifecycle(Some(name), event_kind, watched_components)
+            .with_target(target);
         let status = self.load_ctx.register_lifecycle_observer(
             self.instance,
-            name,
-            event_kind,
-            watched_components,
-            target,
-            0,
-            BamComponent::INVALID,
+            &cfg,
             move |tgt, validated_cmds| {
                 with_guest_commands(validated_cmds, |cmds| callback(tgt, cmds));
                 FfiResult::OK
@@ -268,13 +270,13 @@ impl<'a> GuestApp<'a> {
         E: AbiPod,
         F: FnMut(FfiEntity, &mut E, &mut bool, &mut GuestCommands<'_>) + Send + 'static,
     {
+        let cfg = ObserverRegistrationConfig::custom(Some(name), event)
+            .with_target(target)
+            .with_flags(flags)
+            .with_propagate_relationship(propagate_relationship);
         let status = self.load_ctx.register_observer_mut::<E, _>(
             self.instance,
-            name,
-            event,
-            target,
-            flags,
-            propagate_relationship,
+            &cfg,
             move |tgt, ev, prop, validated_cmds| {
                 with_guest_commands(validated_cmds, |cmds| callback(tgt, ev, prop, cmds));
                 FfiResult::OK
@@ -335,17 +337,15 @@ impl<'a> GuestCommands<'a> {
         E: AbiPod,
         F: FnMut(FfiEntity, &E, &mut GuestCommands<'_>) + Send + 'static,
     {
-        self.inner.observe::<E, _>(
-            name,
-            event,
-            target,
-            flags,
-            propagate_relationship,
-            move |tgt, ev, validated_cmds| {
+        let cfg = ObserverRegistrationConfig::custom(name, event)
+            .with_target(target)
+            .with_flags(flags)
+            .with_propagate_relationship(propagate_relationship);
+        self.inner
+            .observe::<E, _>(&cfg, move |tgt, ev, validated_cmds| {
                 with_guest_commands(validated_cmds, |cmds| callback(tgt, ev, cmds));
                 FfiResult::OK
-            },
-        )
+            })
     }
 
     /// Queues deferred spawning of a mutable entity-scoped runtime observer for `E: GuestComponent`.
@@ -381,17 +381,15 @@ impl<'a> GuestCommands<'a> {
         } else {
             0
         };
-        self.inner.observe_mut::<E, _>(
-            None,
-            event,
-            target,
-            flags,
-            propagate_relationship,
-            move |tgt, ev, prop, validated_cmds| {
+        let cfg = ObserverRegistrationConfig::custom(None, event)
+            .with_target(target)
+            .with_flags(flags)
+            .with_propagate_relationship(propagate_relationship);
+        self.inner
+            .observe_mut::<E, _>(&cfg, move |tgt, ev, prop, validated_cmds| {
                 with_guest_commands(validated_cmds, |cmds| callback(tgt, ev, prop, cmds));
                 FfiResult::OK
-            },
-        )
+            })
     }
 
     /// Queues deferred spawning of a runtime lifecycle observer for `C: GuestComponent` on `target`
@@ -493,18 +491,13 @@ impl<'a> GuestCommands<'a> {
     where
         F: FnMut(FfiEntity, &mut GuestCommands<'_>) + Send + 'static,
     {
-        self.inner.observe_lifecycle(
-            None,
-            event_kind,
-            watched_components,
-            target,
-            0,
-            BamComponent::INVALID,
-            move |tgt, validated_cmds| {
+        let cfg = ObserverRegistrationConfig::lifecycle(None, event_kind, watched_components)
+            .with_target(target);
+        self.inner
+            .observe_lifecycle(&cfg, move |tgt, validated_cmds| {
                 with_guest_commands(validated_cmds, |cmds| callback(tgt, cmds));
                 FfiResult::OK
-            },
-        )
+            })
     }
 
     /// Triggers an `EntityEvent` `E: GuestComponent` on `target` that propagates upward along
@@ -618,18 +611,15 @@ impl<'a> GuestCommands<'a> {
         } else {
             0
         };
-        self.inner.observe_lifecycle(
-            None,
-            BamEventKind::READY,
-            &[],
-            target,
-            flags,
-            propagate_relationship,
-            move |tgt, validated_cmds| {
+        let cfg = ObserverRegistrationConfig::lifecycle(None, BamEventKind::READY, &[])
+            .with_target(target)
+            .with_flags(flags)
+            .with_propagate_relationship(propagate_relationship);
+        self.inner
+            .observe_lifecycle(&cfg, move |tgt, validated_cmds| {
                 with_guest_commands(validated_cmds, |cmds| callback(tgt, cmds));
                 FfiResult::OK
-            },
-        )
+            })
     }
 
     /// Queues a propagating `Ready` trigger starting at `target` and bubbling upward along Bevy's
@@ -811,14 +801,17 @@ impl<'app, 'a> ObserverBuilder<'app, 'a> {
             return Err(err);
         }
         let mut conditions = self.conditions;
-        let status = self.app.load_ctx.register_lifecycle_observer(
-            self.app.instance,
-            &self.name,
+        let cfg = ObserverRegistrationConfig::lifecycle(
+            Some(&self.name),
             self.event_kind,
             &self.watched_components,
-            self.target,
-            self.flags,
-            self.propagate_relationship,
+        )
+        .with_target(self.target)
+        .with_flags(self.flags)
+        .with_propagate_relationship(self.propagate_relationship);
+        let status = self.app.load_ctx.register_lifecycle_observer(
+            self.app.instance,
+            &cfg,
             move |tgt, validated_cmds| {
                 if !conditions.is_empty() {
                     let cond_ctx = RunConditionContext::new(validated_cmds.host());
@@ -947,6 +940,8 @@ pub struct TypedObserverBuilder<'app, 'a, E: AbiPod> {
     next_param_set_group: u32,
     system_resources: Vec<BamTermDesc>,
     conditions: Vec<RunIfPredicate>,
+    run_if_ctx_terms: Vec<BamTermDesc>,
+    run_if_ctx_preds: Vec<ObserverRunIfCtxPredicate>,
     first_error: Option<FfiResult>,
     _marker: PhantomData<fn() -> E>,
 }
@@ -972,6 +967,8 @@ impl<'app, 'a, E: AbiPod> TypedObserverBuilder<'app, 'a, E> {
             next_param_set_group: 1,
             system_resources: Vec::new(),
             conditions: Vec::new(),
+            run_if_ctx_terms: Vec::new(),
+            run_if_ctx_preds: Vec::new(),
             first_error: None,
             _marker: PhantomData,
         }
@@ -997,6 +994,8 @@ impl<'app, 'a, E: AbiPod> TypedObserverBuilder<'app, 'a, E> {
             next_param_set_group: 1,
             system_resources: Vec::new(),
             conditions: Vec::new(),
+            run_if_ctx_terms: Vec::new(),
+            run_if_ctx_preds: Vec::new(),
             first_error: Some(err),
             _marker: PhantomData,
         }
@@ -1298,9 +1297,73 @@ impl<'app, 'a, E: AbiPod> TypedObserverBuilder<'app, 'a, E> {
         self.run_if(move |_ctx| predicate())
     }
 
+    /// Appends an ECS-aware run condition declaring read-only terms via `configure_query` and
+    /// evaluating `condition(&mut RunConditionSystemContext<'_>)` before invoking the observer.
+    ///
+    /// Rejects mutable terms (`WRITE`, `OPTIONAL_WRITE`, `RESOURCE_WRITE`, `MESSAGE_WRITE`) with
+    /// [`FfiResult::PERMISSION_DENIED`].
+    pub fn run_if_with<Q, F>(mut self, configure_query: Q, mut condition: F) -> Self
+    where
+        Q: for<'q> FnOnce(QueryBuilder<'q>) -> QueryBuilder<'q>,
+        F: FnMut(&mut RunConditionSystemContext<'_>) -> bool + Send + 'static,
+    {
+        if self.first_error.is_some() {
+            return self;
+        }
+        let host = *self.app.host();
+        let qb = QueryBuilder::new(&host, host.manifest_name());
+        let finished = configure_query(qb);
+        match finished.into_terms() {
+            Ok(terms) => {
+                self.push_run_if_ctx_terms_and_pred(terms, move |ctx, _offset| condition(ctx));
+            }
+            Err(err) => self.record_error(err),
+        }
+        self
+    }
+
+    /// Appends a composable [`EcsRunCondition`] evaluated before invoking the observer.
+    pub fn run_if_condition(mut self, condition: EcsRunCondition) -> Self {
+        if self.first_error.is_some() {
+            return self;
+        }
+        let host = *self.app.host();
+        match (condition.build_terms)(&host, host.manifest_name()) {
+            Ok(terms) => {
+                let mut eval = condition.eval;
+                self.push_run_if_ctx_terms_and_pred(terms, move |ctx, offset| eval(ctx, offset));
+            }
+            Err(err) => self.record_error(err),
+        }
+        self
+    }
+
+    /// Validates read-only condition terms and records `pred` at its starting term offset.
+    fn push_run_if_ctx_terms_and_pred<F>(&mut self, terms: Vec<BamTermDesc>, pred: F)
+    where
+        F: FnMut(&mut RunConditionSystemContext<'_>, usize) -> bool + Send + 'static,
+    {
+        for term in &terms {
+            if term.mode.is_mutable() {
+                self.record_error(FfiResult::PERMISSION_DENIED);
+                return;
+            }
+        }
+        let offset = self.run_if_ctx_terms.len();
+        if offset.saturating_add(terms.len()) > MAX_TERMS_PER_QUERY {
+            self.record_error(FfiResult::CAPACITY_EXCEEDED);
+            return;
+        }
+        self.run_if_ctx_terms.extend(terms);
+        self.run_if_ctx_preds.push((offset, Box::new(pred)));
+    }
+
     /// Registers a context-aware `(target, &E, &mut SystemContext<'_>) -> R` observer backed by
     /// `BamObserverCtxFn` and declared `queries` / singleton resources.
-    pub fn build_with_ctx<F, R>(self, mut callback: F) -> Result<&'app mut GuestApp<'a>, FfiResult>
+    pub fn build_with_ctx<F, R>(
+        mut self,
+        mut callback: F,
+    ) -> Result<&'app mut GuestApp<'a>, FfiResult>
     where
         F: FnMut(FfiEntity, &E, &mut SystemContext<'_>) -> R + Send + 'static,
         R: IntoSystemResult,
@@ -1308,6 +1371,19 @@ impl<'app, 'a, E: AbiPod> TypedObserverBuilder<'app, 'a, E> {
         if let Some(err) = self.first_error {
             return Err(err);
         }
+        let cond_query_index = if self.run_if_ctx_preds.is_empty() {
+            None
+        } else {
+            let max_user_queries =
+                MAX_QUERIES_PER_SYSTEM - usize::from(!self.system_resources.is_empty());
+            if self.queries.len() >= max_user_queries {
+                return Err(FfiResult::CAPACITY_EXCEEDED);
+            }
+            let idx = self.queries.len();
+            self.queries.push(self.run_if_ctx_terms);
+            self.query_param_set_groups.push(0);
+            Some(idx)
+        };
         let query_slices: Vec<&[BamTermDesc]> = self.queries.iter().map(Vec::as_slice).collect();
         let config = ObserverCtxRegistrationConfig {
             name: (!self.name.is_empty()).then_some(self.name.as_str()),
@@ -1326,12 +1402,18 @@ impl<'app, 'a, E: AbiPod> TypedObserverBuilder<'app, 'a, E> {
         macro_rules! dispatch_ctx_bucket {
             ($n:expr, $init:expr) => {{
                 let mut conditions = self.conditions;
+                let mut run_if_ctx_preds = self.run_if_ctx_preds;
                 self.app.load_ctx.register_observer_ctx_slice::<$n, E, _>(
                     self.app.instance,
                     &config,
                     move |tgt: FfiEntity, ev: &E, inv: &mut ValidatedSystemSlice<'_>| {
                         let mut slots: [Option<ChunkIter<'_>>; $n] = $init;
                         let mut ctx = SystemContext::from_slice_invocation(inv, &mut slots);
+                        if let Some(cond_idx) = cond_query_index {
+                            if !ctx.eval_observer_run_if_with(cond_idx, &mut run_if_ctx_preds) {
+                                return FfiResult::OK;
+                            }
+                        }
                         invoke_observer_ctx_callback(
                             &mut conditions,
                             &mut callback,
@@ -1360,10 +1442,103 @@ impl<'app, 'a, E: AbiPod> TypedObserverBuilder<'app, 'a, E> {
         }
     }
 
+    /// Registers a mutable context-aware
+    /// `(target, &mut E, &mut bool /* propagate */, &mut SystemContext<'_>) -> R` observer backed by
+    /// `BamObserverDesc::ctx_mut_callback` (`BamObserverCtxMutFn`) and declared `queries` /
+    /// singleton resources.
+    pub fn build_mut_with_ctx<F, R>(
+        mut self,
+        mut callback: F,
+    ) -> Result<&'app mut GuestApp<'a>, FfiResult>
+    where
+        F: FnMut(FfiEntity, &mut E, &mut bool, &mut SystemContext<'_>) -> R + Send + 'static,
+        R: IntoSystemResult,
+    {
+        if let Some(err) = self.first_error {
+            return Err(err);
+        }
+        let cond_query_index = if self.run_if_ctx_preds.is_empty() {
+            None
+        } else {
+            let max_user_queries =
+                MAX_QUERIES_PER_SYSTEM - usize::from(!self.system_resources.is_empty());
+            if self.queries.len() >= max_user_queries {
+                return Err(FfiResult::CAPACITY_EXCEEDED);
+            }
+            let idx = self.queries.len();
+            self.queries.push(self.run_if_ctx_terms);
+            self.query_param_set_groups.push(0);
+            Some(idx)
+        };
+        let query_slices: Vec<&[BamTermDesc]> = self.queries.iter().map(Vec::as_slice).collect();
+        let config = ObserverCtxRegistrationConfig {
+            name: (!self.name.is_empty()).then_some(self.name.as_str()),
+            event: self.event,
+            watched_components: &self.watched_components,
+            target: self.target,
+            flags: self.flags,
+            propagate_relationship: self.propagate_relationship,
+            user_queries: &query_slices,
+            user_query_param_set_groups: &self.query_param_set_groups,
+            system_resources: &self.system_resources,
+        };
+        let total_query_count =
+            config.user_queries.len() + usize::from(!config.system_resources.is_empty());
+
+        macro_rules! dispatch_ctx_mut_bucket {
+            ($n:expr, $init:expr) => {{
+                let mut conditions = self.conditions;
+                let mut run_if_ctx_preds = self.run_if_ctx_preds;
+                self.app
+                    .load_ctx
+                    .register_observer_ctx_mut_slice::<$n, E, _>(
+                        self.app.instance,
+                        &config,
+                        move |tgt: FfiEntity,
+                              ev: &mut E,
+                              prop: &mut bool,
+                              inv: &mut ValidatedSystemSlice<'_>| {
+                            let mut slots: [Option<ChunkIter<'_>>; $n] = $init;
+                            let mut ctx = SystemContext::from_slice_invocation(inv, &mut slots);
+                            if !conditions.is_empty() {
+                                let cond_ctx = RunConditionContext::new(ctx.host());
+                                if !conditions.iter_mut().all(|pred| pred(&cond_ctx)) {
+                                    return FfiResult::OK;
+                                }
+                            }
+                            if let Some(cond_idx) = cond_query_index {
+                                if !ctx.eval_observer_run_if_with(cond_idx, &mut run_if_ctx_preds) {
+                                    return FfiResult::OK;
+                                }
+                            }
+                            callback(tgt, ev, prop, &mut ctx).into_ffi_result()
+                        },
+                    )
+            }};
+        }
+
+        let status = match total_query_count {
+            0 => dispatch_ctx_mut_bucket!(0, []),
+            1 => dispatch_ctx_mut_bucket!(1, [None]),
+            2..=4 => dispatch_ctx_mut_bucket!(4, [const { None }; 4]),
+            _ => dispatch_ctx_mut_bucket!(
+                MAX_QUERIES_PER_SYSTEM,
+                [const { None }; MAX_QUERIES_PER_SYSTEM]
+            ),
+        };
+        if status.is_ok() {
+            Ok(self.app)
+        } else {
+            Err(status)
+        }
+    }
+
     /// Registers a read-only `(target, &E, &mut GuestCommands<'_>)` observer.
     ///
-    /// Returns [`FfiResult::INVALID_ARGUMENT`] if queries, resources, messages, or removed streams
-    /// were declared (use [`Self::build_with_ctx`] for context-aware observers).
+    /// Automatically upgrades to `BamObserverCtxFn` when `.run_if_with(...)` /
+    /// `.run_if_condition(...)` predicates are attached; returns [`FfiResult::INVALID_ARGUMENT`]
+    /// if queries, resources, messages, or removed streams were declared (use [`Self::build_with_ctx`]
+    /// for context-aware observers).
     pub fn build<F>(self, mut callback: F) -> Result<&'app mut GuestApp<'a>, FfiResult>
     where
         F: FnMut(FfiEntity, &E, &mut GuestCommands<'_>) + Send + 'static,
@@ -1374,15 +1549,18 @@ impl<'app, 'a, E: AbiPod> TypedObserverBuilder<'app, 'a, E> {
         if !self.queries.is_empty() || !self.system_resources.is_empty() {
             return Err(FfiResult::INVALID_ARGUMENT);
         }
+        if !self.run_if_ctx_preds.is_empty() {
+            return self.build_with_ctx(move |tgt, ev, ctx| callback(tgt, ev, ctx.commands()));
+        }
         let mut conditions = self.conditions;
+        let cfg = ObserverRegistrationConfig::custom(Some(&self.name), self.event)
+            .with_watched_components(&self.watched_components)
+            .with_target(self.target)
+            .with_flags(self.flags)
+            .with_propagate_relationship(self.propagate_relationship);
         let status = self.app.load_ctx.register_observer_with_watched::<E, _>(
             self.app.instance,
-            &self.name,
-            self.event,
-            &self.watched_components,
-            self.target,
-            self.flags,
-            self.propagate_relationship,
+            &cfg,
             move |tgt, ev, validated_cmds| {
                 if !conditions.is_empty() {
                     let cond_ctx = RunConditionContext::new(validated_cmds.host());
@@ -1416,18 +1594,23 @@ impl<'app, 'a, E: AbiPod> TypedObserverBuilder<'app, 'a, E> {
         if !self.queries.is_empty() || !self.system_resources.is_empty() {
             return Err(FfiResult::INVALID_ARGUMENT);
         }
+        if !self.run_if_ctx_preds.is_empty() {
+            return self.build_mut_with_ctx(move |tgt, ev, prop, ctx| {
+                callback(tgt, ev, prop, ctx.commands())
+            });
+        }
         let mut conditions = self.conditions;
+        let cfg = ObserverRegistrationConfig::custom(Some(&self.name), self.event)
+            .with_watched_components(&self.watched_components)
+            .with_target(self.target)
+            .with_flags(self.flags)
+            .with_propagate_relationship(self.propagate_relationship);
         let status = self
             .app
             .load_ctx
             .register_observer_mut_with_watched::<E, _>(
                 self.app.instance,
-                &self.name,
-                self.event,
-                &self.watched_components,
-                self.target,
-                self.flags,
-                self.propagate_relationship,
+                &cfg,
                 move |tgt, ev, prop, validated_cmds| {
                     if !conditions.is_empty() {
                         let cond_ctx = RunConditionContext::new(validated_cmds.host());
@@ -1456,7 +1639,6 @@ mod tests {
 
     /// Compile-time signature fixture covering `Ready`, lifecycle, stoppable, and runtime
     /// observer registration and trigger helpers under `#![forbid(unsafe_code)]`.
-    #[allow(dead_code)]
     fn _verify_ready_observer_sdk_signatures<'a>(
         app: &'a mut GuestApp<'a>,
         cmds: &'a mut GuestCommands<'a>,

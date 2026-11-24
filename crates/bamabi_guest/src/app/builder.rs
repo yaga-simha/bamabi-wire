@@ -10,9 +10,10 @@ use bamabi_guest_sys::{
 use bamabi_sys::{
     AbiPod, AccessMode, BAM_COMPONENT_FLAG_IMMUTABLE, BAM_COMPONENT_FLAG_SPARSE_SET,
     BAM_COMPONENT_FLAG_SUMMARY_TICK, BAM_SYSTEM_FLAG_AMBIGUOUS_WITH_ALL,
-    BAM_SYSTEM_FLAG_MAIN_THREAD, BamComponent, BamFieldDesc, BamHostApi, BamLoadCtx,
-    BamRequiredComponent, BamSystem, BamTermDesc, ComponentDropFn, ComponentUuid, FfiDisabled,
-    FfiEntity, FfiResult, MAX_QUERIES_PER_SYSTEM, MAX_TERMS_PER_QUERY, ModComponent, ScheduleId,
+    BAM_SYSTEM_FLAG_MAIN_THREAD, BAM_TERM_KNOWN_FLAGS, BamComponent, BamFieldDesc, BamHostApi,
+    BamLoadCtx, BamRequiredComponent, BamSystem, BamTermDesc, ComponentDropFn, ComponentUuid,
+    FfiDisabled, FfiEntity, FfiResult, MAX_QUERIES_PER_SYSTEM, MAX_TERMS_PER_QUERY, ModComponent,
+    ScheduleId,
 };
 
 use crate::{
@@ -24,6 +25,7 @@ use crate::{
     commands::GuestCommands,
     component::{
         GuestComponent, GuestComponentHooks, qualify_component_identity, resolve_guest_component,
+        resolve_guest_component_uncached,
     },
     iter::{ChunkIter, typed_query::QueryTuple},
 };
@@ -348,7 +350,8 @@ impl<'a> GuestApp<'a> {
         self.instance.host().resolve_custom_symbol(symbol)
     }
 
-    /// Resolves a [`BamComponent`] handle for `T: GuestComponent`.
+    /// Resolves a [`BamComponent`] handle for `T: GuestComponent`, caching validated handles in
+    /// the owning [`GuestInstance`].
     ///
     /// Tries the manifest-qualified name first when `T::NAME` is unqualified, falling back to
     /// `(T::NAME, T::UUID)`.
@@ -358,13 +361,25 @@ impl<'a> GuestApp<'a> {
     }
 
     /// Resolves `T: GuestComponent` and validates its registered layout against `T` into a
-    /// [`TypedComponent<T>`].
+    /// [`TypedComponent<T>`], caching the layout-verified handle in the owning [`GuestInstance`].
     #[inline]
     pub fn resolve_component_typed<T: GuestComponent>(
         &self,
     ) -> Result<TypedComponent<T>, FfiResult> {
-        let handle = self.resolve_component::<T>()?;
-        TypedComponent::validate(self.host(), handle)
+        let (_, uuid) = qualify_component_identity::<T>(self.instance.manifest_name())?;
+        self.instance.host().cached_typed_component::<T>(uuid, || {
+            resolve_guest_component_uncached::<T>(
+                self.instance.host(),
+                self.instance.manifest_name(),
+            )
+        })
+    }
+
+    /// Returns a cached [`TypedComponent<T>`] handle for `T: GuestComponent` without redundant
+    /// per-call FFI round-trips after the first registration or resolution.
+    #[inline]
+    pub fn cached_component<T: GuestComponent>(&self) -> Result<TypedComponent<T>, FfiResult> {
+        self.resolve_component_typed::<T>()
     }
 
     /// Resolves a [`BamComponent`] handle by explicit `name` and/or `uuid`.
@@ -388,29 +403,23 @@ impl<'a> GuestApp<'a> {
     }
 
     /// Registers `T: GuestComponent` on the host `World` and validates its registered layout into
-    /// a [`TypedComponent<T>`].
+    /// a cached [`TypedComponent<T>`].
     #[inline]
     pub fn register_component_typed<T: GuestComponent>(
         &mut self,
     ) -> Result<TypedComponent<T>, FfiResult> {
-        let handle = self.register_component::<T>()?;
-        TypedComponent::validate(self.host(), handle)
+        let _ = self.register_component::<T>()?;
+        self.cached_component::<T>()
     }
 
     /// Registers `T: GuestComponent` with explicit `BAM_COMPONENT_FLAG_*` flags (e.g.
-    /// `BAM_COMPONENT_FLAG_SPARSE_SET` or `BAM_COMPONENT_FLAG_IMMUTABLE`).
+    /// `BAM_COMPONENT_FLAG_SPARSE_SET` or `BAM_COMPONENT_FLAG_IMMUTABLE`), propagating
+    /// `T::SCHEMA_FINGERPRINT` and `T::BAM_FIELDS`.
     pub fn register_component_with_flags<T: GuestComponent>(
         &mut self,
         flags: u32,
     ) -> Result<BamComponent, FfiResult> {
-        let (qualified_name, uuid) =
-            qualify_component_identity::<T>(self.instance.manifest_name())?;
-        self.load_ctx.register_pod_component::<T>(
-            self.instance,
-            qualified_name.as_c_str(),
-            uuid,
-            flags,
-        )
+        self.register_component_with_flags_and_hooks::<T>(flags, GuestComponentHooks::new())
     }
 
     /// Registers an `AbiPod` component under an explicit `name`, `uuid`, and `flags`.
@@ -421,8 +430,13 @@ impl<'a> GuestApp<'a> {
         uuid: ComponentUuid,
         flags: u32,
     ) -> Result<BamComponent, FfiResult> {
-        self.load_ctx
-            .register_pod_component::<T>(self.instance, name, uuid, flags)
+        let handle = self
+            .load_ctx
+            .register_pod_component::<T>(self.instance, name, uuid, flags)?;
+        self.instance
+            .host()
+            .cache_component_handle::<T>(uuid, handle, true);
+        Ok(handle)
     }
 
     /// Registers `T: GuestComponent` with optional `on_add` and `on_remove` hooks.
@@ -434,21 +448,96 @@ impl<'a> GuestApp<'a> {
         self.register_component_with_flags_and_hooks::<T>(T::FLAGS, hooks)
     }
 
-    /// Registers `T: GuestComponent` with explicit `flags` and optional lifecycle hooks.
+    /// Registers `T: GuestComponent` with explicit `flags` and optional lifecycle hooks,
+    /// propagating `T::SCHEMA_FINGERPRINT` / `T::BAM_FIELDS` and caching the validated handle.
     pub fn register_component_with_flags_and_hooks<T: GuestComponent>(
         &mut self,
         flags: u32,
-        hooks: GuestComponentHooks<T>,
+        mut hooks: GuestComponentHooks<T>,
     ) -> Result<BamComponent, FfiResult> {
         let (qualified_name, uuid) =
             qualify_component_identity::<T>(self.instance.manifest_name())?;
-        self.load_ctx.register_pod_component_with_hooks::<T>(
+        if hooks.inner.schema_fingerprint == 0 {
+            hooks.inner.schema_fingerprint = T::SCHEMA_FINGERPRINT;
+        }
+        if hooks.inner.fields.is_empty() {
+            hooks.inner.fields = T::BAM_FIELDS;
+        }
+        let handle = self.load_ctx.register_pod_component_with_hooks::<T>(
             self.instance,
             qualified_name.as_c_str(),
             uuid,
             flags,
             hooks.inner,
-        )
+        )?;
+        self.instance
+            .host()
+            .cache_component_handle::<T>(uuid, handle, true);
+        Ok(handle)
+    }
+
+    /// Registers a cross-language `R: GuestComponent` (`AbiPod`) dynamic singleton resource via
+    /// `BamHostApi::register_resource` (slot 73), caching its handle and propagating
+    /// `R::SCHEMA_FINGERPRINT` and `R::BAM_FIELDS`.
+    pub fn register_resource<R: GuestComponent>(&mut self) -> Result<BamComponent, FfiResult> {
+        let (qualified_name, uuid) =
+            qualify_component_identity::<R>(self.instance.manifest_name())?;
+        let mut hooks = bamabi_guest_sys::PodComponentHooks::<R>::new();
+        hooks.schema_fingerprint = R::SCHEMA_FINGERPRINT;
+        hooks.fields = R::BAM_FIELDS;
+        let handle = self.load_ctx.register_pod_resource::<R>(
+            self.instance,
+            qualified_name.as_c_str(),
+            uuid,
+            R::FLAGS,
+            hooks,
+        )?;
+        self.instance
+            .host()
+            .cache_component_handle::<R>(uuid, handle, true);
+        Ok(handle)
+    }
+
+    /// Registers `R: GuestComponent` via `BamHostApi::register_resource` (slot 73) and returns
+    /// its cached [`TypedComponent<R>`].
+    #[inline]
+    pub fn register_resource_typed<R: GuestComponent>(
+        &mut self,
+    ) -> Result<TypedComponent<R>, FfiResult> {
+        let _ = self.register_resource::<R>()?;
+        self.cached_component::<R>()
+    }
+
+    /// Registers a cross-language `M: GuestComponent` (`AbiPod`) dynamic buffered message type via
+    /// `BamHostApi::register_message` (slot 74), caching its handle and propagating
+    /// `M::SCHEMA_FINGERPRINT` and `M::BAM_FIELDS`.
+    pub fn register_message<M: GuestComponent>(&mut self) -> Result<BamComponent, FfiResult> {
+        let (qualified_name, uuid) =
+            qualify_component_identity::<M>(self.instance.manifest_name())?;
+        let mut hooks = bamabi_guest_sys::PodComponentHooks::<M>::new();
+        hooks.schema_fingerprint = M::SCHEMA_FINGERPRINT;
+        hooks.fields = M::BAM_FIELDS;
+        let handle = self.load_ctx.register_pod_message::<M>(
+            self.instance,
+            qualified_name.as_c_str(),
+            uuid,
+            M::FLAGS,
+            hooks,
+        )?;
+        self.instance
+            .host()
+            .cache_component_handle::<M>(uuid, handle, true);
+        Ok(handle)
+    }
+
+    /// Registers `M: GuestComponent` via `BamHostApi::register_message` (slot 74) and returns
+    /// its cached [`TypedComponent<M>`].
+    #[inline]
+    pub fn register_message_typed<M: GuestComponent>(
+        &mut self,
+    ) -> Result<TypedComponent<M>, FfiResult> {
+        let _ = self.register_message::<M>()?;
+        self.cached_component::<M>()
     }
 
     /// Registers `T: GuestComponent` with [`GuestComponentOptions`] (`summary_tick`, `clone`,
@@ -644,6 +733,27 @@ pub struct QueryBuilder<'b> {
 }
 
 impl<'b> QueryBuilder<'b> {
+    /// Creates an empty [`QueryBuilder`] bound to `host` and `manifest_name`.
+    #[inline]
+    pub(crate) fn new(host: &'b Host, manifest_name: &'b str) -> Self {
+        Self {
+            host,
+            manifest_name,
+            terms: Vec::new(),
+            first_error: None,
+        }
+    }
+
+    /// Finalizes this builder into its validated `Vec<BamTermDesc>` list.
+    #[inline]
+    pub(crate) fn into_terms(self) -> Result<Vec<BamTermDesc>, FfiResult> {
+        if let Some(err) = self.first_error {
+            Err(err)
+        } else {
+            Ok(self.terms)
+        }
+    }
+
     /// Latches the first builder error encountered so fluent chaining can finish cleanly before
     /// propagating the error during [`SystemBuilder::build`].
     #[inline]
@@ -657,11 +767,23 @@ impl<'b> QueryBuilder<'b> {
     /// [`BamTermDesc`] to the query's term list.
     #[inline]
     pub(crate) fn push_term(&mut self, component: BamComponent, mode: AccessMode) {
+        self.push_term_with_flags(component, mode, 0);
+    }
+
+    /// Validates `component`, `mode`, `flags`, and the `MAX_TERMS_PER_QUERY` cap before appending
+    /// a [`BamTermDesc`] with explicit `BAM_TERM_FLAG_*` bits.
+    #[inline]
+    pub(crate) fn push_term_with_flags(
+        &mut self,
+        component: BamComponent,
+        mode: AccessMode,
+        flags: u16,
+    ) {
         if !component.is_valid() {
             self.record_error(FfiResult::INVALID_COMPONENT);
             return;
         }
-        if !mode.is_valid() {
+        if !mode.is_valid() || (flags & !BAM_TERM_KNOWN_FLAGS) != 0 {
             self.record_error(FfiResult::INVALID_ARGUMENT);
             return;
         }
@@ -669,7 +791,8 @@ impl<'b> QueryBuilder<'b> {
             self.record_error(FfiResult::CAPACITY_EXCEEDED);
             return;
         }
-        self.terms.push(BamTermDesc::new(component, mode));
+        self.terms
+            .push(BamTermDesc::new(component, mode).with_flags(flags));
     }
 
     /// Resolves `T: GuestComponent` on the host (trying manifest-qualified identity first) and
@@ -678,6 +801,16 @@ impl<'b> QueryBuilder<'b> {
     fn push_guest_term<T: GuestComponent>(&mut self, mode: AccessMode) {
         match resolve_guest_component::<T>(self.host, self.manifest_name) {
             Ok(comp) => self.push_term(comp, mode),
+            Err(err) => self.record_error(err),
+        }
+    }
+
+    /// Resolves `T: GuestComponent` on the host and appends it with `mode` and explicit
+    /// `BAM_TERM_FLAG_*` flags.
+    #[inline]
+    fn push_guest_term_with_flags<T: GuestComponent>(&mut self, mode: AccessMode, flags: u16) {
+        match resolve_guest_component::<T>(self.host, self.manifest_name) {
+            Ok(comp) => self.push_term_with_flags(comp, mode, flags),
             Err(err) => self.record_error(err),
         }
     }
@@ -748,6 +881,57 @@ impl<'b> QueryBuilder<'b> {
     #[inline]
     pub fn term(mut self, component: BamComponent, mode: AccessMode) -> Self {
         self.push_term(component, mode);
+        self
+    }
+
+    /// Appends a pre-resolved [`BamComponent`] handle with explicit [`AccessMode`] and
+    /// `BAM_TERM_FLAG_*` flags (such as `BAM_TERM_FLAG_CHANGED` or `BAM_TERM_FLAG_ADDED`).
+    #[inline]
+    pub fn term_with_flags(
+        mut self,
+        component: BamComponent,
+        mode: AccessMode,
+        flags: u16,
+    ) -> Self {
+        self.push_term_with_flags(component, mode, flags);
+        self
+    }
+
+    /// Appends an exclusive mutable column term filtered by `Changed<T>`
+    /// (`AccessMode::WRITE` + `BAM_TERM_FLAG_CHANGED`).
+    #[inline]
+    pub fn changed_write<T: GuestComponent>(mut self) -> Self {
+        self.push_guest_term_with_flags::<T>(AccessMode::WRITE, bamabi_sys::BAM_TERM_FLAG_CHANGED);
+        self
+    }
+
+    /// Appends an exclusive mutable column term filtered by `Added<T>`
+    /// (`AccessMode::WRITE` + `BAM_TERM_FLAG_ADDED`).
+    #[inline]
+    pub fn added_write<T: GuestComponent>(mut self) -> Self {
+        self.push_guest_term_with_flags::<T>(AccessMode::WRITE, bamabi_sys::BAM_TERM_FLAG_ADDED);
+        self
+    }
+
+    /// Appends a pure change-detection filter (`AccessMode::FILTER_ONLY` +
+    /// `BAM_TERM_FLAG_CHANGED`) without borrowing `T`'s column data.
+    #[inline]
+    pub fn with_changed<T: GuestComponent>(mut self) -> Self {
+        self.push_guest_term_with_flags::<T>(
+            AccessMode::FILTER_ONLY,
+            bamabi_sys::BAM_TERM_FLAG_CHANGED,
+        );
+        self
+    }
+
+    /// Appends a pure added-detection filter (`AccessMode::FILTER_ONLY` + `BAM_TERM_FLAG_ADDED`)
+    /// without borrowing `T`'s column data.
+    #[inline]
+    pub fn with_added<T: GuestComponent>(mut self) -> Self {
+        self.push_guest_term_with_flags::<T>(
+            AccessMode::FILTER_ONLY,
+            bamabi_sys::BAM_TERM_FLAG_ADDED,
+        );
         self
     }
 

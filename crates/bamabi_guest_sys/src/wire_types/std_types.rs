@@ -1015,204 +1015,397 @@ pub struct FfiKeyCode(pub u16);
 
 impl_wire_abi_pod!(FfiKeyCode, size = 2, align = 2, fields = [u16]);
 
-#[allow(missing_docs)]
 impl FfiKeyCode {
     /// Total number of named Bevy `0.20` `KeyCode` indices (`0..194`).
     pub const COUNT: usize = 194;
 
+    /// Bevy `KeyCode` index `0` (`BACKQUOTE`).
     pub const BACKQUOTE: Self = Self(0);
+    /// Bevy `KeyCode` index `1` (`BACKSLASH`).
     pub const BACKSLASH: Self = Self(1);
+    /// Bevy `KeyCode` index `2` (`BRACKET_LEFT`).
     pub const BRACKET_LEFT: Self = Self(2);
+    /// Bevy `KeyCode` index `3` (`BRACKET_RIGHT`).
     pub const BRACKET_RIGHT: Self = Self(3);
+    /// Bevy `KeyCode` index `4` (`COMMA`).
     pub const COMMA: Self = Self(4);
+    /// Bevy `KeyCode` index `5` (`DIGIT_0`).
     pub const DIGIT_0: Self = Self(5);
+    /// Bevy `KeyCode` index `6` (`DIGIT_1`).
     pub const DIGIT_1: Self = Self(6);
+    /// Bevy `KeyCode` index `7` (`DIGIT_2`).
     pub const DIGIT_2: Self = Self(7);
+    /// Bevy `KeyCode` index `8` (`DIGIT_3`).
     pub const DIGIT_3: Self = Self(8);
+    /// Bevy `KeyCode` index `9` (`DIGIT_4`).
     pub const DIGIT_4: Self = Self(9);
+    /// Bevy `KeyCode` index `10` (`DIGIT_5`).
     pub const DIGIT_5: Self = Self(10);
+    /// Bevy `KeyCode` index `11` (`DIGIT_6`).
     pub const DIGIT_6: Self = Self(11);
+    /// Bevy `KeyCode` index `12` (`DIGIT_7`).
     pub const DIGIT_7: Self = Self(12);
+    /// Bevy `KeyCode` index `13` (`DIGIT_8`).
     pub const DIGIT_8: Self = Self(13);
+    /// Bevy `KeyCode` index `14` (`DIGIT_9`).
     pub const DIGIT_9: Self = Self(14);
+    /// Bevy `KeyCode` index `15` (`EQUAL`).
     pub const EQUAL: Self = Self(15);
+    /// Bevy `KeyCode` index `16` (`INTL_BACKSLASH`).
     pub const INTL_BACKSLASH: Self = Self(16);
+    /// Bevy `KeyCode` index `17` (`INTL_RO`).
     pub const INTL_RO: Self = Self(17);
+    /// Bevy `KeyCode` index `18` (`INTL_YEN`).
     pub const INTL_YEN: Self = Self(18);
+    /// Bevy `KeyCode` index `19` (`KEY_A`).
     pub const KEY_A: Self = Self(19);
+    /// Bevy `KeyCode` index `20` (`KEY_B`).
     pub const KEY_B: Self = Self(20);
+    /// Bevy `KeyCode` index `21` (`KEY_C`).
     pub const KEY_C: Self = Self(21);
+    /// Bevy `KeyCode` index `22` (`KEY_D`).
     pub const KEY_D: Self = Self(22);
+    /// Bevy `KeyCode` index `23` (`KEY_E`).
     pub const KEY_E: Self = Self(23);
+    /// Bevy `KeyCode` index `24` (`KEY_F`).
     pub const KEY_F: Self = Self(24);
+    /// Bevy `KeyCode` index `25` (`KEY_G`).
     pub const KEY_G: Self = Self(25);
+    /// Bevy `KeyCode` index `26` (`KEY_H`).
     pub const KEY_H: Self = Self(26);
+    /// Bevy `KeyCode` index `27` (`KEY_I`).
     pub const KEY_I: Self = Self(27);
+    /// Bevy `KeyCode` index `28` (`KEY_J`).
     pub const KEY_J: Self = Self(28);
+    /// Bevy `KeyCode` index `29` (`KEY_K`).
     pub const KEY_K: Self = Self(29);
+    /// Bevy `KeyCode` index `30` (`KEY_L`).
     pub const KEY_L: Self = Self(30);
+    /// Bevy `KeyCode` index `31` (`KEY_M`).
     pub const KEY_M: Self = Self(31);
+    /// Bevy `KeyCode` index `32` (`KEY_N`).
     pub const KEY_N: Self = Self(32);
+    /// Bevy `KeyCode` index `33` (`KEY_O`).
     pub const KEY_O: Self = Self(33);
+    /// Bevy `KeyCode` index `34` (`KEY_P`).
     pub const KEY_P: Self = Self(34);
+    /// Bevy `KeyCode` index `35` (`KEY_Q`).
     pub const KEY_Q: Self = Self(35);
+    /// Bevy `KeyCode` index `36` (`KEY_R`).
     pub const KEY_R: Self = Self(36);
+    /// Bevy `KeyCode` index `37` (`KEY_S`).
     pub const KEY_S: Self = Self(37);
+    /// Bevy `KeyCode` index `38` (`KEY_T`).
     pub const KEY_T: Self = Self(38);
+    /// Bevy `KeyCode` index `39` (`KEY_U`).
     pub const KEY_U: Self = Self(39);
+    /// Bevy `KeyCode` index `40` (`KEY_V`).
     pub const KEY_V: Self = Self(40);
+    /// Bevy `KeyCode` index `41` (`KEY_W`).
     pub const KEY_W: Self = Self(41);
+    /// Bevy `KeyCode` index `42` (`KEY_X`).
     pub const KEY_X: Self = Self(42);
+    /// Bevy `KeyCode` index `43` (`KEY_Y`).
     pub const KEY_Y: Self = Self(43);
+    /// Bevy `KeyCode` index `44` (`KEY_Z`).
     pub const KEY_Z: Self = Self(44);
+    /// Bevy `KeyCode` index `45` (`MINUS`).
     pub const MINUS: Self = Self(45);
+    /// Bevy `KeyCode` index `46` (`PERIOD`).
     pub const PERIOD: Self = Self(46);
+    /// Bevy `KeyCode` index `47` (`QUOTE`).
     pub const QUOTE: Self = Self(47);
+    /// Bevy `KeyCode` index `48` (`SEMICOLON`).
     pub const SEMICOLON: Self = Self(48);
+    /// Bevy `KeyCode` index `49` (`SLASH`).
     pub const SLASH: Self = Self(49);
+    /// Bevy `KeyCode` index `50` (`ALT_LEFT`).
     pub const ALT_LEFT: Self = Self(50);
+    /// Bevy `KeyCode` index `51` (`ALT_RIGHT`).
     pub const ALT_RIGHT: Self = Self(51);
+    /// Bevy `KeyCode` index `52` (`BACKSPACE`).
     pub const BACKSPACE: Self = Self(52);
+    /// Bevy `KeyCode` index `53` (`CAPS_LOCK`).
     pub const CAPS_LOCK: Self = Self(53);
+    /// Bevy `KeyCode` index `54` (`CONTEXT_MENU`).
     pub const CONTEXT_MENU: Self = Self(54);
+    /// Bevy `KeyCode` index `55` (`CONTROL_LEFT`).
     pub const CONTROL_LEFT: Self = Self(55);
+    /// Bevy `KeyCode` index `56` (`CONTROL_RIGHT`).
     pub const CONTROL_RIGHT: Self = Self(56);
+    /// Bevy `KeyCode` index `57` (`ENTER`).
     pub const ENTER: Self = Self(57);
+    /// Bevy `KeyCode` index `58` (`SUPER_LEFT`).
     pub const SUPER_LEFT: Self = Self(58);
+    /// Bevy `KeyCode` index `59` (`SUPER_RIGHT`).
     pub const SUPER_RIGHT: Self = Self(59);
+    /// Bevy `KeyCode` index `60` (`SHIFT_LEFT`).
     pub const SHIFT_LEFT: Self = Self(60);
+    /// Bevy `KeyCode` index `61` (`SHIFT_RIGHT`).
     pub const SHIFT_RIGHT: Self = Self(61);
+    /// Bevy `KeyCode` index `62` (`SPACE`).
     pub const SPACE: Self = Self(62);
+    /// Bevy `KeyCode` index `63` (`TAB`).
     pub const TAB: Self = Self(63);
+    /// Bevy `KeyCode` index `64` (`CONVERT`).
     pub const CONVERT: Self = Self(64);
+    /// Bevy `KeyCode` index `65` (`KANA_MODE`).
     pub const KANA_MODE: Self = Self(65);
+    /// Bevy `KeyCode` index `66` (`LANG_1`).
     pub const LANG_1: Self = Self(66);
+    /// Bevy `KeyCode` index `67` (`LANG_2`).
     pub const LANG_2: Self = Self(67);
+    /// Bevy `KeyCode` index `68` (`LANG_3`).
     pub const LANG_3: Self = Self(68);
+    /// Bevy `KeyCode` index `69` (`LANG_4`).
     pub const LANG_4: Self = Self(69);
+    /// Bevy `KeyCode` index `70` (`LANG_5`).
     pub const LANG_5: Self = Self(70);
+    /// Bevy `KeyCode` index `71` (`NON_CONVERT`).
     pub const NON_CONVERT: Self = Self(71);
+    /// Bevy `KeyCode` index `72` (`DELETE`).
     pub const DELETE: Self = Self(72);
+    /// Bevy `KeyCode` index `73` (`END`).
     pub const END: Self = Self(73);
+    /// Bevy `KeyCode` index `74` (`HELP`).
     pub const HELP: Self = Self(74);
+    /// Bevy `KeyCode` index `75` (`HOME`).
     pub const HOME: Self = Self(75);
+    /// Bevy `KeyCode` index `76` (`INSERT`).
     pub const INSERT: Self = Self(76);
+    /// Bevy `KeyCode` index `77` (`PAGE_DOWN`).
     pub const PAGE_DOWN: Self = Self(77);
+    /// Bevy `KeyCode` index `78` (`PAGE_UP`).
     pub const PAGE_UP: Self = Self(78);
+    /// Bevy `KeyCode` index `79` (`ARROW_DOWN`).
     pub const ARROW_DOWN: Self = Self(79);
+    /// Bevy `KeyCode` index `80` (`ARROW_LEFT`).
     pub const ARROW_LEFT: Self = Self(80);
+    /// Bevy `KeyCode` index `81` (`ARROW_RIGHT`).
     pub const ARROW_RIGHT: Self = Self(81);
+    /// Bevy `KeyCode` index `82` (`ARROW_UP`).
     pub const ARROW_UP: Self = Self(82);
+    /// Bevy `KeyCode` index `83` (`NUM_LOCK`).
     pub const NUM_LOCK: Self = Self(83);
+    /// Bevy `KeyCode` index `84` (`NUMPAD_0`).
     pub const NUMPAD_0: Self = Self(84);
+    /// Bevy `KeyCode` index `85` (`NUMPAD_1`).
     pub const NUMPAD_1: Self = Self(85);
+    /// Bevy `KeyCode` index `86` (`NUMPAD_2`).
     pub const NUMPAD_2: Self = Self(86);
+    /// Bevy `KeyCode` index `87` (`NUMPAD_3`).
     pub const NUMPAD_3: Self = Self(87);
+    /// Bevy `KeyCode` index `88` (`NUMPAD_4`).
     pub const NUMPAD_4: Self = Self(88);
+    /// Bevy `KeyCode` index `89` (`NUMPAD_5`).
     pub const NUMPAD_5: Self = Self(89);
+    /// Bevy `KeyCode` index `90` (`NUMPAD_6`).
     pub const NUMPAD_6: Self = Self(90);
+    /// Bevy `KeyCode` index `91` (`NUMPAD_7`).
     pub const NUMPAD_7: Self = Self(91);
+    /// Bevy `KeyCode` index `92` (`NUMPAD_8`).
     pub const NUMPAD_8: Self = Self(92);
+    /// Bevy `KeyCode` index `93` (`NUMPAD_9`).
     pub const NUMPAD_9: Self = Self(93);
+    /// Bevy `KeyCode` index `94` (`NUMPAD_ADD`).
     pub const NUMPAD_ADD: Self = Self(94);
+    /// Bevy `KeyCode` index `95` (`NUMPAD_BACKSPACE`).
     pub const NUMPAD_BACKSPACE: Self = Self(95);
+    /// Bevy `KeyCode` index `96` (`NUMPAD_CLEAR`).
     pub const NUMPAD_CLEAR: Self = Self(96);
+    /// Bevy `KeyCode` index `97` (`NUMPAD_CLEAR_ENTRY`).
     pub const NUMPAD_CLEAR_ENTRY: Self = Self(97);
+    /// Bevy `KeyCode` index `98` (`NUMPAD_COMMA`).
     pub const NUMPAD_COMMA: Self = Self(98);
+    /// Bevy `KeyCode` index `99` (`NUMPAD_DECIMAL`).
     pub const NUMPAD_DECIMAL: Self = Self(99);
+    /// Bevy `KeyCode` index `100` (`NUMPAD_DIVIDE`).
     pub const NUMPAD_DIVIDE: Self = Self(100);
+    /// Bevy `KeyCode` index `101` (`NUMPAD_ENTER`).
     pub const NUMPAD_ENTER: Self = Self(101);
+    /// Bevy `KeyCode` index `102` (`NUMPAD_EQUAL`).
     pub const NUMPAD_EQUAL: Self = Self(102);
+    /// Bevy `KeyCode` index `103` (`NUMPAD_HASH`).
     pub const NUMPAD_HASH: Self = Self(103);
+    /// Bevy `KeyCode` index `104` (`NUMPAD_MEMORY_ADD`).
     pub const NUMPAD_MEMORY_ADD: Self = Self(104);
+    /// Bevy `KeyCode` index `105` (`NUMPAD_MEMORY_CLEAR`).
     pub const NUMPAD_MEMORY_CLEAR: Self = Self(105);
+    /// Bevy `KeyCode` index `106` (`NUMPAD_MEMORY_RECALL`).
     pub const NUMPAD_MEMORY_RECALL: Self = Self(106);
+    /// Bevy `KeyCode` index `107` (`NUMPAD_MEMORY_STORE`).
     pub const NUMPAD_MEMORY_STORE: Self = Self(107);
+    /// Bevy `KeyCode` index `108` (`NUMPAD_MEMORY_SUBTRACT`).
     pub const NUMPAD_MEMORY_SUBTRACT: Self = Self(108);
+    /// Bevy `KeyCode` index `109` (`NUMPAD_MULTIPLY`).
     pub const NUMPAD_MULTIPLY: Self = Self(109);
+    /// Bevy `KeyCode` index `110` (`NUMPAD_PAREN_LEFT`).
     pub const NUMPAD_PAREN_LEFT: Self = Self(110);
+    /// Bevy `KeyCode` index `111` (`NUMPAD_PAREN_RIGHT`).
     pub const NUMPAD_PAREN_RIGHT: Self = Self(111);
+    /// Bevy `KeyCode` index `112` (`NUMPAD_STAR`).
     pub const NUMPAD_STAR: Self = Self(112);
+    /// Bevy `KeyCode` index `113` (`NUMPAD_SUBTRACT`).
     pub const NUMPAD_SUBTRACT: Self = Self(113);
+    /// Bevy `KeyCode` index `114` (`ESCAPE`).
     pub const ESCAPE: Self = Self(114);
+    /// Bevy `KeyCode` index `115` (`FN`).
     pub const FN: Self = Self(115);
+    /// Bevy `KeyCode` index `116` (`FN_LOCK`).
     pub const FN_LOCK: Self = Self(116);
+    /// Bevy `KeyCode` index `117` (`PRINT_SCREEN`).
     pub const PRINT_SCREEN: Self = Self(117);
+    /// Bevy `KeyCode` index `118` (`SCROLL_LOCK`).
     pub const SCROLL_LOCK: Self = Self(118);
+    /// Bevy `KeyCode` index `119` (`PAUSE`).
     pub const PAUSE: Self = Self(119);
+    /// Bevy `KeyCode` index `120` (`BROWSER_BACK`).
     pub const BROWSER_BACK: Self = Self(120);
+    /// Bevy `KeyCode` index `121` (`BROWSER_FAVORITES`).
     pub const BROWSER_FAVORITES: Self = Self(121);
+    /// Bevy `KeyCode` index `122` (`BROWSER_FORWARD`).
     pub const BROWSER_FORWARD: Self = Self(122);
+    /// Bevy `KeyCode` index `123` (`BROWSER_HOME`).
     pub const BROWSER_HOME: Self = Self(123);
+    /// Bevy `KeyCode` index `124` (`BROWSER_REFRESH`).
     pub const BROWSER_REFRESH: Self = Self(124);
+    /// Bevy `KeyCode` index `125` (`BROWSER_SEARCH`).
     pub const BROWSER_SEARCH: Self = Self(125);
+    /// Bevy `KeyCode` index `126` (`BROWSER_STOP`).
     pub const BROWSER_STOP: Self = Self(126);
+    /// Bevy `KeyCode` index `127` (`EJECT`).
     pub const EJECT: Self = Self(127);
+    /// Bevy `KeyCode` index `128` (`LAUNCH_APP_1`).
     pub const LAUNCH_APP_1: Self = Self(128);
+    /// Bevy `KeyCode` index `129` (`LAUNCH_APP_2`).
     pub const LAUNCH_APP_2: Self = Self(129);
+    /// Bevy `KeyCode` index `130` (`LAUNCH_MAIL`).
     pub const LAUNCH_MAIL: Self = Self(130);
+    /// Bevy `KeyCode` index `131` (`MEDIA_PLAY_PAUSE`).
     pub const MEDIA_PLAY_PAUSE: Self = Self(131);
+    /// Bevy `KeyCode` index `132` (`MEDIA_SELECT`).
     pub const MEDIA_SELECT: Self = Self(132);
+    /// Bevy `KeyCode` index `133` (`MEDIA_STOP`).
     pub const MEDIA_STOP: Self = Self(133);
+    /// Bevy `KeyCode` index `134` (`MEDIA_TRACK_NEXT`).
     pub const MEDIA_TRACK_NEXT: Self = Self(134);
+    /// Bevy `KeyCode` index `135` (`MEDIA_TRACK_PREVIOUS`).
     pub const MEDIA_TRACK_PREVIOUS: Self = Self(135);
+    /// Bevy `KeyCode` index `136` (`POWER`).
     pub const POWER: Self = Self(136);
+    /// Bevy `KeyCode` index `137` (`SLEEP`).
     pub const SLEEP: Self = Self(137);
+    /// Bevy `KeyCode` index `138` (`AUDIO_VOLUME_DOWN`).
     pub const AUDIO_VOLUME_DOWN: Self = Self(138);
+    /// Bevy `KeyCode` index `139` (`AUDIO_VOLUME_MUTE`).
     pub const AUDIO_VOLUME_MUTE: Self = Self(139);
+    /// Bevy `KeyCode` index `140` (`AUDIO_VOLUME_UP`).
     pub const AUDIO_VOLUME_UP: Self = Self(140);
+    /// Bevy `KeyCode` index `141` (`WAKE_UP`).
     pub const WAKE_UP: Self = Self(141);
+    /// Bevy `KeyCode` index `142` (`META`).
     pub const META: Self = Self(142);
+    /// Bevy `KeyCode` index `143` (`HYPER`).
     pub const HYPER: Self = Self(143);
+    /// Bevy `KeyCode` index `144` (`TURBO`).
     pub const TURBO: Self = Self(144);
+    /// Bevy `KeyCode` index `145` (`ABORT`).
     pub const ABORT: Self = Self(145);
+    /// Bevy `KeyCode` index `146` (`RESUME`).
     pub const RESUME: Self = Self(146);
+    /// Bevy `KeyCode` index `147` (`SUSPEND`).
     pub const SUSPEND: Self = Self(147);
+    /// Bevy `KeyCode` index `148` (`AGAIN`).
     pub const AGAIN: Self = Self(148);
+    /// Bevy `KeyCode` index `149` (`COPY`).
     pub const COPY: Self = Self(149);
+    /// Bevy `KeyCode` index `150` (`CUT`).
     pub const CUT: Self = Self(150);
+    /// Bevy `KeyCode` index `151` (`FIND`).
     pub const FIND: Self = Self(151);
+    /// Bevy `KeyCode` index `152` (`OPEN`).
     pub const OPEN: Self = Self(152);
+    /// Bevy `KeyCode` index `153` (`PASTE`).
     pub const PASTE: Self = Self(153);
+    /// Bevy `KeyCode` index `154` (`PROPS`).
     pub const PROPS: Self = Self(154);
+    /// Bevy `KeyCode` index `155` (`SELECT`).
     pub const SELECT: Self = Self(155);
+    /// Bevy `KeyCode` index `156` (`UNDO`).
     pub const UNDO: Self = Self(156);
+    /// Bevy `KeyCode` index `157` (`HIRAGANA`).
     pub const HIRAGANA: Self = Self(157);
+    /// Bevy `KeyCode` index `158` (`KATAKANA`).
     pub const KATAKANA: Self = Self(158);
+    /// Bevy `KeyCode` index `159` (`F1`).
     pub const F1: Self = Self(159);
+    /// Bevy `KeyCode` index `160` (`F2`).
     pub const F2: Self = Self(160);
+    /// Bevy `KeyCode` index `161` (`F3`).
     pub const F3: Self = Self(161);
+    /// Bevy `KeyCode` index `162` (`F4`).
     pub const F4: Self = Self(162);
+    /// Bevy `KeyCode` index `163` (`F5`).
     pub const F5: Self = Self(163);
+    /// Bevy `KeyCode` index `164` (`F6`).
     pub const F6: Self = Self(164);
+    /// Bevy `KeyCode` index `165` (`F7`).
     pub const F7: Self = Self(165);
+    /// Bevy `KeyCode` index `166` (`F8`).
     pub const F8: Self = Self(166);
+    /// Bevy `KeyCode` index `167` (`F9`).
     pub const F9: Self = Self(167);
+    /// Bevy `KeyCode` index `168` (`F10`).
     pub const F10: Self = Self(168);
+    /// Bevy `KeyCode` index `169` (`F11`).
     pub const F11: Self = Self(169);
+    /// Bevy `KeyCode` index `170` (`F12`).
     pub const F12: Self = Self(170);
+    /// Bevy `KeyCode` index `171` (`F13`).
     pub const F13: Self = Self(171);
+    /// Bevy `KeyCode` index `172` (`F14`).
     pub const F14: Self = Self(172);
+    /// Bevy `KeyCode` index `173` (`F15`).
     pub const F15: Self = Self(173);
+    /// Bevy `KeyCode` index `174` (`F16`).
     pub const F16: Self = Self(174);
+    /// Bevy `KeyCode` index `175` (`F17`).
     pub const F17: Self = Self(175);
+    /// Bevy `KeyCode` index `176` (`F18`).
     pub const F18: Self = Self(176);
+    /// Bevy `KeyCode` index `177` (`F19`).
     pub const F19: Self = Self(177);
+    /// Bevy `KeyCode` index `178` (`F20`).
     pub const F20: Self = Self(178);
+    /// Bevy `KeyCode` index `179` (`F21`).
     pub const F21: Self = Self(179);
+    /// Bevy `KeyCode` index `180` (`F22`).
     pub const F22: Self = Self(180);
+    /// Bevy `KeyCode` index `181` (`F23`).
     pub const F23: Self = Self(181);
+    /// Bevy `KeyCode` index `182` (`F24`).
     pub const F24: Self = Self(182);
+    /// Bevy `KeyCode` index `183` (`F25`).
     pub const F25: Self = Self(183);
+    /// Bevy `KeyCode` index `184` (`F26`).
     pub const F26: Self = Self(184);
+    /// Bevy `KeyCode` index `185` (`F27`).
     pub const F27: Self = Self(185);
+    /// Bevy `KeyCode` index `186` (`F28`).
     pub const F28: Self = Self(186);
+    /// Bevy `KeyCode` index `187` (`F29`).
     pub const F29: Self = Self(187);
+    /// Bevy `KeyCode` index `188` (`F30`).
     pub const F30: Self = Self(188);
+    /// Bevy `KeyCode` index `189` (`F31`).
     pub const F31: Self = Self(189);
+    /// Bevy `KeyCode` index `190` (`F32`).
     pub const F32: Self = Self(190);
+    /// Bevy `KeyCode` index `191` (`F33`).
     pub const F33: Self = Self(191);
+    /// Bevy `KeyCode` index `192` (`F34`).
     pub const F34: Self = Self(192);
+    /// Bevy `KeyCode` index `193` (`F35`).
     pub const F35: Self = Self(193);
 
     /// Complete ordered table of all 194 named Bevy `0.20` `KeyCode` indices (`0..=193`).
@@ -1843,26 +2036,44 @@ pub struct FfiGamepadButton(pub u8);
 
 impl_wire_abi_pod!(FfiGamepadButton, size = 1, align = 1, fields = [u8]);
 
-#[allow(missing_docs)]
 impl FfiGamepadButton {
+    /// Bottom face button (`GamepadButton::South` / A / Cross).
     pub const SOUTH: Self = Self(0);
+    /// Right face button (`GamepadButton::East` / B / Circle).
     pub const EAST: Self = Self(1);
+    /// Top face button (`GamepadButton::North` / Y / Triangle).
     pub const NORTH: Self = Self(2);
+    /// Left face button (`GamepadButton::West` / X / Square).
     pub const WEST: Self = Self(3);
+    /// C button (`GamepadButton::C`).
     pub const C: Self = Self(4);
+    /// Z button (`GamepadButton::Z`).
     pub const Z: Self = Self(5);
+    /// Left shoulder bumper (`GamepadButton::LeftTrigger`).
     pub const LEFT_TRIGGER: Self = Self(6);
+    /// Left analog/digital trigger (`GamepadButton::LeftTrigger2`).
     pub const LEFT_TRIGGER2: Self = Self(7);
+    /// Right shoulder bumper (`GamepadButton::RightTrigger`).
     pub const RIGHT_TRIGGER: Self = Self(8);
+    /// Right analog/digital trigger (`GamepadButton::RightTrigger2`).
     pub const RIGHT_TRIGGER2: Self = Self(9);
+    /// Select / Back / Share button (`GamepadButton::Select`).
     pub const SELECT: Self = Self(10);
+    /// Start / Options / Menu button (`GamepadButton::Start`).
     pub const START: Self = Self(11);
+    /// Home / Guide / Mode button (`GamepadButton::Mode`).
     pub const MODE: Self = Self(12);
+    /// Left stick click (`GamepadButton::LeftThumb`).
     pub const LEFT_THUMB: Self = Self(13);
+    /// Right stick click (`GamepadButton::RightThumb`).
     pub const RIGHT_THUMB: Self = Self(14);
+    /// Directional pad up (`GamepadButton::DPadUp`).
     pub const DPAD_UP: Self = Self(15);
+    /// Directional pad down (`GamepadButton::DPadDown`).
     pub const DPAD_DOWN: Self = Self(16);
+    /// Directional pad left (`GamepadButton::DPadLeft`).
     pub const DPAD_LEFT: Self = Self(17);
+    /// Directional pad right (`GamepadButton::DPadRight`).
     pub const DPAD_RIGHT: Self = Self(18);
     /// Starting bit index for vendor-specific `GamepadButton::Other(u8)` buttons (`19..64`).
     pub const OTHER_BASE: u8 = 19;

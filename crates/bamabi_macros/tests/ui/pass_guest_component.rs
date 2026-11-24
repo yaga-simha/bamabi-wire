@@ -5,7 +5,7 @@ use bamabi_sys::{
 };
 
 mod mock_guest {
-    use bamabi_sys::{AbiPod, ComponentUuid};
+    use bamabi_sys::{AbiPod, BamFieldDesc, ComponentUuid};
     use core::ffi::CStr;
 
     pub trait GuestComponent: AbiPod {
@@ -21,6 +21,8 @@ mod mock_guest {
             ),
             Err(_) => panic!("GuestComponent::NAME must be valid UTF-8"),
         };
+        const SCHEMA_FINGERPRINT: u64 = 0;
+        const BAM_FIELDS: &'static [BamFieldDesc] = &[];
     }
 }
 
@@ -66,6 +68,11 @@ const _: () = {
         <HostPosition as ModComponentTrait>::UUID.to_u128()
             == <GuestPosition as GuestComponentTrait>::UUID.to_u128()
     );
+    assert!(
+        <HostPosition as ModComponentTrait>::SCHEMA_FINGERPRINT
+            == <GuestPosition as GuestComponentTrait>::SCHEMA_FINGERPRINT
+    );
+    assert!(<GuestPosition as GuestComponentTrait>::BAM_FIELDS.len() == 3);
     assert!(<GuestPosition as GuestComponentTrait>::FLAGS == BAM_COMPONENT_FLAG_SUMMARY_TICK);
 
     // `#[derive(ModComponent, GuestComponent)]` fallback to `#[mod_component(...)]`.
@@ -73,12 +80,20 @@ const _: () = {
         <DualDerived as ModComponentTrait>::UUID.to_u128()
             == <DualDerived as GuestComponentTrait>::UUID.to_u128()
     );
+    assert!(
+        <DualDerived as ModComponentTrait>::SCHEMA_FINGERPRINT
+            == <DualDerived as GuestComponentTrait>::SCHEMA_FINGERPRINT
+    );
     assert!(<DualDerived as GuestComponentTrait>::FLAGS == BAM_COMPONENT_FLAG_IMMUTABLE);
 
     // `#[mod_component(..., guest)]` shorthand.
     assert!(
         <ShorthandGuest as ModComponentTrait>::UUID.to_u128()
             == <ShorthandGuest as GuestComponentTrait>::UUID.to_u128()
+    );
+    assert!(
+        <ShorthandGuest as ModComponentTrait>::SCHEMA_FINGERPRINT
+            == <ShorthandGuest as GuestComponentTrait>::SCHEMA_FINGERPRINT
     );
     assert!(<ShorthandGuest as GuestComponentTrait>::FLAGS == BAM_COMPONENT_FLAG_SPARSE_SET);
 };

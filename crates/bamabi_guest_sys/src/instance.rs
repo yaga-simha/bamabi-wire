@@ -53,6 +53,10 @@ impl Drop for ErasedAllocation {
 
 /// Monomorphized destructor function stored in [`ErasedAllocation::drop_fn`] to reconstitute and
 /// drop a `Box<T>` created by `Box::into_raw`.
+///
+/// # Safety
+/// `ptr` must have been produced by `Box::into_raw` for the exact type `T`, remain non-null and
+/// unfreed, and be dropped at most once.
 unsafe fn drop_boxed<T>(ptr: *mut c_void) {
     // SAFETY: Caller guarantees `ptr` came from `Box::into_raw` for `T` and has not been freed.
     drop(unsafe { Box::from_raw(ptr.cast::<T>()) });
@@ -75,6 +79,9 @@ pub(crate) struct RuntimeAllocTracker {
     allocations: core::cell::RefCell<Vec<ErasedAllocation>>,
     #[cfg(not(kani))]
     symbol_cache: std::sync::Mutex<HashMap<(core::any::TypeId, u8), GuestSymbolPtr>>,
+    #[cfg(not(kani))]
+    component_cache:
+        std::sync::Mutex<HashMap<core::any::TypeId, (BamComponent, ComponentUuid, bool)>>,
 }
 
 #[cfg(kani)]
@@ -95,6 +102,8 @@ impl RuntimeAllocTracker {
             allocations: core::cell::RefCell::new(Vec::new()),
             #[cfg(not(kani))]
             symbol_cache: std::sync::Mutex::new(HashMap::new()),
+            #[cfg(not(kani))]
+            component_cache: std::sync::Mutex::new(HashMap::new()),
         }
     }
 
@@ -124,6 +133,61 @@ impl RuntimeAllocTracker {
             guard.insert(key, GuestSymbolPtr(ptr));
         }
         Ok(ptr)
+    }
+
+    /// Looks up a cached validated [`BamComponent`] handle keyed by `(TypeId, expected_uuid)`,
+    /// calling `resolve` outside the lock on a cache miss and storing only valid handles matching
+    /// `expected_uuid`.
+    #[cfg(not(kani))]
+    pub(crate) fn cached_component_lookup(
+        &self,
+        key: core::any::TypeId,
+        expected_uuid: ComponentUuid,
+        require_layout_verified: bool,
+        resolve: impl FnOnce() -> Result<BamComponent, FfiResult>,
+    ) -> Result<BamComponent, FfiResult> {
+        {
+            let guard = self
+                .component_cache
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if let Some(&(handle, uuid, verified)) = guard.get(&key)
+                && handle.is_valid()
+                && uuid == expected_uuid
+                && (!require_layout_verified || verified)
+            {
+                return Ok(handle);
+            }
+        }
+        let handle = resolve()?;
+        if handle.is_valid() {
+            let mut guard = self
+                .component_cache
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            guard.insert(key, (handle, expected_uuid, require_layout_verified));
+        }
+        Ok(handle)
+    }
+
+    /// Inserts or updates a validated `(TypeId, ComponentUuid, layout_verified) -> BamComponent`
+    /// cache entry.
+    #[cfg(not(kani))]
+    pub(crate) fn cache_component_handle(
+        &self,
+        key: core::any::TypeId,
+        expected_uuid: ComponentUuid,
+        handle: BamComponent,
+        layout_verified: bool,
+    ) {
+        if !handle.is_valid() {
+            return;
+        }
+        let mut guard = self
+            .component_cache
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        guard.insert(key, (handle, expected_uuid, layout_verified));
     }
 
     /// Binds the owning [`GuestInstance`]'s stable heap-pinned [`Host`] pointer so runtime

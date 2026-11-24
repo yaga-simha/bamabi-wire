@@ -567,7 +567,7 @@ mod derive_guest_component_tests {
         );
         assert_eq!(
             <ExplicitUuid as GuestComponent>::UUID,
-            ComponentUuid::parse_hex("01234567-89ab-cdef-0123-456789abcdef")
+            ComponentUuid::try_parse_hex("01234567-89ab-cdef-0123-456789abcdef").unwrap()
         );
 
         // 8. Unqualified default name (`c"UnqualifiedHealth"`) auto-prefixes manifest name during registration.

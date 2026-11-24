@@ -902,3 +902,181 @@ fn po_w9_telemetry_digest64_roundtrip() {
         assert_eq!(slice_res, Err(TelemetrySliceError::InvalidLength(len)));
     }
 }
+
+// ============================================================================
+// PO-W10: ABI 0.4.0 Extensible Structs, BamSpawnColumnDesc, BamRowRange & FfiOption
+// ============================================================================
+
+/// PO-W10: `BamTimeInfo` & `BamParOptions` extensible prefix reading/validation,
+/// `BamSpawnColumnDesc::validate` (dense vs SPLAT, flags, null check), `BamRowRange::end_row`
+/// overflow safety, and `FfiOption::write_zeroed_bytes` / `write_none_zeroed` padding zeroing.
+#[kani::proof]
+fn po_w10_v04_extensible_and_spawn_desc() {
+    use crate::{
+        BAM_SPAWN_COL_FLAG_SPLAT, BAM_SPAWN_COL_KNOWN_FLAGS, BamParOptions, BamRowRange,
+        BamSpawnColumnDesc, BamTimeInfo,
+    };
+
+    #[repr(C, align(8))]
+    struct AlignedBuf<const N: usize>([u8; N]);
+
+    // 1. BamTimeInfo extensible reading & validate
+    let mut raw_time = AlignedBuf([0u8; size_of::<BamTimeInfo>() + 8]);
+    let time_struct_size: u32 = kani::any();
+    let time_flags: u32 = kani::any();
+    raw_time.0[0..4].copy_from_slice(&time_struct_size.to_le_bytes());
+    raw_time.0[4..8].copy_from_slice(&time_flags.to_le_bytes());
+    // SAFETY: `raw_time` is aligned readable stack memory of `size_of::<BamTimeInfo>() + 8 >= size_of::<BamTimeInfo>()` bytes.
+    let read_time = unsafe { crate::read_descriptor::<BamTimeInfo>(raw_time.0.as_ptr().cast()) };
+    if (time_struct_size as usize) < BamTimeInfo::MIN_V0_4_SIZE {
+        assert_eq!(read_time.unwrap_err(), FfiResult::INVALID_VERSION);
+    } else {
+        let info = read_time.expect("struct_size >= MIN_V0_4_SIZE must read cleanly");
+        if time_flags != 0 {
+            assert_eq!(info.validate(), FfiResult::UNSUPPORTED);
+        } else {
+            assert_eq!(info.validate(), FfiResult::OK);
+        }
+    }
+
+    // 2. BamParOptions extensible reading & validate
+    let mut raw_par = AlignedBuf([0u8; size_of::<BamParOptions>() + 8]);
+    let par_struct_size: u32 = kani::any();
+    let par_flags: u32 = kani::any();
+    raw_par.0[0..4].copy_from_slice(&par_struct_size.to_le_bytes());
+    raw_par.0[4..8].copy_from_slice(&par_flags.to_le_bytes());
+    // SAFETY: `raw_par` is aligned readable stack memory of `size_of::<BamParOptions>() + 8 >= size_of::<BamParOptions>()` bytes.
+    let read_par = unsafe { crate::read_descriptor::<BamParOptions>(raw_par.0.as_ptr().cast()) };
+    if (par_struct_size as usize) < BamParOptions::MIN_V0_4_SIZE {
+        assert_eq!(read_par.unwrap_err(), FfiResult::INVALID_VERSION);
+    } else {
+        let par = read_par.expect("struct_size >= MIN_V0_4_SIZE must read cleanly");
+        if par_flags != 0 {
+            assert_eq!(par.validate(), FfiResult::UNSUPPORTED);
+        } else {
+            assert_eq!(par.validate(), FfiResult::OK);
+        }
+    }
+
+    // 3. BamSpawnColumnDesc::validate (dense vs SPLAT)
+    let comp_raw: u32 = kani::any();
+    let col_flags: u32 = kani::any();
+    let is_null_ptr: bool = kani::any();
+    let elem_size: usize = kani::any();
+    let entity_count: usize = kani::any();
+    let dummy: u8 = 0;
+    let col_ptr = if is_null_ptr {
+        core::ptr::null()
+    } else {
+        &raw const dummy
+    };
+    let col_desc = if col_flags == BAM_SPAWN_COL_FLAG_SPLAT {
+        BamSpawnColumnDesc::splat(BamComponent::from_raw(comp_raw), col_ptr, elem_size)
+    } else {
+        let mut d = BamSpawnColumnDesc::dense(BamComponent::from_raw(comp_raw), col_ptr, elem_size);
+        d.flags = col_flags;
+        d
+    };
+    assert_eq!(
+        col_desc.is_splat(),
+        (col_flags & BAM_SPAWN_COL_FLAG_SPLAT) != 0
+    );
+    let col_res = col_desc.validate(entity_count);
+    if comp_raw == 0 {
+        assert_eq!(col_res, FfiResult::INVALID_COMPONENT);
+    } else if (col_flags & !BAM_SPAWN_COL_KNOWN_FLAGS) != 0 {
+        assert_eq!(col_res, FfiResult::UNSUPPORTED);
+    } else if entity_count > 0 && elem_size > 0 && is_null_ptr {
+        assert_eq!(col_res, FfiResult::NULL_POINTER);
+    } else {
+        assert_eq!(col_res, FfiResult::OK);
+    }
+
+    // 4. BamRowRange overflow-free end_row
+    let start_row: usize = kani::any();
+    let row_count: usize = kani::any();
+    let range = BamRowRange::new(start_row, row_count);
+    assert_eq!(range.is_empty(), row_count == 0);
+    assert_eq!(range.end_row(), start_row.checked_add(row_count));
+
+    // 5. FfiOption::<u32>::write_zeroed_bytes & write_none_zeroed
+    let is_some: bool = kani::any();
+    let val: u32 = kani::any();
+    let opt = if is_some {
+        FfiOption::some(val)
+    } else {
+        FfiOption::none()
+    };
+    let mut dst = [0xAAu8; 12];
+    let dst_len: usize = kani::any();
+    kani::assume(dst_len <= dst.len());
+    let written = opt.write_zeroed_bytes(&mut dst[..dst_len]);
+    if dst_len < size_of::<FfiOption<u32>>() {
+        assert_eq!(written, None);
+    } else {
+        assert_eq!(written, Some(size_of::<FfiOption<u32>>()));
+        assert_eq!(dst[0], u8::from(is_some));
+        assert_eq!(&dst[1..4], &[0, 0, 0]);
+        if is_some {
+            assert_eq!(&dst[4..8], &val.to_le_bytes());
+        } else {
+            assert_eq!(&dst[4..8], &[0, 0, 0, 0]);
+        }
+    }
+
+    let mut slot = core::mem::MaybeUninit::<FfiOption<u32>>::new(FfiOption::some(0xFFFF_FFFF));
+    let ptr = FfiOption::<u32>::write_none_zeroed(&mut slot);
+    // SAFETY: `write_none_zeroed` initialized every byte of `slot`, including padding.
+    let bytes =
+        unsafe { core::slice::from_raw_parts(ptr.cast::<u8>(), size_of::<FfiOption<u32>>()) };
+    assert_eq!(bytes, &[0u8; size_of::<FfiOption<u32>>()]);
+}
+
+// ============================================================================
+// PO-W11: DirtyRunCoalescer Overflow-Free Coalescing
+// ============================================================================
+
+/// PO-W11: `DirtyRunCoalescer` merges ascending/overlapping/disjoint rows and ranges with zero
+/// integer overflow (including the `usize::MAX` boundary) and exact output buffer bounds checking.
+#[kani::proof]
+fn po_w11_dirty_run_coalescer() {
+    use crate::{BamRowRange, DirtyRunCoalescer};
+
+    // Symbolic 4-element row sequence with bounded values plus usize::MAX boundary check.
+    let r0: usize = kani::any();
+    let r1: usize = kani::any();
+    let r2: usize = kani::any();
+    let r3: usize = kani::any();
+    kani::assume(r0 <= r1 && r1 <= r2 && r2 <= r3);
+    kani::assume(r3 < usize::MAX);
+
+    let rows = [r0, r1, r2, r3];
+    let mut out = [BamRowRange::default(); 4];
+    let count =
+        DirtyRunCoalescer::coalesce_into(&rows, &mut out).expect("4 slots suffice for 4 rows");
+    assert!((1..=4).contains(&count));
+    assert_eq!(out[0].start_row, r0);
+
+    // Every input row is covered by at least one output range, and total covered rows <= 4.
+    let mut total_rows = 0usize;
+    let mut idx = 0usize;
+    while idx < count {
+        assert!(!out[idx].is_empty());
+        assert!(out[idx].end_row().is_some());
+        total_rows += out[idx].row_count;
+        if idx + 1 < count {
+            assert!(out[idx].end_row().expect("non-overflow") < out[idx + 1].start_row);
+        }
+        idx += 1;
+    }
+    assert!((1..=4).contains(&total_rows));
+
+    // Boundary check: pushing `usize::MAX` onto `(0, usize::MAX)` flushes without overflow.
+    let mut boundary = DirtyRunCoalescer::new();
+    assert_eq!(boundary.push_range(BamRowRange::new(0, usize::MAX)), None);
+    assert_eq!(
+        boundary.push_row(usize::MAX),
+        Some(BamRowRange::new(0, usize::MAX))
+    );
+    assert_eq!(boundary.finish(), Some(BamRowRange::new(usize::MAX, 1)));
+}

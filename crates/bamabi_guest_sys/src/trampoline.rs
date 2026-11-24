@@ -11,11 +11,11 @@ use std::ffi::CString;
 
 use bamabi_sys::{
     AbiPod, BAM_STORAGE_FLAG_IMMUTABLE, BAM_SYSTEM_KNOWN_FLAGS, BamChangeTicks, BamCommands,
-    BamComponent, BamEventKind, BamHostCtx, BamIter, BamLayoutInfo, BamLoadCtx, BamObserverDesc,
-    BamObserverFn, BamObserverMutFn, BamQueryDesc, BamRunIfFn, BamScheduleSetDesc, BamSymbol,
-    BamSystem, BamSystemCtx, BamSystemDesc, BamSystemFn, BamSystemSet, BamTermDesc, ComponentUuid,
-    FfiBool, FfiEntity, FfiResult, MAX_QUERIES_PER_SYSTEM, MAX_TERMS_PER_QUERY, ModComponent,
-    ScheduleId,
+    BamComponent, BamEventKind, BamHostCtx, BamIter, BamLayoutInfo, BamLoadCtx,
+    BamObserverCtxMutFn, BamObserverDesc, BamObserverFn, BamObserverMutFn, BamQueryDesc,
+    BamRunIfFn, BamScheduleSetDesc, BamSymbol, BamSystem, BamSystemCtx, BamSystemDesc, BamSystemFn,
+    BamSystemSet, BamTermDesc, BamTimeInfo, ComponentUuid, FfiBool, FfiEntity, FfiResult,
+    MAX_QUERIES_PER_SYSTEM, MAX_TERMS_PER_QUERY, ModComponent, ScheduleId,
 };
 
 use crate::{
@@ -404,6 +404,10 @@ pub struct ValidatedSystemInvocation<'a> {
 
 impl<'a> ValidatedSystemInvocation<'a> {
     /// Internal constructor shared by [`Self::from_raw`] and [`Self::from_raw_with_parts`].
+    ///
+    /// # Safety
+    /// - `sys_ctx` must be null or an active [`BamSystemCtx`] valid for `'a`.
+    /// - `scratches` must outlive `'a`.
     #[inline]
     unsafe fn from_parts(
         sys_ctx: *mut BamSystemCtx,
@@ -1197,6 +1201,247 @@ impl<'a> ValidatedSystemRef<'a> {
         }
     }
 
+    /// Resolves a canonical non-empty UTF-8 lookup `name` to its bound [`FfiEntity`] via
+    /// `BamHostApi::resolve_named_object` (slot 75) without materializing a full [`Host`] copy.
+    #[inline]
+    pub fn resolve_named_object(&self, name: &str) -> Result<FfiEntity, FfiResult> {
+        // SAFETY: `self.resolve_ctx()` returns a valid active `BamHostCtx` matching `self.host.api()`.
+        unsafe { Host::resolve_named_object_with_ctx(self.host.api(), self.resolve_ctx(), name) }
+    }
+
+    /// Resolves an interned [`BamSymbol`] handle back to its owned UTF-8 string via
+    /// `BamHostApi::resolve_symbol_str` (slot 76) without materializing a full [`Host`] copy.
+    #[inline]
+    pub fn resolve_symbol_str(&self, symbol: BamSymbol) -> Result<String, FfiResult> {
+        // SAFETY: `self.resolve_ctx()` returns a valid active `BamHostCtx` matching `self.host.api()`.
+        unsafe { Host::resolve_symbol_str_with_ctx(self.host.api(), self.resolve_ctx(), symbol) }
+    }
+
+    /// Returns `(last_run, this_run)` Bevy change-detection ticks for the current system invocation
+    /// via `BamHostApi::sys_current_ticks` (slot 79).
+    #[inline]
+    pub fn current_ticks(&self) -> Result<(u32, u32), FfiResult> {
+        if self.sys_ctx.is_null() {
+            return Err(FfiResult::NULL_POINTER);
+        }
+        let ticks_fn =
+            host_slot!(self.host.api(), sys_current_ticks).ok_or(FfiResult::UNSUPPORTED)?;
+        let mut last_run = 0u32;
+        let mut this_run = 0u32;
+        // SAFETY: `self.sys_ctx` is active for `'a`, and both out-pointers are aligned stack storage.
+        let status = unsafe { ticks_fn(self.sys_ctx.cast_const(), &mut last_run, &mut this_run) };
+        if status.is_ok() {
+            Ok((last_run, this_run))
+        } else {
+            Err(status)
+        }
+    }
+
+    /// Returns frame/fixed-step timing metadata ([`BamTimeInfo`]) for the current system invocation
+    /// via `BamHostApi::sys_time_info` (slot 80).
+    #[inline]
+    pub fn time_info(&self) -> Result<BamTimeInfo, FfiResult> {
+        if self.sys_ctx.is_null() {
+            return Err(FfiResult::NULL_POINTER);
+        }
+        let time_fn = host_slot!(self.host.api(), sys_time_info).ok_or(FfiResult::UNSUPPORTED)?;
+        let mut info = BamTimeInfo {
+            struct_size: core::mem::size_of::<BamTimeInfo>() as u32,
+            flags: 0,
+            delta_secs: 0.0,
+            fixed_delta_secs: 0.0,
+            elapsed_secs: 0.0,
+            elapsed_secs_wrapped: 0.0,
+            overstep_fraction: 0.0,
+        };
+        // SAFETY: `self.sys_ctx` is active for `'a`, and `&mut info` is aligned writable storage
+        // prefixed by `struct_size == size_of::<BamTimeInfo>()`.
+        let status = unsafe { time_fn(self.sys_ctx.cast_const(), &mut info) };
+        if status.is_ok() {
+            Ok(info)
+        } else {
+            Err(status)
+        }
+    }
+
+    /// Queries all outgoing target entities linked to `entity` via relationship `relation` using
+    /// `BamHostApi::sys_relation_targets` (slot 82).
+    #[inline]
+    pub fn relation_targets(
+        &self,
+        entity: FfiEntity,
+        relation: BamComponent,
+    ) -> Result<&[FfiEntity], FfiResult> {
+        if self.sys_ctx.is_null() {
+            return Err(FfiResult::NULL_POINTER);
+        }
+        if entity.is_null() {
+            return Err(FfiResult::INVALID_ENTITY);
+        }
+        if !relation.is_valid() {
+            return Err(FfiResult::INVALID_COMPONENT);
+        }
+        let targets_fn =
+            host_slot!(self.host.api(), sys_relation_targets).ok_or(FfiResult::UNSUPPORTED)?;
+        let mut ptr: *const FfiEntity = core::ptr::null();
+        let mut len: usize = 0;
+        // SAFETY: `self.sys_ctx` is active for `'a`; out-pointers are aligned stack storage.
+        let status = unsafe {
+            targets_fn(
+                self.sys_ctx.cast_const(),
+                entity,
+                relation,
+                &mut ptr,
+                &mut len,
+            )
+        };
+        if !status.is_ok() {
+            return Err(status);
+        }
+        if len == 0 {
+            return Ok(&[]);
+        }
+        let bytes = len
+            .checked_mul(core::mem::size_of::<FfiEntity>())
+            .ok_or(FfiResult::OUT_OF_RANGE)?;
+        if bytes > isize::MAX as usize {
+            return Err(FfiResult::OUT_OF_RANGE);
+        }
+        if ptr.is_null() || !(ptr as usize).is_multiple_of(core::mem::align_of::<FfiEntity>()) {
+            return Err(FfiResult::NULL_POINTER);
+        }
+        // SAFETY: Host reported `OK`, `ptr` is non-null, aligned, `bytes <= isize::MAX`, and valid
+        // for shared reads tied to `&self` within `'a`.
+        Ok(unsafe { core::slice::from_raw_parts(ptr, len) })
+    }
+
+    /// Queries all incoming source entities targeting `target` via relationship `relation` using
+    /// `BamHostApi::sys_relation_sources` (slot 83).
+    #[inline]
+    pub fn relation_sources(
+        &self,
+        target: FfiEntity,
+        relation: BamComponent,
+    ) -> Result<&[FfiEntity], FfiResult> {
+        if self.sys_ctx.is_null() {
+            return Err(FfiResult::NULL_POINTER);
+        }
+        if target.is_null() {
+            return Err(FfiResult::INVALID_ENTITY);
+        }
+        if !relation.is_valid() {
+            return Err(FfiResult::INVALID_COMPONENT);
+        }
+        let sources_fn =
+            host_slot!(self.host.api(), sys_relation_sources).ok_or(FfiResult::UNSUPPORTED)?;
+        let mut ptr: *const FfiEntity = core::ptr::null();
+        let mut len: usize = 0;
+        // SAFETY: `self.sys_ctx` is active for `'a`; out-pointers are aligned stack storage.
+        let status = unsafe {
+            sources_fn(
+                self.sys_ctx.cast_const(),
+                target,
+                relation,
+                &mut ptr,
+                &mut len,
+            )
+        };
+        if !status.is_ok() {
+            return Err(status);
+        }
+        if len == 0 {
+            return Ok(&[]);
+        }
+        let bytes = len
+            .checked_mul(core::mem::size_of::<FfiEntity>())
+            .ok_or(FfiResult::OUT_OF_RANGE)?;
+        if bytes > isize::MAX as usize {
+            return Err(FfiResult::OUT_OF_RANGE);
+        }
+        if ptr.is_null() || !(ptr as usize).is_multiple_of(core::mem::align_of::<FfiEntity>()) {
+            return Err(FfiResult::NULL_POINTER);
+        }
+        // SAFETY: Host reported `OK`, `ptr` is non-null, aligned, `bytes <= isize::MAX`, and valid
+        // for shared reads tied to `&self` within `'a`.
+        Ok(unsafe { core::slice::from_raw_parts(ptr, len) })
+    }
+
+    /// Borrows raw payload bytes for relationship edge `(entity, relation, target)` via
+    /// `BamHostApi::sys_relation_edge_data` (slot 84).
+    #[inline]
+    pub fn relation_edge_bytes(
+        &self,
+        entity: FfiEntity,
+        relation: BamComponent,
+        target: FfiEntity,
+    ) -> Result<&[u8], FfiResult> {
+        if self.sys_ctx.is_null() {
+            return Err(FfiResult::NULL_POINTER);
+        }
+        if entity.is_null() || target.is_null() {
+            return Err(FfiResult::INVALID_ENTITY);
+        }
+        if !relation.is_valid() {
+            return Err(FfiResult::INVALID_COMPONENT);
+        }
+        let edge_fn =
+            host_slot!(self.host.api(), sys_relation_edge_data).ok_or(FfiResult::UNSUPPORTED)?;
+        let mut ptr: *const c_void = core::ptr::null();
+        let mut size: usize = 0;
+        // SAFETY: `self.sys_ctx` is active for `'a`; out-pointers are aligned stack storage.
+        let status = unsafe {
+            edge_fn(
+                self.sys_ctx.cast_const(),
+                entity,
+                relation,
+                target,
+                &mut ptr,
+                &mut size,
+            )
+        };
+        if !status.is_ok() {
+            return Err(status);
+        }
+        if size == 0 {
+            return Ok(&[]);
+        }
+        if size > isize::MAX as usize {
+            return Err(FfiResult::OUT_OF_RANGE);
+        }
+        if ptr.is_null() {
+            return Err(FfiResult::NULL_POINTER);
+        }
+        // SAFETY: Host reported `OK`, `ptr` is non-null, `size <= isize::MAX`, and valid for
+        // shared byte reads tied to `&self` within `'a`.
+        Ok(unsafe { core::slice::from_raw_parts(ptr.cast::<u8>(), size) })
+    }
+
+    /// Borrows typed POD payload `&T` for relationship edge `(entity, relation, target)` via
+    /// `BamHostApi::sys_relation_edge_data` (slot 84).
+    #[inline]
+    pub fn relation_edge_data<T: AbiPod>(
+        &self,
+        entity: FfiEntity,
+        relation: BamComponent,
+        target: FfiEntity,
+    ) -> Result<&T, FfiResult> {
+        let bytes = self.relation_edge_bytes(entity, relation, target)?;
+        if bytes.len() != core::mem::size_of::<T>() {
+            return Err(FfiResult::TYPE_MISMATCH);
+        }
+        if core::mem::size_of::<T>() == 0 {
+            // SAFETY: Zero-sized `T: AbiPod` may be referenced via `NonNull::dangling()`.
+            return Ok(unsafe { core::ptr::NonNull::<T>::dangling().as_ref() });
+        }
+        let ptr = bytes.as_ptr();
+        if !(ptr as usize).is_multiple_of(core::mem::align_of::<T>()) {
+            return Err(FfiResult::TYPE_MISMATCH);
+        }
+        // SAFETY: `bytes` came from `relation_edge_bytes` with exact `size_of::<T>()` and
+        // verified alignment for `T: AbiPod`, valid for `&self`.
+        Ok(unsafe { &*ptr.cast::<T>() })
+    }
+
     /// Validates `iter.column_info(term_index)` via `check_info` and invokes
     /// `BamHostApi::sys_entity_get` to retrieve a shared component pointer for `entity`.
     #[inline]
@@ -1228,9 +1473,6 @@ impl<'a> ValidatedSystemRef<'a> {
     /// Validates writable `iter.column_info(term_index)` via `check_info` and invokes
     /// `BamHostApi::sys_entity_get_mut` to retrieve an exclusive component pointer for `entity`.
     #[inline]
-    // `&mut ValidatedIter` is an intentional borrow-guard preventing aliasing chunk borrows while
-    // `sys_entity_get_mut` holds a mutable pointer into `iter`'s query storage.
-    #[allow(clippy::needless_pass_by_ref_mut)]
     fn raw_entity_ptr_mut(
         &mut self,
         iter: &mut ValidatedIter<'a>,
@@ -1239,7 +1481,9 @@ impl<'a> ValidatedSystemRef<'a> {
         entity: FfiEntity,
         check_info: impl FnOnce(&bamabi_sys::BamColumnInfo) -> bool,
     ) -> Option<*mut u8> {
+        iter.touch_exclusive_borrow();
         if self.sys_ctx.is_null() {
+            self.sys_ctx = core::ptr::null_mut();
             return None;
         }
         let get_mut_fn = host_slot!(self.host.api(), sys_entity_get_mut)?;
@@ -1263,6 +1507,10 @@ impl<'a> ValidatedSystemRef<'a> {
 
     /// Converts a verified non-null read-only entity/resource pointer into `&'b T`, checking
     /// alignment and handling zero-sized `T` via `NonNull::dangling()`.
+    ///
+    /// # Safety
+    /// When `size_of::<T>() > 0`, `ptr` must be non-null and point to an initialized `T` valid for
+    /// shared borrow lifetime `'b`.
     #[inline]
     unsafe fn cast_entity_ref<'b, T>(ptr: *const u8) -> Option<&'b T> {
         if core::mem::size_of::<T>() == 0 {
@@ -1278,6 +1526,10 @@ impl<'a> ValidatedSystemRef<'a> {
 
     /// Converts a verified non-null writable entity/resource pointer into `&'b mut T`, checking
     /// alignment and handling zero-sized `T` via `NonNull::dangling()`.
+    ///
+    /// # Safety
+    /// When `size_of::<T>() > 0`, `ptr` must be non-null and point to an initialized `T` valid for
+    /// exclusive borrow lifetime `'b`.
     #[inline]
     unsafe fn cast_entity_mut<'b, T>(ptr: *mut u8) -> Option<&'b mut T> {
         if core::mem::size_of::<T>() == 0 {
@@ -1341,9 +1593,6 @@ impl<'a> ValidatedSystemRef<'a> {
     /// [`FfiResult::TYPE_MISMATCH`], non-writable/immutable columns with
     /// [`FfiResult::PERMISSION_DENIED`], and missing `sys_entity_get_mut` slot with
     /// [`FfiResult::UNSUPPORTED`].
-    // `&mut ValidatedIter` is an intentional borrow-guard preventing aliasing chunk borrows while
-    // `sys_entity_get_mut` holds mutable pointers into `iter`'s query storage.
-    #[allow(clippy::needless_pass_by_ref_mut)]
     pub fn entity_get_many_mut_checked<'b, const N: usize, T: AbiPod>(
         &'b mut self,
         iter: &'b mut ValidatedIter<'a>,
@@ -1352,7 +1601,9 @@ impl<'a> ValidatedSystemRef<'a> {
         entities: [FfiEntity; N],
         expected_uuid: Option<UuidFilter>,
     ) -> Result<[&'b mut T; N], FfiResult> {
+        iter.touch_exclusive_borrow();
         if self.sys_ctx.is_null() {
+            self.sys_ctx = core::ptr::null_mut();
             return Err(FfiResult::NULL_POINTER);
         }
         let get_mut_fn =
@@ -1760,6 +2011,11 @@ pub(crate) struct RunIfClosureState<R> {
 /// `BamHostApi::sys_host_ctx(sys_ctx)` eagerly; per-tick `BamHostCtx` refresh is performed lazily
 /// via [`LazyInvocationHost`] only when the system actually accesses `Host`. Returns
 /// [`FfiResult::ACCESS_CONFLICT`] on re-entry or [`FfiResult::PANIC_CAUGHT`] on panic.
+///
+/// # Safety
+/// - `sys_ctx` must be null or an active [`BamSystemCtx`] for this host system tick.
+/// - `user_data` must be null or point to a `GuestInstance`-pinned [`SystemClosureState<F>`]
+///   outliving this call.
 pub(crate) unsafe extern "C" fn system_closure_trampoline<F>(
     sys_ctx: *mut BamSystemCtx,
     user_data: *mut c_void,
@@ -1855,6 +2111,11 @@ unsafe fn prepare_slice_scratches<F>(
 ///
 /// When `N == 0`, query counts and scratch resetting fold to compile-time constants (`0`),
 /// eliminating all `sys_query` / `fetch_query_slot_raw` calls and stack query arrays.
+///
+/// # Safety
+/// - `sys_ctx` must be null or an active [`BamSystemCtx`] for this host system tick.
+/// - `user_data` must be null or point to a `GuestInstance`-pinned [`SystemClosureState<F>`]
+///   outliving this call.
 pub(crate) unsafe extern "C" fn system_closure_slice_trampoline<const N: usize, F>(
     sys_ctx: *mut BamSystemCtx,
     user_data: *mut c_void,
@@ -1901,6 +2162,10 @@ where
 
 /// Panic-safe, re-entrancy-guarded `extern "C"` [`BamRunIfFn`] trampoline returning
 /// [`FfiBool::FALSE`] on null `user_data`, re-entrant entry, or guest panic.
+///
+/// # Safety
+/// `user_data` must be null or point to a `GuestInstance`-pinned [`RunIfClosureState<R>`]
+/// outliving this call.
 pub(crate) unsafe extern "C" fn run_if_closure_trampoline<R>(user_data: *mut c_void) -> FfiBool
 where
     R: FnMut(&Host) -> bool + Send + 'static,
@@ -2814,6 +3079,126 @@ pub unsafe fn configure_schedule_set(
     unsafe { configure_schedule_set_raw(load_ctx, &host, &desc) }
 }
 
+/// Configuration for configuring a schedule system set with ABI `0.4.0` parent sets and optional
+/// ECS `run_if_ctx` predicate/query via [`configure_schedule_set_with_parents`].
+pub struct ScheduleSetConfig<'a> {
+    /// NUL-terminated UTF-8 schedule set name.
+    pub name: &'a CStr,
+    /// Target [`ScheduleId`].
+    pub schedule: ScheduleId,
+    /// Ordering / execution mode `BAM_SCHEDULE_SET_FLAG_*` bitmask.
+    pub flags: u32,
+    /// Existing sets this set runs before.
+    pub before_sets: &'a [BamSystemSet],
+    /// Existing sets this set runs after.
+    pub after_sets: &'a [BamSystemSet],
+    /// Parent sets containing this set (`BAM_SCHEDULE_SET` hierarchy).
+    pub parent_sets: &'a [BamSystemSet],
+    /// Optional ECS-aware run-condition callback (`run_if_ctx`).
+    pub run_if_ctx: Option<BamSystemFn>,
+    /// Optional read-only query descriptor for `run_if_ctx`.
+    pub run_if_query: *const BamQueryDesc,
+    /// Opaque user-data pointer passed to `run_if_ctx`.
+    pub run_if_ctx_user_data: *mut c_void,
+}
+
+/// Configures a named schedule system set via `BamHostApi::configure_schedule_set` (slot 61) with
+/// optional ABI `0.4.0` parent sets and ECS `run_if_ctx` predicate/query.
+///
+/// # Safety
+/// - `load_ctx` must be a non-null, active [`BamLoadCtx`] belonging to `instance` during
+///   `bamabi_init`.
+/// - If `config.run_if_ctx` is `Some`, `(config.run_if_query, config.run_if_ctx_user_data)` must
+///   remain valid for the lifetime of the host schedule.
+pub unsafe fn configure_schedule_set_with_parents(
+    instance: &mut GuestInstance,
+    load_ctx: *mut BamLoadCtx,
+    config: &ScheduleSetConfig<'_>,
+) -> Result<BamSystemSet, FfiResult> {
+    if load_ctx.is_null() {
+        return Err(FfiResult::NULL_POINTER);
+    }
+    let name = config.name;
+    let schedule = config.schedule;
+    let flags = config.flags;
+    let before_sets = config.before_sets;
+    let after_sets = config.after_sets;
+    let parent_sets = config.parent_sets;
+    let run_if_ctx = config.run_if_ctx;
+    let run_if_query = config.run_if_query;
+    let run_if_ctx_user_data = config.run_if_ctx_user_data;
+    if name.to_bytes().is_empty() {
+        return Err(FfiResult::INVALID_ARGUMENT);
+    }
+    if name.to_str().is_err() {
+        return Err(FfiResult::INVALID_UTF8);
+    }
+    if before_sets.iter().any(|s| !s.is_valid())
+        || after_sets.iter().any(|s| !s.is_valid())
+        || parent_sets.iter().any(|s| !s.is_valid())
+    {
+        return Err(FfiResult::INVALID_ARGUMENT);
+    }
+    let before_count =
+        u32::try_from(before_sets.len()).map_err(|_| FfiResult::CAPACITY_EXCEEDED)?;
+    let after_count = u32::try_from(after_sets.len()).map_err(|_| FfiResult::CAPACITY_EXCEEDED)?;
+    let parent_count =
+        u32::try_from(parent_sets.len()).map_err(|_| FfiResult::CAPACITY_EXCEEDED)?;
+    let host = *instance.host();
+    if host_slot!(host.api(), configure_schedule_set).is_none() {
+        return Err(FfiResult::UNSUPPORTED);
+    }
+    let before_ptr = if before_sets.is_empty() {
+        core::ptr::null()
+    } else {
+        before_sets.as_ptr()
+    };
+    let after_ptr = if after_sets.is_empty() {
+        core::ptr::null()
+    } else {
+        after_sets.as_ptr()
+    };
+    let parent_ptr = if parent_sets.is_empty() {
+        core::ptr::null()
+    } else {
+        parent_sets.as_ptr()
+    };
+    let mut probe_desc = BamScheduleSetDesc::new(name.as_ptr()).with_flags(flags);
+    probe_desc.schedule = schedule;
+    probe_desc.before_count = before_count;
+    probe_desc.after_count = after_count;
+    probe_desc.before_sets = before_ptr;
+    probe_desc.after_sets = after_ptr;
+    probe_desc.run_if_ctx = run_if_ctx;
+    probe_desc.run_if_query = run_if_query;
+    probe_desc.run_if_ctx_user_data = run_if_ctx_user_data;
+    probe_desc.parent_sets = parent_ptr;
+    probe_desc.parent_set_count = parent_count;
+    let validation = probe_desc.validate();
+    if !validation.is_ok() {
+        return Err(validation);
+    }
+
+    let owned_name = CString::from(name);
+    let raw_name = instance.track_allocation(Box::new(owned_name));
+    // SAFETY: `raw_name` stays pinned inside `instance` until `bamabi_shutdown` (or rollback).
+    let name_ptr = unsafe { (*raw_name).as_ptr() };
+    let mut desc = BamScheduleSetDesc::new(name_ptr).with_flags(flags);
+    desc.schedule = schedule;
+    desc.before_count = before_count;
+    desc.after_count = after_count;
+    desc.before_sets = before_ptr;
+    desc.after_sets = after_ptr;
+    desc.run_if_ctx = run_if_ctx;
+    desc.run_if_query = run_if_query;
+    desc.run_if_ctx_user_data = run_if_ctx_user_data;
+    desc.parent_sets = parent_ptr;
+    desc.parent_set_count = parent_count;
+    // SAFETY: `load_ctx` is active per caller contract, `name_ptr` is owned by `instance`, and
+    // ordering/parent slices plus `run_if_ctx` pointers uphold caller invariants.
+    unsafe { configure_schedule_set_raw(load_ctx, &host, &desc) }
+}
+
 /// Mounts a previously registered [`BamSystem`] handle into `schedule` and optional `set`
 /// (`BamSystemSet::INVALID` for ungrouped mounting) via `BamHostApi::mount_system_in_schedule`
 /// (slot 62).
@@ -2850,6 +3235,11 @@ pub(crate) struct ObserverTrampolineState<F> {
 
 /// Panic-safe, re-entrancy-guarded `extern "C"` [`BamObserverFn`] trampoline for read-only custom
 /// `E: AbiPod` event observers.
+///
+/// # Safety
+/// - `user_data` must be null or point to a `GuestInstance`-pinned [`ObserverTrampolineState<F>`].
+/// - `commands` must be null or an active [`BamCommands`] for this observer invocation.
+/// - For non-ZST `E`, `event_data` must be null or point to an initialized `E` valid for this call.
 pub(crate) unsafe extern "C" fn observer_closure_trampoline<E, F>(
     target: FfiEntity,
     event_data: *const c_void,
@@ -2928,6 +3318,88 @@ impl ObserverAllocTarget<'_> {
     }
 }
 
+/// Configuration for registering or spawning a custom or lifecycle observer via
+/// [`crate::ValidatedLoadCtx`] / [`crate::ValidatedCommands`] / `bamabi_guest_sys`.
+#[derive(Clone, Copy, Debug)]
+pub struct ObserverRegistrationConfig<'a> {
+    /// Optional UTF-8 diagnostic observer name (`None` leaves `BamObserverDesc::name` null).
+    pub name: Option<&'a str>,
+    /// Custom event component handle (`BamComponent::INVALID` for lifecycle/`Ready` observers).
+    pub event: BamComponent,
+    /// Lifecycle/`Ready` event kind (`BamEventKind::CUSTOM` for custom event observers).
+    pub event_kind: BamEventKind,
+    /// Watched component handles for lifecycle observers or `EntityComponentsTrigger`.
+    pub watched_components: &'a [BamComponent],
+    /// Target entity (`FfiEntity::NULL` for global observation).
+    pub target: FfiEntity,
+    /// Observer flags (`BAM_OBSERVER_FLAG_*`).
+    pub flags: u32,
+    /// Custom relationship component for propagation (`BamComponent::INVALID` defaults to `ChildOf`).
+    pub propagate_relationship: BamComponent,
+}
+
+impl<'a> ObserverRegistrationConfig<'a> {
+    /// Constructs a custom event observer configuration for `event`.
+    #[inline]
+    pub const fn custom(name: Option<&'a str>, event: BamComponent) -> Self {
+        Self {
+            name,
+            event,
+            event_kind: BamEventKind::CUSTOM,
+            watched_components: &[],
+            target: FfiEntity::NULL,
+            flags: 0,
+            propagate_relationship: BamComponent::INVALID,
+        }
+    }
+
+    /// Constructs a lifecycle or `Ready` observer configuration for `(event_kind, watched_components)`.
+    #[inline]
+    pub const fn lifecycle(
+        name: Option<&'a str>,
+        event_kind: BamEventKind,
+        watched_components: &'a [BamComponent],
+    ) -> Self {
+        Self {
+            name,
+            event: BamComponent::INVALID,
+            event_kind,
+            watched_components,
+            target: FfiEntity::NULL,
+            flags: 0,
+            propagate_relationship: BamComponent::INVALID,
+        }
+    }
+
+    /// Sets the target entity (`FfiEntity::NULL` for global observation).
+    #[inline]
+    pub const fn with_target(mut self, target: FfiEntity) -> Self {
+        self.target = target;
+        self
+    }
+
+    /// Sets `BAM_OBSERVER_FLAG_*` bitflags.
+    #[inline]
+    pub const fn with_flags(mut self, flags: u32) -> Self {
+        self.flags = flags;
+        self
+    }
+
+    /// Sets watched component handles for `EntityComponentsTrigger` / lifecycle filtering.
+    #[inline]
+    pub const fn with_watched_components(mut self, watched_components: &'a [BamComponent]) -> Self {
+        self.watched_components = watched_components;
+        self
+    }
+
+    /// Sets a custom relationship component for upward propagation.
+    #[inline]
+    pub const fn with_propagate_relationship(mut self, relationship: BamComponent) -> Self {
+        self.propagate_relationship = relationship;
+        self
+    }
+}
+
 /// Discriminates the three observer registration shapes supported by [`build_observer_desc`].
 enum ObserverKind {
     CustomRead(BamComponent, BamObserverFn),
@@ -2937,15 +3409,10 @@ enum ObserverKind {
 
 /// Validates observer parameters, pins optional name/watched-component/closure allocations via
 /// `alloc`, and returns a validated [`BamObserverDesc`].
-#[allow(clippy::too_many_arguments)]
 fn build_observer_desc<F: Send + 'static>(
     mut alloc: ObserverAllocTarget<'_>,
-    name: Option<&str>,
+    config: &ObserverRegistrationConfig<'_>,
     kind: ObserverKind,
-    watched_components: &[BamComponent],
-    target: FfiEntity,
-    flags: u32,
-    propagate_relationship: BamComponent,
     callback: F,
 ) -> Result<BamObserverDesc, FfiResult> {
     match kind {
@@ -2961,7 +3428,7 @@ fn build_observer_desc<F: Send + 'static>(
         }
     }
 
-    let name_ptr = match name {
+    let name_ptr = match config.name {
         Some(s) => {
             if s.is_empty() {
                 return Err(FfiResult::INVALID_ARGUMENT);
@@ -2974,10 +3441,10 @@ fn build_observer_desc<F: Send + 'static>(
         None => core::ptr::null(),
     };
 
-    let (watched_ptr, watched_len) = if watched_components.is_empty() {
+    let (watched_ptr, watched_len) = if config.watched_components.is_empty() {
         (core::ptr::null(), 0)
     } else {
-        let boxed: Box<[BamComponent]> = watched_components.into();
+        let boxed: Box<[BamComponent]> = config.watched_components.into();
         let len = boxed.len();
         let raw_watched = alloc.track(Box::new(boxed))?;
         // SAFETY: `raw_watched` stays pinned inside `GuestInstance` until shutdown.
@@ -3007,14 +3474,14 @@ fn build_observer_desc<F: Send + 'static>(
             raw_state.cast::<c_void>(),
         ),
     }
-    .with_entity(target)
-    .with_flags(flags);
+    .with_entity(config.target)
+    .with_flags(config.flags);
 
     if !name_ptr.is_null() {
         desc = desc.with_name(name_ptr);
     }
-    if propagate_relationship.is_valid() {
-        desc = desc.with_propagate(propagate_relationship);
+    if config.propagate_relationship.is_valid() {
+        desc = desc.with_propagate(config.propagate_relationship);
     }
     let validation = desc.validate();
     if !validation.is_ok() {
@@ -3025,16 +3492,15 @@ fn build_observer_desc<F: Send + 'static>(
 
 /// Shared init-time observer registration helper that builds a [`BamObserverDesc`] via
 /// [`build_observer_desc`] and submits it to `BamHostApi::register_observer`.
-#[allow(clippy::too_many_arguments)]
+///
+/// # Safety
+/// `load_ctx` must be a non-null, active [`BamLoadCtx`] belonging to `instance` during
+/// `bamabi_init`.
 unsafe fn submit_init_observer<F: Send + 'static>(
     instance: &mut GuestInstance,
     load_ctx: *mut BamLoadCtx,
-    name: &str,
+    config: &ObserverRegistrationConfig<'_>,
     kind: ObserverKind,
-    watched_components: &[BamComponent],
-    target: FfiEntity,
-    flags: u32,
-    propagate_relationship: BamComponent,
     callback: F,
 ) -> FfiResult {
     if load_ctx.is_null() {
@@ -3043,19 +3509,11 @@ unsafe fn submit_init_observer<F: Send + 'static>(
     let Some(register_fn) = host_slot!(instance.host().api(), register_observer) else {
         return FfiResult::UNSUPPORTED;
     };
-    let desc = match build_observer_desc(
-        ObserverAllocTarget::Init(instance),
-        Some(name),
-        kind,
-        watched_components,
-        target,
-        flags,
-        propagate_relationship,
-        callback,
-    ) {
-        Ok(d) => d,
-        Err(err) => return err,
-    };
+    let desc =
+        match build_observer_desc(ObserverAllocTarget::Init(instance), config, kind, callback) {
+            Ok(d) => d,
+            Err(err) => return err,
+        };
     // SAFETY: `load_ctx` is active per caller contract and `desc` passed validation with all
     // pointed-to strings, watched component lists, and closure state owned by `instance`.
     unsafe { register_fn(load_ctx, &desc) }
@@ -3079,23 +3537,19 @@ where
     E: AbiPod,
     F: FnMut(FfiEntity, &E, &mut ValidatedCommands<'_>) -> FfiResult + Send + 'static,
 {
+    let config = ObserverRegistrationConfig::custom(Some(name), event).with_target(target);
     // SAFETY: Forwarding identical `load_ctx` invariant to `register_observer_closure_with_options`.
-    unsafe {
-        register_observer_closure_with_options::<E, F>(
-            instance,
-            load_ctx,
-            name,
-            event,
-            target,
-            0,
-            BamComponent::INVALID,
-            callback,
-        )
-    }
+    unsafe { register_observer_closure_with_options::<E, F>(instance, load_ctx, &config, callback) }
 }
 
 /// Panic-safe, re-entrancy-guarded `extern "C"` [`BamObserverMutFn`] trampoline for mutable custom
 /// `E: AbiPod` event observers (`&mut E` + `&mut bool` propagation toggle).
+///
+/// # Safety
+/// - `user_data` must be null or point to a `GuestInstance`-pinned [`ObserverTrampolineState<F>`].
+/// - `commands` must be null or an active [`BamCommands`] for this observer invocation.
+/// - For non-ZST `E`, `event_data` must be null or point to an exclusively writable initialized `E`.
+/// - `propagate` must be null or point to an initialized writable `FfiBool`.
 pub(crate) unsafe extern "C" fn observer_mut_closure_trampoline<E, F>(
     target: FfiEntity,
     event_data: *mut u8,
@@ -3165,6 +3619,10 @@ where
 
 /// Panic-safe, re-entrancy-guarded `extern "C"` [`BamObserverFn`] trampoline for component
 /// lifecycle (`ADD`/`INSERT`/`DISCARD`/`REMOVE`/`DESPAWN`) and scene `READY` observers.
+///
+/// # Safety
+/// - `user_data` must be null or point to a `GuestInstance`-pinned [`ObserverTrampolineState<F>`].
+/// - `commands` must be null or an active [`BamCommands`] for this observer invocation.
 pub(crate) unsafe extern "C" fn lifecycle_observer_closure_trampoline<F>(
     target: FfiEntity,
     _event_data: *const c_void,
@@ -3196,21 +3654,16 @@ where
     })
 }
 
-/// Validates and registers a custom [`BamObserverDesc`] closure with explicit propagation flags
-/// and optional `propagate_relationship` on `load_ctx`.
+/// Validates and registers a custom [`BamObserverDesc`] closure configured by `config` on
+/// `load_ctx`.
 ///
 /// # Safety
 /// `load_ctx` must be a non-null, active [`BamLoadCtx`] belonging to `instance` during
 /// `bamabi_init`.
-#[allow(clippy::too_many_arguments)]
 pub unsafe fn register_observer_closure_with_options<E, F>(
     instance: &mut GuestInstance,
     load_ctx: *mut BamLoadCtx,
-    name: &str,
-    event: BamComponent,
-    target: FfiEntity,
-    flags: u32,
-    propagate_relationship: BamComponent,
+    config: &ObserverRegistrationConfig<'_>,
     callback: F,
 ) -> FfiResult
 where
@@ -3218,75 +3671,51 @@ where
     F: FnMut(FfiEntity, &E, &mut ValidatedCommands<'_>) -> FfiResult + Send + 'static,
 {
     // SAFETY: Forwarding identical `load_ctx` invariant to `register_observer_closure_with_watched`.
-    unsafe {
-        register_observer_closure_with_watched::<E, F>(
-            instance,
-            load_ctx,
-            name,
-            event,
-            &[],
-            target,
-            flags,
-            propagate_relationship,
-            callback,
-        )
-    }
+    unsafe { register_observer_closure_with_watched::<E, F>(instance, load_ctx, config, callback) }
 }
 
-/// Validates and registers a custom [`BamObserverDesc`] closure with explicit
-/// `watched_components` filters, propagation flags, and optional `propagate_relationship` on
+/// Validates and registers a custom [`BamObserverDesc`] closure configured by `config` (including
+/// optional `watched_components` filters, propagation flags, and `propagate_relationship`) on
 /// `load_ctx`.
 ///
 /// # Safety
 /// `load_ctx` must be a non-null, active [`BamLoadCtx`] belonging to `instance` during
 /// `bamabi_init`.
-#[allow(clippy::too_many_arguments)]
 pub unsafe fn register_observer_closure_with_watched<E, F>(
     instance: &mut GuestInstance,
     load_ctx: *mut BamLoadCtx,
-    name: &str,
-    event: BamComponent,
-    watched_components: &[BamComponent],
-    target: FfiEntity,
-    flags: u32,
-    propagate_relationship: BamComponent,
+    config: &ObserverRegistrationConfig<'_>,
     callback: F,
 ) -> FfiResult
 where
     E: AbiPod,
     F: FnMut(FfiEntity, &E, &mut ValidatedCommands<'_>) -> FfiResult + Send + 'static,
 {
+    if config.name.is_none() {
+        return FfiResult::INVALID_ARGUMENT;
+    }
     // SAFETY: Caller guarantees `load_ctx` is an active `BamLoadCtx` belonging to `instance`.
     unsafe {
         submit_init_observer(
             instance,
             load_ctx,
-            name,
-            ObserverKind::CustomRead(event, observer_closure_trampoline::<E, F>),
-            watched_components,
-            target,
-            flags,
-            propagate_relationship,
+            config,
+            ObserverKind::CustomRead(config.event, observer_closure_trampoline::<E, F>),
             callback,
         )
     }
 }
 
 /// Validates and registers a mutable [`BamObserverDesc`] closure (`&mut E` + `&mut bool` propagate)
-/// on `load_ctx`.
+/// configured by `config` on `load_ctx`.
 ///
 /// # Safety
 /// `load_ctx` must be a non-null, active [`BamLoadCtx`] belonging to `instance` during
 /// `bamabi_init`.
-#[allow(clippy::too_many_arguments)]
 pub unsafe fn register_observer_mut_closure<E, F>(
     instance: &mut GuestInstance,
     load_ctx: *mut BamLoadCtx,
-    name: &str,
-    event: BamComponent,
-    target: FfiEntity,
-    flags: u32,
-    propagate_relationship: BamComponent,
+    config: &ObserverRegistrationConfig<'_>,
     callback: F,
 ) -> FfiResult
 where
@@ -3297,36 +3726,20 @@ where
 {
     // SAFETY: Forwarding identical `load_ctx` invariant to `register_observer_mut_closure_with_watched`.
     unsafe {
-        register_observer_mut_closure_with_watched::<E, F>(
-            instance,
-            load_ctx,
-            name,
-            event,
-            &[],
-            target,
-            flags,
-            propagate_relationship,
-            callback,
-        )
+        register_observer_mut_closure_with_watched::<E, F>(instance, load_ctx, config, callback)
     }
 }
 
 /// Validates and registers a mutable [`BamObserverDesc`] closure (`&mut E` + `&mut bool` propagate)
-/// with explicit `watched_components` filters on `load_ctx`.
+/// configured by `config` (with explicit `watched_components` filters) on `load_ctx`.
 ///
 /// # Safety
 /// `load_ctx` must be a non-null, active [`BamLoadCtx`] belonging to `instance` during
 /// `bamabi_init`.
-#[allow(clippy::too_many_arguments)]
 pub unsafe fn register_observer_mut_closure_with_watched<E, F>(
     instance: &mut GuestInstance,
     load_ctx: *mut BamLoadCtx,
-    name: &str,
-    event: BamComponent,
-    watched_components: &[BamComponent],
-    target: FfiEntity,
-    flags: u32,
-    propagate_relationship: BamComponent,
+    config: &ObserverRegistrationConfig<'_>,
     callback: F,
 ) -> FfiResult
 where
@@ -3335,17 +3748,16 @@ where
         + Send
         + 'static,
 {
+    if config.name.is_none() {
+        return FfiResult::INVALID_ARGUMENT;
+    }
     // SAFETY: Caller guarantees `load_ctx` is an active `BamLoadCtx` belonging to `instance`.
     unsafe {
         submit_init_observer(
             instance,
             load_ctx,
-            name,
-            ObserverKind::CustomMut(event, observer_mut_closure_trampoline::<E, F>),
-            watched_components,
-            target,
-            flags,
-            propagate_relationship,
+            config,
+            ObserverKind::CustomMut(config.event, observer_mut_closure_trampoline::<E, F>),
             callback,
         )
     }
@@ -3477,6 +3889,11 @@ fn pin_observer_ctx_descriptor_storage(
 
 /// Const-bucketed panic-safe, re-entrancy-guarded `extern "C"` [`bamabi_sys::BamObserverCtxFn`] trampoline
 /// passing a zero-array [`ValidatedSystemSlice`] (`N ∈ {0, 1, 4, 16}`).
+///
+/// # Safety
+/// - `sys_ctx` must be null or an active [`BamSystemCtx`].
+/// - `user_data` must be null or point to a `GuestInstance`-pinned [`SystemClosureState<F>`].
+/// - For non-ZST `E`, `event_data` must be null or point to a valid initialized `E`.
 pub(crate) unsafe extern "C" fn observer_ctx_slice_trampoline<const N: usize, E, F>(
     target: FfiEntity,
     event_data: *const c_void,
@@ -3641,38 +4058,222 @@ where
     build_observer_ctx_slice_desc::<N, E, F>(ObserverAllocTarget::Runtime(host), config, callback)
 }
 
-/// Validates and registers a component lifecycle or `Ready` [`BamObserverDesc`] closure on
-/// `load_ctx`.
+/// Const-bucketed panic-safe, re-entrancy-guarded `extern "C"` [`bamabi_sys::BamObserverCtxMutFn`]
+/// trampoline receiving `(FfiEntity, &mut E, &mut bool /* propagate */, &mut ValidatedSystemSlice<'_>)`.
+///
+/// # Safety
+/// - `sys_ctx` must be null or an active [`BamSystemCtx`].
+/// - `user_data` must be null or point to a `GuestInstance`-pinned [`SystemClosureState<F>`].
+/// - For non-ZST `E`, `event_data` must be null or point to an exclusively writable `E`.
+/// - `propagate` must be null or point to an initialized writable `FfiBool`.
+unsafe extern "C" fn observer_ctx_mut_slice_trampoline<const N: usize, E, F>(
+    target: FfiEntity,
+    event_data: *mut u8,
+    propagate: *mut FfiBool,
+    sys_ctx: *mut BamSystemCtx,
+    user_data: *mut c_void,
+) -> FfiResult
+where
+    E: AbiPod,
+    F: FnMut(FfiEntity, &mut E, &mut bool, &mut ValidatedSystemSlice<'_>) -> FfiResult
+        + Send
+        + 'static,
+{
+    catch_guest_result(|| {
+        if propagate.is_null() || sys_ctx.is_null() || user_data.is_null() {
+            return FfiResult::NULL_POINTER;
+        }
+        if !(user_data as usize).is_multiple_of(core::mem::align_of::<SystemClosureState<F>>()) {
+            return FfiResult::INVALID_ARGUMENT;
+        }
+        if core::mem::size_of::<E>() > 0
+            && (event_data.is_null()
+                || !(event_data as usize).is_multiple_of(core::mem::align_of::<E>()))
+        {
+            return FfiResult::INVALID_ARGUMENT;
+        }
+        // SAFETY: `user_data` is non-null, aligned, and points to `SystemClosureState<F>` owned
+        // by `GuestInstance` (or its `RuntimeAllocTracker`).
+        let state = unsafe { &*user_data.cast::<SystemClosureState<F>>() };
+        // SAFETY: `state.host` points to `GuestInstance`'s heap-pinned `Host` outliving `state`.
+        let base_host = unsafe { state.host.as_ref() };
+        let Some(result) = state.closure.try_with_mut(|func| {
+            let event_mut: &mut E = if core::mem::size_of::<E>() == 0 {
+                // SAFETY: Zero-sized `E: AbiPod` may be mutably referenced via `NonNull::dangling()`.
+                unsafe { core::ptr::NonNull::<E>::dangling().as_mut() }
+            } else {
+                // SAFETY: Verified non-null and aligned above; `try_with_mut` excludes re-entrant
+                // execution and host guarantees `event_data` is exclusively writable for `E`.
+                unsafe { &mut *event_data.cast::<E>() }
+            };
+            // SAFETY: `propagate` was verified non-null and points to writable `FfiBool` storage.
+            let mut prop = unsafe { (*propagate).get() };
+            let lazy_host = LazyInvocationHost::new(base_host, sys_ctx, &state.host_scratch.0);
+            // SAFETY: `state.closure.try_with_mut` holds exclusive access for this invocation.
+            let (clamped_total, clamped_user, clamped_res, scratches) =
+                unsafe { prepare_slice_scratches(N, state) };
+            // SAFETY: `sys_ctx` is non-null and active for the duration of this `BamObserverCtxMutFn` call.
+            let mut slice = unsafe {
+                ValidatedSystemSlice::from_raw_with_lazy_host(
+                    sys_ctx,
+                    &lazy_host,
+                    scratches,
+                    clamped_total,
+                    clamped_user,
+                    clamped_res,
+                )
+            };
+            let status = func(target, event_mut, &mut prop, &mut slice);
+            // SAFETY: `propagate` remains exclusively writable across this synchronous callback.
+            unsafe {
+                *propagate = FfiBool::from_bool(prop);
+            }
+            status
+        }) else {
+            return FfiResult::ACCESS_CONFLICT;
+        };
+        result
+    })
+}
+
+/// Validates `config`, pins descriptor buffers and [`SystemClosureState`] via `alloc`, and returns
+/// a validated [`BamObserverDesc`] configured for `ctx_mut_callback`.
+fn build_observer_ctx_mut_slice_desc<const N: usize, E, F>(
+    mut alloc: ObserverAllocTarget<'_>,
+    config: &ObserverCtxRegistrationConfig<'_>,
+    callback: F,
+) -> Result<BamObserverDesc, FfiResult>
+where
+    E: AbiPod,
+    F: FnMut(FfiEntity, &mut E, &mut bool, &mut ValidatedSystemSlice<'_>) -> FfiResult
+        + Send
+        + 'static,
+{
+    let parts = pin_observer_ctx_descriptor_storage(&mut alloc, config)?;
+    let host = alloc.pinned_host_ptr()?;
+    let scratch_len = if N == 0 {
+        0
+    } else {
+        parts.total_query_count.min(N).min(MAX_QUERIES_PER_SYSTEM)
+    };
+    let raw_state = alloc.track(Box::new(SystemClosureState {
+        host,
+        total_query_count: parts.total_query_count,
+        user_query_count: parts.user_query_count,
+        resource_query_index: parts.resource_query_index,
+        host_scratch: InvocationHostScratch::new(),
+        slot_scratches: SlotScratchesCell::with_len(scratch_len),
+        closure: ReentrantCell::new(callback),
+    }))?;
+
+    let mut desc = BamObserverDesc::new_with_ctx(
+        config.event,
+        observer_ctx_mut_dummy as bamabi_sys::BamObserverCtxFn,
+        parts.queries_ptr,
+        parts.total_query_count,
+        raw_state.cast::<c_void>(),
+    )
+    .with_entity(config.target)
+    .with_flags(config.flags)
+    .with_watched_components(parts.watched_ptr, parts.watched_len);
+    desc.ctx_callback = None;
+    desc.ctx_mut_callback =
+        Some(observer_ctx_mut_slice_trampoline::<N, E, F> as BamObserverCtxMutFn);
+
+    if !parts.name_ptr.is_null() {
+        desc = desc.with_name(parts.name_ptr);
+    }
+    if config.propagate_relationship.is_valid() {
+        desc = desc.with_propagate(config.propagate_relationship);
+    }
+
+    let validation = desc.validate();
+    if !validation.is_ok() {
+        return Err(validation);
+    }
+    Ok(desc)
+}
+
+/// Helper placeholder cleared immediately in [`build_observer_ctx_mut_slice_desc`].
+///
+/// # Safety
+/// Pure placeholder conforming to `BamObserverCtxFn`; performs no pointer dereferences and
+/// immediately returns `FfiResult::UNSUPPORTED`.
+unsafe extern "C" fn observer_ctx_mut_dummy(
+    _target: FfiEntity,
+    _event_data: *const c_void,
+    _sys_ctx: *mut BamSystemCtx,
+    _user_data: *mut c_void,
+) -> FfiResult {
+    FfiResult::UNSUPPORTED
+}
+
+/// Validates and registers a mutable context-aware [`BamObserverDesc`] backed by
+/// `observer_ctx_mut_slice_trampoline<N, E, F>` (`BamObserverCtxMutFn` + `BamObserverDesc::queries`)
+/// on `load_ctx`, tracking all closure state and owned descriptor buffers inside `instance`.
 ///
 /// # Safety
 /// `load_ctx` must be a non-null, active [`BamLoadCtx`] belonging to `instance` during
 /// `bamabi_init`.
-#[allow(clippy::too_many_arguments)]
+pub unsafe fn register_observer_ctx_mut_slice_closure<const N: usize, E, F>(
+    instance: &mut GuestInstance,
+    load_ctx: *mut BamLoadCtx,
+    config: &ObserverCtxRegistrationConfig<'_>,
+    callback: F,
+) -> FfiResult
+where
+    E: AbiPod,
+    F: FnMut(FfiEntity, &mut E, &mut bool, &mut ValidatedSystemSlice<'_>) -> FfiResult
+        + Send
+        + 'static,
+{
+    if load_ctx.is_null() {
+        return FfiResult::NULL_POINTER;
+    }
+    let Some(register_fn) = host_slot!(instance.host().api(), register_observer) else {
+        return FfiResult::UNSUPPORTED;
+    };
+    let desc = match build_observer_ctx_mut_slice_desc::<N, E, F>(
+        ObserverAllocTarget::Init(instance),
+        config,
+        callback,
+    ) {
+        Ok(d) => d,
+        Err(err) => return err,
+    };
+    // SAFETY: `load_ctx` is active per caller contract and `desc` passed full validation with all
+    // pointed-to strings, watched component handles, query buffers, and closures owned by `instance`.
+    unsafe { register_fn(load_ctx, &desc) }
+}
+
+/// Validates and registers a component lifecycle or `Ready` [`BamObserverDesc`] closure
+/// configured by `config` on `load_ctx`.
+///
+/// # Safety
+/// `load_ctx` must be a non-null, active [`BamLoadCtx`] belonging to `instance` during
+/// `bamabi_init`.
 pub unsafe fn register_lifecycle_observer_closure<F>(
     instance: &mut GuestInstance,
     load_ctx: *mut BamLoadCtx,
-    name: &str,
-    event_kind: BamEventKind,
-    watched_components: &[BamComponent],
-    target: FfiEntity,
-    flags: u32,
-    propagate_relationship: BamComponent,
+    config: &ObserverRegistrationConfig<'_>,
     callback: F,
 ) -> FfiResult
 where
     F: FnMut(FfiEntity, &mut ValidatedCommands<'_>) -> FfiResult + Send + 'static,
 {
+    if config.name.is_none() {
+        return FfiResult::INVALID_ARGUMENT;
+    }
     // SAFETY: Caller guarantees `load_ctx` is an active `BamLoadCtx` belonging to `instance`.
     unsafe {
         submit_init_observer(
             instance,
             load_ctx,
-            name,
-            ObserverKind::Lifecycle(event_kind, lifecycle_observer_closure_trampoline::<F>),
-            watched_components,
-            target,
-            flags,
-            propagate_relationship,
+            config,
+            ObserverKind::Lifecycle(
+                config.event_kind,
+                lifecycle_observer_closure_trampoline::<F>,
+            ),
             callback,
         )
     }
@@ -3682,11 +4283,7 @@ where
 /// [`RuntimeAllocTracker`] for [`ValidatedCommands::observe`].
 pub(crate) fn allocate_runtime_observer_desc<E, F>(
     host: &Host,
-    name: Option<&str>,
-    event: BamComponent,
-    target: FfiEntity,
-    flags: u32,
-    propagate_relationship: BamComponent,
+    config: &ObserverRegistrationConfig<'_>,
     callback: F,
 ) -> Result<BamObserverDesc, FfiResult>
 where
@@ -3695,12 +4292,8 @@ where
 {
     build_observer_desc(
         ObserverAllocTarget::Runtime(host),
-        name,
-        ObserverKind::CustomRead(event, observer_closure_trampoline::<E, F>),
-        &[],
-        target,
-        flags,
-        propagate_relationship,
+        config,
+        ObserverKind::CustomRead(config.event, observer_closure_trampoline::<E, F>),
         callback,
     )
 }
@@ -3709,11 +4302,7 @@ where
 /// [`RuntimeAllocTracker`] for [`ValidatedCommands::observe_mut`].
 pub(crate) fn allocate_runtime_observer_mut_desc<E, F>(
     host: &Host,
-    name: Option<&str>,
-    event: BamComponent,
-    target: FfiEntity,
-    flags: u32,
-    propagate_relationship: BamComponent,
+    config: &ObserverRegistrationConfig<'_>,
     callback: F,
 ) -> Result<BamObserverDesc, FfiResult>
 where
@@ -3724,12 +4313,8 @@ where
 {
     build_observer_desc(
         ObserverAllocTarget::Runtime(host),
-        name,
-        ObserverKind::CustomMut(event, observer_mut_closure_trampoline::<E, F>),
-        &[],
-        target,
-        flags,
-        propagate_relationship,
+        config,
+        ObserverKind::CustomMut(config.event, observer_mut_closure_trampoline::<E, F>),
         callback,
     )
 }
@@ -3738,12 +4323,7 @@ where
 /// [`RuntimeAllocTracker`] for [`ValidatedCommands::observe_lifecycle`].
 pub(crate) fn allocate_runtime_lifecycle_observer_desc<F>(
     host: &Host,
-    name: Option<&str>,
-    event_kind: BamEventKind,
-    watched_components: &[BamComponent],
-    target: FfiEntity,
-    flags: u32,
-    propagate_relationship: BamComponent,
+    config: &ObserverRegistrationConfig<'_>,
     callback: F,
 ) -> Result<BamObserverDesc, FfiResult>
 where
@@ -3751,12 +4331,11 @@ where
 {
     build_observer_desc(
         ObserverAllocTarget::Runtime(host),
-        name,
-        ObserverKind::Lifecycle(event_kind, lifecycle_observer_closure_trampoline::<F>),
-        watched_components,
-        target,
-        flags,
-        propagate_relationship,
+        config,
+        ObserverKind::Lifecycle(
+            config.event_kind,
+            lifecycle_observer_closure_trampoline::<F>,
+        ),
         callback,
     )
 }
@@ -3910,6 +4489,10 @@ fn validate_dynamic_dense_col<T: ModComponent>(
 
 /// Forms `&'b [T]` for a verified same-mod dynamic [`ModComponent`] column after checking
 /// non-nullness, alignment, zero-sized handling, and `len * size_of::<T>() <= isize::MAX`.
+///
+/// # Safety
+/// When `size_of::<T>() > 0` and `len > 0`, `ptr` must point to `len` contiguous initialized `T`
+/// values valid for shared borrow lifetime `'b`.
 #[inline]
 unsafe fn cast_dynamic_slice<'b, T>(ptr: *const u8, len: usize) -> Option<&'b [T]> {
     let elem_size = core::mem::size_of::<T>();
@@ -3936,6 +4519,10 @@ unsafe fn cast_dynamic_slice<'b, T>(ptr: *const u8, len: usize) -> Option<&'b [T
 
 /// Forms `&'b mut [T]` for a verified writable same-mod dynamic [`ModComponent`] column after
 /// checking non-nullness, alignment, zero-sized handling, and `len * size_of::<T>() <= isize::MAX`.
+///
+/// # Safety
+/// When `size_of::<T>() > 0` and `len > 0`, `ptr` must point to `len` contiguous initialized `T`
+/// values valid for exclusive borrow lifetime `'b`.
 #[inline]
 unsafe fn cast_dynamic_slice_mut<'b, T>(ptr: *mut u8, len: usize) -> Option<&'b mut [T]> {
     let elem_size = core::mem::size_of::<T>();

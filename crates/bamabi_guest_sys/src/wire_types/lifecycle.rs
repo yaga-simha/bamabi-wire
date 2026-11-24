@@ -298,10 +298,12 @@ pub struct FfiWindowMode(pub u8);
 
 impl_wire_abi_pod!(FfiWindowMode, size = 1, align = 1, fields = [u8]);
 
-#[allow(missing_docs)]
 impl FfiWindowMode {
+    /// Standard resizable desktop window (`WindowMode::Windowed`).
     pub const WINDOWED: Self = Self(0);
+    /// Borderless fullscreen window (`WindowMode::BorderlessFullscreen`).
     pub const BORDERLESS_FULLSCREEN: Self = Self(1);
+    /// Exclusive fullscreen window (`WindowMode::Fullscreen`).
     pub const FULLSCREEN: Self = Self(2);
 }
 
@@ -458,12 +460,16 @@ pub struct FfiAssetEventKind(pub u8);
 
 impl_wire_abi_pod!(FfiAssetEventKind, size = 1, align = 1, fields = [u8]);
 
-#[allow(missing_docs)]
 impl FfiAssetEventKind {
+    /// Asset was newly created or inserted (`AssetEvent::Added`).
     pub const ADDED: Self = Self(0);
+    /// Asset contents were modified (`AssetEvent::Modified`).
     pub const MODIFIED: Self = Self(1);
+    /// Asset was removed from storage (`AssetEvent::Removed`).
     pub const REMOVED: Self = Self(2);
+    /// Last strong handle was dropped (`AssetEvent::Unused`).
     pub const UNUSED: Self = Self(3);
+    /// Asset and all recursive dependencies finished loading (`AssetEvent::LoadedWithDependencies`).
     pub const LOADED_WITH_DEPENDENCIES: Self = Self(4);
 }
 

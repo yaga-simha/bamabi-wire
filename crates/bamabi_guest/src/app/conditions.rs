@@ -5,7 +5,7 @@
 use core::ffi::CStr;
 
 use bamabi_guest_sys::Host;
-use bamabi_sys::{AccessMode, BamTermDesc, FfiResult};
+use bamabi_sys::{AccessMode, BamTermDesc, FfiResult, MAX_TERMS_PER_QUERY};
 
 use crate::{
     app::{RunConditionContext, RunConditionSystemContext},
@@ -156,6 +156,84 @@ impl EcsRunCondition {
             build_terms: self.build_terms,
             eval: Box::new(move |ctx, offset| !inner(ctx, offset)),
         }
+    }
+
+    /// Composes two ECS run conditions with short-circuit logical AND (`self && other`).
+    pub fn and(self, other: Self) -> Self {
+        let a_count = std::sync::Arc::new(core::sync::atomic::AtomicUsize::new(0));
+        let a_count_eval = std::sync::Arc::clone(&a_count);
+        let a_build = self.build_terms;
+        let b_build = other.build_terms;
+        let mut a_eval = self.eval;
+        let mut b_eval = other.eval;
+        Self::new(
+            move |host, manifest| {
+                let mut terms = a_build(host, manifest)?;
+                a_count.store(terms.len(), core::sync::atomic::Ordering::Release);
+                let b_terms = b_build(host, manifest)?;
+                if terms.len().saturating_add(b_terms.len()) > MAX_TERMS_PER_QUERY {
+                    return Err(FfiResult::CAPACITY_EXCEEDED);
+                }
+                terms.extend(b_terms);
+                Ok(terms)
+            },
+            move |ctx, offset| {
+                let b_offset = offset + a_count_eval.load(core::sync::atomic::Ordering::Acquire);
+                a_eval(ctx, offset) && b_eval(ctx, b_offset)
+            },
+        )
+    }
+
+    /// Composes two ECS run conditions with short-circuit logical OR (`self || other`).
+    pub fn or(self, other: Self) -> Self {
+        let a_count = std::sync::Arc::new(core::sync::atomic::AtomicUsize::new(0));
+        let a_count_eval = std::sync::Arc::clone(&a_count);
+        let a_build = self.build_terms;
+        let b_build = other.build_terms;
+        let mut a_eval = self.eval;
+        let mut b_eval = other.eval;
+        Self::new(
+            move |host, manifest| {
+                let mut terms = a_build(host, manifest)?;
+                a_count.store(terms.len(), core::sync::atomic::Ordering::Release);
+                let b_terms = b_build(host, manifest)?;
+                if terms.len().saturating_add(b_terms.len()) > MAX_TERMS_PER_QUERY {
+                    return Err(FfiResult::CAPACITY_EXCEEDED);
+                }
+                terms.extend(b_terms);
+                Ok(terms)
+            },
+            move |ctx, offset| {
+                let b_offset = offset + a_count_eval.load(core::sync::atomic::Ordering::Acquire);
+                a_eval(ctx, offset) || b_eval(ctx, b_offset)
+            },
+        )
+    }
+
+    /// Composes two ECS run conditions with logical XOR (`self ^ other`), evaluating both terms.
+    pub fn xor(self, other: Self) -> Self {
+        let a_count = std::sync::Arc::new(core::sync::atomic::AtomicUsize::new(0));
+        let a_count_eval = std::sync::Arc::clone(&a_count);
+        let a_build = self.build_terms;
+        let b_build = other.build_terms;
+        let mut a_eval = self.eval;
+        let mut b_eval = other.eval;
+        Self::new(
+            move |host, manifest| {
+                let mut terms = a_build(host, manifest)?;
+                a_count.store(terms.len(), core::sync::atomic::Ordering::Release);
+                let b_terms = b_build(host, manifest)?;
+                if terms.len().saturating_add(b_terms.len()) > MAX_TERMS_PER_QUERY {
+                    return Err(FfiResult::CAPACITY_EXCEEDED);
+                }
+                terms.extend(b_terms);
+                Ok(terms)
+            },
+            move |ctx, offset| {
+                let b_offset = offset + a_count_eval.load(core::sync::atomic::Ordering::Acquire);
+                a_eval(ctx, offset) ^ b_eval(ctx, b_offset)
+            },
+        )
     }
 }
 

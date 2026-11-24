@@ -122,14 +122,20 @@ impl_wire_abi_pod!(
     ]
 );
 
-#[allow(missing_docs)]
 impl FfiStandardMaterial {
+    /// Fully opaque alpha mode (`AlphaMode::Opaque`).
     pub const ALPHA_OPAQUE: u8 = 0;
+    /// Alpha cutoff mask mode (`AlphaMode::Mask`).
     pub const ALPHA_MASK: u8 = 1;
+    /// Straight alpha blending (`AlphaMode::Blend`).
     pub const ALPHA_BLEND: u8 = 2;
+    /// Premultiplied alpha blending (`AlphaMode::Premultiplied`).
     pub const ALPHA_PREMULTIPLIED: u8 = 3;
+    /// Additive blending (`AlphaMode::Add`).
     pub const ALPHA_ADD: u8 = 4;
+    /// Multiplicative blending (`AlphaMode::Multiply`).
     pub const ALPHA_MULTIPLY: u8 = 5;
+    /// MSAA alpha-to-coverage (`AlphaMode::AlphaToCoverage`).
     pub const ALPHA_TO_COVERAGE: u8 = 6;
 }
 

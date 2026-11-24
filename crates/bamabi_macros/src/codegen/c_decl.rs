@@ -7,7 +7,7 @@ use std::fmt::Write as _;
 use syn::{Ident, Type};
 
 /// Maps a syntactic Rust primitive or ABI primitive type to `(c_type, zig_type)`.
-fn map_scalar_type(ty: &Type) -> Option<(&'static str, &'static str)> {
+pub(crate) fn map_scalar_type(ty: &Type) -> Option<(&'static str, &'static str)> {
     if let Type::Path(tp) = ty
         && tp.qself.is_none()
         && let Some(last) = tp.path.segments.last()
@@ -39,6 +39,8 @@ fn map_scalar_type(ty: &Type) -> Option<(&'static str, &'static str)> {
             "FfiAssetHandle" => Some(("BamAssetHandle", "bam.BamAssetHandle")),
             "BamChangeTicks" => Some(("BamChangeTicks", "bam.BamChangeTicks")),
             "ComponentUuid" => Some(("BamComponentUuid", "bam.BamComponentUuid")),
+            "BamRowRange" => Some(("BamRowRange", "bam.BamRowRange")),
+            "BamTimeInfo" => Some(("BamTimeInfo", "bam.BamTimeInfo")),
             _ => None,
         };
     }
@@ -60,6 +62,20 @@ fn map_type_name(ty: &Type, fallback_c: &str, fallback_zig: &str) -> (String, St
     } else {
         (fallback_c.to_owned(), fallback_zig.to_owned())
     }
+}
+
+/// Returns `true` when `ty` names a zero-sized `bamabi_schema` wire marker (such as `FfiDisabled`).
+fn is_wire_zst_type(ty: &Type) -> bool {
+    if let Type::Path(tp) = ty
+        && tp.qself.is_none()
+        && let Some(last) = tp.path.segments.last()
+        && last.arguments.is_empty()
+    {
+        let ident = last.ident.to_string();
+        return bamabi_schema::lookup_wire_type(&ident, bamabi_schema::TargetLayout::HOST)
+            .is_some_and(|s| s.size == 0);
+    }
+    false
 }
 
 /// Formats one struct field declaration line for both C99 (`<ty> <name>;`) and Zig (`<name>: <ty>,`),
@@ -98,6 +114,11 @@ fn format_c_zig_field_decl(field_name: &str, ty: &Type) -> Option<(String, Strin
                 && last.arguments.is_empty()
             {
                 let ident = last.ident.to_string();
+                if bamabi_schema::lookup_wire_type(&ident, bamabi_schema::TargetLayout::HOST)
+                    .is_some_and(|s| s.size == 0)
+                {
+                    return None;
+                }
                 Some((
                     format!("    {ident} {field_name};"),
                     format!("    {field_name}: {ident},"),
@@ -123,6 +144,7 @@ pub(crate) struct DeclFieldInfo {
 pub(crate) enum DeclFieldKind {
     Bool,
     Primitive,
+    Pad,
     HostString,
     HostVec { elem_ty: Box<Type> },
     FfiOption { inner_ty: Box<Type> },
@@ -148,6 +170,7 @@ impl DeclFieldInfo {
         };
         let decl_kind = match kind {
             FieldKind::Skip => return None,
+            FieldKind::Pad(_) => DeclFieldKind::Pad,
             FieldKind::Bool(_) => DeclFieldKind::Bool,
             FieldKind::Primitive { .. } => DeclFieldKind::Primitive,
             FieldKind::HostString(_) => DeclFieldKind::HostString,
@@ -345,10 +368,11 @@ public:
     bool empty() const noexcept { return len() == 0u; }
 
     SliceTy as_slice() const noexcept {
-        if (ptr_ == nullptr || ops_.get == nullptr) {
-            return SliceTy{nullptr, 0u};
+        SliceTy out{nullptr, 0u};
+        if (ptr_ != nullptr && ops_.get != nullptr) {
+            ops_.get(ptr_, &out);
         }
-        return ops_.get(ptr_);
+        return out;
     }
 
     const Elem* data() const noexcept { return as_slice().ptr; }
@@ -367,7 +391,8 @@ public:
         if (ptr_ == nullptr || ops_.set == nullptr) {
             return BAM_RESULT_NULL_POINTER;
         }
-        return ops_.set(ptr_, SliceTy{ptr, count});
+        const SliceTy slice{ptr, count};
+        return ops_.set(ptr_, &slice);
     }
 
     BamResult clear() noexcept {
@@ -441,10 +466,11 @@ public:
     bool empty() const noexcept { return len() == 0u; }
 
     SliceTy as_slice() const noexcept {
-        if (ptr_ == nullptr || ops_.get == nullptr) {
-            return SliceTy{nullptr, 0u};
+        SliceTy out{nullptr, 0u};
+        if (ptr_ != nullptr && ops_.get != nullptr) {
+            ops_.get(ptr_, &out);
         }
-        return ops_.get(ptr_);
+        return out;
     }
 
     const Elem* data() const noexcept { return as_slice().ptr; }
@@ -465,23 +491,19 @@ private:
     );
 }
 
-/// Generates `(c_decl, zig_decl)` for a `#[derive(ModComponent)]` enum (fieldless or tagged),
-/// emitting C99 tag constants, VTable struct with static size asserts, C++17 views, and Zig wrappers.
-#[allow(clippy::too_many_lines)]
-fn generate_enum_decls(
+/// Emits C99/Zig tag constants, helper typedefs, and VTable declarations for an enum.
+fn emit_enum_vtable_decls(
     state: &CodegenState,
     enum_info: &DeclEnumInfo,
     vtable_ident: &Ident,
-) -> (String, String) {
+    c_out: &mut String,
+    zig_out: &mut String,
+) {
     let enum_name = state.struct_ident.to_string();
     let vt_name = vtable_ident.to_string();
     let c_tag_ty = enum_info.int_repr.c_ty_str();
     let zig_tag_ty = enum_info.int_repr.zig_ty_str();
 
-    let mut c_out = String::new();
-    let mut zig_out = String::new();
-
-    // 1. Enum type & tag constants
     if enum_info.is_fieldless {
         if !enum_info.int_repr.is_some() {
             let _ = writeln!(c_out, "typedef enum {enum_name} {{");
@@ -534,7 +556,6 @@ fn generate_enum_decls(
         let _ = writeln!(zig_out, "}};\n");
     }
 
-    // 2. Helper slice / option typedefs for variant fields
     for var in &enum_info.variants {
         for f in &var.fields {
             let pfx = format!("{}_{}", var.snake_name, f.field_name);
@@ -553,14 +574,13 @@ fn generate_enum_decls(
                 }
                 DeclFieldKind::FfiOption { inner_ty } => {
                     let opt_ty = option_typedef_name(&enum_name, &pfx);
-                    let _ = emit_option_typedef(&mut c_out, &mut zig_out, &opt_ty, inner_ty);
+                    let _ = emit_option_typedef(c_out, zig_out, &opt_ty, inner_ty);
                 }
                 _ => {}
             }
         }
     }
 
-    // 3. VTable struct slots
     let mut c_vt_lines = Vec::new();
     let mut zig_vt_lines = Vec::new();
     let mut slot_count: usize = 0;
@@ -588,14 +608,15 @@ fn generate_enum_decls(
                         let _ = write!(c_params, ", {c_ty} {}", f.c_field_ident);
                         let _ = write!(zig_params, ", {zig_ty}");
                     }
+                    DeclFieldKind::Pad => {}
                     DeclFieldKind::HostString => {
-                        let _ = write!(c_params, ", BamStrView {}", f.c_field_ident);
-                        zig_params.push_str(", bam.BamStrView");
+                        let _ = write!(c_params, ", const BamStrView* {}", f.c_field_ident);
+                        zig_params.push_str(", ?*const bam.BamStrView");
                     }
                     DeclFieldKind::HostVec { .. } => {
                         let slice_ty = slice_typedef_name(&vt_name, &pfx);
-                        let _ = write!(c_params, ", {slice_ty} {}", f.c_field_ident);
-                        let _ = write!(zig_params, ", {slice_ty}");
+                        let _ = write!(c_params, ", const {slice_ty}* {}", f.c_field_ident);
+                        let _ = write!(zig_params, ", ?*const {slice_ty}");
                     }
                     DeclFieldKind::FfiOption { .. } => {
                         let opt_ty = option_typedef_name(&enum_name, &pfx);
@@ -621,6 +642,7 @@ fn generate_enum_decls(
             let (c_out_ty, zig_out_ty) = match &f.kind {
                 DeclFieldKind::Bool => ("BamBool".to_owned(), "bam.BamBool".to_owned()),
                 DeclFieldKind::Primitive => map_type_name(&f.raw_ty, "uintptr_t", "usize"),
+                DeclFieldKind::Pad => continue,
                 DeclFieldKind::HostString => ("BamStrView".to_owned(), "bam.BamStrView".to_owned()),
                 DeclFieldKind::HostVec { .. } => {
                     let s = slice_typedef_name(&vt_name, &pfx);
@@ -662,9 +684,25 @@ fn generate_enum_decls(
         "#if UINTPTR_MAX == UINT64_MAX\nBAM_STATIC_ASSERT(sizeof({vt_name}) == {size64}u, {assert_tag}_size64);\n#elif UINTPTR_MAX == UINT32_MAX\nBAM_STATIC_ASSERT(sizeof({vt_name}) == {size32}u, {assert_tag}_size32);\n#endif\n"
     );
 
-    // 4. C++17 noexcept view classes for enum
+    let _ = writeln!(zig_out, "pub const {vt_name} = extern struct {{");
+    zig_out.push_str("    header: bam.BamVTableHeader,\n");
+    for line in &zig_vt_lines {
+        zig_out.push_str(line);
+        zig_out.push('\n');
+    }
+    zig_out.push_str("};\n\n");
+}
+
+/// Emits C++17 noexcept view classes for an enum component.
+fn emit_enum_cpp_views(
+    enum_name: &str,
+    vt_name: &str,
+    enum_info: &DeclEnumInfo,
+    c_out: &mut String,
+) {
+    let c_tag_ty = enum_info.int_repr.c_ty_str();
     c_out.push_str("#ifdef __cplusplus\nextern \"C++\" {\n");
-    emit_cpp_shared_helpers(&mut c_out);
+    emit_cpp_shared_helpers(c_out);
 
     let mut cpp_const_methods = String::new();
     let mut cpp_mut_methods = String::new();
@@ -699,17 +737,18 @@ fn generate_enum_decls(
                         let _ = write!(sig_params, "{c_ty} {arg_name}");
                         let _ = write!(call_args, ", {arg_name}");
                     }
+                    DeclFieldKind::Pad => {}
                     DeclFieldKind::HostString => {
                         let _ = write!(sig_params, "BamStrView {arg_name}");
-                        let _ = write!(call_args, ", {arg_name}");
+                        let _ = write!(call_args, ", &{arg_name}");
                     }
                     DeclFieldKind::HostVec { .. } => {
-                        let slice_ty = slice_typedef_name(&vt_name, &pfx);
+                        let slice_ty = slice_typedef_name(vt_name, &pfx);
                         let _ = write!(sig_params, "{slice_ty} {arg_name}");
-                        let _ = write!(call_args, ", {arg_name}");
+                        let _ = write!(call_args, ", &{arg_name}");
                     }
                     DeclFieldKind::FfiOption { .. } => {
-                        let opt_ty = option_typedef_name(&enum_name, &pfx);
+                        let opt_ty = option_typedef_name(enum_name, &pfx);
                         let _ = write!(sig_params, "{opt_ty} {arg_name}");
                         let _ = write!(call_args, ", {arg_name}");
                     }
@@ -731,9 +770,10 @@ fn generate_enum_decls(
             let c_out_ty = match &f.kind {
                 DeclFieldKind::Bool => "BamBool".to_owned(),
                 DeclFieldKind::Primitive => map_type_name(&f.raw_ty, "uintptr_t", "usize").0,
+                DeclFieldKind::Pad => continue,
                 DeclFieldKind::HostString => "BamStrView".to_owned(),
-                DeclFieldKind::HostVec { .. } => slice_typedef_name(&vt_name, &pfx),
-                DeclFieldKind::FfiOption { .. } => option_typedef_name(&enum_name, &pfx),
+                DeclFieldKind::HostVec { .. } => slice_typedef_name(vt_name, &pfx),
+                DeclFieldKind::FfiOption { .. } => option_typedef_name(enum_name, &pfx),
                 DeclFieldKind::Nested => "const void*".to_owned(),
             };
             let method = format!(
@@ -753,16 +793,16 @@ fn generate_enum_decls(
         "class {enum_name}View {{\npublic:\n    {enum_name}View() noexcept = default;\n    {enum_name}View(void* ptr, const {vt_name}* vt) noexcept : ptr_(ptr), vt_(vt) {{}}\n    bool valid() const noexcept {{ return ptr_ != nullptr && vt_ != nullptr; }}\n    explicit operator bool() const noexcept {{ return valid(); }}\n    void* raw() const noexcept {{ return ptr_; }}\n    const {vt_name}* vtable() const noexcept {{ return vt_; }}\n    {enum_name}ConstView as_const() const noexcept {{ return {enum_name}ConstView(ptr_, vt_); }}\n{cpp_mut_methods}private:\n    void* ptr_{{nullptr}};\n    const {vt_name}* vt_{{nullptr}};\n}};\n"
     );
     c_out.push_str("} // extern \"C++\"\n#endif /* __cplusplus */\n");
+}
 
-    // 5. Zig VTable + comptime View wrapper
-    let _ = writeln!(zig_out, "pub const {vt_name} = extern struct {{");
-    zig_out.push_str("    header: bam.BamVTableHeader,\n");
-    for line in &zig_vt_lines {
-        zig_out.push_str(line);
-        zig_out.push('\n');
-    }
-    zig_out.push_str("};\n\n");
-
+/// Emits Zig View wrapper for an enum component.
+fn emit_enum_zig_views(
+    enum_name: &str,
+    vt_name: &str,
+    enum_info: &DeclEnumInfo,
+    zig_out: &mut String,
+) {
+    let zig_tag_ty = enum_info.int_repr.zig_ty_str();
     let mut zig_view_methods = String::new();
     let _ = writeln!(
         zig_view_methods,
@@ -776,16 +816,25 @@ fn generate_enum_decls(
             for f in &var.fields {
                 let pfx = format!("{v_snake}_{}", f.field_name);
                 let arg_name = &f.c_field_ident;
-                let zig_ty = match &f.kind {
-                    DeclFieldKind::Bool => "bam.BamBool".to_owned(),
-                    DeclFieldKind::Primitive => map_type_name(&f.raw_ty, "uintptr_t", "usize").1,
-                    DeclFieldKind::HostString => "bam.BamStrView".to_owned(),
-                    DeclFieldKind::HostVec { .. } => slice_typedef_name(&vt_name, &pfx),
-                    DeclFieldKind::FfiOption { .. } => option_typedef_name(&enum_name, &pfx),
-                    DeclFieldKind::Nested => "?*const anyopaque".to_owned(),
+                let (zig_ty, is_ptr_arg) = match &f.kind {
+                    DeclFieldKind::Pad => continue,
+                    DeclFieldKind::Bool => ("bam.BamBool".to_owned(), false),
+                    DeclFieldKind::Primitive => {
+                        (map_type_name(&f.raw_ty, "uintptr_t", "usize").1, false)
+                    }
+                    DeclFieldKind::HostString => ("bam.BamStrView".to_owned(), true),
+                    DeclFieldKind::HostVec { .. } => (slice_typedef_name(vt_name, &pfx), true),
+                    DeclFieldKind::FfiOption { .. } => {
+                        (option_typedef_name(enum_name, &pfx), false)
+                    }
+                    DeclFieldKind::Nested => ("?*const anyopaque".to_owned(), false),
                 };
                 let _ = write!(zig_sig, ", {arg_name}: {zig_ty}");
-                let _ = write!(zig_args, ", {arg_name}");
+                if is_ptr_arg {
+                    let _ = write!(zig_args, ", &{arg_name}");
+                } else {
+                    let _ = write!(zig_args, ", {arg_name}");
+                }
             }
             let _ = writeln!(
                 zig_view_methods,
@@ -798,9 +847,10 @@ fn generate_enum_decls(
             let zig_out_ty = match &f.kind {
                 DeclFieldKind::Bool => "bam.BamBool".to_owned(),
                 DeclFieldKind::Primitive => map_type_name(&f.raw_ty, "uintptr_t", "usize").1,
+                DeclFieldKind::Pad => continue,
                 DeclFieldKind::HostString => "bam.BamStrView".to_owned(),
-                DeclFieldKind::HostVec { .. } => slice_typedef_name(&vt_name, &pfx),
-                DeclFieldKind::FfiOption { .. } => option_typedef_name(&enum_name, &pfx),
+                DeclFieldKind::HostVec { .. } => slice_typedef_name(vt_name, &pfx),
+                DeclFieldKind::FfiOption { .. } => option_typedef_name(enum_name, &pfx),
                 DeclFieldKind::Nested => "?*const anyopaque".to_owned(),
             };
             let _ = writeln!(
@@ -814,56 +864,68 @@ fn generate_enum_decls(
         zig_out,
         "pub const {enum_name}View = struct {{\n    ptr: *anyopaque,\n    vt: *const {vt_name},\n\n    comptime {{\n        if (@offsetOf({vt_name}, \"header\") != 0) @compileError(\"{vt_name} header must be at offset 0\");\n    }}\n\n    pub fn resolveVTable(\n        api: *const bam.BamHostApi,\n        host_ctx: ?*const bam.BamHostCtx,\n        symbol: [*:0]const u8,\n    ) !*const {vt_name} {{\n        const get_proc = api.get_proc_address orelse return error.NullPointer;\n        const raw = get_proc(host_ctx, symbol) orelse return error.NotFound;\n        const hdr: *const bam.BamVTableHeader = @ptrCast(@alignCast(raw));\n        if (hdr.struct_size < @sizeOf({vt_name}) or bam.bam_version_is_compatible(bam.BAM_ABI_VERSION, hdr.abi_version) == bam.BAM_FALSE) {{\n            return error.InvalidVersion;\n        }}\n        return @ptrCast(@alignCast(raw));\n    }}\n\n    pub fn init(ptr: *anyopaque, vt: *const {vt_name}) @This() {{\n        return .{{ .ptr = ptr, .vt = vt }};\n    }}\n\n{zig_view_methods}}};\n"
     );
-
-    // Prevent unused helper warning when enum has no PascalCase->snake collisions
-    let _ = to_snake_case;
-
-    (c_out, zig_out)
 }
 
-/// Builds `(c_decl_string, zig_decl_string)` for a `#[derive(ModComponent)]` struct or enum.
-#[allow(clippy::too_many_lines)]
-pub(crate) fn generate_decls(
+/// Generates `(c_decl, zig_decl)` for a `#[derive(ModComponent)]` enum (fieldless or tagged),
+/// emitting C99 tag constants, VTable struct with static size asserts, C++17 views, and Zig wrappers.
+fn generate_enum_decls(
     state: &CodegenState,
+    enum_info: &DeclEnumInfo,
     vtable_ident: &Ident,
-    is_abi_pod: bool,
 ) -> (String, String) {
-    if let Some(ref enum_info) = state.decl_enum {
-        return generate_enum_decls(state, enum_info, vtable_ident);
-    }
-
-    let struct_name = state.struct_ident.to_string();
+    let enum_name = state.struct_ident.to_string();
     let vt_name = vtable_ident.to_string();
+
     let mut c_out = String::new();
     let mut zig_out = String::new();
 
-    // 1. Emit helper `FfiOption<T>` struct typedefs BEFORE the enclosing struct definition so POD
-    //    structs containing `FfiOption<T>` fields can embed them directly by value in C99 and Zig.
+    emit_enum_vtable_decls(state, enum_info, vtable_ident, &mut c_out, &mut zig_out);
+    emit_enum_cpp_views(&enum_name, &vt_name, enum_info, &mut c_out);
+    emit_enum_zig_views(&enum_name, &vt_name, enum_info, &mut zig_out);
+
+    let _ = to_snake_case;
+    (c_out, zig_out)
+}
+
+/// Emits C99 and Zig struct + VTable declarations for a struct component.
+fn emit_struct_vtable_decls(
+    state: &CodegenState,
+    struct_name: &str,
+    vt_name: &str,
+    is_abi_pod: bool,
+    c_out: &mut String,
+    zig_out: &mut String,
+) {
     for f in &state.decl_fields {
         if let DeclFieldKind::FfiOption { inner_ty } = &f.kind {
-            let opt_ty_name = option_typedef_name(&struct_name, &f.slot_suffix);
-            let _ = emit_option_typedef(&mut c_out, &mut zig_out, &opt_ty_name, inner_ty);
+            let opt_ty_name = option_typedef_name(struct_name, &f.slot_suffix);
+            let _ = emit_option_typedef(c_out, zig_out, &opt_ty_name, inner_ty);
         }
     }
 
-    // 2. Struct declaration: full `typedef struct` / `extern struct` when `IS_ABI_POD` and non-empty
-    //    (with mapped fields), otherwise an opaque C99 forward typedef (`typedef struct X X;`) so
-    //    zero-sized types and `#[repr(Rust)]` components remain strictly valid under `-std=c99 -pedantic`.
     let pod_lines: Option<Vec<(String, String)>> = if is_abi_pod && !state.decl_fields.is_empty() {
-        state
-            .decl_fields
-            .iter()
-            .map(|f| match &f.kind {
+        let mut lines = Vec::with_capacity(state.decl_fields.len());
+        let mut ok = true;
+        for f in &state.decl_fields {
+            match &f.kind {
                 DeclFieldKind::FfiOption { .. } => {
-                    let opt_ty = option_typedef_name(&struct_name, &f.slot_suffix);
-                    Some((
+                    let opt_ty = option_typedef_name(struct_name, &f.slot_suffix);
+                    lines.push((
                         format!("    {opt_ty} {};", f.c_field_ident),
                         format!("    {}: {opt_ty},", f.c_field_ident),
-                    ))
+                    ));
                 }
-                _ => format_c_zig_field_decl(&f.c_field_ident, &f.raw_ty),
-            })
-            .collect()
+                _ if is_wire_zst_type(&f.raw_ty) => {}
+                _ => match format_c_zig_field_decl(&f.c_field_ident, &f.raw_ty) {
+                    Some(pair) => lines.push(pair),
+                    None => {
+                        ok = false;
+                        break;
+                    }
+                },
+            }
+        }
+        (ok && !lines.is_empty()).then_some(lines)
     } else {
         None
     };
@@ -884,163 +946,165 @@ pub(crate) fn generate_decls(
         zig_out.push_str(&format!("pub const {struct_name} = opaque {{}};\n\n"));
     }
 
-    // 3. Helper slice typedefs & VTable slots.
     let mut c_vt_lines = Vec::new();
     let mut zig_vt_lines = Vec::new();
     let mut slot_count: usize = 0;
 
-    for f in &state.decl_fields {
-        let sfx = &f.slot_suffix;
-        match &f.kind {
-            DeclFieldKind::Bool => {
-                c_vt_lines.push(format!("    BamBool   (*get_{sfx})(const void* ptr);"));
-                c_vt_lines.push(format!(
-                    "    BamResult (*set_{sfx})(void* ptr, BamBool val);"
-                ));
-                zig_vt_lines.push(format!(
-                    "    get_{sfx}: ?*const fn (?*const anyopaque) callconv(.c) bam.BamBool,"
-                ));
-                zig_vt_lines.push(format!(
-                    "    set_{sfx}: ?*const fn (?*anyopaque, bam.BamBool) callconv(.c) bam.BamResult,"
-                ));
-                slot_count += 2;
-            }
-            DeclFieldKind::Primitive => {
-                let (c_ty, zig_ty) = map_type_name(&f.raw_ty, "uintptr_t", "usize");
-                c_vt_lines.push(format!("    {c_ty} (*get_{sfx})(const void* ptr);"));
-                c_vt_lines.push(format!(
-                    "    BamResult (*set_{sfx})(void* ptr, {c_ty} val);"
-                ));
-                zig_vt_lines.push(format!(
-                    "    get_{sfx}: ?*const fn (?*const anyopaque) callconv(.c) {zig_ty},"
-                ));
-                zig_vt_lines.push(format!(
-                    "    set_{sfx}: ?*const fn (?*anyopaque, {zig_ty}) callconv(.c) bam.BamResult,"
-                ));
-                slot_count += 2;
-            }
-            DeclFieldKind::HostString => {
-                c_vt_lines.push(format!("    BamStrView (*get_{sfx})(const void* ptr);"));
-                c_vt_lines.push(format!(
-                    "    BamResult  (*set_{sfx})(void* ptr, BamStrView view);"
-                ));
-                zig_vt_lines.push(format!(
-                    "    get_{sfx}: ?*const fn (?*const anyopaque) callconv(.c) bam.BamStrView,"
-                ));
-                zig_vt_lines.push(format!(
-                    "    set_{sfx}: ?*const fn (?*anyopaque, bam.BamStrView) callconv(.c) bam.BamResult,"
-                ));
-                slot_count += 2;
-            }
-            DeclFieldKind::FfiOption { .. } => {
-                let opt_ty = option_typedef_name(&struct_name, sfx);
-                c_vt_lines.push(format!("    {opt_ty} (*get_{sfx})(const void* ptr);"));
-                c_vt_lines.push(format!(
-                    "    BamResult (*set_{sfx})(void* ptr, {opt_ty} val);"
-                ));
-                c_vt_lines.push(format!("    BamResult (*clear_{sfx})(void* ptr);"));
-                zig_vt_lines.push(format!(
-                    "    get_{sfx}: ?*const fn (?*const anyopaque) callconv(.c) {opt_ty},"
-                ));
-                zig_vt_lines.push(format!(
-                    "    set_{sfx}: ?*const fn (?*anyopaque, {opt_ty}) callconv(.c) bam.BamResult,"
-                ));
-                zig_vt_lines.push(format!(
-                    "    clear_{sfx}: ?*const fn (?*anyopaque) callconv(.c) bam.BamResult,"
-                ));
-                slot_count += 3;
-            }
-            DeclFieldKind::HostVec { elem_ty } => {
-                let (elem_c, elem_zig) = map_type_name(elem_ty, "uint8_t", "u8");
-                let slice_ty_name = slice_typedef_name(&vt_name, sfx);
-                c_out.push_str(&format!(
-                    "typedef struct {slice_ty_name} {{\n    const {elem_c}* ptr;\n    size_t len;\n}} {slice_ty_name};\n\n"
-                ));
-                zig_out.push_str(&format!(
-                    "pub const {slice_ty_name} = extern struct {{\n    ptr: ?[*]const {elem_zig},\n    len: usize,\n}};\n\n"
-                ));
+    if !state.pod_only {
+        for f in &state.decl_fields {
+            let sfx = &f.slot_suffix;
+            match &f.kind {
+                DeclFieldKind::Pad => {}
+                DeclFieldKind::Bool => {
+                    c_vt_lines.push(format!("    BamBool   (*get_{sfx})(const void* ptr);"));
+                    c_vt_lines.push(format!(
+                        "    BamResult (*set_{sfx})(void* ptr, BamBool val);"
+                    ));
+                    zig_vt_lines.push(format!(
+                        "    get_{sfx}: ?*const fn (?*const anyopaque) callconv(.c) bam.BamBool,"
+                    ));
+                    zig_vt_lines.push(format!(
+                        "    set_{sfx}: ?*const fn (?*anyopaque, bam.BamBool) callconv(.c) bam.BamResult,"
+                    ));
+                    slot_count += 2;
+                }
+                DeclFieldKind::Primitive => {
+                    let (c_ty, zig_ty) = map_type_name(&f.raw_ty, "uintptr_t", "usize");
+                    c_vt_lines.push(format!("    {c_ty} (*get_{sfx})(const void* ptr);"));
+                    c_vt_lines.push(format!(
+                        "    BamResult (*set_{sfx})(void* ptr, {c_ty} val);"
+                    ));
+                    zig_vt_lines.push(format!(
+                        "    get_{sfx}: ?*const fn (?*const anyopaque) callconv(.c) {zig_ty},"
+                    ));
+                    zig_vt_lines.push(format!(
+                        "    set_{sfx}: ?*const fn (?*anyopaque, {zig_ty}) callconv(.c) bam.BamResult,"
+                    ));
+                    slot_count += 2;
+                }
+                DeclFieldKind::HostString => {
+                    c_vt_lines.push(format!(
+                        "    BamResult (*get_{sfx})(const void* ptr, BamStrView* out_view);"
+                    ));
+                    c_vt_lines.push(format!(
+                        "    BamResult (*set_{sfx})(void* ptr, const BamStrView* view);"
+                    ));
+                    zig_vt_lines.push(format!(
+                        "    get_{sfx}: ?*const fn (?*const anyopaque, ?*bam.BamStrView) callconv(.c) bam.BamResult,"
+                    ));
+                    zig_vt_lines.push(format!(
+                        "    set_{sfx}: ?*const fn (?*anyopaque, ?*const bam.BamStrView) callconv(.c) bam.BamResult,"
+                    ));
+                    slot_count += 2;
+                }
+                DeclFieldKind::FfiOption { .. } => {
+                    let opt_ty = option_typedef_name(struct_name, sfx);
+                    c_vt_lines.push(format!("    {opt_ty} (*get_{sfx})(const void* ptr);"));
+                    c_vt_lines.push(format!(
+                        "    BamResult (*set_{sfx})(void* ptr, {opt_ty} val);"
+                    ));
+                    c_vt_lines.push(format!("    BamResult (*clear_{sfx})(void* ptr);"));
+                    zig_vt_lines.push(format!(
+                        "    get_{sfx}: ?*const fn (?*const anyopaque) callconv(.c) {opt_ty},"
+                    ));
+                    zig_vt_lines.push(format!(
+                        "    set_{sfx}: ?*const fn (?*anyopaque, {opt_ty}) callconv(.c) bam.BamResult,"
+                    ));
+                    zig_vt_lines.push(format!(
+                        "    clear_{sfx}: ?*const fn (?*anyopaque) callconv(.c) bam.BamResult,"
+                    ));
+                    slot_count += 3;
+                }
+                DeclFieldKind::HostVec { elem_ty } => {
+                    let (elem_c, elem_zig) = map_type_name(elem_ty, "uint8_t", "u8");
+                    let slice_ty_name = slice_typedef_name(vt_name, sfx);
+                    c_out.push_str(&format!(
+                        "typedef struct {slice_ty_name} {{\n    const {elem_c}* ptr;\n    size_t len;\n}} {slice_ty_name};\n\n"
+                    ));
+                    zig_out.push_str(&format!(
+                        "pub const {slice_ty_name} = extern struct {{\n    ptr: ?[*]const {elem_zig},\n    len: usize,\n}};\n\n"
+                    ));
 
-                c_vt_lines.push(format!(
-                    "    {slice_ty_name} (*get_{sfx})(const void* ptr);"
-                ));
-                c_vt_lines.push(format!(
-                    "    BamResult (*set_{sfx})(void* ptr, {slice_ty_name} slice);"
-                ));
-                c_vt_lines.push(format!("    size_t (*len_{sfx})(const void* ptr);"));
-                c_vt_lines.push(format!("    BamResult (*clear_{sfx})(void* ptr);"));
-                c_vt_lines.push(format!(
-                    "    BamResult (*push_{sfx})(void* ptr, {elem_c} val);"
-                ));
-                c_vt_lines.push(format!(
-                    "    BamBool (*pop_{sfx})(void* ptr, {elem_c}* out_elem);"
-                ));
-                c_vt_lines.push(format!(
-                    "    BamResult (*remove_{sfx})(void* ptr, size_t index, {elem_c}* out_elem);"
-                ));
-                c_vt_lines.push(format!(
-                    "    BamResult (*swap_remove_{sfx})(void* ptr, size_t index, {elem_c}* out_elem);"
-                ));
-                c_vt_lines.push(format!(
-                    "    BamResult (*truncate_{sfx})(void* ptr, size_t new_len);"
-                ));
-                c_vt_lines.push(format!(
-                    "    BamResult (*reserve_{sfx})(void* ptr, size_t additional);"
-                ));
-                c_vt_lines.push(format!(
-                    "    {elem_c}* (*as_mut_slice_{sfx})(void* ptr, size_t* out_len);"
-                ));
+                    c_vt_lines.push(format!(
+                        "    BamResult (*get_{sfx})(const void* ptr, {slice_ty_name}* out_slice);"
+                    ));
+                    c_vt_lines.push(format!(
+                        "    BamResult (*set_{sfx})(void* ptr, const {slice_ty_name}* slice);"
+                    ));
+                    c_vt_lines.push(format!("    size_t (*len_{sfx})(const void* ptr);"));
+                    c_vt_lines.push(format!("    BamResult (*clear_{sfx})(void* ptr);"));
+                    c_vt_lines.push(format!(
+                        "    BamResult (*push_{sfx})(void* ptr, {elem_c} val);"
+                    ));
+                    c_vt_lines.push(format!(
+                        "    BamBool (*pop_{sfx})(void* ptr, {elem_c}* out_elem);"
+                    ));
+                    c_vt_lines.push(format!(
+                        "    BamResult (*remove_{sfx})(void* ptr, size_t index, {elem_c}* out_elem);"
+                    ));
+                    c_vt_lines.push(format!(
+                        "    BamResult (*swap_remove_{sfx})(void* ptr, size_t index, {elem_c}* out_elem);"
+                    ));
+                    c_vt_lines.push(format!(
+                        "    BamResult (*truncate_{sfx})(void* ptr, size_t new_len);"
+                    ));
+                    c_vt_lines.push(format!(
+                        "    BamResult (*reserve_{sfx})(void* ptr, size_t additional);"
+                    ));
+                    c_vt_lines.push(format!(
+                        "    {elem_c}* (*as_mut_slice_{sfx})(void* ptr, size_t* out_len);"
+                    ));
 
-                zig_vt_lines.push(format!(
-                    "    get_{sfx}: ?*const fn (?*const anyopaque) callconv(.c) {slice_ty_name},"
-                ));
-                zig_vt_lines.push(format!(
-                    "    set_{sfx}: ?*const fn (?*anyopaque, {slice_ty_name}) callconv(.c) bam.BamResult,"
-                ));
-                zig_vt_lines.push(format!(
-                    "    len_{sfx}: ?*const fn (?*const anyopaque) callconv(.c) usize,"
-                ));
-                zig_vt_lines.push(format!(
-                    "    clear_{sfx}: ?*const fn (?*anyopaque) callconv(.c) bam.BamResult,"
-                ));
-                zig_vt_lines.push(format!(
-                    "    push_{sfx}: ?*const fn (?*anyopaque, {elem_zig}) callconv(.c) bam.BamResult,"
-                ));
-                zig_vt_lines.push(format!(
-                    "    pop_{sfx}: ?*const fn (?*anyopaque, ?*{elem_zig}) callconv(.c) bam.BamBool,"
-                ));
-                zig_vt_lines.push(format!(
-                    "    remove_{sfx}: ?*const fn (?*anyopaque, usize, ?*{elem_zig}) callconv(.c) bam.BamResult,"
-                ));
-                zig_vt_lines.push(format!(
-                    "    swap_remove_{sfx}: ?*const fn (?*anyopaque, usize, ?*{elem_zig}) callconv(.c) bam.BamResult,"
-                ));
-                zig_vt_lines.push(format!(
-                    "    truncate_{sfx}: ?*const fn (?*anyopaque, usize) callconv(.c) bam.BamResult,"
-                ));
-                zig_vt_lines.push(format!(
-                    "    reserve_{sfx}: ?*const fn (?*anyopaque, usize) callconv(.c) bam.BamResult,"
-                ));
-                zig_vt_lines.push(format!(
-                    "    as_mut_slice_{sfx}: ?*const fn (?*anyopaque, ?*usize) callconv(.c) ?[*]{elem_zig},"
-                ));
-                slot_count += 11;
-            }
-            DeclFieldKind::Nested => {
-                c_vt_lines.push(format!("    const void* (*ptr_{sfx})(const void* ptr);"));
-                c_vt_lines.push(format!("    void*       (*ptr_mut_{sfx})(void* ptr);"));
-                zig_vt_lines.push(format!(
-                    "    ptr_{sfx}: ?*const fn (?*const anyopaque) callconv(.c) ?*const anyopaque,"
-                ));
-                zig_vt_lines.push(format!(
-                    "    ptr_mut_{sfx}: ?*const fn (?*anyopaque) callconv(.c) ?*anyopaque,"
-                ));
-                slot_count += 2;
+                    zig_vt_lines.push(format!(
+                        "    get_{sfx}: ?*const fn (?*const anyopaque, ?*{slice_ty_name}) callconv(.c) bam.BamResult,"
+                    ));
+                    zig_vt_lines.push(format!(
+                        "    set_{sfx}: ?*const fn (?*anyopaque, ?*const {slice_ty_name}) callconv(.c) bam.BamResult,"
+                    ));
+                    zig_vt_lines.push(format!(
+                        "    len_{sfx}: ?*const fn (?*const anyopaque) callconv(.c) usize,"
+                    ));
+                    zig_vt_lines.push(format!(
+                        "    clear_{sfx}: ?*const fn (?*anyopaque) callconv(.c) bam.BamResult,"
+                    ));
+                    zig_vt_lines.push(format!(
+                        "    push_{sfx}: ?*const fn (?*anyopaque, {elem_zig}) callconv(.c) bam.BamResult,"
+                    ));
+                    zig_vt_lines.push(format!(
+                        "    pop_{sfx}: ?*const fn (?*anyopaque, ?*{elem_zig}) callconv(.c) bam.BamBool,"
+                    ));
+                    zig_vt_lines.push(format!(
+                        "    remove_{sfx}: ?*const fn (?*anyopaque, usize, ?*{elem_zig}) callconv(.c) bam.BamResult,"
+                    ));
+                    zig_vt_lines.push(format!(
+                        "    swap_remove_{sfx}: ?*const fn (?*anyopaque, usize, ?*{elem_zig}) callconv(.c) bam.BamResult,"
+                    ));
+                    zig_vt_lines.push(format!(
+                        "    truncate_{sfx}: ?*const fn (?*anyopaque, usize) callconv(.c) bam.BamResult,"
+                    ));
+                    zig_vt_lines.push(format!(
+                        "    reserve_{sfx}: ?*const fn (?*anyopaque, usize) callconv(.c) bam.BamResult,"
+                    ));
+                    zig_vt_lines.push(format!(
+                        "    as_mut_slice_{sfx}: ?*const fn (?*anyopaque, ?*usize) callconv(.c) ?[*]{elem_zig},"
+                    ));
+                    slot_count += 11;
+                }
+                DeclFieldKind::Nested => {
+                    c_vt_lines.push(format!("    const void* (*ptr_{sfx})(const void* ptr);"));
+                    c_vt_lines.push(format!("    void*       (*ptr_mut_{sfx})(void* ptr);"));
+                    zig_vt_lines.push(format!(
+                        "    ptr_{sfx}: ?*const fn (?*const anyopaque) callconv(.c) ?*const anyopaque,"
+                    ));
+                    zig_vt_lines.push(format!(
+                        "    ptr_mut_{sfx}: ?*const fn (?*anyopaque) callconv(.c) ?*anyopaque,"
+                    ));
+                    slot_count += 2;
+                }
             }
         }
     }
 
-    // 4. VTable declaration + static size/offset assertions (`VTableHeader` is 40 bytes on 64-bit,
-    //    32 bytes on 32-bit, followed by `slot_count` function pointers).
     c_out.push_str(&format!("typedef struct {vt_name} {{\n"));
     c_out.push_str("    BamVTableHeader header;\n");
     for line in &c_vt_lines {
@@ -1051,7 +1115,7 @@ pub(crate) fn generate_decls(
 
     let size64 = 40 + slot_count * 8;
     let size32 = 32 + slot_count * 4;
-    let assert_tag = crate::attrs::sanitize_symbol_segment(&vt_name).to_ascii_lowercase();
+    let assert_tag = crate::attrs::sanitize_symbol_segment(vt_name).to_ascii_lowercase();
     c_out.push_str(&format!(
         "BAM_STATIC_ASSERT(offsetof({vt_name}, header) == 0u, {assert_tag}_header_off);\n"
     ));
@@ -1059,88 +1123,106 @@ pub(crate) fn generate_decls(
         "#if UINTPTR_MAX == UINT64_MAX\nBAM_STATIC_ASSERT(sizeof({vt_name}) == {size64}u, {assert_tag}_size64);\n#elif UINTPTR_MAX == UINT32_MAX\nBAM_STATIC_ASSERT(sizeof({vt_name}) == {size32}u, {assert_tag}_size32);\n#endif\n"
     ));
 
-    // 5. `#ifdef __cplusplus` C++17 noexcept RAII & typed view classes
+    zig_out.push_str(&format!("pub const {vt_name} = extern struct {{\n"));
+    zig_out.push_str("    header: bam.BamVTableHeader,\n");
+    for line in &zig_vt_lines {
+        zig_out.push_str(line);
+        zig_out.push('\n');
+    }
+    zig_out.push_str("};\n\n");
+}
+
+/// Emits C++17 noexcept view classes for a struct component.
+fn emit_struct_cpp_views(
+    state: &CodegenState,
+    struct_name: &str,
+    vt_name: &str,
+    c_out: &mut String,
+) {
     c_out.push_str("#ifdef __cplusplus\nextern \"C++\" {\n");
-    emit_cpp_shared_helpers(&mut c_out);
+    emit_cpp_shared_helpers(c_out);
 
     let mut cpp_vec_ops_decls = String::new();
     let mut cpp_const_methods = String::new();
     let mut cpp_mut_methods = String::new();
 
-    for f in &state.decl_fields {
-        let sfx = &f.slot_suffix;
-        let method_name = &f.c_field_ident;
-        match &f.kind {
-            DeclFieldKind::Bool => {
-                let _ = writeln!(
-                    cpp_const_methods,
-                    "    bool get_{method_name}() const noexcept {{\n        return (ptr_ != nullptr && vt_ != nullptr && vt_->get_{sfx} != nullptr) ? (vt_->get_{sfx}(ptr_) != BAM_FALSE) : false;\n    }}"
-                );
-                let _ = writeln!(
-                    cpp_mut_methods,
-                    "    bool get_{method_name}() const noexcept {{\n        return (ptr_ != nullptr && vt_ != nullptr && vt_->get_{sfx} != nullptr) ? (vt_->get_{sfx}(ptr_) != BAM_FALSE) : false;\n    }}\n    BamResult set_{method_name}(bool val) noexcept {{\n        return (ptr_ != nullptr && vt_ != nullptr && vt_->set_{sfx} != nullptr) ? vt_->set_{sfx}(ptr_, val ? BAM_TRUE : BAM_FALSE) : BAM_RESULT_NULL_POINTER;\n    }}"
-                );
-            }
-            DeclFieldKind::Primitive => {
-                let (c_ty, _) = map_type_name(&f.raw_ty, "uintptr_t", "usize");
-                let _ = writeln!(
-                    cpp_const_methods,
-                    "    {c_ty} get_{method_name}() const noexcept {{\n        return (ptr_ != nullptr && vt_ != nullptr && vt_->get_{sfx} != nullptr) ? vt_->get_{sfx}(ptr_) : {c_ty}{{}};\n    }}"
-                );
-                let _ = writeln!(
-                    cpp_mut_methods,
-                    "    {c_ty} get_{method_name}() const noexcept {{\n        return (ptr_ != nullptr && vt_ != nullptr && vt_->get_{sfx} != nullptr) ? vt_->get_{sfx}(ptr_) : {c_ty}{{}};\n    }}\n    BamResult set_{method_name}({c_ty} val) noexcept {{\n        return (ptr_ != nullptr && vt_ != nullptr && vt_->set_{sfx} != nullptr) ? vt_->set_{sfx}(ptr_, val) : BAM_RESULT_NULL_POINTER;\n    }}"
-                );
-            }
-            DeclFieldKind::HostString => {
-                let _ = writeln!(
-                    cpp_const_methods,
-                    "    BamStrView get_{method_name}() const noexcept {{\n        return (ptr_ != nullptr && vt_ != nullptr && vt_->get_{sfx} != nullptr) ? vt_->get_{sfx}(ptr_) : BamStrView{{nullptr, 0u}};\n    }}"
-                );
-                let _ = writeln!(
-                    cpp_mut_methods,
-                    "    BamStrView get_{method_name}() const noexcept {{\n        return (ptr_ != nullptr && vt_ != nullptr && vt_->get_{sfx} != nullptr) ? vt_->get_{sfx}(ptr_) : BamStrView{{nullptr, 0u}};\n    }}\n    BamResult set_{method_name}(BamStrView view) noexcept {{\n        return (ptr_ != nullptr && vt_ != nullptr && vt_->set_{sfx} != nullptr) ? vt_->set_{sfx}(ptr_, view) : BAM_RESULT_NULL_POINTER;\n    }}\n    BamResult set_{method_name}(const char* cstr) noexcept {{\n        const BamStrView view{{reinterpret_cast<const uint8_t*>(cstr), cstr != nullptr ? strlen(cstr) : 0u}};\n        return set_{method_name}(view);\n    }}"
-                );
-            }
-            DeclFieldKind::FfiOption { inner_ty } => {
-                let opt_ty = option_typedef_name(&struct_name, sfx);
-                let (elem_c, _) = map_type_name(inner_ty, "uint8_t", "u8");
-                let _ = writeln!(
-                    cpp_const_methods,
-                    "    {opt_ty} get_{method_name}() const noexcept {{\n        return (ptr_ != nullptr && vt_ != nullptr && vt_->get_{sfx} != nullptr) ? vt_->get_{sfx}(ptr_) : {opt_ty}{{BAM_FALSE, {{}}}};\n    }}"
-                );
-                let _ = writeln!(
-                    cpp_mut_methods,
-                    "    {opt_ty} get_{method_name}() const noexcept {{\n        return (ptr_ != nullptr && vt_ != nullptr && vt_->get_{sfx} != nullptr) ? vt_->get_{sfx}(ptr_) : {opt_ty}{{BAM_FALSE, {{}}}};\n    }}\n    BamResult set_{method_name}({opt_ty} val) noexcept {{\n        return (ptr_ != nullptr && vt_ != nullptr && vt_->set_{sfx} != nullptr) ? vt_->set_{sfx}(ptr_, val) : BAM_RESULT_NULL_POINTER;\n    }}\n    BamResult set_{method_name}_some({elem_c} val) noexcept {{\n        return set_{method_name}({opt_ty}{{BAM_TRUE, val}});\n    }}\n    BamResult clear_{method_name}() noexcept {{\n        return (ptr_ != nullptr && vt_ != nullptr && vt_->clear_{sfx} != nullptr) ? vt_->clear_{sfx}(ptr_) : BAM_RESULT_NULL_POINTER;\n    }}"
-                );
-            }
-            DeclFieldKind::HostVec { elem_ty } => {
-                let (elem_c, _) = map_type_name(elem_ty, "uint8_t", "u8");
-                let slice_ty = slice_typedef_name(&vt_name, sfx);
-                let ops_name = format!("{vt_name}_{sfx}_VecOps");
-                let const_ops_name = format!("{vt_name}_{sfx}_ConstVecOps");
-                let _ = writeln!(
-                    cpp_vec_ops_decls,
-                    "struct {const_ops_name} {{\n    {slice_ty} (*get)(const void*) = nullptr;\n    size_t (*len)(const void*) = nullptr;\n    static {const_ops_name} from_vtable(const {vt_name}* vt) noexcept {{\n        if (vt == nullptr) return {const_ops_name}{{}};\n        return {const_ops_name}{{vt->get_{sfx}, vt->len_{sfx}}};\n    }}\n}};\nstruct {ops_name} {{\n    {slice_ty} (*get)(const void*) = nullptr;\n    BamResult (*set)(void*, {slice_ty}) = nullptr;\n    size_t (*len)(const void*) = nullptr;\n    BamResult (*clear)(void*) = nullptr;\n    BamResult (*push)(void*, {elem_c}) = nullptr;\n    BamBool (*pop)(void*, {elem_c}*) = nullptr;\n    BamResult (*remove)(void*, size_t, {elem_c}*) = nullptr;\n    BamResult (*swap_remove)(void*, size_t, {elem_c}*) = nullptr;\n    BamResult (*truncate)(void*, size_t) = nullptr;\n    BamResult (*reserve)(void*, size_t) = nullptr;\n    {elem_c}* (*as_mut_slice)(void*, size_t*) = nullptr;\n    bool valid() const noexcept {{\n        return get != nullptr && set != nullptr && len != nullptr && clear != nullptr &&\n               push != nullptr && pop != nullptr && remove != nullptr && swap_remove != nullptr &&\n               truncate != nullptr && reserve != nullptr && as_mut_slice != nullptr;\n    }}\n    static {ops_name} from_vtable(const {vt_name}* vt) noexcept {{\n        if (vt == nullptr) return {ops_name}{{}};\n        return {ops_name}{{\n            vt->get_{sfx}, vt->set_{sfx}, vt->len_{sfx}, vt->clear_{sfx},\n            vt->push_{sfx}, vt->pop_{sfx}, vt->remove_{sfx}, vt->swap_remove_{sfx},\n            vt->truncate_{sfx}, vt->reserve_{sfx}, vt->as_mut_slice_{sfx}\n        }};\n    }}\n}};\nusing {vt_name}_{sfx}_ConstVecView = bam::ConstHostVecView<{elem_c}, {slice_ty}, {const_ops_name}>;\nusing {vt_name}_{sfx}_VecView = bam::HostVecView<{elem_c}, {slice_ty}, {ops_name}>;\n"
-                );
-                let _ = writeln!(
-                    cpp_const_methods,
-                    "    {vt_name}_{sfx}_ConstVecView {method_name}() const noexcept {{\n        return {vt_name}_{sfx}_ConstVecView(ptr_, {const_ops_name}::from_vtable(vt_));\n    }}"
-                );
-                let _ = writeln!(
-                    cpp_mut_methods,
-                    "    {vt_name}_{sfx}_VecView {method_name}() noexcept {{\n        return {vt_name}_{sfx}_VecView(ptr_, {ops_name}::from_vtable(vt_));\n    }}\n    {vt_name}_{sfx}_ConstVecView {method_name}() const noexcept {{\n        return {vt_name}_{sfx}_ConstVecView(ptr_, {const_ops_name}::from_vtable(vt_));\n    }}"
-                );
-            }
-            DeclFieldKind::Nested => {
-                let _ = writeln!(
-                    cpp_const_methods,
-                    "    const void* ptr_{method_name}() const noexcept {{\n        return (ptr_ != nullptr && vt_ != nullptr && vt_->ptr_{sfx} != nullptr) ? vt_->ptr_{sfx}(ptr_) : nullptr;\n    }}"
-                );
-                let _ = writeln!(
-                    cpp_mut_methods,
-                    "    const void* ptr_{method_name}() const noexcept {{\n        return (ptr_ != nullptr && vt_ != nullptr && vt_->ptr_{sfx} != nullptr) ? vt_->ptr_{sfx}(ptr_) : nullptr;\n    }}\n    void* ptr_mut_{method_name}() noexcept {{\n        return (ptr_ != nullptr && vt_ != nullptr && vt_->ptr_mut_{sfx} != nullptr) ? vt_->ptr_mut_{sfx}(ptr_) : nullptr;\n    }}"
-                );
+    if !state.pod_only {
+        for f in &state.decl_fields {
+            let sfx = &f.slot_suffix;
+            let method_name = &f.c_field_ident;
+            match &f.kind {
+                DeclFieldKind::Pad => {}
+                DeclFieldKind::Bool => {
+                    let _ = writeln!(
+                        cpp_const_methods,
+                        "    bool get_{method_name}() const noexcept {{\n        return (ptr_ != nullptr && vt_ != nullptr && vt_->get_{sfx} != nullptr) ? (vt_->get_{sfx}(ptr_) != BAM_FALSE) : false;\n    }}"
+                    );
+                    let _ = writeln!(
+                        cpp_mut_methods,
+                        "    bool get_{method_name}() const noexcept {{\n        return (ptr_ != nullptr && vt_ != nullptr && vt_->get_{sfx} != nullptr) ? (vt_->get_{sfx}(ptr_) != BAM_FALSE) : false;\n    }}\n    BamResult set_{method_name}(bool val) noexcept {{\n        return (ptr_ != nullptr && vt_ != nullptr && vt_->set_{sfx} != nullptr) ? vt_->set_{sfx}(ptr_, val ? BAM_TRUE : BAM_FALSE) : BAM_RESULT_NULL_POINTER;\n    }}"
+                    );
+                }
+                DeclFieldKind::Primitive => {
+                    let (c_ty, _) = map_type_name(&f.raw_ty, "uintptr_t", "usize");
+                    let _ = writeln!(
+                        cpp_const_methods,
+                        "    {c_ty} get_{method_name}() const noexcept {{\n        return (ptr_ != nullptr && vt_ != nullptr && vt_->get_{sfx} != nullptr) ? vt_->get_{sfx}(ptr_) : {c_ty}{{}};\n    }}"
+                    );
+                    let _ = writeln!(
+                        cpp_mut_methods,
+                        "    {c_ty} get_{method_name}() const noexcept {{\n        return (ptr_ != nullptr && vt_ != nullptr && vt_->get_{sfx} != nullptr) ? vt_->get_{sfx}(ptr_) : {c_ty}{{}};\n    }}\n    BamResult set_{method_name}({c_ty} val) noexcept {{\n        return (ptr_ != nullptr && vt_ != nullptr && vt_->set_{sfx} != nullptr) ? vt_->set_{sfx}(ptr_, val) : BAM_RESULT_NULL_POINTER;\n    }}"
+                    );
+                }
+                DeclFieldKind::HostString => {
+                    let _ = writeln!(
+                        cpp_const_methods,
+                        "    BamStrView get_{method_name}() const noexcept {{\n        BamStrView out{{nullptr, 0u}};\n        if (ptr_ != nullptr && vt_ != nullptr && vt_->get_{sfx} != nullptr) {{\n            vt_->get_{sfx}(ptr_, &out);\n        }}\n        return out;\n    }}"
+                    );
+                    let _ = writeln!(
+                        cpp_mut_methods,
+                        "    BamStrView get_{method_name}() const noexcept {{\n        BamStrView out{{nullptr, 0u}};\n        if (ptr_ != nullptr && vt_ != nullptr && vt_->get_{sfx} != nullptr) {{\n            vt_->get_{sfx}(ptr_, &out);\n        }}\n        return out;\n    }}\n    BamResult set_{method_name}(BamStrView view) noexcept {{\n        return (ptr_ != nullptr && vt_ != nullptr && vt_->set_{sfx} != nullptr) ? vt_->set_{sfx}(ptr_, &view) : BAM_RESULT_NULL_POINTER;\n    }}\n    BamResult set_{method_name}(const char* cstr) noexcept {{\n        const BamStrView view{{reinterpret_cast<const uint8_t*>(cstr), cstr != nullptr ? strlen(cstr) : 0u}};\n        return set_{method_name}(view);\n    }}"
+                    );
+                }
+                DeclFieldKind::FfiOption { inner_ty } => {
+                    let opt_ty = option_typedef_name(struct_name, sfx);
+                    let (elem_c, _) = map_type_name(inner_ty, "uint8_t", "u8");
+                    let _ = writeln!(
+                        cpp_const_methods,
+                        "    {opt_ty} get_{method_name}() const noexcept {{\n        return (ptr_ != nullptr && vt_ != nullptr && vt_->get_{sfx} != nullptr) ? vt_->get_{sfx}(ptr_) : {opt_ty}{{BAM_FALSE, {{}}}};\n    }}"
+                    );
+                    let _ = writeln!(
+                        cpp_mut_methods,
+                        "    {opt_ty} get_{method_name}() const noexcept {{\n        return (ptr_ != nullptr && vt_ != nullptr && vt_->get_{sfx} != nullptr) ? vt_->get_{sfx}(ptr_) : {opt_ty}{{BAM_FALSE, {{}}}};\n    }}\n    BamResult set_{method_name}({opt_ty} val) noexcept {{\n        return (ptr_ != nullptr && vt_ != nullptr && vt_->set_{sfx} != nullptr) ? vt_->set_{sfx}(ptr_, val) : BAM_RESULT_NULL_POINTER;\n    }}\n    BamResult set_{method_name}_some({elem_c} val) noexcept {{\n        return set_{method_name}({opt_ty}{{BAM_TRUE, val}});\n    }}\n    BamResult clear_{method_name}() noexcept {{\n        return (ptr_ != nullptr && vt_ != nullptr && vt_->clear_{sfx} != nullptr) ? vt_->clear_{sfx}(ptr_) : BAM_RESULT_NULL_POINTER;\n    }}"
+                    );
+                }
+                DeclFieldKind::HostVec { elem_ty } => {
+                    let (elem_c, _) = map_type_name(elem_ty, "uint8_t", "u8");
+                    let slice_ty = slice_typedef_name(vt_name, sfx);
+                    let ops_name = format!("{vt_name}_{sfx}_VecOps");
+                    let const_ops_name = format!("{vt_name}_{sfx}_ConstVecOps");
+                    let _ = writeln!(
+                        cpp_vec_ops_decls,
+                        "struct {const_ops_name} {{\n    BamResult (*get)(const void*, {slice_ty}*) = nullptr;\n    size_t (*len)(const void*) = nullptr;\n    static {const_ops_name} from_vtable(const {vt_name}* vt) noexcept {{\n        if (vt == nullptr) return {const_ops_name}{{}};\n        return {const_ops_name}{{vt->get_{sfx}, vt->len_{sfx}}};\n    }}\n}};\nstruct {ops_name} {{\n    BamResult (*get)(const void*, {slice_ty}*) = nullptr;\n    BamResult (*set)(void*, const {slice_ty}*) = nullptr;\n    size_t (*len)(const void*) = nullptr;\n    BamResult (*clear)(void*) = nullptr;\n    BamResult (*push)(void*, {elem_c}) = nullptr;\n    BamBool (*pop)(void*, {elem_c}*) = nullptr;\n    BamResult (*remove)(void*, size_t, {elem_c}*) = nullptr;\n    BamResult (*swap_remove)(void*, size_t, {elem_c}*) = nullptr;\n    BamResult (*truncate)(void*, size_t) = nullptr;\n    BamResult (*reserve)(void*, size_t) = nullptr;\n    {elem_c}* (*as_mut_slice)(void*, size_t*) = nullptr;\n    bool valid() const noexcept {{\n        return get != nullptr && set != nullptr && len != nullptr && clear != nullptr &&\n               push != nullptr && pop != nullptr && remove != nullptr && swap_remove != nullptr &&\n               truncate != nullptr && reserve != nullptr && as_mut_slice != nullptr;\n    }}\n    static {ops_name} from_vtable(const {vt_name}* vt) noexcept {{\n        if (vt == nullptr) return {ops_name}{{}};\n        return {ops_name}{{\n            vt->get_{sfx}, vt->set_{sfx}, vt->len_{sfx}, vt->clear_{sfx},\n            vt->push_{sfx}, vt->pop_{sfx}, vt->remove_{sfx}, vt->swap_remove_{sfx},\n            vt->truncate_{sfx}, vt->reserve_{sfx}, vt->as_mut_slice_{sfx}\n        }};\n    }}\n}};\nusing {vt_name}_{sfx}_ConstVecView = bam::ConstHostVecView<{elem_c}, {slice_ty}, {const_ops_name}>;\nusing {vt_name}_{sfx}_VecView = bam::HostVecView<{elem_c}, {slice_ty}, {ops_name}>;\n"
+                    );
+                    let _ = writeln!(
+                        cpp_const_methods,
+                        "    {vt_name}_{sfx}_ConstVecView {method_name}() const noexcept {{\n        return {vt_name}_{sfx}_ConstVecView(ptr_, {const_ops_name}::from_vtable(vt_));\n    }}"
+                    );
+                    let _ = writeln!(
+                        cpp_mut_methods,
+                        "    {vt_name}_{sfx}_VecView {method_name}() noexcept {{\n        return {vt_name}_{sfx}_VecView(ptr_, {ops_name}::from_vtable(vt_));\n    }}\n    {vt_name}_{sfx}_ConstVecView {method_name}() const noexcept {{\n        return {vt_name}_{sfx}_ConstVecView(ptr_, {const_ops_name}::from_vtable(vt_));\n    }}"
+                    );
+                }
+                DeclFieldKind::Nested => {
+                    let _ = writeln!(
+                        cpp_const_methods,
+                        "    const void* ptr_{method_name}() const noexcept {{\n        return (ptr_ != nullptr && vt_ != nullptr && vt_->ptr_{sfx} != nullptr) ? vt_->ptr_{sfx}(ptr_) : nullptr;\n    }}"
+                    );
+                    let _ = writeln!(
+                        cpp_mut_methods,
+                        "    const void* ptr_{method_name}() const noexcept {{\n        return (ptr_ != nullptr && vt_ != nullptr && vt_->ptr_{sfx} != nullptr) ? vt_->ptr_{sfx}(ptr_) : nullptr;\n    }}\n    void* ptr_mut_{method_name}() noexcept {{\n        return (ptr_ != nullptr && vt_ != nullptr && vt_->ptr_mut_{sfx} != nullptr) ? vt_->ptr_mut_{sfx}(ptr_) : nullptr;\n    }}"
+                    );
+                }
             }
         }
     }
@@ -1155,67 +1237,69 @@ pub(crate) fn generate_decls(
         "class {struct_name}View {{\npublic:\n    {struct_name}View() noexcept = default;\n    {struct_name}View(void* ptr, const {vt_name}* vt) noexcept : ptr_(ptr), vt_(vt) {{}}\n    bool valid() const noexcept {{ return ptr_ != nullptr && vt_ != nullptr; }}\n    explicit operator bool() const noexcept {{ return valid(); }}\n    void* raw() const noexcept {{ return ptr_; }}\n    const {vt_name}* vtable() const noexcept {{ return vt_; }}\n    {struct_name}ConstView as_const() const noexcept {{ return {struct_name}ConstView(ptr_, vt_); }}\n{cpp_mut_methods}private:\n    void* ptr_{{nullptr}};\n    const {vt_name}* vt_{{nullptr}};\n}};\n"
     );
     c_out.push_str("} // extern \"C++\"\n#endif /* __cplusplus */\n");
+}
 
-    // 6. Zig VTable + comptime View & HostVecView wrappers
-    zig_out.push_str(&format!("pub const {vt_name} = extern struct {{\n"));
-    zig_out.push_str("    header: bam.BamVTableHeader,\n");
-    for line in &zig_vt_lines {
-        zig_out.push_str(line);
-        zig_out.push('\n');
-    }
-    zig_out.push_str("};\n\n");
-
+/// Emits Zig View and `HostVecView` wrappers for a struct component.
+fn emit_struct_zig_views(
+    state: &CodegenState,
+    struct_name: &str,
+    vt_name: &str,
+    zig_out: &mut String,
+) {
     let mut zig_extra_types = String::new();
     let mut zig_view_methods = String::new();
 
-    for f in &state.decl_fields {
-        let sfx = &f.slot_suffix;
-        let method_name = &f.c_field_ident;
-        match &f.kind {
-            DeclFieldKind::Bool => {
-                let _ = writeln!(
-                    zig_view_methods,
-                    "    pub fn get_{method_name}(self: @This()) bool {{\n        const f = self.vt.get_{sfx} orelse return false;\n        return f(self.ptr) != bam.BAM_FALSE;\n    }}\n    pub fn set_{method_name}(self: @This(), val: bool) bam.BamResult {{\n        const f = self.vt.set_{sfx} orelse return bam.BAM_RESULT_NULL_POINTER;\n        return f(self.ptr, if (val) bam.BAM_TRUE else bam.BAM_FALSE);\n    }}"
-                );
-            }
-            DeclFieldKind::Primitive => {
-                let (_, zig_ty) = map_type_name(&f.raw_ty, "uintptr_t", "usize");
-                let _ = writeln!(
-                    zig_view_methods,
-                    "    pub fn get_{method_name}(self: @This()) {zig_ty} {{\n        const f = self.vt.get_{sfx} orelse return std.mem.zeroes({zig_ty});\n        return f(self.ptr);\n    }}\n    pub fn set_{method_name}(self: @This(), val: {zig_ty}) bam.BamResult {{\n        const f = self.vt.set_{sfx} orelse return bam.BAM_RESULT_NULL_POINTER;\n        return f(self.ptr, val);\n    }}"
-                );
-            }
-            DeclFieldKind::HostString => {
-                let _ = writeln!(
-                    zig_view_methods,
-                    "    pub fn get_{method_name}(self: @This()) []const u8 {{\n        const f = self.vt.get_{sfx} orelse return &[_]u8{{}};\n        const v = f(self.ptr);\n        const p = v.ptr orelse return &[_]u8{{}};\n        return p[0..v.len];\n    }}\n    pub fn set_{method_name}(self: @This(), text: []const u8) bam.BamResult {{\n        const f = self.vt.set_{sfx} orelse return bam.BAM_RESULT_NULL_POINTER;\n        return f(self.ptr, .{{ .ptr = if (text.len == 0) null else text.ptr, .len = text.len }});\n    }}"
-                );
-            }
-            DeclFieldKind::FfiOption { .. } => {
-                let opt_ty = option_typedef_name(&struct_name, sfx);
-                let _ = writeln!(
-                    zig_view_methods,
-                    "    pub fn get_{method_name}(self: @This()) {opt_ty} {{\n        const f = self.vt.get_{sfx} orelse return std.mem.zeroes({opt_ty});\n        return f(self.ptr);\n    }}\n    pub fn set_{method_name}(self: @This(), val: {opt_ty}) bam.BamResult {{\n        const f = self.vt.set_{sfx} orelse return bam.BAM_RESULT_NULL_POINTER;\n        return f(self.ptr, val);\n    }}\n    pub fn clear_{method_name}(self: @This()) bam.BamResult {{\n        const f = self.vt.clear_{sfx} orelse return bam.BAM_RESULT_NULL_POINTER;\n        return f(self.ptr);\n    }}"
-                );
-            }
-            DeclFieldKind::HostVec { elem_ty } => {
-                let (_, elem_zig) = map_type_name(elem_ty, "uint8_t", "u8");
-                let slice_ty = slice_typedef_name(&vt_name, sfx);
-                let vec_view_name = format!("{vt_name}_{sfx}_VecView");
-                let _ = writeln!(
-                    zig_extra_types,
-                    "pub const {vec_view_name} = struct {{\n    ptr: *anyopaque,\n    vt: *const {vt_name},\n\n    pub fn len(self: @This()) usize {{\n        const f = self.vt.len_{sfx} orelse return 0;\n        return f(self.ptr);\n    }}\n    pub fn isEmpty(self: @This()) bool {{\n        return self.len() == 0;\n    }}\n    pub fn slice(self: @This()) []const {elem_zig} {{\n        const f = self.vt.get_{sfx} orelse return &[_]{elem_zig}{{}};\n        const s = f(self.ptr);\n        const p = s.ptr orelse return &[_]{elem_zig}{{}};\n        return p[0..s.len];\n    }}\n    pub fn mutSlice(self: @This()) []{elem_zig} {{\n        const f = self.vt.as_mut_slice_{sfx} orelse return &[_]{elem_zig}{{}};\n        var n: usize = 0;\n        const p = f(self.ptr, &n) orelse return &[_]{elem_zig}{{}};\n        return p[0..n];\n    }}\n    pub fn set(self: @This(), items: []const {elem_zig}) bam.BamResult {{\n        const f = self.vt.set_{sfx} orelse return bam.BAM_RESULT_NULL_POINTER;\n        return f(self.ptr, {slice_ty}{{ .ptr = if (items.len == 0) null else items.ptr, .len = items.len }});\n    }}\n    pub fn clear(self: @This()) bam.BamResult {{\n        const f = self.vt.clear_{sfx} orelse return bam.BAM_RESULT_NULL_POINTER;\n        return f(self.ptr);\n    }}\n    pub fn push(self: @This(), val: {elem_zig}) bam.BamResult {{\n        const f = self.vt.push_{sfx} orelse return bam.BAM_RESULT_NULL_POINTER;\n        return f(self.ptr, val);\n    }}\n    pub fn pop(self: @This(), out_elem: *{elem_zig}) bool {{\n        const f = self.vt.pop_{sfx} orelse return false;\n        return f(self.ptr, out_elem) != bam.BAM_FALSE;\n    }}\n    pub fn remove(self: @This(), index: usize, out_elem: *{elem_zig}) bam.BamResult {{\n        const f = self.vt.remove_{sfx} orelse return bam.BAM_RESULT_NULL_POINTER;\n        return f(self.ptr, index, out_elem);\n    }}\n    pub fn swapRemove(self: @This(), index: usize, out_elem: *{elem_zig}) bam.BamResult {{\n        const f = self.vt.swap_remove_{sfx} orelse return bam.BAM_RESULT_NULL_POINTER;\n        return f(self.ptr, index, out_elem);\n    }}\n    pub fn truncate(self: @This(), new_len: usize) bam.BamResult {{\n        const f = self.vt.truncate_{sfx} orelse return bam.BAM_RESULT_NULL_POINTER;\n        return f(self.ptr, new_len);\n    }}\n    pub fn reserve(self: @This(), additional: usize) bam.BamResult {{\n        const f = self.vt.reserve_{sfx} orelse return bam.BAM_RESULT_NULL_POINTER;\n        return f(self.ptr, additional);\n    }}\n}};\n"
-                );
-                let _ = writeln!(
-                    zig_view_methods,
-                    "    pub fn {method_name}(self: @This()) {vec_view_name} {{\n        return .{{ .ptr = self.ptr, .vt = self.vt }};\n    }}"
-                );
-            }
-            DeclFieldKind::Nested => {
-                let _ = writeln!(
-                    zig_view_methods,
-                    "    pub fn ptr_{method_name}(self: @This()) ?*const anyopaque {{\n        const f = self.vt.ptr_{sfx} orelse return null;\n        return f(self.ptr);\n    }}\n    pub fn ptr_mut_{method_name}(self: @This()) ?*anyopaque {{\n        const f = self.vt.ptr_mut_{sfx} orelse return null;\n        return f(self.ptr);\n    }}"
-                );
+    if !state.pod_only {
+        for f in &state.decl_fields {
+            let sfx = &f.slot_suffix;
+            let method_name = &f.c_field_ident;
+            match &f.kind {
+                DeclFieldKind::Pad => {}
+                DeclFieldKind::Bool => {
+                    let _ = writeln!(
+                        zig_view_methods,
+                        "    pub fn get_{method_name}(self: @This()) bool {{\n        const f = self.vt.get_{sfx} orelse return false;\n        return f(self.ptr) != bam.BAM_FALSE;\n    }}\n    pub fn set_{method_name}(self: @This(), val: bool) bam.BamResult {{\n        const f = self.vt.set_{sfx} orelse return bam.BAM_RESULT_NULL_POINTER;\n        return f(self.ptr, if (val) bam.BAM_TRUE else bam.BAM_FALSE);\n    }}"
+                    );
+                }
+                DeclFieldKind::Primitive => {
+                    let (_, zig_ty) = map_type_name(&f.raw_ty, "uintptr_t", "usize");
+                    let _ = writeln!(
+                        zig_view_methods,
+                        "    pub fn get_{method_name}(self: @This()) {zig_ty} {{\n        const f = self.vt.get_{sfx} orelse return std.mem.zeroes({zig_ty});\n        return f(self.ptr);\n    }}\n    pub fn set_{method_name}(self: @This(), val: {zig_ty}) bam.BamResult {{\n        const f = self.vt.set_{sfx} orelse return bam.BAM_RESULT_NULL_POINTER;\n        return f(self.ptr, val);\n    }}"
+                    );
+                }
+                DeclFieldKind::HostString => {
+                    let _ = writeln!(
+                        zig_view_methods,
+                        "    pub fn get_{method_name}(self: @This()) []const u8 {{\n        const f = self.vt.get_{sfx} orelse return &[_]u8{{}};\n        var v: bam.BamStrView = .{{ .ptr = null, .len = 0 }};\n        if (f(self.ptr, &v) != bam.BAM_RESULT_OK) return &[_]u8{{}};\n        const p = v.ptr orelse return &[_]u8{{}};\n        return p[0..v.len];\n    }}\n    pub fn set_{method_name}(self: @This(), text: []const u8) bam.BamResult {{\n        const f = self.vt.set_{sfx} orelse return bam.BAM_RESULT_NULL_POINTER;\n        const v = bam.BamStrView{{ .ptr = if (text.len == 0) null else text.ptr, .len = text.len }};\n        return f(self.ptr, &v);\n    }}"
+                    );
+                }
+                DeclFieldKind::FfiOption { .. } => {
+                    let opt_ty = option_typedef_name(struct_name, sfx);
+                    let _ = writeln!(
+                        zig_view_methods,
+                        "    pub fn get_{method_name}(self: @This()) {opt_ty} {{\n        const f = self.vt.get_{sfx} orelse return std.mem.zeroes({opt_ty});\n        return f(self.ptr);\n    }}\n    pub fn set_{method_name}(self: @This(), val: {opt_ty}) bam.BamResult {{\n        const f = self.vt.set_{sfx} orelse return bam.BAM_RESULT_NULL_POINTER;\n        return f(self.ptr, val);\n    }}\n    pub fn clear_{method_name}(self: @This()) bam.BamResult {{\n        const f = self.vt.clear_{sfx} orelse return bam.BAM_RESULT_NULL_POINTER;\n        return f(self.ptr);\n    }}"
+                    );
+                }
+                DeclFieldKind::HostVec { elem_ty } => {
+                    let (_, elem_zig) = map_type_name(elem_ty, "uint8_t", "u8");
+                    let slice_ty = slice_typedef_name(vt_name, sfx);
+                    let vec_view_name = format!("{vt_name}_{sfx}_VecView");
+                    let _ = writeln!(
+                        zig_extra_types,
+                        "pub const {vec_view_name} = struct {{\n    ptr: *anyopaque,\n    vt: *const {vt_name},\n\n    pub fn len(self: @This()) usize {{\n        const f = self.vt.len_{sfx} orelse return 0;\n        return f(self.ptr);\n    }}\n    pub fn isEmpty(self: @This()) bool {{\n        return self.len() == 0;\n    }}\n    pub fn slice(self: @This()) []const {elem_zig} {{\n        const f = self.vt.get_{sfx} orelse return &[_]{elem_zig}{{}};\n        var s: {slice_ty} = .{{ .ptr = null, .len = 0 }};\n        if (f(self.ptr, &s) != bam.BAM_RESULT_OK) return &[_]{elem_zig}{{}};\n        const p = s.ptr orelse return &[_]{elem_zig}{{}};\n        return p[0..s.len];\n    }}\n    pub fn mutSlice(self: @This()) []{elem_zig} {{\n        const f = self.vt.as_mut_slice_{sfx} orelse return &[_]{elem_zig}{{}};\n        var n: usize = 0;\n        const p = f(self.ptr, &n) orelse return &[_]{elem_zig}{{}};\n        return p[0..n];\n    }}\n    pub fn set(self: @This(), items: []const {elem_zig}) bam.BamResult {{\n        const f = self.vt.set_{sfx} orelse return bam.BAM_RESULT_NULL_POINTER;\n        const s = {slice_ty}{{ .ptr = if (items.len == 0) null else items.ptr, .len = items.len }};\n        return f(self.ptr, &s);\n    }}\n    pub fn clear(self: @This()) bam.BamResult {{\n        const f = self.vt.clear_{sfx} orelse return bam.BAM_RESULT_NULL_POINTER;\n        return f(self.ptr);\n    }}\n    pub fn push(self: @This(), val: {elem_zig}) bam.BamResult {{\n        const f = self.vt.push_{sfx} orelse return bam.BAM_RESULT_NULL_POINTER;\n        return f(self.ptr, val);\n    }}\n    pub fn pop(self: @This(), out_elem: *{elem_zig}) bool {{\n        const f = self.vt.pop_{sfx} orelse return false;\n        return f(self.ptr, out_elem) != bam.BAM_FALSE;\n    }}\n    pub fn remove(self: @This(), index: usize, out_elem: *{elem_zig}) bam.BamResult {{\n        const f = self.vt.remove_{sfx} orelse return bam.BAM_RESULT_NULL_POINTER;\n        return f(self.ptr, index, out_elem);\n    }}\n    pub fn swapRemove(self: @This(), index: usize, out_elem: *{elem_zig}) bam.BamResult {{\n        const f = self.vt.swap_remove_{sfx} orelse return bam.BAM_RESULT_NULL_POINTER;\n        return f(self.ptr, index, out_elem);\n    }}\n    pub fn truncate(self: @This(), new_len: usize) bam.BamResult {{\n        const f = self.vt.truncate_{sfx} orelse return bam.BAM_RESULT_NULL_POINTER;\n        return f(self.ptr, new_len);\n    }}\n    pub fn reserve(self: @This(), additional: usize) bam.BamResult {{\n        const f = self.vt.reserve_{sfx} orelse return bam.BAM_RESULT_NULL_POINTER;\n        return f(self.ptr, additional);\n    }}\n}};\n"
+                    );
+                    let _ = writeln!(
+                        zig_view_methods,
+                        "    pub fn {method_name}(self: @This()) {vec_view_name} {{\n        return .{{ .ptr = self.ptr, .vt = self.vt }};\n    }}"
+                    );
+                }
+                DeclFieldKind::Nested => {
+                    let _ = writeln!(
+                        zig_view_methods,
+                        "    pub fn ptr_{method_name}(self: @This()) ?*const anyopaque {{\n        const f = self.vt.ptr_{sfx} orelse return null;\n        return f(self.ptr);\n    }}\n    pub fn ptr_mut_{method_name}(self: @This()) ?*anyopaque {{\n        const f = self.vt.ptr_mut_{sfx} orelse return null;\n        return f(self.ptr);\n    }}"
+                    );
+                }
             }
         }
     }
@@ -1225,6 +1309,33 @@ pub(crate) fn generate_decls(
         zig_out,
         "pub const {struct_name}View = struct {{\n    ptr: *anyopaque,\n    vt: *const {vt_name},\n\n    comptime {{\n        if (@offsetOf({vt_name}, \"header\") != 0) @compileError(\"{vt_name} header must be at offset 0\");\n    }}\n\n    pub fn resolveVTable(\n        api: *const bam.BamHostApi,\n        host_ctx: ?*const bam.BamHostCtx,\n        symbol: [*:0]const u8,\n    ) !*const {vt_name} {{\n        const get_proc = api.get_proc_address orelse return error.NullPointer;\n        const raw = get_proc(host_ctx, symbol) orelse return error.NotFound;\n        const hdr: *const bam.BamVTableHeader = @ptrCast(@alignCast(raw));\n        if (hdr.struct_size < @sizeOf({vt_name}) or bam.bam_version_is_compatible(bam.BAM_ABI_VERSION, hdr.abi_version) == bam.BAM_FALSE) {{\n            return error.InvalidVersion;\n        }}\n        return @ptrCast(@alignCast(raw));\n    }}\n\n    pub fn init(ptr: *anyopaque, vt: *const {vt_name}) @This() {{\n        return .{{ .ptr = ptr, .vt = vt }};\n    }}\n\n{zig_view_methods}}};\n"
     );
+}
+
+/// Builds `(c_decl_string, zig_decl_string)` for a `#[derive(ModComponent)]` struct or enum.
+pub(crate) fn generate_decls(
+    state: &CodegenState,
+    vtable_ident: &Ident,
+    is_abi_pod: bool,
+) -> (String, String) {
+    if let Some(ref enum_info) = state.decl_enum {
+        return generate_enum_decls(state, enum_info, vtable_ident);
+    }
+
+    let struct_name = state.struct_ident.to_string();
+    let vt_name = vtable_ident.to_string();
+    let mut c_out = String::new();
+    let mut zig_out = String::new();
+
+    emit_struct_vtable_decls(
+        state,
+        &struct_name,
+        &vt_name,
+        is_abi_pod,
+        &mut c_out,
+        &mut zig_out,
+    );
+    emit_struct_cpp_views(state, &struct_name, &vt_name, &mut c_out);
+    emit_struct_zig_views(state, &struct_name, &vt_name, &mut zig_out);
 
     (c_out, zig_out)
 }

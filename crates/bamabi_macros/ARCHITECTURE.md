@@ -141,7 +141,7 @@ If a user defines a local `struct String;` without `#[mod_field(nested)]`, `clas
 
 ### `#[derive(GuestComponent)]` (`guest_component.rs`)
 1. Rejects generics, enums/unions, `#[repr(packed)]`, and structs lacking `#[repr(C)]` / `#[repr(transparent)]`.
-2. Computes `NAME` (`LitCStr`), `FIELD_SCHEMA_HASH` (chaining `ComponentUuid::hash_field_schema` over `(field_name, canonical_field_type_tag, offset_of!)`, or `0u64` with `no_schema_hash`), bitmask `FLAGS`, and optional `UUID` (`parse_hex`).
+2. Computes `NAME` (`LitCStr`), `FIELD_SCHEMA_HASH` (chaining `ComponentUuid::hash_field_schema` over `(field_name, canonical_field_type_tag, offset_of!)`, or `0u64` with `no_schema_hash`), bitmask `FLAGS`, and optional `UUID` (`from_bytes`).
 3. Emits **only** `impl #guest_crate::GuestComponent for #struct_ident` inside `const _: ()`—relying on `GuestComponent: AbiPod` so `#[derive(AbiPod, GuestComponent)]` enforces all POD checks with zero VTable/C-decl overhead.
 
 ### `#[derive(ModComponent)]` (`codegen/mod.rs`)
@@ -183,7 +183,7 @@ Enums always set `can_impl_raw_insertable = false` and `can_impl_abi_pod = false
 ### Identity, Fingerprinting & Reflection (`codegen/vtable.rs`)
 
 1. **`ComponentUuid` Parity (`ModComponent::UUID` vs. `GuestComponent::UUID`):**
-   - Explicit `uuid = "..."` → `ComponentUuid::parse_hex(hex)`.
+   - Explicit `uuid = "..."` → `ComponentUuid::from_bytes([ ... ])`.
    - `AbiPod` structs → `ComponentUuid::from_parts(CANONICAL_NAME, size_of::<Self>(), align_of::<Self>(), pod_schema_hash)`, where `pod_schema_hash` folds each non-skipped field via `ComponentUuid::hash_field_schema(h, field_name, type_tag, offset_of!(Self, field))`. This matches `#[derive(GuestComponent)]`'s `FIELD_SCHEMA_HASH` **bit-for-bit**, ensuring host and guest derive identical UUIDs.
    - Enums → `ComponentUuid::from_parts` hashing `"__enum_tag"`, each variant `(variant_name, "variant:<disc>")`, and each payload field `("<Var>::<field>", type_tag, field_idx)`.
    - Non-POD / opaque structs → `ComponentUuid::from_canonical_name(CANONICAL_NAME)` (`size = 0, align = 0, schema = 0`).

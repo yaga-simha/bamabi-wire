@@ -279,7 +279,8 @@ fn supports_enums_ffi_option_summary_tick_and_require() {
     assert!(ts_opt.contains("pub get_target :"));
     assert!(ts_opt.contains("pub set_target :"));
     assert!(ts_opt.contains("pub clear_target :"));
-    assert!(ts_opt.contains("IS_ABI_POD : bool = true"));
+    assert!(ts_opt.contains("IS_ABI_POD : bool = false"));
+    assert!(ts_opt.contains("IS_RAW_INSERTABLE : bool = true"));
 
     let bad_combo: DeriveInput = parse_quote! {
         #[mod_component(sparse_set, summary_tick)]
@@ -573,7 +574,9 @@ fn guest_component_derive_expansion_and_errors() {
     assert!(ts_custom.contains("c\"net::Tick\""));
     assert!(ts_custom.contains("FIELD_SCHEMA_HASH : u64 = 0u64"));
     assert!(ts_custom.contains("BAM_COMPONENT_FLAG_SPARSE_SET"));
-    assert!(ts_custom.contains("parse_hex (\"11111111-2222-3333-4444-555555555555\")"));
+    assert!(ts_custom.contains(
+        "from_bytes ([17u8 , 17u8 , 17u8 , 17u8 , 34u8 , 34u8 , 51u8 , 51u8 , 68u8 , 68u8 , 85u8 , 85u8 , 85u8 , 85u8 , 85u8 , 85u8])"
+    ));
 
     // Fallback to `#[mod_component(...)]` when `#[guest_component(...)]` is absent.
     let fallback: DeriveInput = parse_quote! {
@@ -721,4 +724,140 @@ fn abi_v03_handles_classify_as_primitives_and_emit_c_zig_types() {
     assert!(ts.contains("field_kind: bam.BamFieldKind,"));
     assert!(ts.contains("parent: bam.BamChildOf,"));
     assert!(ts.contains("asset: bam.BamAssetHandle,"));
+}
+
+#[test]
+fn mod_component_v04_attributes_and_pointer_safe_signatures() {
+    let input: DeriveInput = parse_quote! {
+        #[repr(C)]
+        #[mod_component(name = "game::PaddedPod", pod_only, schema_fingerprint = 0x1234_5678_9abc_def0)]
+        pub struct PaddedPod {
+            pub val: u32,
+            #[mod_field(pad)]
+            pub _pad0: [u8; 4],
+            pub asset: FfiAssetHandle,
+            pub child: FfiChildOf,
+            pub uuid: ComponentUuid,
+        }
+    };
+    let ts = expand_mod_component(&input).unwrap().to_string();
+    assert!(ts.contains("IS_ABI_POD : bool = true"));
+    assert!(ts.contains("1311768467463790320")); // 0x1234_5678_9abc_def0
+    assert!(ts.contains("BamFieldKind :: NESTED"));
+    assert!(!ts.contains("BamFieldKind :: UNKNOWN"));
+    assert!(!ts.contains("get__pad0"));
+    assert!(!ts.contains("set__pad0"));
+    assert!(!ts.contains("ptr__pad0"));
+
+    let str_vec_input: DeriveInput = parse_quote! {
+        #[mod_component(name = "game::StringsAndVecs")]
+        pub struct StringsAndVecs {
+            pub label: String,
+            pub nums: Vec<u32>,
+        }
+    };
+    let str_vec_ts = expand_mod_component(&str_vec_input).unwrap().to_string();
+    assert!(str_vec_ts.contains("* mut :: bamabi_sys :: StrView"));
+    assert!(str_vec_ts.contains("* const :: bamabi_sys :: StrView"));
+    assert!(str_vec_ts.contains("* mut :: bamabi_sys :: FfiSlice"));
+    assert!(str_vec_ts.contains("* const :: bamabi_sys :: FfiSlice"));
+
+    let bad_combo: DeriveInput = parse_quote! {
+        #[repr(C)]
+        #[mod_component(pod_only, opaque)]
+        pub struct BadCombo {
+            pub x: u32,
+        }
+    };
+    assert!(expand_mod_component(&bad_combo).is_err());
+}
+
+#[test]
+fn ffi_disabled_bam_row_range_bam_time_info_and_scalar_mapping_coverage() {
+    use crate::classify::{FieldKind, classify_type};
+    use crate::codegen::c_decl::map_scalar_type;
+
+    for &name in bamabi_schema::WIRE_TYPE_NAMES {
+        let spec = bamabi_schema::lookup_wire_type(name, bamabi_schema::TargetLayout::HOST)
+            .expect("WIRE_TYPE_NAMES entry must resolve");
+        if matches!(name, "bool" | "String" | "u128" | "i128") {
+            continue;
+        }
+        let ty: syn::Type = syn::parse_str(name).expect("wire type name must parse as syn::Type");
+        let kind = classify_type(&ty, crate::attrs::FieldAttrOverride::None)
+            .expect("wire type must classify");
+        if spec.size == 0 {
+            assert!(
+                matches!(kind, FieldKind::Nested { .. }),
+                "ZST wire type {name} must classify as Nested, not Primitive"
+            );
+        } else {
+            assert!(
+                matches!(kind, FieldKind::Primitive { .. }),
+                "non-ZST wire type {name} must classify as Primitive"
+            );
+            assert!(
+                map_scalar_type(&ty).is_some(),
+                "Primitive wire type {name} must have an explicit c_decl::map_scalar_type entry"
+            );
+        }
+    }
+
+    let zst_and_new_prims: DeriveInput = parse_quote! {
+        #[repr(C)]
+        #[mod_component(name = "game::V04WireFields")]
+        pub struct V04WireFields {
+            pub disabled: FfiDisabled,
+            pub range: BamRowRange,
+            pub time: BamTimeInfo,
+        }
+    };
+    let ts = expand_mod_component(&zst_and_new_prims)
+        .unwrap()
+        .to_string();
+    assert!(ts.contains("ptr_disabled"));
+    assert!(ts.contains("get_range"));
+    assert!(ts.contains("get_time"));
+    assert!(ts.contains("bam.BamRowRange"));
+    assert!(ts.contains("bam.BamTimeInfo"));
+    // Wire ZST field `FfiDisabled` is omitted from C99/Zig struct fields while preserving
+    // non-ZST fields (`BamRowRange`, `BamTimeInfo`).
+    assert!(ts.contains("typedef struct V04WireFields {"));
+    assert!(ts.contains("pub const V04WireFields = extern struct {"));
+    assert!(!ts.contains("    disabled:"));
+
+    let zst_only: DeriveInput = parse_quote! {
+        #[repr(C)]
+        #[mod_component(name = "game::OnlyDisabled")]
+        pub struct OnlyDisabled {
+            pub disabled: FfiDisabled,
+        }
+    };
+    let ts_only = expand_mod_component(&zst_only).unwrap().to_string();
+    assert!(ts_only.contains("typedef struct OnlyDisabled OnlyDisabled;"));
+    assert!(ts_only.contains("pub const OnlyDisabled = opaque {};"));
+}
+
+#[test]
+fn separate_derive_forwards_and_overrides_schema_fingerprint() {
+    let forwarded: DeriveInput = parse_quote! {
+        #[repr(C)]
+        #[derive(ModComponent, GuestComponent)]
+        #[mod_component(namespace = "probe", schema_fingerprint = 9876543210)]
+        pub struct ForwardedFp {
+            pub x: f32,
+        }
+    };
+    let ts_fwd = expand_guest_component(&forwarded).unwrap().to_string();
+    assert!(ts_fwd.contains("9876543210u64"));
+
+    let direct: DeriveInput = parse_quote! {
+        #[repr(C)]
+        #[guest_component(namespace = "probe", schema_fingerprint = 16045690984833335023)]
+        pub struct DirectFp {
+            pub x: f32,
+        }
+    };
+    let ts_dir = expand_guest_component(&direct).unwrap().to_string();
+    assert!(ts_dir.contains("16045690984833335023u64"));
 }

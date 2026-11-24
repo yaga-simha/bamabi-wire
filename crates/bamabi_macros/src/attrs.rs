@@ -35,6 +35,11 @@ pub(crate) struct ComponentAttrs {
     pub(crate) export_symbols: bool,
     /// Explicit opt-out of `AbiPod` auto-implementation on `#[repr(C)]` structs (`#[mod_component(no_pod)]`).
     pub(crate) no_pod: bool,
+    /// Explicit opt-in to POD-only component mode (`#[mod_component(pod_only)]`) emitting metadata and
+    /// `VTableHeader`-only VTables without per-field accessor slots.
+    pub(crate) pod_only: bool,
+    /// Explicit `u64` override for `ModComponent::SCHEMA_FINGERPRINT` (`#[mod_component(schema_fingerprint = ...)]`).
+    pub(crate) custom_schema_fingerprint: Option<u64>,
     /// Explicit opt-out of both `RawInsertable` and `AbiPod` (`#[mod_component(opaque)]`).
     pub(crate) opaque: bool,
     /// Sets `BAM_COMPONENT_FLAG_SPARSE_SET` on `ModComponent::COMPONENT_FLAGS`.
@@ -218,7 +223,7 @@ fn parse_crate_path_value(meta: &syn::meta::ParseNestedMeta<'_>) -> syn::Result<
 }
 
 /// Validates a UUID hex string against the exact 36-char hyphenated `"8-4-4-4-12"` or 32-char
-/// contiguous format accepted by `bamabi_sys::ComponentUuid::parse_hex`.
+/// contiguous format accepted by `bamabi_sys::ComponentUuid::try_parse_hex`.
 pub(crate) fn is_valid_uuid_hex(hex: &str) -> bool {
     let src = hex.as_bytes();
     let hyphenated = match src.len() {
@@ -294,6 +299,7 @@ pub(crate) struct GuestComponentAttrs {
     pub(crate) custom_name: Option<String>,
     pub(crate) custom_namespace: Option<String>,
     pub(crate) custom_uuid: Option<String>,
+    pub(crate) custom_schema_fingerprint: Option<u64>,
     pub(crate) no_schema_hash: bool,
     pub(crate) sparse_set: bool,
     pub(crate) immutable: bool,
@@ -314,6 +320,8 @@ pub(crate) fn parse_component_attrs(input: &DeriveInput) -> syn::Result<Componen
         emit_guest: false,
         export_symbols: false,
         no_pod: false,
+        pod_only: false,
+        custom_schema_fingerprint: None,
         opaque: false,
         sparse_set: false,
         immutable: false,
@@ -362,6 +370,15 @@ pub(crate) fn parse_component_attrs(input: &DeriveInput) -> syn::Result<Componen
             } else if meta.path.is_ident("no_pod") {
                 attrs.no_pod = true;
                 Ok(())
+            } else if meta.path.is_ident("pod_only") {
+                attrs.pod_only = true;
+                Ok(())
+            } else if meta.path.is_ident("schema_fingerprint") {
+                let value = meta.value()?;
+                let lit: syn::LitInt = value.parse()?;
+                let fp = lit.base10_parse::<u64>()?;
+                attrs.custom_schema_fingerprint = Some(fp);
+                Ok(())
             } else if meta.path.is_ident("opaque") {
                 attrs.no_pod = true;
                 attrs.opaque = true;
@@ -408,10 +425,17 @@ pub(crate) fn parse_component_attrs(input: &DeriveInput) -> syn::Result<Componen
                 Ok(())
             } else {
                 Err(meta.error(
-                    "unsupported `#[mod_component(...)]` attribute; expected `name = \"...\"`, `namespace = \"...\"`, `uuid = \"...\"`, `prefix = \"...\"`, `crate = ...`, `guest`, `guest_crate = ...`, `export_symbols`, `no_pod`, `opaque`, `sparse_set`, `immutable`, `summary_tick`, or `require(...)`",
+                    "unsupported `#[mod_component(...)]` attribute; expected `name = \"...\"`, `namespace = \"...\"`, `uuid = \"...\"`, `prefix = \"...\"`, `crate = ...`, `guest`, `guest_crate = ...`, `export_symbols`, `no_pod`, `pod_only`, `schema_fingerprint = ...`, `opaque`, `sparse_set`, `immutable`, `summary_tick`, or `require(...)`",
                 ))
             }
         })?;
+    }
+
+    if attrs.pod_only && (attrs.opaque || attrs.no_pod) {
+        return Err(syn::Error::new_spanned(
+            &input.ident,
+            "cannot combine `#[mod_component(pod_only)]` with `opaque` or `no_pod`",
+        ));
     }
 
     if attrs.sparse_set && attrs.summary_tick {
@@ -442,6 +466,7 @@ pub(crate) fn parse_guest_component_attrs(input: &DeriveInput) -> syn::Result<Gu
         custom_name: None,
         custom_namespace: None,
         custom_uuid: None,
+        custom_schema_fingerprint: None,
         no_schema_hash: false,
         sparse_set: false,
         immutable: false,
@@ -473,6 +498,12 @@ pub(crate) fn parse_guest_component_attrs(input: &DeriveInput) -> syn::Result<Gu
                 let lit: LitStr = value.parse()?;
                 attrs.custom_uuid = Some(validate_uuid_lit(&lit, "guest_component")?);
                 Ok(())
+            } else if meta.path.is_ident("schema_fingerprint") {
+                let value = meta.value()?;
+                let lit: syn::LitInt = value.parse()?;
+                let fp = lit.base10_parse::<u64>()?;
+                attrs.custom_schema_fingerprint = Some(fp);
+                Ok(())
             } else if meta.path.is_ident("no_schema_hash") {
                 attrs.no_schema_hash = true;
                 Ok(())
@@ -493,7 +524,7 @@ pub(crate) fn parse_guest_component_attrs(input: &DeriveInput) -> syn::Result<Gu
                 Ok(())
             } else {
                 Err(meta.error(
-                    "unsupported `#[guest_component(...)]` attribute; expected `name = \"...\"`, `namespace = \"...\"`, `uuid = \"...\"`, `no_schema_hash`, `sparse_set`, `immutable`, `summary_tick`, `crate = ...`, or `guest_crate = ...`",
+                    "unsupported `#[guest_component(...)]` attribute; expected `name = \"...\"`, `namespace = \"...\"`, `uuid = \"...\"`, `schema_fingerprint = ...`, `no_schema_hash`, `sparse_set`, `immutable`, `summary_tick`, `crate = ...`, or `guest_crate = ...`",
                 ))
             }
         })?;
@@ -509,6 +540,7 @@ pub(crate) fn parse_guest_component_attrs(input: &DeriveInput) -> syn::Result<Gu
             attrs.custom_name = mod_attrs.custom_name;
             attrs.custom_namespace = mod_attrs.custom_namespace;
             attrs.custom_uuid = mod_attrs.custom_uuid;
+            attrs.custom_schema_fingerprint = mod_attrs.custom_schema_fingerprint;
             attrs.sparse_set = mod_attrs.sparse_set;
             attrs.immutable = mod_attrs.immutable;
             attrs.summary_tick = mod_attrs.summary_tick;
@@ -521,6 +553,9 @@ pub(crate) fn parse_guest_component_attrs(input: &DeriveInput) -> syn::Result<Gu
             }
             if attrs.custom_uuid.is_none() {
                 attrs.custom_uuid = mod_attrs.custom_uuid;
+            }
+            if attrs.custom_schema_fingerprint.is_none() {
+                attrs.custom_schema_fingerprint = mod_attrs.custom_schema_fingerprint;
             }
             if attrs.crate_override.is_none() {
                 attrs.crate_override = mod_attrs.crate_override;
@@ -697,6 +732,7 @@ where
 pub(crate) enum FieldAttrOverride {
     None,
     Skip,
+    Pad,
     Bool,
     Primitive,
     HostString,
@@ -715,6 +751,9 @@ pub(crate) fn parse_field_attr(attrs: &[Attribute]) -> syn::Result<FieldAttrOver
         attr.parse_nested_meta(|meta| {
             if meta.path.is_ident("skip") {
                 result = FieldAttrOverride::Skip;
+                Ok(())
+            } else if meta.path.is_ident("pad") {
+                result = FieldAttrOverride::Pad;
                 Ok(())
             } else if meta.path.is_ident("bool") {
                 result = FieldAttrOverride::Bool;
@@ -750,7 +789,7 @@ pub(crate) fn parse_field_attr(attrs: &[Attribute]) -> syn::Result<FieldAttrOver
                 Ok(())
             } else {
                 Err(meta.error(
-                    "unsupported `#[mod_field(...)]` attribute; expected `skip`, `bool`, `primitive`, `string`, `vec`, `vec(ElemTy)`, `option`, `option(InnerTy)`, or `nested`",
+                    "unsupported `#[mod_field(...)]` attribute; expected `skip`, `pad`, `bool`, `primitive`, `string`, `vec`, `vec(ElemTy)`, `option`, `option(InnerTy)`, or `nested`",
                 ))
             }
         })?;

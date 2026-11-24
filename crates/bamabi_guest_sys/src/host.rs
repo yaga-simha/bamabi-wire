@@ -4,9 +4,9 @@
 use core::ffi::{CStr, c_void};
 
 use bamabi_sys::{
-    ABI_VERSION, AbiPod, BamComponent, BamEventKind, BamHostApi, BamHostCtx, BamLayoutInfo,
-    BamLoadCtx, BamRelationDesc, BamRowMigrateFn, BamScheduleSetDesc, BamSymbol, BamSystem,
-    BamSystemSet, ComponentDesc, ComponentUuid, FfiAssetHandle, FfiAssetLoadState, FfiEntity,
+    ABI_VERSION, AbiPod, BamComponent, BamHostApi, BamHostCtx, BamLayoutInfo, BamLoadCtx,
+    BamRelationDesc, BamRowMigrateFn, BamScheduleSetDesc, BamSymbol, BamSystem, BamSystemSet,
+    BamTermDesc, ComponentDesc, ComponentUuid, FfiAssetHandle, FfiAssetLoadState, FfiEntity,
     FfiResult, MappedStringVTable, MappedWireVTable, ModComponent, ScheduleId, StrView,
     VTableHeader, read_descriptor,
 };
@@ -15,16 +15,19 @@ use crate::{
     component::{
         PodComponentHooks, migrate_component_column_pod, migrate_component_column_raw,
         migrate_mod_component_column, migrate_pod_component_column, register_component_with_layout,
-        register_pod_component, register_pod_component_with_hooks, register_relation,
-        register_relation_raw,
+        register_message_raw, register_pod_component, register_pod_component_with_hooks,
+        register_pod_message, register_pod_resource, register_relation, register_relation_raw,
+        register_resource_raw,
     },
     instance::{GuestInstance, RuntimeAllocTracker},
     trampoline::{
-        ObserverCtxRegistrationConfig, PreparedRunIf, SystemRegistrationConfig,
-        ValidatedSystemInvocation, ValidatedSystemSlice, configure_schedule_set,
-        configure_schedule_set_raw, mount_system_in_schedule, register_lifecycle_observer_closure,
-        register_observer_closure, register_observer_closure_with_options,
-        register_observer_closure_with_watched, register_observer_ctx_slice_closure,
+        ObserverCtxRegistrationConfig, PreparedRunIf, ScheduleSetConfig, SystemRegistrationConfig,
+        ValidatedSystemInvocation, ValidatedSystemSlice, allocate_run_if_ctx_query,
+        allocate_run_if_ctx_trampoline, configure_schedule_set, configure_schedule_set_raw,
+        configure_schedule_set_with_parents, mount_system_in_schedule,
+        register_lifecycle_observer_closure, register_observer_closure,
+        register_observer_closure_with_options, register_observer_closure_with_watched,
+        register_observer_ctx_mut_slice_closure, register_observer_ctx_slice_closure,
         register_observer_mut_closure, register_observer_mut_closure_with_watched,
         register_system_closure, register_system_handle_closure,
         register_system_handle_slice_closure, register_system_slice_closure,
@@ -566,16 +569,10 @@ impl Host {
         }
         let load_fn = host_slot!(&self.api, asset_load).ok_or(FfiResult::UNSUPPORTED)?;
         let mut out = FfiAssetHandle::NONE;
-        // SAFETY: `self.host_ctx.0` is an active `BamHostCtx`, `StrView::from_str(path)` borrows
-        // valid UTF-8 for this call, and `out` is aligned writable stack storage.
-        let status = unsafe {
-            load_fn(
-                self.host_ctx.0,
-                asset_type,
-                StrView::from_str(path),
-                &mut out,
-            )
-        };
+        let path_view = StrView::from_str(path);
+        // SAFETY: `self.host_ctx.0` is an active `BamHostCtx`, `path_view` borrows valid UTF-8
+        // for this synchronous call, and `out` is aligned writable stack storage.
+        let status = unsafe { load_fn(self.host_ctx.0, asset_type, &path_view, &mut out) };
         if status.is_ok() { Ok(out) } else { Err(status) }
     }
 
@@ -630,9 +627,10 @@ impl Host {
         let Some(log_fn) = host_slot!(api, log_diagnostic) else {
             return FfiResult::UNSUPPORTED;
         };
-        // SAFETY: `host_ctx` is a valid active `BamHostCtx`, and `StrView::from_str(message)`
-        // borrows valid UTF-8 bytes for the synchronous duration of this call.
-        unsafe { log_fn(host_ctx, level, StrView::from_str(message)) }
+        let msg_view = StrView::from_str(message);
+        // SAFETY: `host_ctx` is a valid active `BamHostCtx`, and `msg_view` borrows valid UTF-8
+        // bytes for the synchronous duration of this call.
+        unsafe { log_fn(host_ctx, level, &msg_view) }
     }
 
     /// Emits a structured guest diagnostic message via `BamHostApi::log_diagnostic` (slot 50)
@@ -659,9 +657,10 @@ impl Host {
         let Some(fault_fn) = host_slot!(api, report_guest_fault) else {
             return FfiResult::UNSUPPORTED;
         };
-        // SAFETY: `host_ctx` is a valid active `BamHostCtx`, and `StrView::from_str(message)`
-        // borrows valid UTF-8 bytes for the synchronous duration of this call.
-        unsafe { fault_fn(host_ctx, StrView::from_str(message)) }
+        let msg_view = StrView::from_str(message);
+        // SAFETY: `host_ctx` is a valid active `BamHostCtx`, and `msg_view` borrows valid UTF-8
+        // bytes for the synchronous duration of this call.
+        unsafe { fault_fn(host_ctx, &msg_view) }
     }
 
     /// Records a guest-reported fault message on this world's host context via
@@ -766,9 +765,10 @@ impl Host {
         }
         let intern_fn = host_slot!(api, intern_symbol).ok_or(FfiResult::UNSUPPORTED)?;
         let mut out = BamSymbol::INVALID;
-        // SAFETY: `host_ctx` is an active `BamHostCtx`, `StrView::from_str(symbol)` borrows
-        // valid UTF-8 bytes for this call, and `&mut out` is aligned writable stack storage.
-        let status = unsafe { intern_fn(host_ctx, StrView::from_str(symbol), &mut out) };
+        let sym_view = StrView::from_str(symbol);
+        // SAFETY: `host_ctx` is an active `BamHostCtx`, `sym_view` borrows valid UTF-8 bytes for
+        // this call, and `&mut out` is aligned writable stack storage.
+        let status = unsafe { intern_fn(host_ctx, &sym_view, &mut out) };
         if !status.is_ok() {
             return Err(status);
         }
@@ -809,9 +809,10 @@ impl Host {
         let Some(bind_fn) = host_slot!(api, bind_named_object) else {
             return FfiResult::UNSUPPORTED;
         };
-        // SAFETY: `host_ctx` is an active `BamHostCtx` and `StrView::from_str(name)` borrows
-        // valid UTF-8 bytes for this synchronous call.
-        unsafe { bind_fn(host_ctx, StrView::from_str(name), entity) }
+        let name_view = StrView::from_str(name);
+        // SAFETY: `host_ctx` is an active `BamHostCtx` and `name_view` borrows valid UTF-8 bytes
+        // for this synchronous call.
+        unsafe { bind_fn(host_ctx, &name_view, entity) }
     }
 
     /// Binds a canonical non-empty UTF-8 lookup `name` to `entity` in the host symbol registry via
@@ -822,6 +823,188 @@ impl Host {
     pub fn bind_named_object(&self, name: &str, entity: FfiEntity) -> FfiResult {
         // SAFETY: `self.host_ctx.0` is an active `BamHostCtx` matching `&self.api`.
         unsafe { Self::bind_named_object_with_ctx(&self.api, self.host_ctx.0, name, entity) }
+    }
+
+    /// Resolves a canonical non-empty UTF-8 lookup `name` to its bound [`FfiEntity`] via
+    /// `BamHostApi::resolve_named_object` (slot 75) using an explicit `host_ctx` without copying
+    /// [`Host`].
+    ///
+    /// # Safety
+    /// `host_ctx` must be a valid active [`BamHostCtx`] matching `api` for the duration of this call.
+    #[inline]
+    pub unsafe fn resolve_named_object_with_ctx(
+        api: &BamHostApi,
+        host_ctx: *const BamHostCtx,
+        name: &str,
+    ) -> Result<FfiEntity, FfiResult> {
+        if name.is_empty() {
+            return Err(FfiResult::INVALID_ARGUMENT);
+        }
+        let resolve_fn = host_slot!(api, resolve_named_object).ok_or(FfiResult::UNSUPPORTED)?;
+        let mut out = FfiEntity::NULL;
+        let name_view = StrView::from_str(name);
+        // SAFETY: `host_ctx` is an active `BamHostCtx`, `name_view` borrows valid UTF-8 bytes
+        // for this synchronous call, and `&mut out` is aligned writable stack storage.
+        let status = unsafe { resolve_fn(host_ctx, &name_view, &mut out) };
+        if !status.is_ok() {
+            return Err(status);
+        }
+        if out.is_null() {
+            return Err(FfiResult::INVALID_ENTITY);
+        }
+        Ok(out)
+    }
+
+    /// Resolves a canonical non-empty UTF-8 lookup `name` to its bound [`FfiEntity`] via
+    /// `BamHostApi::resolve_named_object` (slot 75).
+    ///
+    /// Returns [`FfiResult::UNSUPPORTED`] when connected to an ABI `<= 0.3` host.
+    #[inline]
+    pub fn resolve_named_object(&self, name: &str) -> Result<FfiEntity, FfiResult> {
+        // SAFETY: `self.host_ctx.0` is an active `BamHostCtx` matching `&self.api`.
+        unsafe { Self::resolve_named_object_with_ctx(&self.api, self.host_ctx.0, name) }
+    }
+
+    /// Resolves an interned [`BamSymbol`] handle back to its owned UTF-8 string via
+    /// `BamHostApi::resolve_symbol_str` (slot 76) using an explicit `host_ctx` without copying
+    /// [`Host`].
+    ///
+    /// # Safety
+    /// `host_ctx` must be a valid active [`BamHostCtx`] matching `api` for the duration of this call.
+    #[inline]
+    pub unsafe fn resolve_symbol_str_with_ctx(
+        api: &BamHostApi,
+        host_ctx: *const BamHostCtx,
+        symbol: BamSymbol,
+    ) -> Result<String, FfiResult> {
+        if !symbol.is_valid() {
+            return Err(FfiResult::INVALID_ARGUMENT);
+        }
+        let resolve_fn = host_slot!(api, resolve_symbol_str).ok_or(FfiResult::UNSUPPORTED)?;
+        let mut out = StrView::empty();
+        // SAFETY: `host_ctx` is an active `BamHostCtx` and `&mut out` is aligned writable stack storage.
+        let status = unsafe { resolve_fn(host_ctx, symbol, &mut out) };
+        if !status.is_ok() {
+            return Err(status);
+        }
+        // SAFETY: On `OK`, the host guarantees `out` borrows valid UTF-8 symbol bytes for the
+        // duration of this synchronous call before copying into `String`.
+        let s = unsafe { out.try_as_str() }?;
+        Ok(String::from(s))
+    }
+
+    /// Resolves an interned [`BamSymbol`] handle back to its owned UTF-8 string via
+    /// `BamHostApi::resolve_symbol_str` (slot 76).
+    ///
+    /// Returns [`FfiResult::UNSUPPORTED`] when connected to an ABI `<= 0.3` host.
+    #[inline]
+    pub fn resolve_symbol_str(&self, symbol: BamSymbol) -> Result<String, FfiResult> {
+        // SAFETY: `self.host_ctx.0` is an active `BamHostCtx` matching `&self.api`.
+        unsafe { Self::resolve_symbol_str_with_ctx(&self.api, self.host_ctx.0, symbol) }
+    }
+
+    /// Looks up a cached validated [`BamComponent`] handle keyed by `(TypeId, expected_uuid)` on
+    /// the owning [`GuestInstance`], invoking `resolve` on a cache miss.
+    #[inline]
+    pub fn cached_component_lookup<T: 'static>(
+        &self,
+        expected_uuid: ComponentUuid,
+        resolve: impl FnOnce() -> Result<BamComponent, FfiResult>,
+    ) -> Result<BamComponent, FfiResult> {
+        #[cfg(kani)]
+        {
+            let _ = expected_uuid;
+            resolve()
+        }
+        #[cfg(not(kani))]
+        {
+            if self.runtime_allocs_ptr.0.is_null() {
+                return resolve();
+            }
+            // SAFETY: `with_runtime_allocs` guarantees `runtime_allocs_ptr.0` points to a live
+            // `RuntimeAllocTracker` inside `GuestInstance` outliving `&self`.
+            unsafe {
+                (&*self.runtime_allocs_ptr.0).cached_component_lookup(
+                    core::any::TypeId::of::<T>(),
+                    expected_uuid,
+                    false,
+                    resolve,
+                )
+            }
+        }
+    }
+
+    /// Looks up a cached layout-validated [`crate::TypedComponent<T>`] keyed by
+    /// `(TypeId, expected_uuid)` on the owning [`GuestInstance`], calling `resolve` +
+    /// [`crate::TypedComponent::validate`] at most once on a cache miss.
+    #[inline]
+    pub fn cached_typed_component<T: AbiPod>(
+        &self,
+        expected_uuid: ComponentUuid,
+        resolve: impl FnOnce() -> Result<BamComponent, FfiResult>,
+    ) -> Result<crate::TypedComponent<T>, FfiResult> {
+        #[cfg(kani)]
+        {
+            let _ = expected_uuid;
+            let handle = resolve()?;
+            crate::TypedComponent::validate(self, handle)
+        }
+        #[cfg(not(kani))]
+        {
+            if self.runtime_allocs_ptr.0.is_null() {
+                let handle = resolve()?;
+                return crate::TypedComponent::validate(self, handle);
+            }
+            // SAFETY: `with_runtime_allocs` guarantees `runtime_allocs_ptr.0` points to a live
+            // `RuntimeAllocTracker` inside `GuestInstance` outliving `&self`.
+            let handle = unsafe {
+                (&*self.runtime_allocs_ptr.0).cached_component_lookup(
+                    core::any::TypeId::of::<T>(),
+                    expected_uuid,
+                    true,
+                    || {
+                        let raw = resolve()?;
+                        let validated = crate::TypedComponent::<T>::validate(self, raw)?;
+                        Ok(validated.handle())
+                    },
+                )
+            }?;
+            // SAFETY: `cached_component_lookup(..., require_layout_verified = true)` only returns a
+            // handle stored after `TypedComponent::<T>::validate` or `register_pod_*::<T>` verified
+            // `T`'s exact `(size, align)` on this host `World`.
+            Ok(unsafe { crate::TypedComponent::from_raw_unchecked(handle) })
+        }
+    }
+
+    /// Inserts or updates a cached validated [`BamComponent`] handle keyed by `(TypeId, expected_uuid)`
+    /// on the owning [`GuestInstance`].
+    #[inline]
+    pub fn cache_component_handle<T: 'static>(
+        &self,
+        expected_uuid: ComponentUuid,
+        handle: BamComponent,
+        layout_verified: bool,
+    ) {
+        #[cfg(kani)]
+        {
+            let _ = (expected_uuid, handle, layout_verified);
+        }
+        #[cfg(not(kani))]
+        {
+            if self.runtime_allocs_ptr.0.is_null() {
+                return;
+            }
+            // SAFETY: `with_runtime_allocs` guarantees `runtime_allocs_ptr.0` points to a live
+            // `RuntimeAllocTracker` inside `GuestInstance` outliving `&self`.
+            unsafe {
+                (&*self.runtime_allocs_ptr.0).cache_component_handle(
+                    core::any::TypeId::of::<T>(),
+                    expected_uuid,
+                    handle,
+                    layout_verified,
+                );
+            }
+        }
     }
 }
 
@@ -915,6 +1098,82 @@ impl<'a> ValidatedLoadCtx<'a> {
         unsafe { register_component_with_layout(instance, self.raw, name, size, align, drop_fn) }
     }
 
+    /// Raw wrapper invoking `BamHostApi::register_resource` (slot 73) on this validated load context.
+    ///
+    /// # Safety
+    /// `desc` must satisfy [`ComponentDesc::validate`] with buffers valid for the host `World`.
+    #[inline]
+    pub unsafe fn register_resource_raw(
+        &self,
+        desc: &ComponentDesc,
+    ) -> Result<BamComponent, FfiResult> {
+        // SAFETY: `self.raw` was validated in `ValidatedLoadCtx::from_raw`; caller guarantees `desc`.
+        unsafe { register_resource_raw(self.raw, self.host, desc) }
+    }
+
+    /// Registers a cross-language `T: AbiPod` dynamic singleton resource via
+    /// `BamHostApi::register_resource` (slot 73), storing owned metadata inside `instance`.
+    #[inline]
+    pub fn register_pod_resource<T: AbiPod>(
+        &self,
+        instance: &mut GuestInstance,
+        name: &CStr,
+        uuid: ComponentUuid,
+        flags: u32,
+        hooks: PodComponentHooks<T>,
+    ) -> Result<BamComponent, FfiResult> {
+        // SAFETY: `self.raw` was validated in `ValidatedLoadCtx::from_raw`; `vtable_ptr` is null.
+        unsafe {
+            register_pod_resource::<T>(
+                instance,
+                self.raw,
+                name,
+                uuid,
+                flags,
+                core::ptr::null(),
+                hooks,
+            )
+        }
+    }
+
+    /// Raw wrapper invoking `BamHostApi::register_message` (slot 74) on this validated load context.
+    ///
+    /// # Safety
+    /// `desc` must satisfy [`ComponentDesc::validate`] with buffers valid for the host `World`.
+    #[inline]
+    pub unsafe fn register_message_raw(
+        &self,
+        desc: &ComponentDesc,
+    ) -> Result<BamComponent, FfiResult> {
+        // SAFETY: `self.raw` was validated in `ValidatedLoadCtx::from_raw`; caller guarantees `desc`.
+        unsafe { register_message_raw(self.raw, self.host, desc) }
+    }
+
+    /// Registers a cross-language `T: AbiPod` dynamic buffered message type via
+    /// `BamHostApi::register_message` (slot 74), storing owned metadata inside `instance`.
+    #[inline]
+    pub fn register_pod_message<T: AbiPod>(
+        &self,
+        instance: &mut GuestInstance,
+        name: &CStr,
+        uuid: ComponentUuid,
+        flags: u32,
+        hooks: PodComponentHooks<T>,
+    ) -> Result<BamComponent, FfiResult> {
+        // SAFETY: `self.raw` was validated in `ValidatedLoadCtx::from_raw`; `vtable_ptr` is null.
+        unsafe {
+            register_pod_message::<T>(
+                instance,
+                self.raw,
+                name,
+                uuid,
+                flags,
+                core::ptr::null(),
+                hooks,
+            )
+        }
+    }
+
     /// Registers a dynamic Bevy ECS [`Observer`](bamabi_sys::BamObserverDesc) callback on
     /// this validated load context, storing all owned state inside `instance`.
     #[inline]
@@ -945,15 +1204,10 @@ impl<'a> ValidatedLoadCtx<'a> {
     /// Registers a custom [`BamObserverDesc`](bamabi_sys::BamObserverDesc) callback with
     /// explicit propagation flags and optional `propagate_relationship` component handle.
     #[inline]
-    #[allow(clippy::too_many_arguments)]
     pub fn register_observer_with_options<E, F>(
         &self,
         instance: &mut GuestInstance,
-        name: &str,
-        event: BamComponent,
-        target: bamabi_sys::FfiEntity,
-        flags: u32,
-        propagate_relationship: BamComponent,
+        config: &crate::trampoline::ObserverRegistrationConfig<'_>,
         callback: F,
     ) -> FfiResult
     where
@@ -968,16 +1222,7 @@ impl<'a> ValidatedLoadCtx<'a> {
     {
         // SAFETY: `self.raw` was validated as an active `BamLoadCtx` in `ValidatedLoadCtx::from_raw`.
         unsafe {
-            register_observer_closure_with_options::<E, F>(
-                instance,
-                self.raw,
-                name,
-                event,
-                target,
-                flags,
-                propagate_relationship,
-                callback,
-            )
+            register_observer_closure_with_options::<E, F>(instance, self.raw, config, callback)
         }
     }
 
@@ -985,16 +1230,10 @@ impl<'a> ValidatedLoadCtx<'a> {
     /// explicit `watched_components` filters, propagation flags, and optional
     /// `propagate_relationship` component handle.
     #[inline]
-    #[allow(clippy::too_many_arguments)]
     pub fn register_observer_with_watched<E, F>(
         &self,
         instance: &mut GuestInstance,
-        name: &str,
-        event: BamComponent,
-        watched_components: &[BamComponent],
-        target: bamabi_sys::FfiEntity,
-        flags: u32,
-        propagate_relationship: BamComponent,
+        config: &crate::trampoline::ObserverRegistrationConfig<'_>,
         callback: F,
     ) -> FfiResult
     where
@@ -1009,17 +1248,7 @@ impl<'a> ValidatedLoadCtx<'a> {
     {
         // SAFETY: `self.raw` was validated as an active `BamLoadCtx` in `ValidatedLoadCtx::from_raw`.
         unsafe {
-            register_observer_closure_with_watched::<E, F>(
-                instance,
-                self.raw,
-                name,
-                event,
-                watched_components,
-                target,
-                flags,
-                propagate_relationship,
-                callback,
-            )
+            register_observer_closure_with_watched::<E, F>(instance, self.raw, config, callback)
         }
     }
 
@@ -1045,18 +1274,40 @@ impl<'a> ValidatedLoadCtx<'a> {
         }
     }
 
+    /// Registers a mutable context-aware [`BamObserverDesc`](bamabi_sys::BamObserverDesc) callback
+    /// (`BamObserverCtxMutFn` + `BamObserverDesc::queries`) backed by a const-bucketed
+    /// `observer_ctx_mut_slice_trampoline<N, E, F>` on this validated load context.
+    #[inline]
+    pub fn register_observer_ctx_mut_slice<const N: usize, E, F>(
+        &self,
+        instance: &mut GuestInstance,
+        config: &ObserverCtxRegistrationConfig<'_>,
+        callback: F,
+    ) -> FfiResult
+    where
+        E: AbiPod,
+        F: FnMut(
+                bamabi_sys::FfiEntity,
+                &mut E,
+                &mut bool,
+                &mut ValidatedSystemSlice<'_>,
+            ) -> FfiResult
+            + Send
+            + 'static,
+    {
+        // SAFETY: `self.raw` was validated as an active `BamLoadCtx` in `ValidatedLoadCtx::from_raw`.
+        unsafe {
+            register_observer_ctx_mut_slice_closure::<N, E, F>(instance, self.raw, config, callback)
+        }
+    }
+
     /// Registers a mutable [`BamObserverDesc`](bamabi_sys::BamObserverDesc) callback (`&mut E`
     /// plus `&mut bool` propagation flag) on this validated load context.
     #[inline]
-    #[allow(clippy::too_many_arguments)]
     pub fn register_observer_mut<E, F>(
         &self,
         instance: &mut GuestInstance,
-        name: &str,
-        event: BamComponent,
-        target: bamabi_sys::FfiEntity,
-        flags: u32,
-        propagate_relationship: BamComponent,
+        config: &crate::trampoline::ObserverRegistrationConfig<'_>,
         callback: F,
     ) -> FfiResult
     where
@@ -1071,34 +1322,17 @@ impl<'a> ValidatedLoadCtx<'a> {
             + 'static,
     {
         // SAFETY: `self.raw` was validated as an active `BamLoadCtx` in `ValidatedLoadCtx::from_raw`.
-        unsafe {
-            register_observer_mut_closure::<E, F>(
-                instance,
-                self.raw,
-                name,
-                event,
-                target,
-                flags,
-                propagate_relationship,
-                callback,
-            )
-        }
+        unsafe { register_observer_mut_closure::<E, F>(instance, self.raw, config, callback) }
     }
 
     /// Registers a mutable [`BamObserverDesc`](bamabi_sys::BamObserverDesc) callback (`&mut E`
     /// plus `&mut bool` propagation flag) with explicit `watched_components` filters on this
     /// validated load context.
     #[inline]
-    #[allow(clippy::too_many_arguments)]
     pub fn register_observer_mut_with_watched<E, F>(
         &self,
         instance: &mut GuestInstance,
-        name: &str,
-        event: BamComponent,
-        watched_components: &[BamComponent],
-        target: bamabi_sys::FfiEntity,
-        flags: u32,
-        propagate_relationship: BamComponent,
+        config: &crate::trampoline::ObserverRegistrationConfig<'_>,
         callback: F,
     ) -> FfiResult
     where
@@ -1114,33 +1348,17 @@ impl<'a> ValidatedLoadCtx<'a> {
     {
         // SAFETY: `self.raw` was validated as an active `BamLoadCtx` in `ValidatedLoadCtx::from_raw`.
         unsafe {
-            register_observer_mut_closure_with_watched::<E, F>(
-                instance,
-                self.raw,
-                name,
-                event,
-                watched_components,
-                target,
-                flags,
-                propagate_relationship,
-                callback,
-            )
+            register_observer_mut_closure_with_watched::<E, F>(instance, self.raw, config, callback)
         }
     }
 
     /// Registers a component lifecycle or scene `Ready` observer (`ADD`, `INSERT`, `DISCARD`,
     /// `REMOVE`, `DESPAWN`, `READY`) on this validated load context.
     #[inline]
-    #[allow(clippy::too_many_arguments)]
     pub fn register_lifecycle_observer<F>(
         &self,
         instance: &mut GuestInstance,
-        name: &str,
-        event_kind: BamEventKind,
-        watched_components: &[BamComponent],
-        target: bamabi_sys::FfiEntity,
-        flags: u32,
-        propagate_relationship: BamComponent,
+        config: &crate::trampoline::ObserverRegistrationConfig<'_>,
         callback: F,
     ) -> FfiResult
     where
@@ -1149,19 +1367,7 @@ impl<'a> ValidatedLoadCtx<'a> {
             + 'static,
     {
         // SAFETY: `self.raw` was validated as an active `BamLoadCtx` in `ValidatedLoadCtx::from_raw`.
-        unsafe {
-            register_lifecycle_observer_closure(
-                instance,
-                self.raw,
-                name,
-                event_kind,
-                watched_components,
-                target,
-                flags,
-                propagate_relationship,
-                callback,
-            )
-        }
+        unsafe { register_lifecycle_observer_closure(instance, self.raw, config, callback) }
     }
 
     /// Registers a unified [`bamabi_sys::BamSystemDesc`] on this validated load context,
@@ -1288,25 +1494,15 @@ impl<'a> ValidatedLoadCtx<'a> {
     }
 
     /// Registers a typed entity relationship edge via `BamHostApi::register_relation` (slot 54),
-    /// storing an owned copy of `name` inside `instance`.
+    /// storing an owned copy of `config.name` inside `instance`.
     #[inline]
-    #[allow(clippy::too_many_arguments)]
     pub fn register_relation(
         &self,
         instance: &mut GuestInstance,
-        name: &CStr,
-        uuid: ComponentUuid,
-        flags: u32,
-        data_size: usize,
-        data_align: usize,
-        max_degree: u32,
+        config: &crate::component::RelationRegistrationConfig<'_>,
     ) -> Result<BamComponent, FfiResult> {
         // SAFETY: `self.raw` was validated as an active `BamLoadCtx` in `ValidatedLoadCtx::from_raw`.
-        unsafe {
-            register_relation(
-                instance, self.raw, name, uuid, flags, data_size, data_align, max_degree,
-            )
-        }
+        unsafe { register_relation(instance, self.raw, config) }
     }
 
     /// Configures a schedule system set from a caller-constructed [`BamScheduleSetDesc`] via
@@ -1350,6 +1546,69 @@ impl<'a> ValidatedLoadCtx<'a> {
                 after_sets,
             )
         }
+    }
+
+    /// Configures a named schedule system set via `BamHostApi::configure_schedule_set` (slot 61)
+    /// with ABI `0.4.0` parent sets and optional ECS `run_if_ctx` predicate/query.
+    ///
+    /// # Safety
+    /// If `config.run_if_ctx` is `Some`, `(config.run_if_query, config.run_if_ctx_user_data)` must
+    /// remain valid for the lifetime of the host schedule.
+    #[inline]
+    pub unsafe fn configure_schedule_set_with_parents(
+        &self,
+        instance: &mut GuestInstance,
+        config: &ScheduleSetConfig<'_>,
+    ) -> Result<BamSystemSet, FfiResult> {
+        // SAFETY: `self.raw` was validated as an active `BamLoadCtx` in `ValidatedLoadCtx::from_raw`,
+        // and caller upholds `config.run_if_ctx` pointer lifetimes.
+        unsafe { configure_schedule_set_with_parents(instance, self.raw, config) }
+    }
+
+    /// Safe wrapper configuring a named schedule system set with optional ABI `0.4.0` parent sets
+    /// and an optional instance-owned ECS `run_if_ctx` predicate/query.
+    pub fn configure_schedule_set_with_condition<F>(
+        &self,
+        instance: &mut GuestInstance,
+        name: &CStr,
+        schedule: ScheduleId,
+        flags: u32,
+        before_sets: &[BamSystemSet],
+        after_sets: &[BamSystemSet],
+        parent_sets: &[BamSystemSet],
+        run_if_terms: Option<(&[BamTermDesc], F)>,
+    ) -> Result<BamSystemSet, FfiResult>
+    where
+        F: FnMut(&mut ValidatedSystemInvocation<'_>) -> bool + Send + 'static,
+    {
+        let (run_if_ctx, run_if_query, run_if_ctx_user_data) = match run_if_terms {
+            Some((terms, pred)) => {
+                for term in terms {
+                    if term.mode.is_mutable() {
+                        return Err(FfiResult::PERMISSION_DENIED);
+                    }
+                }
+                let query_ptr = allocate_run_if_ctx_query(instance, terms)?;
+                let query_count = usize::from(!terms.is_empty());
+                let (cb, ud) = allocate_run_if_ctx_trampoline(instance, query_count, pred);
+                (Some(cb), query_ptr, ud)
+            }
+            None => (None, core::ptr::null(), core::ptr::null_mut()),
+        };
+        let config = ScheduleSetConfig {
+            name,
+            schedule,
+            flags,
+            before_sets,
+            after_sets,
+            parent_sets,
+            run_if_ctx,
+            run_if_query,
+            run_if_ctx_user_data,
+        };
+        // SAFETY: `run_if_query` and `run_if_ctx_user_data` were just pinned inside `instance`
+        // (or are null), and `self.raw` is an active `BamLoadCtx`.
+        unsafe { configure_schedule_set_with_parents(instance, self.raw, &config) }
     }
 
     /// Mounts a registered [`BamSystem`] handle into `schedule` and optional `set`
@@ -1451,20 +1710,13 @@ impl<'a> ValidatedLoadCtx<'a> {
         }
     }
 
-    /// Safe panic-guarded row migration of `component` from `Old: AbiPod` to `New: AbiPod` with
-    /// explicit name, UUID, flags, and fingerprints (storing an owned copy of `new_name` in
-    /// `instance`).
+    /// Safe panic-guarded row migration of `config.component` from `Old: AbiPod` to `New: AbiPod`
+    /// (storing an owned copy of `config.new_name` in `instance`).
     #[inline]
-    #[allow(clippy::too_many_arguments)]
     pub fn migrate_pod_component_column<Old, New, F>(
         &self,
         instance: &mut GuestInstance,
-        component: BamComponent,
-        old_fingerprint: u64,
-        new_name: &CStr,
-        new_uuid: ComponentUuid,
-        new_flags: u32,
-        new_fingerprint: u64,
+        config: &crate::component::PodMigrationConfig<'_>,
         migrate: F,
     ) -> FfiResult
     where
@@ -1473,18 +1725,6 @@ impl<'a> ValidatedLoadCtx<'a> {
         F: FnMut(&Old) -> Result<New, FfiResult>,
     {
         // SAFETY: `self.raw` was validated as an active `BamLoadCtx` in `ValidatedLoadCtx::from_raw`.
-        unsafe {
-            migrate_pod_component_column::<Old, New, F>(
-                instance,
-                self.raw,
-                component,
-                old_fingerprint,
-                new_name,
-                new_uuid,
-                new_flags,
-                new_fingerprint,
-                migrate,
-            )
-        }
+        unsafe { migrate_pod_component_column::<Old, New, F>(instance, self.raw, config, migrate) }
     }
 }

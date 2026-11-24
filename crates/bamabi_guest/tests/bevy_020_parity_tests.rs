@@ -683,6 +683,23 @@ impl MockHost {
             cmd_clone_entity: None,
             cmd_insert_resource: None,
             cmd_remove_resource: None,
+            register_resource: None,
+            register_message: None,
+            resolve_named_object: None,
+            resolve_symbol_str: None,
+            iter_column_rows_mutable_untracked: None,
+            iter_mark_changed_ranges: None,
+            sys_current_ticks: None,
+            sys_time_info: None,
+            par_for_each_chunk_ex: None,
+            sys_relation_targets: None,
+            sys_relation_sources: None,
+            sys_relation_edge_data: None,
+            cmd_despawn_batch: None,
+            cmd_insert_batch: None,
+            cmd_remove_batch: None,
+            msg_read_slice: None,
+            cmd_spawn_batch_ex: None,
         }
     }
 }
@@ -2624,13 +2641,20 @@ fn read_removed_preserves_type_mismatch_when_zero_user_queries() {
 fn ui_mapped_string_and_wire_bridges_and_disabled_bridge_roundtrip() {
     use bamabi_guest::raw::MappedStringVTable;
 
-    unsafe extern "C" fn mock_string_get(ptr: *const c_void) -> StrView {
+    unsafe extern "C" fn mock_string_get(ptr: *const c_void, out_view: *mut StrView) -> FfiResult {
+        if ptr.is_null() || out_view.is_null() {
+            return FfiResult::NULL_POINTER;
+        }
         let s = unsafe { &*ptr.cast::<String>() };
-        StrView::from_str(s.as_str())
+        unsafe { *out_view = StrView::from_str(s.as_str()) };
+        FfiResult::OK
     }
-    unsafe extern "C" fn mock_string_set(ptr: *mut c_void, view: StrView) -> FfiResult {
+    unsafe extern "C" fn mock_string_set(ptr: *mut c_void, view: *const StrView) -> FfiResult {
+        if ptr.is_null() || view.is_null() {
+            return FfiResult::NULL_POINTER;
+        }
         let s = unsafe { &mut *ptr.cast::<String>() };
-        let Ok(slice) = (unsafe { view.try_as_str() }) else {
+        let Ok(slice) = (unsafe { (*view).try_as_str() }) else {
             return FfiResult::INVALID_UTF8;
         };
         s.clear();
@@ -3986,13 +4010,20 @@ fn spawn_audio_resolves_before_spawn_no_orphan_entity_and_v02_fallback() {
 fn ui_handles_text_span_default_inserters_trigger_activate_and_gamepad_rumble_end_to_end() {
     use bamabi_guest::raw::MappedStringVTable;
 
-    unsafe extern "C" fn mock_string_get(ptr: *const c_void) -> StrView {
+    unsafe extern "C" fn mock_string_get(ptr: *const c_void, out_view: *mut StrView) -> FfiResult {
+        if ptr.is_null() || out_view.is_null() {
+            return FfiResult::NULL_POINTER;
+        }
         let s = unsafe { &*ptr.cast::<String>() };
-        StrView::from_str(s.as_str())
+        unsafe { *out_view = StrView::from_str(s.as_str()) };
+        FfiResult::OK
     }
-    unsafe extern "C" fn mock_string_set(ptr: *mut c_void, view: StrView) -> FfiResult {
+    unsafe extern "C" fn mock_string_set(ptr: *mut c_void, view: *const StrView) -> FfiResult {
+        if ptr.is_null() || view.is_null() {
+            return FfiResult::NULL_POINTER;
+        }
         let s = unsafe { &mut *ptr.cast::<String>() };
-        let Ok(slice) = (unsafe { view.try_as_str() }) else {
+        let Ok(slice) = (unsafe { (*view).try_as_str() }) else {
             return FfiResult::INVALID_UTF8;
         };
         s.clear();

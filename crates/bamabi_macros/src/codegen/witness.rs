@@ -43,10 +43,8 @@ pub(crate) struct WitnessEnumVariant {
     pub(crate) fields: Vec<WitnessEnumVariantField>,
 }
 
-/// Emits shared internal traits & helpers inside `const _: () = { ... };` for
-/// `field_info`, `export_fields`, and `import_field` witness symbols.
-#[allow(clippy::too_many_lines)]
-pub(crate) fn emit_witness_helpers(sys_crate: &TokenStream) -> TokenStream {
+/// Emits primitive widening import traits and fallback impls for `__BamImportWrap`.
+fn emit_witness_import_helpers(sys_crate: &TokenStream) -> TokenStream {
     let widen_specs: &[(&str, &[(&str, &str)])] = &[
         ("i16", &[("i8", "i8")]),
         ("i32", &[("i8", "i8"), ("i16", "i16")]),
@@ -115,192 +113,6 @@ pub(crate) fn emit_witness_helpers(sys_crate: &TokenStream) -> TokenStream {
 
     quote! {
         #[allow(dead_code)]
-        struct __BamExportWrap<T>(*const T);
-
-        #[allow(dead_code, clippy::undocumented_unsafe_blocks)]
-        trait __BamTryModCompExport {
-            unsafe fn __bam_export_nested(
-                &self,
-                prefix: &str,
-                _type_tag: &str,
-                sink: unsafe extern "C" fn(
-                    *mut ::core::ffi::c_void,
-                    #sys_crate::StrView,
-                    #sys_crate::StrView,
-                    #sys_crate::FfiSlice<u8>,
-                ) -> #sys_crate::FfiResult,
-                sink_ctx: *mut ::core::ffi::c_void,
-            ) -> #sys_crate::FfiResult;
-        }
-
-        #[allow(dead_code, clippy::undocumented_unsafe_blocks)]
-        impl<T: #sys_crate::ModComponent> __BamTryModCompExport for &&__BamExportWrap<T> {
-            unsafe fn __bam_export_nested(
-                &self,
-                prefix: &str,
-                _type_tag: &str,
-                sink: unsafe extern "C" fn(
-                    *mut ::core::ffi::c_void,
-                    #sys_crate::StrView,
-                    #sys_crate::StrView,
-                    #sys_crate::FfiSlice<u8>,
-                ) -> #sys_crate::FfiResult,
-                sink_ctx: *mut ::core::ffi::c_void,
-            ) -> #sys_crate::FfiResult {
-                let mut sym = ::std::string::String::from("bam.v0.");
-                sym.push_str(<T as #sys_crate::ModComponent>::CANONICAL_NAME);
-                sym.push_str(".export_fields");
-                let Some(fn_ptr) = <T as #sys_crate::ModComponent>::resolve_symbol(&sym) else {
-                    return #sys_crate::FfiResult::OK;
-                };
-                type ExportFn = unsafe extern "C" fn(
-                    *const ::core::ffi::c_void,
-                    ::core::option::Option<
-                        unsafe extern "C" fn(
-                            *mut ::core::ffi::c_void,
-                            #sys_crate::StrView,
-                            #sys_crate::StrView,
-                            #sys_crate::FfiSlice<u8>,
-                        ) -> #sys_crate::FfiResult,
-                    >,
-                    *mut ::core::ffi::c_void,
-                ) -> #sys_crate::FfiResult;
-                let export_fn: ExportFn = unsafe { ::core::mem::transmute(fn_ptr) };
-
-                struct PrefixCtx<'a> {
-                    prefix: &'a str,
-                    outer_sink: unsafe extern "C" fn(
-                        *mut ::core::ffi::c_void,
-                        #sys_crate::StrView,
-                        #sys_crate::StrView,
-                        #sys_crate::FfiSlice<u8>,
-                    ) -> #sys_crate::FfiResult,
-                    outer_ctx: *mut ::core::ffi::c_void,
-                }
-
-                unsafe extern "C" fn prefix_trampoline(
-                    ctx: *mut ::core::ffi::c_void,
-                    sub_name: #sys_crate::StrView,
-                    type_tag: #sys_crate::StrView,
-                    payload: #sys_crate::FfiSlice<u8>,
-                ) -> #sys_crate::FfiResult {
-                    let pctx = unsafe { &*ctx.cast::<PrefixCtx<'_>>() };
-                    let Ok(sub_str) = sub_name.try_as_str() else {
-                        return #sys_crate::FfiResult::INVALID_UTF8;
-                    };
-                    let mut full = ::std::string::String::with_capacity(
-                        pctx.prefix.len() + 1 + sub_str.len(),
-                    );
-                    full.push_str(pctx.prefix);
-                    full.push('.');
-                    full.push_str(sub_str);
-                    unsafe {
-                        (pctx.outer_sink)(
-                            pctx.outer_ctx,
-                            #sys_crate::StrView::from_str(&full),
-                            type_tag,
-                            payload,
-                        )
-                    }
-                }
-
-                let mut pctx = PrefixCtx {
-                    prefix,
-                    outer_sink: sink,
-                    outer_ctx: sink_ctx,
-                };
-                unsafe {
-                    export_fn(
-                        self.0.cast::<::core::ffi::c_void>(),
-                        ::core::option::Option::Some(prefix_trampoline),
-                        (&raw mut pctx).cast::<::core::ffi::c_void>(),
-                    )
-                }
-            }
-        }
-
-        #[allow(dead_code, clippy::undocumented_unsafe_blocks)]
-        trait __BamFallbackRawExport {
-            unsafe fn __bam_export_nested(
-                &self,
-                prefix: &str,
-                type_tag: &str,
-                sink: unsafe extern "C" fn(
-                    *mut ::core::ffi::c_void,
-                    #sys_crate::StrView,
-                    #sys_crate::StrView,
-                    #sys_crate::FfiSlice<u8>,
-                ) -> #sys_crate::FfiResult,
-                sink_ctx: *mut ::core::ffi::c_void,
-            ) -> #sys_crate::FfiResult;
-        }
-
-        #[allow(dead_code, clippy::undocumented_unsafe_blocks)]
-        impl<T: #sys_crate::RawInsertable> __BamFallbackRawExport for &__BamExportWrap<T> {
-            unsafe fn __bam_export_nested(
-                &self,
-                prefix: &str,
-                type_tag: &str,
-                sink: unsafe extern "C" fn(
-                    *mut ::core::ffi::c_void,
-                    #sys_crate::StrView,
-                    #sys_crate::StrView,
-                    #sys_crate::FfiSlice<u8>,
-                ) -> #sys_crate::FfiResult,
-                sink_ctx: *mut ::core::ffi::c_void,
-            ) -> #sys_crate::FfiResult {
-                let size = ::core::mem::size_of::<T>();
-                let bytes: &[u8] = if size == 0 {
-                    &[]
-                } else {
-                    unsafe { ::core::slice::from_raw_parts(self.0.cast::<u8>(), size) }
-                };
-                unsafe {
-                    sink(
-                        sink_ctx,
-                        #sys_crate::StrView::from_str(prefix),
-                        #sys_crate::StrView::from_str(type_tag),
-                        #sys_crate::FfiSlice::from_slice(bytes),
-                    )
-                }
-            }
-        }
-
-        #[allow(dead_code)]
-        trait __BamFallbackUnsupportedExport {
-            unsafe fn __bam_export_nested(
-                &self,
-                _prefix: &str,
-                _type_tag: &str,
-                _sink: unsafe extern "C" fn(
-                    *mut ::core::ffi::c_void,
-                    #sys_crate::StrView,
-                    #sys_crate::StrView,
-                    #sys_crate::FfiSlice<u8>,
-                ) -> #sys_crate::FfiResult,
-                _sink_ctx: *mut ::core::ffi::c_void,
-            ) -> #sys_crate::FfiResult;
-        }
-
-        #[allow(dead_code)]
-        impl<T> __BamFallbackUnsupportedExport for __BamExportWrap<T> {
-            unsafe fn __bam_export_nested(
-                &self,
-                _prefix: &str,
-                _type_tag: &str,
-                _sink: unsafe extern "C" fn(
-                    *mut ::core::ffi::c_void,
-                    #sys_crate::StrView,
-                    #sys_crate::StrView,
-                    #sys_crate::FfiSlice<u8>,
-                ) -> #sys_crate::FfiResult,
-                _sink_ctx: *mut ::core::ffi::c_void,
-            ) -> #sys_crate::FfiResult {
-                #sys_crate::FfiResult::UNSUPPORTED
-            }
-        }
-
-        #[allow(dead_code)]
         struct __BamImportWrap<T>(*mut T);
 
         #[allow(dead_code, clippy::undocumented_unsafe_blocks)]
@@ -367,7 +179,12 @@ pub(crate) fn emit_witness_helpers(sys_crate: &TokenStream) -> TokenStream {
         }
 
         #(#widen_impls)*
+    }
+}
 
+/// Emits nested sub-field import and default-value helper traits for `import_field`.
+fn emit_witness_nested_and_default_helpers(sys_crate: &TokenStream) -> TokenStream {
+    quote! {
         #[allow(dead_code)]
         struct __BamNestedImportWrap<T>(*mut T);
 
@@ -397,17 +214,18 @@ pub(crate) fn emit_witness_helpers(sys_crate: &TokenStream) -> TokenStream {
                 };
                 type ImportFn = unsafe extern "C" fn(
                     *mut ::core::ffi::c_void,
-                    #sys_crate::StrView,
-                    #sys_crate::StrView,
-                    #sys_crate::FfiSlice<u8>,
+                    *const #sys_crate::StrView,
+                    *const #sys_crate::StrView,
+                    *const #sys_crate::FfiSlice<u8>,
                 ) -> #sys_crate::FfiResult;
                 let import_fn: ImportFn = unsafe { ::core::mem::transmute(fn_ptr) };
+                let sub_view = #sys_crate::StrView::from_str(sub_name);
                 unsafe {
                     import_fn(
                         self.0.cast::<::core::ffi::c_void>(),
-                        #sys_crate::StrView::from_str(sub_name),
-                        type_tag,
-                        payload,
+                        &raw const sub_view,
+                        &raw const type_tag,
+                        &raw const payload,
                     )
                 }
             }
@@ -478,6 +296,215 @@ pub(crate) fn emit_witness_helpers(sys_crate: &TokenStream) -> TokenStream {
     }
 }
 
+/// Emits shared internal traits & helpers inside `const _: () = { ... };` for
+/// `field_info`, `export_fields`, and `import_field` witness symbols.
+pub(crate) fn emit_witness_helpers(sys_crate: &TokenStream) -> TokenStream {
+    let import_helpers = emit_witness_import_helpers(sys_crate);
+    let nested_and_default_helpers = emit_witness_nested_and_default_helpers(sys_crate);
+
+    quote! {
+        #[allow(dead_code)]
+        struct __BamExportWrap<T>(*const T);
+
+        #[allow(dead_code, clippy::undocumented_unsafe_blocks)]
+        trait __BamTryModCompExport {
+            unsafe fn __bam_export_nested(
+                &self,
+                prefix: &str,
+                _type_tag: &str,
+                sink: unsafe extern "C" fn(
+                    *mut ::core::ffi::c_void,
+                    *const #sys_crate::StrView,
+                    *const #sys_crate::StrView,
+                    *const #sys_crate::FfiSlice<u8>,
+                ) -> #sys_crate::FfiResult,
+                sink_ctx: *mut ::core::ffi::c_void,
+            ) -> #sys_crate::FfiResult;
+        }
+
+        #[allow(dead_code, clippy::undocumented_unsafe_blocks)]
+        impl<T: #sys_crate::ModComponent> __BamTryModCompExport for &&__BamExportWrap<T> {
+            unsafe fn __bam_export_nested(
+                &self,
+                prefix: &str,
+                _type_tag: &str,
+                sink: unsafe extern "C" fn(
+                    *mut ::core::ffi::c_void,
+                    *const #sys_crate::StrView,
+                    *const #sys_crate::StrView,
+                    *const #sys_crate::FfiSlice<u8>,
+                ) -> #sys_crate::FfiResult,
+                sink_ctx: *mut ::core::ffi::c_void,
+            ) -> #sys_crate::FfiResult {
+                let mut sym = ::std::string::String::from("bam.v0.");
+                sym.push_str(<T as #sys_crate::ModComponent>::CANONICAL_NAME);
+                sym.push_str(".export_fields");
+                let Some(fn_ptr) = <T as #sys_crate::ModComponent>::resolve_symbol(&sym) else {
+                    return #sys_crate::FfiResult::OK;
+                };
+                type ExportFn = unsafe extern "C" fn(
+                    *const ::core::ffi::c_void,
+                    ::core::option::Option<
+                        unsafe extern "C" fn(
+                            *mut ::core::ffi::c_void,
+                            *const #sys_crate::StrView,
+                            *const #sys_crate::StrView,
+                            *const #sys_crate::FfiSlice<u8>,
+                        ) -> #sys_crate::FfiResult,
+                    >,
+                    *mut ::core::ffi::c_void,
+                ) -> #sys_crate::FfiResult;
+                let export_fn: ExportFn = unsafe { ::core::mem::transmute(fn_ptr) };
+
+                struct PrefixCtx<'a> {
+                    prefix: &'a str,
+                    outer_sink: unsafe extern "C" fn(
+                        *mut ::core::ffi::c_void,
+                        *const #sys_crate::StrView,
+                        *const #sys_crate::StrView,
+                        *const #sys_crate::FfiSlice<u8>,
+                    ) -> #sys_crate::FfiResult,
+                    outer_ctx: *mut ::core::ffi::c_void,
+                }
+
+                unsafe extern "C" fn prefix_trampoline(
+                    ctx: *mut ::core::ffi::c_void,
+                    sub_name: *const #sys_crate::StrView,
+                    type_tag: *const #sys_crate::StrView,
+                    payload: *const #sys_crate::FfiSlice<u8>,
+                ) -> #sys_crate::FfiResult {
+                    if sub_name.is_null() || type_tag.is_null() || payload.is_null() {
+                        return #sys_crate::FfiResult::NULL_POINTER;
+                    }
+                    if !sub_name.is_aligned() || !type_tag.is_aligned() || !payload.is_aligned() {
+                        return #sys_crate::FfiResult::INVALID_ARGUMENT;
+                    }
+                    let sub_name = unsafe { ::core::ptr::read(sub_name) };
+                    let pctx = unsafe { &*ctx.cast::<PrefixCtx<'_>>() };
+                    let Ok(sub_str) = sub_name.try_as_str() else {
+                        return #sys_crate::FfiResult::INVALID_UTF8;
+                    };
+                    let mut full = ::std::string::String::with_capacity(
+                        pctx.prefix.len() + 1 + sub_str.len(),
+                    );
+                    full.push_str(pctx.prefix);
+                    full.push('.');
+                    full.push_str(sub_str);
+                    let full_view = #sys_crate::StrView::from_str(&full);
+                    unsafe {
+                        (pctx.outer_sink)(
+                            pctx.outer_ctx,
+                            &raw const full_view,
+                            type_tag,
+                            payload,
+                        )
+                    }
+                }
+
+                let mut pctx = PrefixCtx {
+                    prefix,
+                    outer_sink: sink,
+                    outer_ctx: sink_ctx,
+                };
+                unsafe {
+                    export_fn(
+                        self.0.cast::<::core::ffi::c_void>(),
+                        ::core::option::Option::Some(prefix_trampoline),
+                        (&raw mut pctx).cast::<::core::ffi::c_void>(),
+                    )
+                }
+            }
+        }
+
+        #[allow(dead_code, clippy::undocumented_unsafe_blocks)]
+        trait __BamFallbackRawExport {
+            unsafe fn __bam_export_nested(
+                &self,
+                prefix: &str,
+                type_tag: &str,
+                sink: unsafe extern "C" fn(
+                    *mut ::core::ffi::c_void,
+                    *const #sys_crate::StrView,
+                    *const #sys_crate::StrView,
+                    *const #sys_crate::FfiSlice<u8>,
+                ) -> #sys_crate::FfiResult,
+                sink_ctx: *mut ::core::ffi::c_void,
+            ) -> #sys_crate::FfiResult;
+        }
+
+        #[allow(dead_code, clippy::undocumented_unsafe_blocks)]
+        impl<T: #sys_crate::RawInsertable> __BamFallbackRawExport for &__BamExportWrap<T> {
+            unsafe fn __bam_export_nested(
+                &self,
+                prefix: &str,
+                type_tag: &str,
+                sink: unsafe extern "C" fn(
+                    *mut ::core::ffi::c_void,
+                    *const #sys_crate::StrView,
+                    *const #sys_crate::StrView,
+                    *const #sys_crate::FfiSlice<u8>,
+                ) -> #sys_crate::FfiResult,
+                sink_ctx: *mut ::core::ffi::c_void,
+            ) -> #sys_crate::FfiResult {
+                let size = ::core::mem::size_of::<T>();
+                let bytes: &[u8] = if size == 0 {
+                    &[]
+                } else {
+                    unsafe { ::core::slice::from_raw_parts(self.0.cast::<u8>(), size) }
+                };
+                let v_name = #sys_crate::StrView::from_str(prefix);
+                let v_tag = #sys_crate::StrView::from_str(type_tag);
+                let v_pay = #sys_crate::FfiSlice::from_slice(bytes);
+                unsafe {
+                    sink(
+                        sink_ctx,
+                        &raw const v_name,
+                        &raw const v_tag,
+                        &raw const v_pay,
+                    )
+                }
+            }
+        }
+
+        #[allow(dead_code)]
+        trait __BamFallbackUnsupportedExport {
+            unsafe fn __bam_export_nested(
+                &self,
+                _prefix: &str,
+                _type_tag: &str,
+                _sink: unsafe extern "C" fn(
+                    *mut ::core::ffi::c_void,
+                    *const #sys_crate::StrView,
+                    *const #sys_crate::StrView,
+                    *const #sys_crate::FfiSlice<u8>,
+                ) -> #sys_crate::FfiResult,
+                _sink_ctx: *mut ::core::ffi::c_void,
+            ) -> #sys_crate::FfiResult;
+        }
+
+        #[allow(dead_code)]
+        impl<T> __BamFallbackUnsupportedExport for __BamExportWrap<T> {
+            unsafe fn __bam_export_nested(
+                &self,
+                _prefix: &str,
+                _type_tag: &str,
+                _sink: unsafe extern "C" fn(
+                    *mut ::core::ffi::c_void,
+                    *const #sys_crate::StrView,
+                    *const #sys_crate::StrView,
+                    *const #sys_crate::FfiSlice<u8>,
+                ) -> #sys_crate::FfiResult,
+                _sink_ctx: *mut ::core::ffi::c_void,
+            ) -> #sys_crate::FfiResult {
+                #sys_crate::FfiResult::UNSUPPORTED
+            }
+        }
+
+        #import_helpers
+        #nested_and_default_helpers
+    }
+}
+
 /// Emits the statement that exports a single struct or enum field's bytes into `sink_fn`.
 fn emit_export_field_stmt(
     sys_crate: &TokenStream,
@@ -492,12 +519,15 @@ fn emit_export_field_stmt(
             {
                 let val: bool = unsafe { ::core::ptr::read(#ptr_expr) };
                 let byte: u8 = u8::from(val);
+                let __bam_name = #sys_crate::StrView::from_str(#field_name);
+                let __bam_tag = #sys_crate::StrView::from_str("bool");
+                let __bam_pay = #sys_crate::FfiSlice::from_slice(::core::slice::from_ref(&byte));
                 let rc = unsafe {
                     sink_fn(
                         sink_ctx,
-                        #sys_crate::StrView::from_str(#field_name),
-                        #sys_crate::StrView::from_str("bool"),
-                        #sys_crate::FfiSlice::from_slice(::core::slice::from_ref(&byte)),
+                        &raw const __bam_name,
+                        &raw const __bam_tag,
+                        &raw const __bam_pay,
                     )
                 };
                 if rc.is_err() {
@@ -514,12 +544,15 @@ fn emit_export_field_stmt(
                 } else {
                     unsafe { ::core::slice::from_raw_parts(fptr.cast::<u8>(), size) }
                 };
+                let __bam_name = #sys_crate::StrView::from_str(#field_name);
+                let __bam_tag = #sys_crate::StrView::from_str(#type_tag);
+                let __bam_pay = #sys_crate::FfiSlice::from_slice(bytes);
                 let rc = unsafe {
                     sink_fn(
                         sink_ctx,
-                        #sys_crate::StrView::from_str(#field_name),
-                        #sys_crate::StrView::from_str(#type_tag),
-                        #sys_crate::FfiSlice::from_slice(bytes),
+                        &raw const __bam_name,
+                        &raw const __bam_tag,
+                        &raw const __bam_pay,
                     )
                 };
                 if rc.is_err() {
@@ -531,12 +564,15 @@ fn emit_export_field_stmt(
             {
                 let str_ptr = <#raw_ty as __BamStdString>::cast_const_ptr(#ptr_expr);
                 let s_ref: &::std::string::String = unsafe { &*str_ptr };
+                let __bam_name = #sys_crate::StrView::from_str(#field_name);
+                let __bam_tag = #sys_crate::StrView::from_str("String");
+                let __bam_pay = #sys_crate::FfiSlice::from_slice(s_ref.as_bytes());
                 let rc = unsafe {
                     sink_fn(
                         sink_ctx,
-                        #sys_crate::StrView::from_str(#field_name),
-                        #sys_crate::StrView::from_str("String"),
-                        #sys_crate::FfiSlice::from_slice(s_ref.as_bytes()),
+                        &raw const __bam_name,
+                        &raw const __bam_tag,
+                        &raw const __bam_pay,
                     )
                 };
                 if rc.is_err() {
@@ -555,12 +591,15 @@ fn emit_export_field_stmt(
                 } else {
                     unsafe { ::core::slice::from_raw_parts(vec_ref.as_ptr().cast::<u8>(), total_bytes) }
                 };
+                let __bam_name = #sys_crate::StrView::from_str(#field_name);
+                let __bam_tag = #sys_crate::StrView::from_str(#type_tag);
+                let __bam_pay = #sys_crate::FfiSlice::from_slice(bytes);
                 let rc = unsafe {
                     sink_fn(
                         sink_ctx,
-                        #sys_crate::StrView::from_str(#field_name),
-                        #sys_crate::StrView::from_str(#type_tag),
-                        #sys_crate::FfiSlice::from_slice(bytes),
+                        &raw const __bam_name,
+                        &raw const __bam_tag,
+                        &raw const __bam_pay,
                     )
                 };
                 if rc.is_err() {
@@ -575,12 +614,15 @@ fn emit_export_field_stmt(
                 let rc = match opt_ref.as_ref() {
                     ::core::option::Option::None => {
                         let tag_none: [u8; 1] = [0u8];
+                        let __bam_name = #sys_crate::StrView::from_str(#field_name);
+                        let __bam_tag = #sys_crate::StrView::from_str(#type_tag);
+                        let __bam_pay = #sys_crate::FfiSlice::from_slice(&tag_none);
                         unsafe {
                             sink_fn(
                                 sink_ctx,
-                                #sys_crate::StrView::from_str(#field_name),
-                                #sys_crate::StrView::from_str(#type_tag),
-                                #sys_crate::FfiSlice::from_slice(&tag_none),
+                                &raw const __bam_name,
+                                &raw const __bam_tag,
+                                &raw const __bam_pay,
                             )
                         }
                     }
@@ -597,12 +639,15 @@ fn emit_export_field_stmt(
                             };
                             buf.extend_from_slice(inner_bytes);
                         }
+                        let __bam_name = #sys_crate::StrView::from_str(#field_name);
+                        let __bam_tag = #sys_crate::StrView::from_str(#type_tag);
+                        let __bam_pay = #sys_crate::FfiSlice::from_slice(buf.as_slice());
                         unsafe {
                             sink_fn(
                                 sink_ctx,
-                                #sys_crate::StrView::from_str(#field_name),
-                                #sys_crate::StrView::from_str(#type_tag),
-                                #sys_crate::FfiSlice::from_slice(buf.as_slice()),
+                                &raw const __bam_name,
+                                &raw const __bam_tag,
+                                &raw const __bam_pay,
                             )
                         }
                     }
@@ -760,26 +805,14 @@ fn register_witness_symbol(
     quote! {}
 }
 
-/// Emits `field_info`, `export_fields`, and `import_field` `extern "C"` witness functions for a non-opaque struct.
-#[allow(clippy::too_many_lines)]
-pub(crate) fn emit_struct_witnesses(state: &mut CodegenState) {
-    if state.opaque {
-        return;
-    }
-
+/// Emits the `field_info` witness `extern "C"` function for a struct.
+fn emit_struct_field_info(state: &mut CodegenState) {
     let sys_crate = state.sys_crate.clone();
     let struct_ident = state.struct_ident.clone();
-
-    let field_info_ident = format_ident!("__bam_{}_field_info", struct_ident);
-    let export_fields_ident = format_ident!("__bam_{}_export_fields", struct_ident);
-    let import_field_ident = format_ident!("__bam_{}_import_field", struct_ident);
-
+    let struct_snake = crate::attrs::to_snake_case(&struct_ident.to_string());
+    let field_info_ident = format_ident!("__bam_{}_field_info", struct_snake);
     let field_info_export = register_witness_symbol(state, "field_info", &field_info_ident);
-    let export_fields_export =
-        register_witness_symbol(state, "export_fields", &export_fields_ident);
-    let import_field_export = register_witness_symbol(state, "import_field", &import_field_ident);
 
-    // 1. `field_info`
     let mut info_arms = Vec::with_capacity(state.witness_fields.len());
     for (idx, wf) in state.witness_fields.iter().enumerate() {
         let f_name = &wf.field_name;
@@ -798,11 +831,7 @@ pub(crate) fn emit_struct_witnesses(state: &mut CodegenState) {
     }
 
     state.extern_fns.push(quote! {
-        #[allow(
-            non_snake_case,
-            clippy::undocumented_unsafe_blocks,
-            clippy::ptr_as_ptr
-        )]
+        #[allow(clippy::undocumented_unsafe_blocks)]
         #field_info_export
         unsafe extern "C" fn #field_info_ident(
             index: usize,
@@ -822,8 +851,17 @@ pub(crate) fn emit_struct_witnesses(state: &mut CodegenState) {
             }
         }
     });
+}
 
-    // 2. `export_fields`
+/// Emits the `export_fields` witness `extern "C"` function for a struct.
+fn emit_struct_export_fields(state: &mut CodegenState) {
+    let sys_crate = state.sys_crate.clone();
+    let struct_ident = state.struct_ident.clone();
+    let struct_snake = crate::attrs::to_snake_case(&struct_ident.to_string());
+    let export_fields_ident = format_ident!("__bam_{}_export_fields", struct_snake);
+    let export_fields_export =
+        register_witness_symbol(state, "export_fields", &export_fields_ident);
+
     let mut export_stmts = Vec::with_capacity(state.witness_fields.len());
     for wf in &state.witness_fields {
         let member = &wf.member_tokens;
@@ -839,21 +877,16 @@ pub(crate) fn emit_struct_witnesses(state: &mut CodegenState) {
     }
 
     state.extern_fns.push(quote! {
-        #[allow(
-            non_snake_case,
-            clippy::undocumented_unsafe_blocks,
-            clippy::ptr_as_ptr,
-            clippy::cast_ptr_alignment
-        )]
+        #[allow(clippy::undocumented_unsafe_blocks, clippy::cast_ptr_alignment)]
         #export_fields_export
         unsafe extern "C" fn #export_fields_ident(
             src_ptr: *const ::core::ffi::c_void,
             sink: ::core::option::Option<
                 unsafe extern "C" fn(
                     *mut ::core::ffi::c_void,
-                    #sys_crate::StrView,
-                    #sys_crate::StrView,
-                    #sys_crate::FfiSlice<u8>,
+                    *const #sys_crate::StrView,
+                    *const #sys_crate::StrView,
+                    *const #sys_crate::FfiSlice<u8>,
                 ) -> #sys_crate::FfiResult,
             >,
             sink_ctx: *mut ::core::ffi::c_void,
@@ -872,8 +905,16 @@ pub(crate) fn emit_struct_witnesses(state: &mut CodegenState) {
             #sys_crate::FfiResult::OK
         }
     });
+}
 
-    // 3. `import_field`
+/// Emits the `import_field` witness `extern "C"` function for a struct.
+fn emit_struct_import_field(state: &mut CodegenState) {
+    let sys_crate = state.sys_crate.clone();
+    let struct_ident = state.struct_ident.clone();
+    let struct_snake = crate::attrs::to_snake_case(&struct_ident.to_string());
+    let import_field_ident = format_ident!("__bam_{}_import_field", struct_snake);
+    let import_field_export = register_witness_symbol(state, "import_field", &import_field_ident);
+
     let mut import_direct_arms = Vec::new();
     let mut import_nested_checks = Vec::new();
     for wf in &state.witness_fields {
@@ -906,26 +947,28 @@ pub(crate) fn emit_struct_witnesses(state: &mut CodegenState) {
     }
 
     state.extern_fns.push(quote! {
-        #[allow(
-            non_snake_case,
-            clippy::undocumented_unsafe_blocks,
-            clippy::ptr_as_ptr,
-            clippy::cast_ptr_alignment
-        )]
+        #[allow(clippy::undocumented_unsafe_blocks, clippy::cast_ptr_alignment)]
         #import_field_export
         unsafe extern "C" fn #import_field_ident(
             dst_ptr: *mut ::core::ffi::c_void,
-            field_name: #sys_crate::StrView,
-            type_tag: #sys_crate::StrView,
-            payload: #sys_crate::FfiSlice<u8>,
+            field_name: *const #sys_crate::StrView,
+            type_tag: *const #sys_crate::StrView,
+            payload: *const #sys_crate::FfiSlice<u8>,
         ) -> #sys_crate::FfiResult {
-            if dst_ptr.is_null() {
+            if dst_ptr.is_null() || field_name.is_null() || type_tag.is_null() || payload.is_null() {
                 return #sys_crate::FfiResult::NULL_POINTER;
             }
             let typed_ptr = dst_ptr.cast::<#struct_ident>();
-            if !typed_ptr.is_aligned() {
+            if !typed_ptr.is_aligned()
+                || !field_name.is_aligned()
+                || !type_tag.is_aligned()
+                || !payload.is_aligned()
+            {
                 return #sys_crate::FfiResult::INVALID_ARGUMENT;
             }
+            let field_name = unsafe { ::core::ptr::read(field_name) };
+            let type_tag = unsafe { ::core::ptr::read(type_tag) };
+            let payload = unsafe { ::core::ptr::read(payload) };
             let s_name = field_name.validate();
             if s_name.is_err() {
                 return s_name;
@@ -961,26 +1004,24 @@ pub(crate) fn emit_struct_witnesses(state: &mut CodegenState) {
     });
 }
 
-/// Emits `field_info`, `export_fields`, and `import_field` `extern "C"` witness functions for a non-opaque enum.
-#[allow(clippy::too_many_lines)]
-pub(crate) fn emit_enum_witnesses(state: &mut CodegenState, variants: &[WitnessEnumVariant]) {
+/// Emits `field_info`, `export_fields`, and `import_field` `extern "C"` witness functions for a non-opaque struct.
+pub(crate) fn emit_struct_witnesses(state: &mut CodegenState) {
     if state.opaque {
         return;
     }
+    emit_struct_field_info(state);
+    emit_struct_export_fields(state);
+    emit_struct_import_field(state);
+}
 
+/// Emits the `field_info` witness `extern "C"` function for an enum.
+fn emit_enum_field_info(state: &mut CodegenState, variants: &[WitnessEnumVariant]) {
     let sys_crate = state.sys_crate.clone();
     let enum_ident = state.struct_ident.clone();
-
-    let field_info_ident = format_ident!("__bam_{}_field_info", enum_ident);
-    let export_fields_ident = format_ident!("__bam_{}_export_fields", enum_ident);
-    let import_field_ident = format_ident!("__bam_{}_import_field", enum_ident);
-
+    let enum_snake = crate::attrs::to_snake_case(&enum_ident.to_string());
+    let field_info_ident = format_ident!("__bam_{}_field_info", enum_snake);
     let field_info_export = register_witness_symbol(state, "field_info", &field_info_ident);
-    let export_fields_export =
-        register_witness_symbol(state, "export_fields", &export_fields_ident);
-    let import_field_export = register_witness_symbol(state, "import_field", &import_field_ident);
 
-    // 1. `field_info`: index 0 -> ("__variant", "enum_variant", 0), index 1.. -> ("<Var>::<field>", "<tag>", 0)
     let mut info_arms = Vec::new();
     info_arms.push(quote! {
         0usize => {
@@ -1012,11 +1053,7 @@ pub(crate) fn emit_enum_witnesses(state: &mut CodegenState, variants: &[WitnessE
     }
 
     state.extern_fns.push(quote! {
-        #[allow(
-            non_snake_case,
-            clippy::undocumented_unsafe_blocks,
-            clippy::ptr_as_ptr
-        )]
+        #[allow(clippy::undocumented_unsafe_blocks)]
         #field_info_export
         unsafe extern "C" fn #field_info_ident(
             index: usize,
@@ -1036,19 +1073,34 @@ pub(crate) fn emit_enum_witnesses(state: &mut CodegenState, variants: &[WitnessE
             }
         }
     });
+}
 
-    // 2. `export_fields`
+/// Emits the `export_fields` witness `extern "C"` function for an enum.
+fn emit_enum_export_fields(
+    state: &mut CodegenState,
+    variants: &[WitnessEnumVariant],
+) -> syn::Result<()> {
+    let sys_crate = state.sys_crate.clone();
+    let enum_ident = state.struct_ident.clone();
+    let enum_snake = crate::attrs::to_snake_case(&enum_ident.to_string());
+    let export_fields_ident = format_ident!("__bam_{}_export_fields", enum_snake);
+    let export_fields_export =
+        register_witness_symbol(state, "export_fields", &export_fields_ident);
+
     let mut export_arms = Vec::with_capacity(variants.len());
     for var in variants {
         let v_ident = Ident::new(&var.name, Span::call_site());
         let v_name = &var.name;
         let emit_variant_tag = quote! {
+            let __bam_v_name = #sys_crate::StrView::from_str("__variant");
+            let __bam_v_tag = #sys_crate::StrView::from_str("enum_variant");
+            let __bam_v_pay = #sys_crate::FfiSlice::from_slice(#v_name.as_bytes());
             let rc = unsafe {
                 sink_fn(
                     sink_ctx,
-                    #sys_crate::StrView::from_str("__variant"),
-                    #sys_crate::StrView::from_str("enum_variant"),
-                    #sys_crate::FfiSlice::from_slice(#v_name.as_bytes()),
+                    &raw const __bam_v_name,
+                    &raw const __bam_v_tag,
+                    &raw const __bam_v_pay,
                 )
             };
             if rc.is_err() {
@@ -1066,7 +1118,12 @@ pub(crate) fn emit_enum_witnesses(state: &mut CodegenState, variants: &[WitnessE
             let mut bindings = Vec::new();
             let mut stmts = Vec::new();
             for (idx, f) in var.fields.iter().enumerate() {
-                let r_ident = f.rust_ident.as_ref().expect("named field");
+                let r_ident = f.rust_ident.as_ref().ok_or_else(|| {
+                    syn::Error::new_spanned(
+                        &enum_ident,
+                        "internal error: named enum variant field missing ident in export_fields",
+                    )
+                })?;
                 let b_ident = format_ident!("__bf_{idx}");
                 bindings.push(quote! { #r_ident: #b_ident });
                 let full_name = format!("{v_name}::{}", f.field_name);
@@ -1121,21 +1178,16 @@ pub(crate) fn emit_enum_witnesses(state: &mut CodegenState, variants: &[WitnessE
     }
 
     state.extern_fns.push(quote! {
-        #[allow(
-            non_snake_case,
-            clippy::undocumented_unsafe_blocks,
-            clippy::ptr_as_ptr,
-            clippy::cast_ptr_alignment
-        )]
+        #[allow(clippy::undocumented_unsafe_blocks, clippy::cast_ptr_alignment)]
         #export_fields_export
         unsafe extern "C" fn #export_fields_ident(
             src_ptr: *const ::core::ffi::c_void,
             sink: ::core::option::Option<
                 unsafe extern "C" fn(
                     *mut ::core::ffi::c_void,
-                    #sys_crate::StrView,
-                    #sys_crate::StrView,
-                    #sys_crate::FfiSlice<u8>,
+                    *const #sys_crate::StrView,
+                    *const #sys_crate::StrView,
+                    *const #sys_crate::FfiSlice<u8>,
                 ) -> #sys_crate::FfiResult,
             >,
             sink_ctx: *mut ::core::ffi::c_void,
@@ -1156,8 +1208,20 @@ pub(crate) fn emit_enum_witnesses(state: &mut CodegenState, variants: &[WitnessE
             #sys_crate::FfiResult::OK
         }
     });
+    Ok(())
+}
 
-    // 3. `import_field`
+/// Emits the `import_field` witness `extern "C"` function for an enum.
+fn emit_enum_import_field(
+    state: &mut CodegenState,
+    variants: &[WitnessEnumVariant],
+) -> syn::Result<()> {
+    let sys_crate = state.sys_crate.clone();
+    let enum_ident = state.struct_ident.clone();
+    let enum_snake = crate::attrs::to_snake_case(&enum_ident.to_string());
+    let import_field_ident = format_ident!("__bam_{}_import_field", enum_snake);
+    let import_field_export = register_witness_symbol(state, "import_field", &import_field_ident);
+
     let variant_count = variants.len();
     let mut variant_switch_arms = Vec::new();
     let mut field_import_arms = Vec::new();
@@ -1212,7 +1276,12 @@ pub(crate) fn emit_enum_witnesses(state: &mut CodegenState, variants: &[WitnessE
         for (idx, f) in var.fields.iter().enumerate() {
             let full_name = format!("{v_name}::{}", f.field_name);
             let pat = if var.is_named {
-                let r_ident = f.rust_ident.as_ref().expect("named field");
+                let r_ident = f.rust_ident.as_ref().ok_or_else(|| {
+                    syn::Error::new_spanned(
+                        &enum_ident,
+                        "internal error: named enum variant field missing ident in import_field",
+                    )
+                })?;
                 quote! { #enum_ident::#v_ident { #r_ident: binding, .. } }
             } else {
                 let mut pats = Vec::new();
@@ -1270,26 +1339,28 @@ pub(crate) fn emit_enum_witnesses(state: &mut CodegenState, variants: &[WitnessE
     }
 
     state.extern_fns.push(quote! {
-        #[allow(
-            non_snake_case,
-            clippy::undocumented_unsafe_blocks,
-            clippy::ptr_as_ptr,
-            clippy::cast_ptr_alignment
-        )]
+        #[allow(clippy::undocumented_unsafe_blocks, clippy::cast_ptr_alignment)]
         #import_field_export
         unsafe extern "C" fn #import_field_ident(
             dst_ptr: *mut ::core::ffi::c_void,
-            field_name: #sys_crate::StrView,
-            type_tag: #sys_crate::StrView,
-            payload: #sys_crate::FfiSlice<u8>,
+            field_name: *const #sys_crate::StrView,
+            type_tag: *const #sys_crate::StrView,
+            payload: *const #sys_crate::FfiSlice<u8>,
         ) -> #sys_crate::FfiResult {
-            if dst_ptr.is_null() {
+            if dst_ptr.is_null() || field_name.is_null() || type_tag.is_null() || payload.is_null() {
                 return #sys_crate::FfiResult::NULL_POINTER;
             }
             let typed_ptr = dst_ptr.cast::<#enum_ident>();
-            if !typed_ptr.is_aligned() {
+            if !typed_ptr.is_aligned()
+                || !field_name.is_aligned()
+                || !type_tag.is_aligned()
+                || !payload.is_aligned()
+            {
                 return #sys_crate::FfiResult::INVALID_ARGUMENT;
             }
+            let field_name = unsafe { ::core::ptr::read(field_name) };
+            let type_tag = unsafe { ::core::ptr::read(type_tag) };
+            let payload = unsafe { ::core::ptr::read(payload) };
             let s_name = field_name.validate();
             if s_name.is_err() {
                 return s_name;
@@ -1336,4 +1407,19 @@ pub(crate) fn emit_enum_witnesses(state: &mut CodegenState, variants: &[WitnessE
             }
         }
     });
+    Ok(())
+}
+
+/// Emits `field_info`, `export_fields`, and `import_field` `extern "C"` witness functions for a non-opaque enum.
+pub(crate) fn emit_enum_witnesses(
+    state: &mut CodegenState,
+    variants: &[WitnessEnumVariant],
+) -> syn::Result<()> {
+    if state.opaque {
+        return Ok(());
+    }
+    emit_enum_field_info(state, variants);
+    emit_enum_export_fields(state, variants)?;
+    emit_enum_import_field(state, variants)?;
+    Ok(())
 }

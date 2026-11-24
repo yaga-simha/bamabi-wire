@@ -11,7 +11,10 @@ use bamabi_sys::{
     AbiPod, BamCommands, BamComponent, BamTermDesc, ComponentUuid, FfiEntity, FfiResult,
 };
 
-use crate::component::{GuestComponent, resolve_guest_component};
+use crate::{
+    app::QueryBuilder,
+    component::{GuestComponent, resolve_guest_component},
+};
 
 /// Safe deferred command buffer bound to an active system execution context.
 ///
@@ -237,6 +240,107 @@ impl<'a> GuestCommands<'a> {
     #[inline]
     pub fn despawn_all(&mut self, terms: &[BamTermDesc]) -> Result<(), FfiResult> {
         let status = self.inner.despawn_all(terms);
+        if status.is_ok() { Ok(()) } else { Err(status) }
+    }
+
+    /// Queues a deferred query-filtered bulk despawn of non-resource entities matching the
+    /// filter configured via `configure(|q| ...)` (using [`QueryBuilder`]).
+    #[inline]
+    pub fn despawn_all_with<F>(&mut self, configure: F) -> Result<(), FfiResult>
+    where
+        F: for<'q> FnOnce(QueryBuilder<'q>) -> QueryBuilder<'q>,
+    {
+        let host = *self.inner.host();
+        let qb = QueryBuilder::new(&host, host.manifest_name());
+        let finished = configure(qb);
+        let terms = finished.into_terms()?;
+        self.despawn_all(&terms)
+    }
+
+    /// Queues a deferred despawn of `entities` in one FFI call via
+    /// `BamHostApi::cmd_despawn_batch` (slot 85).
+    #[inline]
+    pub fn despawn_batch(&mut self, entities: &[FfiEntity]) -> Result<(), FfiResult> {
+        let status = self.inner.despawn_batch(entities);
+        if status.is_ok() { Ok(()) } else { Err(status) }
+    }
+
+    /// Queues deferred insertion of `component` (`T: AbiPod`) across `entities` in one FFI call
+    /// via `BamHostApi::cmd_insert_batch` (slot 86).
+    #[inline]
+    pub fn insert_batch<T: AbiPod>(
+        &mut self,
+        entities: &[FfiEntity],
+        component: BamComponent,
+        data: &[T],
+    ) -> Result<(), FfiResult> {
+        let status = self.inner.insert_batch(entities, component, data);
+        if status.is_ok() { Ok(()) } else { Err(status) }
+    }
+
+    /// Init-validated [`TypedComponent<T>`] variant of [`Self::insert_batch`].
+    #[inline]
+    pub fn insert_batch_typed<T: AbiPod>(
+        &mut self,
+        entities: &[FfiEntity],
+        component: TypedComponent<T>,
+        data: &[T],
+    ) -> Result<(), FfiResult> {
+        let status = self.inner.insert_batch_typed(entities, component, data);
+        if status.is_ok() { Ok(()) } else { Err(status) }
+    }
+
+    /// Queues deferred stride-0 splat insertion (`BAM_SPAWN_COL_FLAG_SPLAT`) of a single `value`
+    /// (`T: AbiPod`) onto all `entities` in one FFI call via `BamHostApi::cmd_insert_batch` (slot 86).
+    #[inline]
+    pub fn insert_batch_splat<T: AbiPod>(
+        &mut self,
+        entities: &[FfiEntity],
+        component: BamComponent,
+        value: &T,
+    ) -> Result<(), FfiResult> {
+        let status = self.inner.insert_batch_splat(entities, component, value);
+        if status.is_ok() { Ok(()) } else { Err(status) }
+    }
+
+    /// Init-validated [`TypedComponent<T>`] variant of [`Self::insert_batch_splat`].
+    #[inline]
+    pub fn insert_batch_splat_typed<T: AbiPod>(
+        &mut self,
+        entities: &[FfiEntity],
+        component: TypedComponent<T>,
+        value: &T,
+    ) -> Result<(), FfiResult> {
+        let status = self
+            .inner
+            .insert_batch_splat_typed(entities, component, value);
+        if status.is_ok() { Ok(()) } else { Err(status) }
+    }
+
+    /// Queues deferred removal of `component` from all `entities` in one FFI call via
+    /// `BamHostApi::cmd_remove_batch` (slot 87).
+    #[inline]
+    pub fn remove_batch(
+        &mut self,
+        entities: &[FfiEntity],
+        component: BamComponent,
+    ) -> Result<(), FfiResult> {
+        let status = self.inner.remove_batch(entities, component);
+        if status.is_ok() { Ok(()) } else { Err(status) }
+    }
+
+    /// Spawns `entity_count` entities via `BamHostApi::cmd_spawn_batch_ex` (slot 89), supporting
+    /// both SoA columns and stride-0 splat (`BAM_SPAWN_COL_FLAG_SPLAT`) columns.
+    #[inline]
+    pub fn spawn_batch_ex(
+        &mut self,
+        columns: &[SpawnBatchColumn<'_>],
+        entity_count: usize,
+        out_entities: Option<&mut [FfiEntity]>,
+    ) -> Result<(), FfiResult> {
+        let status = self
+            .inner
+            .spawn_batch_ex(columns, entity_count, out_entities);
         if status.is_ok() { Ok(()) } else { Err(status) }
     }
 

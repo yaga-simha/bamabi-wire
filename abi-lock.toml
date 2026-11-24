@@ -4,9 +4,9 @@ name = "bamabi-wire"
 layer = 0
 
 [abi]
-bam_abi_version = "0x0003_0000"
+bam_abi_version = "0x0004_0000"
 c_symbol_prefix = "bamabi"
-workspace_version = "0.3.0"
+workspace_version = "0.4.0"
 bevy_version = "0.20.1"
 rust_version = "1.95"
 edition = "2024"

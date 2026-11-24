@@ -1125,7 +1125,6 @@ proptest! {
                         Some(slot) => {
                             let expected = backing[*slot];
                             prop_assert_eq!(rows.get(i).copied(), Some(expected));
-                            prop_assert_eq!(rows[i], expected);
                             iter_vals.push(expected);
                         }
                         None => prop_assert_eq!(rows.get(i), None),

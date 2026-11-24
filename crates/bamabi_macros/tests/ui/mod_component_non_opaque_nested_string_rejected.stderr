@@ -12,7 +12,7 @@ help: the trait `Copy` is not implemented for `NonOpaqueOuter`
 note: required by a bound in `AbiPod`
   --> $WORKSPACE/crates/bamabi_sys/src/traits.rs
    |
-   | pub unsafe trait AbiPod: RawInsertable + Copy + Send + Sync + 'static {}
+   | pub unsafe trait AbiPod: RawInsertable + Copy + Send + Sync + 'static {
    |                                          ^^^^ required by this bound in `AbiPod`
 
 error[E0080]: evaluation panicked: assertion failed: !::core::mem::needs_drop::<NonOpaqueOuter>()
@@ -37,10 +37,10 @@ help: the trait `RawInsertable` is not implemented for `InnerLabel`
              BamComponent
              BamEventKind
              BamFieldKind
+             BamRowRange
              BamSymbol
              BamSystem
              BamSystemSet
-             ComponentUuid
            and $N others
 note: required by a bound in `assert_raw_insertable`
   --> $WORKSPACE/crates/bamabi_sys/src/traits.rs
@@ -82,10 +82,10 @@ help: the trait `AbiPod` is not implemented for `InnerLabel`
              BamComponent
              BamEventKind
              BamFieldKind
+             BamRowRange
              BamSymbol
              BamSystem
              BamSystemSet
-             ComponentUuid
            and $N others
 note: required by a bound in `assert_abi_pod`
   --> $WORKSPACE/crates/bamabi_sys/src/traits.rs

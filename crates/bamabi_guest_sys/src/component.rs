@@ -221,6 +221,13 @@ fn dispatch_pod_hook<T: AbiPod>(
 /// [`HookTrampolineState`] from `user_data` and dispatches to [`dispatch_pod_hook`] for `$field`.
 macro_rules! define_pod_hook_trampoline {
     ($fn_name:ident, $field:ident) => {
+        /// Panic-safe `extern "C"` component lifecycle hook trampoline.
+        ///
+        /// # Safety
+        /// - `user_data` must be null or point to a live [`HookTrampolineState<T>`] owned by
+        ///   [`GuestInstance`].
+        /// - When non-null, `component_ptr` must point to an initialized `T` valid for the
+        ///   synchronous duration of this callback.
         pub(crate) unsafe extern "C" fn $fn_name<T: AbiPod>(
             entity: FfiEntity,
             component_ptr: *const c_void,
@@ -336,6 +343,76 @@ pub unsafe fn register_component_raw(
     Ok(out)
 }
 
+/// Raw wrapper invoking `BamHostApi::register_resource` (slot 73) after validating `desc` via
+/// [`ComponentDesc::validate`].
+///
+/// Returns [`FfiResult::UNSUPPORTED`] when connected to an ABI `<= 0.3` host lacking slot 73.
+///
+/// # Safety
+/// - `load_ctx` must be a non-null, active [`BamLoadCtx`] during `bamabi_init`.
+/// - Every pointer referenced by `desc` (`name`, `vtable_ptr`, `required_components`, `fields`)
+///   must remain valid for the lifetime of the host `World` (or until `dlclose` after `World` drop).
+pub unsafe fn register_resource_raw(
+    load_ctx: *mut BamLoadCtx,
+    host: &Host,
+    desc: &ComponentDesc,
+) -> Result<BamComponent, FfiResult> {
+    if load_ctx.is_null() {
+        return Err(FfiResult::NULL_POINTER);
+    }
+    let validation = desc.validate();
+    if !validation.is_ok() {
+        return Err(validation);
+    }
+    let register_fn = host_slot!(host.api(), register_resource).ok_or(FfiResult::UNSUPPORTED)?;
+    let mut out = BamComponent::INVALID;
+    // SAFETY: `load_ctx` is non-null and active per caller contract, `desc` passed validation, and
+    // `out` is writable stack storage.
+    let status = unsafe { register_fn(load_ctx, desc, &mut out) };
+    if !status.is_ok() {
+        return Err(status);
+    }
+    if !out.is_valid() {
+        return Err(FfiResult::INVALID_COMPONENT);
+    }
+    Ok(out)
+}
+
+/// Raw wrapper invoking `BamHostApi::register_message` (slot 74) after validating `desc` via
+/// [`ComponentDesc::validate`].
+///
+/// Returns [`FfiResult::UNSUPPORTED`] when connected to an ABI `<= 0.3` host lacking slot 74.
+///
+/// # Safety
+/// - `load_ctx` must be a non-null, active [`BamLoadCtx`] during `bamabi_init`.
+/// - Every pointer referenced by `desc` (`name`, `vtable_ptr`, `required_components`, `fields`)
+///   must remain valid for the lifetime of the host `World` (or until `dlclose` after `World` drop).
+pub unsafe fn register_message_raw(
+    load_ctx: *mut BamLoadCtx,
+    host: &Host,
+    desc: &ComponentDesc,
+) -> Result<BamComponent, FfiResult> {
+    if load_ctx.is_null() {
+        return Err(FfiResult::NULL_POINTER);
+    }
+    let validation = desc.validate();
+    if !validation.is_ok() {
+        return Err(validation);
+    }
+    let register_fn = host_slot!(host.api(), register_message).ok_or(FfiResult::UNSUPPORTED)?;
+    let mut out = BamComponent::INVALID;
+    // SAFETY: `load_ctx` is non-null and active per caller contract, `desc` passed validation, and
+    // `out` is writable stack storage.
+    let status = unsafe { register_fn(load_ctx, desc, &mut out) };
+    if !status.is_ok() {
+        return Err(status);
+    }
+    if !out.is_valid() {
+        return Err(FfiResult::INVALID_COMPONENT);
+    }
+    Ok(out)
+}
+
 /// Registers a cross-language `T: AbiPod` dynamic component (`drop_fn = None`), storing an owned
 /// copy of `name` inside `instance` and returning the assigned [`BamComponent`] handle.
 ///
@@ -365,22 +442,16 @@ pub unsafe fn register_pod_component<T: AbiPod>(
     }
 }
 
-/// Registers a cross-language `T: AbiPod` dynamic component with optional `on_add` and `on_remove`
-/// hooks, storing both `name` and the panic-safe hook state inside `instance`.
-///
-/// # Safety
-/// - `load_ctx` must be a non-null, active [`BamLoadCtx`] belonging to `instance`.
-/// - If `vtable_ptr` is non-null, it must point to a static [`bamabi_sys::VTableHeader`]-prefixed
-///   VTable matching `(uuid, size_of::<T>(), align_of::<T>())`.
-pub unsafe fn register_pod_component_with_hooks<T: AbiPod>(
+/// Builds a validated [`ComponentDesc`] for `T: AbiPod`, pinning owned `name`, hook closures,
+/// required component handles, and custom init byte buffers inside `instance`.
+fn build_pod_component_desc<T: AbiPod>(
     instance: &mut GuestInstance,
-    load_ctx: *mut BamLoadCtx,
     name: &CStr,
     uuid: ComponentUuid,
     flags: u32,
     vtable_ptr: *const c_void,
     hooks: PodComponentHooks<T>,
-) -> Result<BamComponent, FfiResult> {
+) -> Result<ComponentDesc, FfiResult> {
     if name.to_bytes().is_empty() {
         return Err(FfiResult::INVALID_ARGUMENT);
     }
@@ -474,11 +545,76 @@ pub unsafe fn register_pod_component_with_hooks<T: AbiPod>(
         let inits_ptr = unsafe { (*raw_inits).as_ptr() };
         desc = desc.with_required_init_descs(inits_ptr, inits_len);
     }
+    Ok(desc)
+}
 
+/// Registers a cross-language `T: AbiPod` dynamic component with optional `on_add` and `on_remove`
+/// hooks, storing both `name` and the panic-safe hook state inside `instance`.
+///
+/// # Safety
+/// - `load_ctx` must be a non-null, active [`BamLoadCtx`] belonging to `instance`.
+/// - If `vtable_ptr` is non-null, it must point to a static [`bamabi_sys::VTableHeader`]-prefixed
+///   VTable matching `(uuid, size_of::<T>(), align_of::<T>())`.
+pub unsafe fn register_pod_component_with_hooks<T: AbiPod>(
+    instance: &mut GuestInstance,
+    load_ctx: *mut BamLoadCtx,
+    name: &CStr,
+    uuid: ComponentUuid,
+    flags: u32,
+    vtable_ptr: *const c_void,
+    hooks: PodComponentHooks<T>,
+) -> Result<BamComponent, FfiResult> {
+    let desc = build_pod_component_desc::<T>(instance, name, uuid, flags, vtable_ptr, hooks)?;
     let host = *instance.host();
     // SAFETY: `load_ctx` and `vtable_ptr` satisfy caller invariants; `name_ptr` and `raw_state`
     // remain valid in `instance` until host disarms hooks and runs `bamabi_shutdown`.
     unsafe { register_component_raw(load_ctx, &host, &desc) }
+}
+
+/// Registers a cross-language `T: AbiPod` dynamic singleton resource via
+/// `BamHostApi::register_resource` (slot 73), storing an owned copy of `name` inside `instance`.
+///
+/// # Safety
+/// - `load_ctx` must be a non-null, active [`BamLoadCtx`] belonging to `instance`.
+/// - If `vtable_ptr` is non-null, it must point to a static [`bamabi_sys::VTableHeader`]-prefixed
+///   VTable matching `(uuid, size_of::<T>(), align_of::<T>())`.
+pub unsafe fn register_pod_resource<T: AbiPod>(
+    instance: &mut GuestInstance,
+    load_ctx: *mut BamLoadCtx,
+    name: &CStr,
+    uuid: ComponentUuid,
+    flags: u32,
+    vtable_ptr: *const c_void,
+    hooks: PodComponentHooks<T>,
+) -> Result<BamComponent, FfiResult> {
+    let desc = build_pod_component_desc::<T>(instance, name, uuid, flags, vtable_ptr, hooks)?;
+    let host = *instance.host();
+    // SAFETY: `load_ctx` and `vtable_ptr` satisfy caller invariants; owned descriptor buffers stay
+    // pinned in `instance` until `bamabi_shutdown`.
+    unsafe { register_resource_raw(load_ctx, &host, &desc) }
+}
+
+/// Registers a cross-language `T: AbiPod` dynamic buffered message type via
+/// `BamHostApi::register_message` (slot 74), storing an owned copy of `name` inside `instance`.
+///
+/// # Safety
+/// - `load_ctx` must be a non-null, active [`BamLoadCtx`] belonging to `instance`.
+/// - If `vtable_ptr` is non-null, it must point to a static [`bamabi_sys::VTableHeader`]-prefixed
+///   VTable matching `(uuid, size_of::<T>(), align_of::<T>())`.
+pub unsafe fn register_pod_message<T: AbiPod>(
+    instance: &mut GuestInstance,
+    load_ctx: *mut BamLoadCtx,
+    name: &CStr,
+    uuid: ComponentUuid,
+    flags: u32,
+    vtable_ptr: *const c_void,
+    hooks: PodComponentHooks<T>,
+) -> Result<BamComponent, FfiResult> {
+    let desc = build_pod_component_desc::<T>(instance, name, uuid, flags, vtable_ptr, hooks)?;
+    let host = *instance.host();
+    // SAFETY: `load_ctx` and `vtable_ptr` satisfy caller invariants; owned descriptor buffers stay
+    // pinned in `instance` until `bamabi_shutdown`.
+    unsafe { register_message_raw(load_ctx, &host, &desc) }
 }
 
 /// Raw escape hatch registering a non-POD dynamic component `T` with [`generic_drop_trampoline`]
@@ -647,54 +783,64 @@ pub unsafe fn register_relation_raw(
     Ok(out)
 }
 
-/// Registers a typed entity relationship edge described by `(name, uuid, flags, data_size,
-/// data_align, max_degree)` via `BamHostApi::register_relation`, storing an owned copy of `name`
-/// inside `instance`.
+/// Configuration for registering a typed entity relationship edge via [`register_relation`].
+#[derive(Clone, Copy, Debug)]
+pub struct RelationRegistrationConfig<'a> {
+    /// Canonical NUL-terminated UTF-8 relation name.
+    pub name: &'a CStr,
+    /// Deterministic 128-bit UUID identifying the relation.
+    pub uuid: ComponentUuid,
+    /// Bitmask of `BAM_RELATION_FLAG_*`.
+    pub flags: u32,
+    /// Edge payload byte size (`0` for tag/marker relations).
+    pub data_size: usize,
+    /// Edge payload byte alignment (`1` when `data_size == 0`).
+    pub data_align: usize,
+    /// Optional out-degree cap (`0` = unlimited).
+    pub max_degree: u32,
+}
+
+/// Registers a typed entity relationship edge described by `config` via
+/// `BamHostApi::register_relation`, storing an owned copy of `config.name` inside `instance`.
 ///
 /// # Safety
 /// `load_ctx` must be a non-null, active [`BamLoadCtx`] belonging to `instance` during
 /// `bamabi_init`.
-#[allow(clippy::too_many_arguments)]
 pub unsafe fn register_relation(
     instance: &mut GuestInstance,
     load_ctx: *mut BamLoadCtx,
-    name: &CStr,
-    uuid: ComponentUuid,
-    flags: u32,
-    data_size: usize,
-    data_align: usize,
-    max_degree: u32,
+    config: &RelationRegistrationConfig<'_>,
 ) -> Result<BamComponent, FfiResult> {
     if load_ctx.is_null() {
         return Err(FfiResult::NULL_POINTER);
     }
-    if name.to_bytes().is_empty() {
+    if config.name.to_bytes().is_empty() {
         return Err(FfiResult::INVALID_ARGUMENT);
     }
-    if name.to_str().is_err() {
+    if config.name.to_str().is_err() {
         return Err(FfiResult::INVALID_UTF8);
     }
     let host = *instance.host();
     if host_slot!(host.api(), register_relation).is_none() {
         return Err(FfiResult::UNSUPPORTED);
     }
-    let mut probe_desc = BamRelationDesc::new(name.as_ptr(), uuid)
-        .with_flags(flags)
-        .with_payload_layout(data_size, data_align);
-    probe_desc.max_degree = max_degree;
+    let mut probe_desc = BamRelationDesc::new(config.name.as_ptr(), config.uuid)
+        .with_flags(config.flags)
+        .with_payload_layout(config.data_size, config.data_align);
+    probe_desc.max_degree = config.max_degree;
     let validation = probe_desc.validate();
     if !validation.is_ok() {
         return Err(validation);
     }
-    let owned_name = CString::from(name);
+    let owned_name = CString::from(config.name);
     let raw_name = instance.track_allocation(Box::new(owned_name));
     // SAFETY: `raw_name` was allocated via `instance.track_allocation` and stays pinned and valid
     // until `bamabi_shutdown` (or init rollback).
     let name_ptr = unsafe { (*raw_name).as_ptr() };
-    let mut desc = BamRelationDesc::new(name_ptr, uuid)
-        .with_flags(flags)
-        .with_payload_layout(data_size, data_align);
-    desc.max_degree = max_degree;
+    let mut desc = BamRelationDesc::new(name_ptr, config.uuid)
+        .with_flags(config.flags)
+        .with_payload_layout(config.data_size, config.data_align);
+    desc.max_degree = config.max_degree;
     // SAFETY: `load_ctx` is active per caller contract and `name_ptr` is owned by `instance`.
     unsafe { register_relation_raw(load_ctx, &host, &desc) }
 }
@@ -711,6 +857,11 @@ pub(crate) struct RowMigrateCtx<F> {
 /// Validates pointer nullness and alignment for `user_data`, `Old`, and `New` (handling zero-sized
 /// types via `NonNull::dangling()`), invokes the guest migration closure inside
 /// [`catch_guest_result`], and writes the resulting `New` value into `dst_row` on success.
+///
+/// # Safety
+/// - `user_data` must be null or point to a live [`RowMigrateCtx<F>`] for this synchronous call.
+/// - For non-ZST `Old`, `src_row` must be null or point to a readable, initialized `Old` value.
+/// - For non-ZST `New`, `dst_row` must be null or point to valid unaliased writable storage for `New`.
 pub(crate) unsafe extern "C" fn row_migrate_trampoline<Old, New, F>(
     src_row: *const c_void,
     dst_row: *mut c_void,
@@ -960,22 +1111,33 @@ where
     }
 }
 
-/// Migrates live rows of `component` from `Old: AbiPod` to `New: AbiPod` using explicit
-/// `(old_fingerprint, new_name, new_uuid, new_flags, new_fingerprint)` metadata.
+/// Configuration for migrating live POD component rows via [`migrate_pod_component_column`].
+#[derive(Clone, Copy, Debug)]
+pub struct PodMigrationConfig<'a> {
+    /// Registered [`BamComponent`] handle being migrated.
+    pub component: BamComponent,
+    /// Expected schema fingerprint of the prior component version.
+    pub old_fingerprint: u64,
+    /// Canonical NUL-terminated UTF-8 name of the new component version.
+    pub new_name: &'a CStr,
+    /// Deterministic 128-bit UUID of the new component version.
+    pub new_uuid: ComponentUuid,
+    /// `BAM_COMPONENT_FLAG_*` bitmask for the new component version.
+    pub new_flags: u32,
+    /// Structural schema fingerprint of the new component version.
+    pub new_fingerprint: u64,
+}
+
+/// Migrates live rows of `config.component` from `Old: AbiPod` to `New: AbiPod` using explicit
+/// metadata in `config`.
 ///
 /// # Safety
 /// `load_ctx` must be a non-null, active [`BamLoadCtx`] belonging to `instance` during
 /// `bamabi_init`.
-#[allow(clippy::too_many_arguments)]
 pub unsafe fn migrate_pod_component_column<Old, New, F>(
     instance: &mut GuestInstance,
     load_ctx: *mut BamLoadCtx,
-    component: BamComponent,
-    old_fingerprint: u64,
-    new_name: &CStr,
-    new_uuid: ComponentUuid,
-    new_flags: u32,
-    new_fingerprint: u64,
+    config: &PodMigrationConfig<'_>,
     migrate: F,
 ) -> FfiResult
 where
@@ -986,39 +1148,39 @@ where
     if load_ctx.is_null() {
         return FfiResult::NULL_POINTER;
     }
-    if !component.is_valid() {
+    if !config.component.is_valid() {
         return FfiResult::INVALID_COMPONENT;
     }
-    if new_name.to_bytes().is_empty() {
+    if config.new_name.to_bytes().is_empty() {
         return FfiResult::INVALID_ARGUMENT;
     }
-    if new_name.to_str().is_err() {
+    if config.new_name.to_str().is_err() {
         return FfiResult::INVALID_UTF8;
     }
     let host = *instance.host();
     if host_slot!(host.api(), migrate_component_column).is_none() {
         return FfiResult::UNSUPPORTED;
     }
-    let owned_name = CString::from(new_name);
+    let owned_name = CString::from(config.new_name);
     let raw_name = instance.track_allocation(Box::new(owned_name));
     // SAFETY: `raw_name` was allocated via `instance.track_allocation` and stays pinned and valid
     // until `bamabi_shutdown` (or init rollback).
     let name_ptr = unsafe { (*raw_name).as_ptr() };
     let new_desc = ComponentDesc::new(
         name_ptr,
-        new_uuid,
+        config.new_uuid,
         core::mem::size_of::<New>(),
         core::mem::align_of::<New>(),
     )
-    .with_flags(new_flags)
-    .with_schema_fingerprint(new_fingerprint);
+    .with_flags(config.new_flags)
+    .with_schema_fingerprint(config.new_fingerprint);
     // SAFETY: `load_ctx` is active per caller contract and `name_ptr` is owned by `instance`.
     unsafe {
         migrate_component_column_pod::<Old, New, F>(
             load_ctx,
             &host,
-            component,
-            old_fingerprint,
+            config.component,
+            config.old_fingerprint,
             &new_desc,
             migrate,
         )

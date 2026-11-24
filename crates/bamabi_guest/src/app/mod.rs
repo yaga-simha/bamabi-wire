@@ -14,7 +14,8 @@ pub use builder::{
 };
 pub use conditions::EcsRunCondition;
 pub use context::{
-    GuestRes, GuestResMut, RunConditionContext, RunConditionSystemContext, SystemContext,
+    GuestRes, GuestResMut, RunConditionContext, RunConditionSystemContext, SplitSystemContext,
+    SystemContext,
 };
 pub use observers::{ObserverBuilder, ObserverParamSetBuilder, TypedObserverBuilder};
 pub use schedules::BevySchedules;

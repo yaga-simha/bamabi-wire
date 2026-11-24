@@ -186,27 +186,39 @@ fn vtable_header_and_error_returning_setters() {
 
     // 4. Verify String getter & StrView setter returning INVALID_UTF8 on bad UTF-8
     unsafe {
-        let slice: StrView = (vt.get_tag.unwrap())(comp_const_ptr);
+        let mut slice = StrView::empty();
+        assert_eq!(
+            (vt.get_tag.unwrap())(comp_const_ptr, &raw mut slice),
+            FfiResult::OK
+        );
         assert_eq!(slice.try_as_str().unwrap(), "initial_player");
 
         let updated = "mutated_across_c_abi_boundary_with_long_heap_allocation";
+        let updated_view = StrView::from_str(updated);
         assert_eq!(
-            (vt.set_tag.unwrap())(comp_ptr, StrView::from_str(updated)),
+            (vt.set_tag.unwrap())(comp_ptr, &raw const updated_view),
             FfiResult::OK
         );
+        let mut updated_out = StrView::empty();
         assert_eq!(
-            (vt.get_tag.unwrap())(comp_const_ptr).try_as_str().unwrap(),
-            updated
+            (vt.get_tag.unwrap())(comp_const_ptr, &raw mut updated_out),
+            FfiResult::OK
         );
+        assert_eq!(updated_out.try_as_str().unwrap(), updated);
 
         let invalid_utf8: [u8; 4] = [0xFF, 0xFE, 0xFD, 0x80];
         let bad_view = StrView::from_slice(&invalid_utf8);
         assert_eq!(
-            (vt.set_tag.unwrap())(comp_ptr, bad_view),
+            (vt.set_tag.unwrap())(comp_ptr, &raw const bad_view),
             FfiResult::INVALID_UTF8
         );
+        let mut after_bad_out = StrView::empty();
         assert_eq!(
-            (vt.get_tag.unwrap())(comp_const_ptr).try_as_str().unwrap(),
+            (vt.get_tag.unwrap())(comp_const_ptr, &raw mut after_bad_out),
+            FfiResult::OK
+        );
+        assert_eq!(
+            after_bad_out.try_as_str().unwrap(),
             updated,
             "INVALID_UTF8 setter failure must leave existing host String untouched"
         );
@@ -216,24 +228,34 @@ fn vtable_header_and_error_returning_setters() {
             ptr: core::ptr::null(),
             len: 0,
         };
-        assert_eq!((vt.set_tag.unwrap())(comp_ptr, c_empty), FfiResult::OK);
+        assert_eq!(
+            (vt.set_tag.unwrap())(comp_ptr, &raw const c_empty),
+            FfiResult::OK
+        );
         assert!(comp.tag.is_empty());
     }
 
     // 5. Verify Vec<u32> getter, FfiSlice<u32> setter, and push_scores
     unsafe {
-        let scores_slice = (vt.get_scores.unwrap())(comp_const_ptr);
+        let mut scores_slice = FfiSlice::empty();
+        assert_eq!(
+            (vt.get_scores.unwrap())(comp_const_ptr, &raw mut scores_slice),
+            FfiResult::OK
+        );
         assert_eq!(scores_slice.as_slice(), &[10, 20, 30]);
 
         let new_scores: [u32; 5] = [1, 1, 2, 3, 5];
+        let new_scores_slice = FfiSlice::from_slice(&new_scores);
         assert_eq!(
-            (vt.set_scores.unwrap())(comp_ptr, FfiSlice::from_slice(&new_scores)),
+            (vt.set_scores.unwrap())(comp_ptr, &raw const new_scores_slice),
             FfiResult::OK
         );
+        let mut updated_scores = FfiSlice::empty();
         assert_eq!(
-            (vt.get_scores.unwrap())(comp_const_ptr).as_slice(),
-            &[1, 1, 2, 3, 5]
+            (vt.get_scores.unwrap())(comp_const_ptr, &raw mut updated_scores),
+            FfiResult::OK
         );
+        assert_eq!(updated_scores.as_slice(), &[1, 1, 2, 3, 5]);
 
         assert_eq!((vt.push_scores.unwrap())(comp_ptr, 8), FfiResult::OK);
         assert_eq!((vt.push_scores.unwrap())(comp_ptr, 13), FfiResult::OK);
@@ -271,48 +293,70 @@ fn vtable_header_and_error_returning_setters() {
         assert!((vt.ptr_mut_position.unwrap())(core::ptr::null_mut()).is_null());
         assert!((vt.ptr_mut_position.unwrap())(unaligned_mut).is_null());
 
-        assert!((vt.get_tag.unwrap())(core::ptr::null()).is_empty());
+        let mut null_tag_out = StrView::empty();
         assert_eq!(
-            (vt.set_tag.unwrap())(core::ptr::null_mut(), StrView::from_str("abc")),
+            (vt.get_tag.unwrap())(core::ptr::null(), &raw mut null_tag_out),
+            FfiResult::NULL_POINTER
+        );
+        assert!(null_tag_out.is_empty());
+        assert_eq!(
+            (vt.get_tag.unwrap())(comp_const_ptr, core::ptr::null_mut()),
+            FfiResult::NULL_POINTER
+        );
+        let abc_view = StrView::from_str("abc");
+        assert_eq!(
+            (vt.set_tag.unwrap())(core::ptr::null_mut(), &raw const abc_view),
             FfiResult::NULL_POINTER
         );
         assert_eq!(
-            (vt.set_tag.unwrap())(
-                comp_ptr,
-                StrView {
-                    ptr: core::ptr::null(),
-                    len: 5,
-                }
-            ),
+            (vt.set_tag.unwrap())(comp_ptr, core::ptr::null()),
+            FfiResult::NULL_POINTER
+        );
+        let null_len5_str = StrView {
+            ptr: core::ptr::null(),
+            len: 5,
+        };
+        assert_eq!(
+            (vt.set_tag.unwrap())(comp_ptr, &raw const null_len5_str),
             FfiResult::NULL_POINTER
         );
         assert_eq!(
-            (vt.set_tag.unwrap())(unaligned_mut, StrView::from_str("abc")),
+            (vt.set_tag.unwrap())(unaligned_mut, &raw const abc_view),
             FfiResult::INVALID_ARGUMENT
         );
 
+        let mut null_scores_out = FfiSlice::empty();
         assert_eq!(
-            (vt.set_scores.unwrap())(core::ptr::null_mut(), FfiSlice::from_slice(&[1u32, 2])),
+            (vt.get_scores.unwrap())(core::ptr::null(), &raw mut null_scores_out),
             FfiResult::NULL_POINTER
         );
         assert_eq!(
-            (vt.set_scores.unwrap())(
-                comp_ptr,
-                FfiSlice {
-                    ptr: core::ptr::null(),
-                    len: 4,
-                }
-            ),
+            (vt.get_scores.unwrap())(comp_const_ptr, core::ptr::null_mut()),
+            FfiResult::NULL_POINTER
+        );
+        let one_two = FfiSlice::from_slice(&[1u32, 2]);
+        assert_eq!(
+            (vt.set_scores.unwrap())(core::ptr::null_mut(), &raw const one_two),
             FfiResult::NULL_POINTER
         );
         assert_eq!(
-            (vt.set_scores.unwrap())(
-                comp_ptr,
-                FfiSlice {
-                    ptr: core::ptr::without_provenance::<u32>(1),
-                    len: 2,
-                }
-            ),
+            (vt.set_scores.unwrap())(comp_ptr, core::ptr::null()),
+            FfiResult::NULL_POINTER
+        );
+        let null_len4_slice = FfiSlice {
+            ptr: core::ptr::null(),
+            len: 4,
+        };
+        assert_eq!(
+            (vt.set_scores.unwrap())(comp_ptr, &raw const null_len4_slice),
+            FfiResult::NULL_POINTER
+        );
+        let unaligned_slice = FfiSlice {
+            ptr: core::ptr::without_provenance::<u32>(1),
+            len: 2,
+        };
+        assert_eq!(
+            (vt.set_scores.unwrap())(comp_ptr, &raw const unaligned_slice),
             FfiResult::INVALID_ARGUMENT
         );
         assert_eq!(
@@ -354,28 +398,56 @@ fn self_aliasing_string_and_vec_setters() {
     let ptr = (&raw mut comp).cast::<c_void>();
 
     unsafe {
-        let full_slice = (vt.get_tag.unwrap())(ptr as *const c_void);
-        assert_eq!((vt.set_tag.unwrap())(ptr, full_slice), FfiResult::OK);
+        let mut full_slice = StrView::empty();
+        assert_eq!(
+            (vt.get_tag.unwrap())(ptr as *const c_void, &raw mut full_slice),
+            FfiResult::OK
+        );
+        assert_eq!(
+            (vt.set_tag.unwrap())(ptr, &raw const full_slice),
+            FfiResult::OK
+        );
         assert_eq!(comp.tag, "hello_world_self_aliasing");
 
-        let sub_slice = (vt.get_tag.unwrap())(ptr as *const c_void);
+        let mut sub_slice = StrView::empty();
+        assert_eq!(
+            (vt.get_tag.unwrap())(ptr as *const c_void, &raw mut sub_slice),
+            FfiResult::OK
+        );
         let interior = StrView {
             ptr: sub_slice.ptr.add(6),
             len: 5,
         };
-        assert_eq!((vt.set_tag.unwrap())(ptr, interior), FfiResult::OK);
+        assert_eq!(
+            (vt.set_tag.unwrap())(ptr, &raw const interior),
+            FfiResult::OK
+        );
         assert_eq!(comp.tag, "world");
 
-        let vec_slice = (vt.get_scores.unwrap())(ptr as *const c_void);
-        assert_eq!((vt.set_scores.unwrap())(ptr, vec_slice), FfiResult::OK);
+        let mut vec_slice = FfiSlice::empty();
+        assert_eq!(
+            (vt.get_scores.unwrap())(ptr as *const c_void, &raw mut vec_slice),
+            FfiResult::OK
+        );
+        assert_eq!(
+            (vt.set_scores.unwrap())(ptr, &raw const vec_slice),
+            FfiResult::OK
+        );
         assert_eq!(comp.scores, vec![10, 20, 30, 40, 50]);
 
-        let vec_sub = (vt.get_scores.unwrap())(ptr as *const c_void);
+        let mut vec_sub = FfiSlice::empty();
+        assert_eq!(
+            (vt.get_scores.unwrap())(ptr as *const c_void, &raw mut vec_sub),
+            FfiResult::OK
+        );
         let sub_view = FfiSlice {
             ptr: vec_sub.ptr.add(1),
             len: 3,
         };
-        assert_eq!((vt.set_scores.unwrap())(ptr, sub_view), FfiResult::OK);
+        assert_eq!(
+            (vt.set_scores.unwrap())(ptr, &raw const sub_view),
+            FfiResult::OK
+        );
         assert_eq!(comp.scores, vec![20, 30, 40]);
     }
 }
@@ -476,7 +548,7 @@ fn namespaced_canonical_names_symbols_and_uuid_fingerprints() {
     // Explicit `#[mod_component(uuid = "...")]` and component registration flags
     assert_eq!(
         ExplicitUuidComp::UUID,
-        ComponentUuid::parse_hex("01234567-89ab-cdef-0123-456789abcdef")
+        ComponentUuid::try_parse_hex("01234567-89ab-cdef-0123-456789abcdef").unwrap()
     );
     assert_eq!(
         ExplicitUuidComp::COMPONENT_FLAGS,
@@ -535,8 +607,9 @@ fn byte_stride_array_iteration_and_tuple_struct() {
             );
 
             let new_tag = format!("updated_{i}");
+            let new_tag_view = StrView::from_str(&new_tag);
             assert_eq!(
-                (vt.set_tag.unwrap())(elem_ptr, StrView::from_str(&new_tag)),
+                (vt.set_tag.unwrap())(elem_ptr, &raw const new_tag_view),
                 FfiResult::OK
             );
         }
@@ -552,14 +625,15 @@ fn byte_stride_array_iteration_and_tuple_struct() {
     let name_tag_vt = NameTag::vtable();
     let nt_ptr = (&raw mut name_tag).cast::<c_void>();
     unsafe {
+        let mut out_nt = StrView::empty();
         assert_eq!(
-            (name_tag_vt.get_0.unwrap())(nt_ptr as *const c_void)
-                .try_as_str()
-                .unwrap(),
-            "hero"
+            (name_tag_vt.get_0.unwrap())(nt_ptr as *const c_void, &raw mut out_nt),
+            FfiResult::OK
         );
+        assert_eq!(out_nt.try_as_str().unwrap(), "hero");
+        let legend_view = StrView::from_str("legendary_hero");
         assert_eq!(
-            (name_tag_vt.set_0.unwrap())(nt_ptr, StrView::from_str("legendary_hero")),
+            (name_tag_vt.set_0.unwrap())(nt_ptr, &raw const legend_view),
             FfiResult::OK
         );
     }
@@ -690,8 +764,9 @@ fn pod_vs_raw_insertable_vs_opaque_traits() {
     let holder_ptr = (&raw mut holder).cast::<c_void>();
     unsafe {
         let inner_name_ptr = (holder_vt.ptr_mut_name.unwrap())(holder_ptr);
+        let updated_view = StrView::from_str("opaque_mutated");
         assert_eq!(
-            (name_vt.set_0.unwrap())(inner_name_ptr, StrView::from_str("opaque_mutated")),
+            (name_vt.set_0.unwrap())(inner_name_ptr, &raw const updated_view),
             FfiResult::OK
         );
     }
@@ -755,12 +830,14 @@ fn m06_qualified_std_types_aliases_and_explicit_mod_field_override() {
     let ptr = (&raw mut item).cast::<c_void>();
 
     unsafe {
+        let q_view = StrView::from_str("qualified_ok");
         assert_eq!(
-            (vt.set_qualified_str.unwrap())(ptr, StrView::from_str("qualified_ok")),
+            (vt.set_qualified_str.unwrap())(ptr, &raw const q_view),
             FfiResult::OK
         );
+        let a_view = StrView::from_str("aliased_ok");
         assert_eq!(
-            (vt.set_aliased_str.unwrap())(ptr, StrView::from_str("aliased_ok")),
+            (vt.set_aliased_str.unwrap())(ptr, &raw const a_view),
             FfiResult::OK
         );
         assert_eq!((vt.push_qualified_vec.unwrap())(ptr, 3.5), FfiResult::OK);
@@ -822,8 +899,9 @@ fn crate_override_and_facade_reexport() {
     let ptr = (&raw mut comp).cast::<c_void>();
     unsafe {
         assert_eq!((vt.set_active.unwrap())(ptr, FfiBool::TRUE), FfiResult::OK);
+        let f_view = StrView::from_str("facade_updated");
         assert_eq!(
-            (vt.set_label.unwrap())(ptr, StrView::from_str("facade_updated")),
+            (vt.set_label.unwrap())(ptr, &raw const f_view),
             FfiResult::OK
         );
     }
@@ -924,7 +1002,7 @@ fn emits_c_decl_and_zig_decl_for_pod_and_non_pod_components() {
     assert!(mixed_c.contains("typedef struct MixedComponent MixedComponent;"));
     assert!(mixed_c.contains("typedef struct MixedComponentVTable_scores_Slice {"));
     assert!(mixed_c.contains("BamBool   (*get_active)(const void* ptr);"));
-    assert!(mixed_c.contains("BamStrView (*get_tag)(const void* ptr);"));
+    assert!(mixed_c.contains("BamResult (*get_tag)(const void* ptr, BamStrView* out_view);"));
     assert!(mixed_c.contains("size_t (*len_scores)(const void* ptr);"));
     assert!(mixed_c.contains("BamResult (*push_scores)(void* ptr, uint32_t val);"));
     assert!(
@@ -1055,13 +1133,12 @@ pub struct TargetWithOptions {
 #[test]
 fn ffi_option_summary_tick_and_require_metadata() {
     const {
-        assert!(TargetWithOptions::IS_ABI_POD);
+        assert!(!TargetWithOptions::IS_ABI_POD);
         assert!(TargetWithOptions::IS_RAW_INSERTABLE);
         assert!(TargetWithOptions::SUMMARY_TICK);
         assert!(TargetWithOptions::COMPONENT_FLAGS == BAM_COMPONENT_FLAG_SUMMARY_TICK);
         assert!(TargetWithOptions::REQUIRED_COMPONENT_NAMES.len() == 1);
     }
-    require_abi_pod::<TargetWithOptions>();
     assert_eq!(
         TargetWithOptions::REQUIRED_COMPONENT_NAMES,
         &[PodPosition::CANONICAL_NAME]
@@ -1223,11 +1300,13 @@ fn repr_c_fieldless_and_tagged_enums_vtable_and_schema_uuid() {
             y: 2.0,
             z: 3.0,
         };
+        let fireball_view = StrView::from_str("fireball");
+        let spell_args_slice = FfiSlice::from_slice(&spell_args);
         assert_eq!(
             (a_vt.set_cast.unwrap())(
                 a_ptr,
-                StrView::from_str("fireball"),
-                FfiSlice::from_slice(&spell_args),
+                &raw const fireball_view,
+                &raw const spell_args_slice,
                 FfiOption::some(77),
                 (&raw const pos).cast::<c_void>(),
             ),
@@ -1251,8 +1330,8 @@ fn repr_c_fieldless_and_tagged_enums_vtable_and_schema_uuid() {
         assert_eq!(
             (a_vt.set_cast.unwrap())(
                 a_ptr,
-                out_str,
-                out_slice,
+                &raw const out_str,
+                &raw const out_slice,
                 FfiOption::none(),
                 (&raw const pos).cast::<c_void>(),
             ),
@@ -1281,10 +1360,20 @@ fn repr_c_fieldless_and_tagged_enums_vtable_and_schema_uuid() {
 }
 
 type FieldInfoFn = unsafe extern "C" fn(usize, *mut StrView, *mut StrView, *mut usize) -> FfiBool;
-type ExportSinkFn = unsafe extern "C" fn(*mut c_void, StrView, StrView, FfiSlice<u8>) -> FfiResult;
+type ExportSinkFn = unsafe extern "C" fn(
+    *mut c_void,
+    *const StrView,
+    *const StrView,
+    *const FfiSlice<u8>,
+) -> FfiResult;
 type ExportFieldsFn =
     unsafe extern "C" fn(*const c_void, Option<ExportSinkFn>, *mut c_void) -> FfiResult;
-type ImportFieldFn = unsafe extern "C" fn(*mut c_void, StrView, StrView, FfiSlice<u8>) -> FfiResult;
+type ImportFieldFn = unsafe extern "C" fn(
+    *mut c_void,
+    *const StrView,
+    *const StrView,
+    *const FfiSlice<u8>,
+) -> FfiResult;
 
 #[derive(Debug, Clone, Default, PartialEq, ModComponent)]
 #[mod_component(name = "mig::RecordV1")]
@@ -1418,11 +1507,14 @@ fn witness_field_info_export_and_import_migration_is_miri_clean() {
 
     unsafe extern "C" fn collect_sink(
         ctx: *mut c_void,
-        field_name: StrView,
-        type_tag: StrView,
-        payload: FfiSlice<u8>,
+        field_name: *const StrView,
+        type_tag: *const StrView,
+        payload: *const FfiSlice<u8>,
     ) -> FfiResult {
         let out = unsafe { &mut *ctx.cast::<Vec<(String, String, Vec<u8>)>>() };
+        let field_name = unsafe { &*field_name };
+        let type_tag = unsafe { &*type_tag };
+        let payload = unsafe { &*payload };
         let bytes = if payload.len == 0 {
             Vec::new()
         } else {
@@ -1461,12 +1553,15 @@ fn witness_field_info_export_and_import_migration_is_miri_clean() {
         ..Default::default()
     };
     for (f_name, t_tag, bytes) in &captured {
+        let f_view = StrView::from_str(f_name);
+        let t_view = StrView::from_str(t_tag);
+        let b_slice = FfiSlice::from_slice(bytes);
         let rc = unsafe {
             import_v2(
                 (&raw mut dst).cast::<c_void>(),
-                StrView::from_str(f_name),
-                StrView::from_str(t_tag),
-                FfiSlice::from_slice(bytes),
+                &raw const f_view,
+                &raw const t_view,
+                &raw const b_slice,
             )
         };
         if f_name == "removed" {
@@ -1512,12 +1607,15 @@ fn witness_field_info_export_and_import_migration_is_miri_clean() {
         ..Default::default()
     };
     for (f_name, t_tag, bytes) in &captured {
+        let f_view = StrView::from_str(f_name);
+        let t_view = StrView::from_str(t_tag);
+        let b_slice = FfiSlice::from_slice(bytes);
         let _ = unsafe {
             import_v2(
                 (&raw mut dst_none).cast::<c_void>(),
-                StrView::from_str(f_name),
-                StrView::from_str(t_tag),
-                FfiSlice::from_slice(bytes),
+                &raw const f_view,
+                &raw const t_view,
+                &raw const b_slice,
             )
         };
     }
@@ -1526,25 +1624,31 @@ fn witness_field_info_export_and_import_migration_is_miri_clean() {
     assert_eq!(dst_none.hp, 7i64);
 
     // Incompatible type_tag leaves destination field untouched and returns NOT_FOUND
+    let bad_f = StrView::from_str("hp");
+    let bad_t = StrView::from_str("String");
+    let bad_b = FfiSlice::from_slice(b"not_an_int");
     assert_eq!(
         unsafe {
             import_v2(
                 (&raw mut dst_none).cast::<c_void>(),
-                StrView::from_str("hp"),
-                StrView::from_str("String"),
-                FfiSlice::from_slice(b"not_an_int"),
+                &raw const bad_f,
+                &raw const bad_t,
+                &raw const bad_b,
             )
         },
         FfiResult::NOT_FOUND
     );
     assert_eq!(dst_none.hp, 7i64);
+    let name_f = StrView::from_str("name");
+    let name_t = StrView::from_str("String");
+    let bad_utf8_b = FfiSlice::from_slice(&[0xFF, 0xFE]);
     assert_eq!(
         unsafe {
             import_v2(
                 (&raw mut dst_none).cast::<c_void>(),
-                StrView::from_str("name"),
-                StrView::from_str("String"),
-                FfiSlice::from_slice(&[0xFF, 0xFE]),
+                &raw const name_f,
+                &raw const name_t,
+                &raw const bad_utf8_b,
             )
         },
         FfiResult::INVALID_UTF8
@@ -1578,13 +1682,16 @@ fn witness_field_info_export_and_import_migration_is_miri_clean() {
     );
     let mut widen_dst = WidenDst::default();
     for (f_name, t_tag, bytes) in &captured {
+        let f_view = StrView::from_str(f_name);
+        let t_view = StrView::from_str(t_tag);
+        let b_slice = FfiSlice::from_slice(bytes);
         assert_eq!(
             unsafe {
                 import_widen(
                     (&raw mut widen_dst).cast::<c_void>(),
-                    StrView::from_str(f_name),
-                    StrView::from_str(t_tag),
-                    FfiSlice::from_slice(bytes),
+                    &raw const f_view,
+                    &raw const t_view,
+                    &raw const b_slice,
                 )
             },
             FfiResult::OK
@@ -1639,13 +1746,16 @@ fn witness_field_info_export_and_import_migration_is_miri_clean() {
         label: String::new(),
     };
     for (f_name, t_tag, bytes) in &captured {
+        let f_view = StrView::from_str(f_name);
+        let t_view = StrView::from_str(t_tag);
+        let b_slice = FfiSlice::from_slice(bytes);
         assert_eq!(
             unsafe {
                 import_nested(
                     (&raw mut nh_dst).cast::<c_void>(),
-                    StrView::from_str(f_name),
-                    StrView::from_str(t_tag),
-                    FfiSlice::from_slice(bytes),
+                    &raw const f_view,
+                    &raw const t_view,
+                    &raw const b_slice,
                 )
             },
             FfiResult::OK
@@ -1691,13 +1801,16 @@ fn witness_field_info_export_and_import_migration_is_miri_clean() {
 
     let mut enum_dst = ActionPayload::Idle;
     for (f_name, t_tag, bytes) in &captured {
+        let f_view = StrView::from_str(f_name);
+        let t_view = StrView::from_str(t_tag);
+        let b_slice = FfiSlice::from_slice(bytes);
         assert_eq!(
             unsafe {
                 import_enum(
                     (&raw mut enum_dst).cast::<c_void>(),
-                    StrView::from_str(f_name),
-                    StrView::from_str(t_tag),
-                    FfiSlice::from_slice(bytes),
+                    &raw const f_view,
+                    &raw const t_view,
+                    &raw const b_slice,
                 )
             },
             FfiResult::OK,
@@ -1705,13 +1818,17 @@ fn witness_field_info_export_and_import_migration_is_miri_clean() {
         );
     }
     assert_eq!(enum_dst, enum_src);
+    let move_f = StrView::from_str("Move::speed");
+    let move_t = StrView::from_str("f32");
+    let move_b_bytes = 1.0f32.to_ne_bytes();
+    let move_b = FfiSlice::from_slice(&move_b_bytes);
     assert_eq!(
         unsafe {
             import_enum(
                 (&raw mut enum_dst).cast::<c_void>(),
-                StrView::from_str("Move::speed"),
-                StrView::from_str("f32"),
-                FfiSlice::from_slice(&1.0f32.to_ne_bytes()),
+                &raw const move_f,
+                &raw const move_t,
+                &raw const move_b,
             )
         },
         FfiResult::INVALID_STATE
@@ -1766,8 +1883,9 @@ fn tuple_struct_mixed_fields_vtable_and_witness_roundtrip() {
         let opt = (vt_ref.get_1.unwrap())(const_ptr);
         assert_eq!(opt.is_some, FfiBool::TRUE);
         assert_eq!(opt.value, 42);
+        let tuple_view = StrView::from_str("tuple_updated");
         assert_eq!(
-            (vt_ref.set_2.unwrap())(mut_ptr, StrView::from_str("tuple_updated")),
+            (vt_ref.set_2.unwrap())(mut_ptr, &raw const tuple_view),
             FfiResult::OK
         );
         assert_eq!(
@@ -1819,11 +1937,14 @@ fn tuple_struct_mixed_fields_vtable_and_witness_roundtrip() {
 
     unsafe extern "C" fn sink(
         ctx: *mut c_void,
-        field_name: StrView,
-        type_tag: StrView,
-        payload: FfiSlice<u8>,
+        field_name: *const StrView,
+        type_tag: *const StrView,
+        payload: *const FfiSlice<u8>,
     ) -> FfiResult {
         let out = unsafe { &mut *ctx.cast::<Vec<(String, String, Vec<u8>)>>() };
+        let field_name = unsafe { &*field_name };
+        let type_tag = unsafe { &*type_tag };
+        let payload = unsafe { &*payload };
         let bytes = if payload.len == 0 {
             Vec::new()
         } else {
@@ -1851,13 +1972,16 @@ fn tuple_struct_mixed_fields_vtable_and_witness_roundtrip() {
 
     let mut dst = TupleMixed::default();
     for (f_name, t_tag, bytes) in &captured {
+        let f_view = StrView::from_str(f_name);
+        let t_view = StrView::from_str(t_tag);
+        let b_slice = FfiSlice::from_slice(bytes);
         assert_eq!(
             unsafe {
                 import_fn(
                     (&raw mut dst).cast::<c_void>(),
-                    StrView::from_str(f_name),
-                    StrView::from_str(t_tag),
-                    FfiSlice::from_slice(bytes),
+                    &raw const f_view,
+                    &raw const t_view,
+                    &raw const b_slice,
                 )
             },
             FfiResult::OK
@@ -1879,13 +2003,16 @@ fn tuple_struct_mixed_fields_vtable_and_witness_roundtrip() {
         FfiResult::OK
     );
     for (f_name, t_tag, bytes) in &captured {
+        let f_view = StrView::from_str(f_name);
+        let t_view = StrView::from_str(t_tag);
+        let b_slice = FfiSlice::from_slice(bytes);
         assert_eq!(
             unsafe {
                 import_fn(
                     (&raw mut dst).cast::<c_void>(),
-                    StrView::from_str(f_name),
-                    StrView::from_str(t_tag),
-                    FfiSlice::from_slice(bytes),
+                    &raw const f_view,
+                    &raw const t_view,
+                    &raw const b_slice,
                 )
             },
             FfiResult::OK
@@ -1931,11 +2058,12 @@ fn wide_i64_and_u64_enums_discriminants_vtables_and_witness_roundtrip() {
     let mut u_val = UnsignedWideTagged::Idle;
     unsafe {
         assert_eq!((u_vt.tag.unwrap())((&raw const u_val).cast()), 0u64);
+        let extreme_view = StrView::from_str("extreme");
         assert_eq!(
             (u_vt.set_extreme.unwrap())(
                 (&raw mut u_val).cast(),
                 0xCAFE_BABE_DEAD_BEEFu64,
-                StrView::from_str("extreme"),
+                &raw const extreme_view,
                 FfiOption::some(999),
             ),
             FfiResult::OK
@@ -1979,11 +2107,14 @@ fn wide_i64_and_u64_enums_discriminants_vtables_and_witness_roundtrip() {
 
     unsafe extern "C" fn sink(
         ctx: *mut c_void,
-        field_name: StrView,
-        type_tag: StrView,
-        payload: FfiSlice<u8>,
+        field_name: *const StrView,
+        type_tag: *const StrView,
+        payload: *const FfiSlice<u8>,
     ) -> FfiResult {
         let out = unsafe { &mut *ctx.cast::<Vec<(String, String, Vec<u8>)>>() };
+        let field_name = unsafe { &*field_name };
+        let type_tag = unsafe { &*type_tag };
+        let payload = unsafe { &*payload };
         let bytes = if payload.len == 0 {
             Vec::new()
         } else {
@@ -2011,13 +2142,16 @@ fn wide_i64_and_u64_enums_discriminants_vtables_and_witness_roundtrip() {
     );
     let mut s_dst = SignedWideEnum::Zero;
     for (f_name, t_tag, bytes) in &captured {
+        let f_view = StrView::from_str(f_name);
+        let t_view = StrView::from_str(t_tag);
+        let b_slice = FfiSlice::from_slice(bytes);
         assert_eq!(
             unsafe {
                 import_s(
                     (&raw mut s_dst).cast::<c_void>(),
-                    StrView::from_str(f_name),
-                    StrView::from_str(t_tag),
-                    FfiSlice::from_slice(bytes),
+                    &raw const f_view,
+                    &raw const t_view,
+                    &raw const b_slice,
                 )
             },
             FfiResult::OK
@@ -2038,13 +2172,16 @@ fn wide_i64_and_u64_enums_discriminants_vtables_and_witness_roundtrip() {
     );
     let mut u_dst = UnsignedWideTagged::Idle;
     for (f_name, t_tag, bytes) in &captured {
+        let f_view = StrView::from_str(f_name);
+        let t_view = StrView::from_str(t_tag);
+        let b_slice = FfiSlice::from_slice(bytes);
         assert_eq!(
             unsafe {
                 import_u(
                     (&raw mut u_dst).cast::<c_void>(),
-                    StrView::from_str(f_name),
-                    StrView::from_str(t_tag),
-                    FfiSlice::from_slice(bytes),
+                    &raw const f_view,
+                    &raw const t_view,
+                    &raw const b_slice,
                 )
             },
             FfiResult::OK
@@ -2284,4 +2421,29 @@ fn promoted_abi_primitives_generate_by_value_get_set_slots() {
     assert!(zig_decl.contains(
         "set_ticks: ?*const fn (?*anyopaque, bam.BamChangeTicks) callconv(.c) bam.BamResult,"
     ));
+}
+
+/// Test scenario: verifies `FfiDisabled`, `BamRowRange`, and `BamTimeInfo` derive cleanly on
+/// `#[derive(ModComponent)]` without `improper_ctypes_definitions` warnings, and verifies
+/// `ModComponent::BAM_FIELD_META` populates safe field metadata.
+#[test]
+fn v04_wire_types_and_bam_field_meta() {
+    #[repr(C)]
+    #[derive(Copy, Clone, Debug, PartialEq, ModComponent)]
+    #[mod_component(name = "probe::V04WireComp")]
+    struct V04WireComp {
+        disabled: bamabi_sys::FfiDisabled,
+        range: bamabi_sys::BamRowRange,
+        time: bamabi_sys::BamTimeInfo,
+    }
+
+    const { assert!(V04WireComp::IS_ABI_POD) };
+    assert_eq!(V04WireComp::BAM_FIELD_META.len(), 3);
+    assert_eq!(V04WireComp::BAM_FIELD_META[0].name, "disabled");
+    assert_eq!(V04WireComp::BAM_FIELD_META[0].type_tag, "FfiDisabled");
+    assert_eq!(V04WireComp::BAM_FIELD_META[0].size, 0);
+    assert_eq!(V04WireComp::BAM_FIELD_META[1].name, "range");
+    assert_eq!(V04WireComp::BAM_FIELD_META[1].type_tag, "BamRowRange");
+    assert_eq!(V04WireComp::BAM_FIELD_META[2].name, "time");
+    assert_eq!(V04WireComp::BAM_FIELD_META[2].type_tag, "BamTimeInfo");
 }

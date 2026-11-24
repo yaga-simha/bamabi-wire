@@ -1,14 +1,17 @@
 //! Deterministic single-source C99 header generator for `include/bamabi.h`.
 //!
 //! Reads ABI constants, discriminants, flags, limits, and verified `size_of` / `align_of` /
-//! `offset_of!` metadata directly from `bamabi_sys` so the C99 wire contract cannot drift
-//! from the Rust source of truth.
+//! `offset_of!` metadata directly from [`bamabi_sys::abi_meta`] so the C99 wire contract cannot
+//! drift from the Rust source of truth.
 
 use std::fmt::Write as _;
 use std::fs;
 use std::mem::{align_of, offset_of, size_of};
 use std::path::Path;
 
+use bamabi_sys::abi_meta::{
+    Align32, HOST_API_SLOTS, StructLayoutSpec, TargetLayout, WIRE_STRUCT_SPECS,
+};
 use bamabi_sys::{
     ABI_VERSION, ABI_VERSION_MAJOR, ABI_VERSION_MINOR, ABI_VERSION_PATCH, AccessMode,
     BAM_CHILD_OF_NAME, BAM_CHILDREN_NAME, BAM_COMPONENT_FLAG_IMMUTABLE,
@@ -22,1766 +25,73 @@ use bamabi_sys::{
     BAM_REQUIRED_FLAG_CUSTOM_BYTES, BAM_REQUIRED_FLAG_INIT_FN, BAM_REQUIRED_FLAG_RESOLVE_BY_UUID,
     BAM_REQUIRED_KNOWN_FLAGS, BAM_SCHEDULE_SET_FLAG_AFTER_WEAK, BAM_SCHEDULE_SET_FLAG_BEFORE_WEAK,
     BAM_SCHEDULE_SET_FLAG_PARALLEL, BAM_SCHEDULE_SET_FLAG_SEQUENCE,
-    BAM_SCHEDULE_SET_FLAG_SEQUENCE_WEAK, BAM_SCHEDULE_SET_KNOWN_FLAGS,
-    BAM_STORAGE_FLAG_ENTITY_EVENT, BAM_STORAGE_FLAG_EVENT, BAM_STORAGE_FLAG_IMMUTABLE,
-    BAM_STORAGE_FLAG_MESSAGE, BAM_STORAGE_FLAG_RESOURCE, BAM_STORAGE_FLAG_SPARSE_SET,
-    BAM_STORAGE_FLAG_SUMMARY_TICK, BAM_SYSTEM_FLAG_AMBIGUOUS_WITH_ALL, BAM_SYSTEM_FLAG_MAIN_THREAD,
-    BAM_SYSTEM_KNOWN_FLAGS, BAM_TERM_FLAG_ADDED, BAM_TERM_FLAG_CHANGED, BAM_TERM_KNOWN_FLAGS,
-    BAM_TRIGGER_FLAG_PROPAGATE, BAM_TRIGGER_KNOWN_FLAGS, BamChangeTicks, BamColumnInfo,
-    BamComponent, BamEventKind, BamFieldDesc, BamFieldKind, BamHostApi, BamLayoutInfo, BamManifest,
-    BamObserverDesc, BamQueryDesc, BamRelationDesc, BamRequiredComponent, BamScheduleSetDesc,
-    BamSymbol, BamSystem, BamSystemDesc, BamSystemSet, BamTermDesc, BamTriggerDesc, ComponentDesc,
-    ComponentUuid, FfiAssetHandle, FfiAssetLoadState, FfiBool, FfiChildOf, FfiEntity, FfiOption,
-    FfiResult, MAX_QUERIES_PER_SYSTEM, MAX_TERMS_PER_QUERY, MappedStringVTable, SIPHASH_KEY_0,
-    SIPHASH_KEY_1, ScheduleId, StrView, VTableHeader, offsets as host_api_offsets,
+    BAM_SCHEDULE_SET_FLAG_SEQUENCE_WEAK, BAM_SCHEDULE_SET_KNOWN_FLAGS, BAM_SPAWN_COL_FLAG_SPLAT,
+    BAM_SPAWN_COL_KNOWN_FLAGS, BAM_STORAGE_FLAG_ENTITY_EVENT, BAM_STORAGE_FLAG_EVENT,
+    BAM_STORAGE_FLAG_IMMUTABLE, BAM_STORAGE_FLAG_MESSAGE, BAM_STORAGE_FLAG_RESOURCE,
+    BAM_STORAGE_FLAG_SPARSE_SET, BAM_STORAGE_FLAG_SUMMARY_TICK, BAM_SYSTEM_FLAG_AMBIGUOUS_WITH_ALL,
+    BAM_SYSTEM_FLAG_MAIN_THREAD, BAM_SYSTEM_KNOWN_FLAGS, BAM_TERM_FLAG_ADDED,
+    BAM_TERM_FLAG_CHANGED, BAM_TERM_KNOWN_FLAGS, BAM_TRIGGER_FLAG_PROPAGATE,
+    BAM_TRIGGER_KNOWN_FLAGS, BamChangeTicks, BamColumnInfo, BamComponent, BamEventKind,
+    BamFieldDesc, BamFieldKind, BamHostApi, BamLayoutInfo, BamManifest, BamObserverDesc,
+    BamParOptions, BamQueryDesc, BamRelationDesc, BamRequiredComponent, BamRowRange,
+    BamScheduleSetDesc, BamSpawnColumnDesc, BamSymbol, BamSystem, BamSystemDesc, BamSystemSet,
+    BamTermDesc, BamTimeInfo, BamTriggerDesc, ComponentDesc, ComponentUuid, FfiAssetHandle,
+    FfiAssetLoadState, FfiBool, FfiChildOf, FfiEntity, FfiOption, FfiResult,
+    MAX_QUERIES_PER_SYSTEM, MAX_TERMS_PER_QUERY, MappedStringVTable, SIPHASH_KEY_0, SIPHASH_KEY_1,
+    SYSTEM_TELEMETRY_DIGEST_SIZE, SYSTEM_TELEMETRY_DIGEST_VERSION, SYSTEM_TELEMETRY_MAGIC,
+    ScheduleId, StrView, SystemTelemetryDigest64, TELEMETRY_FLAG_BUDGET_BREACHED,
+    TELEMETRY_FLAG_FAULTED, TELEMETRY_FLAG_QUARANTINED, TELEMETRY_FLAG_SUMMARY_TICK_ACTIVE,
+    VTableHeader, offsets as host_api_offsets,
 };
 
-/// 32-bit target alignment rule for a C-ABI wire struct.
-///
-/// Intended purpose: models the ABI difference between 32-bit targets whose `uint64_t` alignment
-/// is 4 bytes (e.g., `i686-unknown-linux-gnu`) versus 8 bytes (e.g., 32-bit ARM/Wasm) so emitted
-/// `BAM_STATIC_ASSERT` alignment checks stay portable across all 32-bit C compilers.
-#[derive(Clone, Copy)]
-enum Align32 {
-    /// Fixed byte alignment independent of `alignof(uint64_t)`.
-    Fixed(usize),
-    /// Alignment governed by `BAM_ALIGNOF(uint64_t)` on the target 32-bit ABI.
-    U64,
-}
-
-/// Expected C99 field offset specification for a single wire struct member.
-///
-/// Intended purpose: pairs the canonical C field identifier with its frozen 64-bit and 32-bit
-/// wire offsets and the host Rust compiler's actual `offset_of!` value so [`verify_host_rust_layouts`]
-/// catches any Rust-to-C ABI drift before emitting `include/bamabi.h`.
-struct FieldLayoutSpec {
-    c_name: &'static str,
-    offset_64: usize,
-    offset_32: usize,
-    rust_host_offset: usize,
-}
-
-/// Expected C99 size, alignment, and field-offset specification for one ABI wire struct.
-///
-/// Intended purpose: acts as the single layout table driving both pre-emission Rust layout
-/// validation ([`verify_host_rust_layouts`]) and the emitted `BAM_STATIC_ASSERT` section of
-/// `include/bamabi.h` for 64-bit (`UINTPTR_MAX == 0xffffffffffffffffULL`) and 32-bit targets.
-struct StructLayoutSpec {
-    c_name: &'static str,
-    assert_stem: &'static str,
-    size_64: usize,
-    align_64: usize,
-    size_32: usize,
-    align_32: Align32,
-    rust_host_size: usize,
-    rust_host_align: usize,
-    fields: &'static [FieldLayoutSpec],
-}
-
-/// Builds the complete layout specification table for all C-ABI `0.3.0` wire structs.
-///
-/// Intended purpose: centralizes every wire struct's 64-bit and 32-bit sizes, alignments, and
-/// field offsets (including all 73 `BamHostApi` vtable slots from `bamabi_sys::offsets`) so
-/// `render_c99_header` validates Rust layouts and emits matching C99 static assertions from one table.
-///
-/// What it does: constructs and returns a `Vec<StructLayoutSpec>` covering `BamComponentUuid`,
-/// `BamStrView`, `BamManifest`, `BamAssetHandle`, `BamTermDesc`, `BamQueryDesc`, `BamSystemDesc`,
-/// `BamObserverDesc`, `BamTriggerDesc`, `BamChangeTicks`, `BamFieldDesc`, `BamRequiredComponent`,
-/// `BamRelationDesc`, `BamLayoutInfo`, `BamScheduleSetDesc`, `BamComponentDesc`, `BamColumnInfo`,
-/// `BamVTableHeader`, `BamMappedStringVTable`, and `BamHostApi`.
-fn wire_struct_specs() -> Vec<StructLayoutSpec> {
-    vec![
-        StructLayoutSpec {
-            c_name: "BamComponentUuid",
-            assert_stem: "bam_component_uuid",
-            size_64: 16,
-            align_64: 1,
-            size_32: 16,
-            align_32: Align32::Fixed(1),
-            rust_host_size: size_of::<ComponentUuid>(),
-            rust_host_align: align_of::<ComponentUuid>(),
-            fields: &[FieldLayoutSpec {
-                c_name: "bytes",
-                offset_64: 0,
-                offset_32: 0,
-                rust_host_offset: offset_of!(ComponentUuid, bytes),
-            }],
-        },
-        StructLayoutSpec {
-            c_name: "BamStrView",
-            assert_stem: "bam_str_view",
-            size_64: 16,
-            align_64: 8,
-            size_32: 8,
-            align_32: Align32::Fixed(4),
-            rust_host_size: size_of::<StrView>(),
-            rust_host_align: align_of::<StrView>(),
-            fields: &[
-                FieldLayoutSpec {
-                    c_name: "ptr",
-                    offset_64: 0,
-                    offset_32: 0,
-                    rust_host_offset: offset_of!(StrView, ptr),
-                },
-                FieldLayoutSpec {
-                    c_name: "len",
-                    offset_64: 8,
-                    offset_32: 4,
-                    rust_host_offset: offset_of!(StrView, len),
-                },
-            ],
-        },
-        StructLayoutSpec {
-            c_name: "BamManifest",
-            assert_stem: "bam_manifest",
-            size_64: 48,
-            align_64: 8,
-            size_32: 32,
-            align_32: Align32::Fixed(4),
-            rust_host_size: size_of::<BamManifest>(),
-            rust_host_align: align_of::<BamManifest>(),
-            fields: &[
-                FieldLayoutSpec {
-                    c_name: "struct_size",
-                    offset_64: 0,
-                    offset_32: 0,
-                    rust_host_offset: offset_of!(BamManifest, struct_size),
-                },
-                FieldLayoutSpec {
-                    c_name: "abi_version",
-                    offset_64: 4,
-                    offset_32: 4,
-                    rust_host_offset: offset_of!(BamManifest, abi_version),
-                },
-                FieldLayoutSpec {
-                    c_name: "name",
-                    offset_64: 8,
-                    offset_32: 8,
-                    rust_host_offset: offset_of!(BamManifest, name),
-                },
-                FieldLayoutSpec {
-                    c_name: "version",
-                    offset_64: 16,
-                    offset_32: 12,
-                    rust_host_offset: offset_of!(BamManifest, version),
-                },
-                FieldLayoutSpec {
-                    c_name: "flags",
-                    offset_64: 24,
-                    offset_32: 16,
-                    rust_host_offset: offset_of!(BamManifest, flags),
-                },
-                FieldLayoutSpec {
-                    c_name: "reserved0",
-                    offset_64: 28,
-                    offset_32: 20,
-                    rust_host_offset: offset_of!(BamManifest, reserved0),
-                },
-                FieldLayoutSpec {
-                    c_name: "save_state",
-                    offset_64: 32,
-                    offset_32: 24,
-                    rust_host_offset: offset_of!(BamManifest, save_state),
-                },
-                FieldLayoutSpec {
-                    c_name: "restore_state",
-                    offset_64: 40,
-                    offset_32: 28,
-                    rust_host_offset: offset_of!(BamManifest, restore_state),
-                },
-            ],
-        },
-        StructLayoutSpec {
-            c_name: "BamAssetHandle",
-            assert_stem: "bam_asset_handle",
-            size_64: 32,
-            align_64: 4,
-            size_32: 32,
-            align_32: Align32::Fixed(4),
-            rust_host_size: size_of::<FfiAssetHandle>(),
-            rust_host_align: align_of::<FfiAssetHandle>(),
-            fields: &[
-                FieldLayoutSpec {
-                    c_name: "kind",
-                    offset_64: 0,
-                    offset_32: 0,
-                    rust_host_offset: offset_of!(FfiAssetHandle, kind),
-                },
-                FieldLayoutSpec {
-                    c_name: "reserved0",
-                    offset_64: 1,
-                    offset_32: 1,
-                    rust_host_offset: offset_of!(FfiAssetHandle, reserved0),
-                },
-                FieldLayoutSpec {
-                    c_name: "asset_type",
-                    offset_64: 4,
-                    offset_32: 4,
-                    rust_host_offset: offset_of!(FfiAssetHandle, asset_type),
-                },
-                FieldLayoutSpec {
-                    c_name: "index",
-                    offset_64: 8,
-                    offset_32: 8,
-                    rust_host_offset: offset_of!(FfiAssetHandle, index),
-                },
-                FieldLayoutSpec {
-                    c_name: "generation",
-                    offset_64: 12,
-                    offset_32: 12,
-                    rust_host_offset: offset_of!(FfiAssetHandle, generation),
-                },
-                FieldLayoutSpec {
-                    c_name: "uuid",
-                    offset_64: 16,
-                    offset_32: 16,
-                    rust_host_offset: offset_of!(FfiAssetHandle, uuid),
-                },
-            ],
-        },
-        StructLayoutSpec {
-            c_name: "BamTermDesc",
-            assert_stem: "bam_term_desc",
-            size_64: 12,
-            align_64: 4,
-            size_32: 12,
-            align_32: Align32::Fixed(4),
-            rust_host_size: size_of::<BamTermDesc>(),
-            rust_host_align: align_of::<BamTermDesc>(),
-            fields: &[
-                FieldLayoutSpec {
-                    c_name: "component",
-                    offset_64: 0,
-                    offset_32: 0,
-                    rust_host_offset: offset_of!(BamTermDesc, component),
-                },
-                FieldLayoutSpec {
-                    c_name: "mode",
-                    offset_64: 4,
-                    offset_32: 4,
-                    rust_host_offset: offset_of!(BamTermDesc, mode),
-                },
-                FieldLayoutSpec {
-                    c_name: "flags",
-                    offset_64: 8,
-                    offset_32: 8,
-                    rust_host_offset: offset_of!(BamTermDesc, flags),
-                },
-                FieldLayoutSpec {
-                    c_name: "or_group",
-                    offset_64: 10,
-                    offset_32: 10,
-                    rust_host_offset: offset_of!(BamTermDesc, or_group),
-                },
-                FieldLayoutSpec {
-                    c_name: "reserved0",
-                    offset_64: 11,
-                    offset_32: 11,
-                    rust_host_offset: offset_of!(BamTermDesc, reserved0),
-                },
-            ],
-        },
-        StructLayoutSpec {
-            c_name: "BamQueryDesc",
-            assert_stem: "bam_query_desc",
-            size_64: 32,
-            align_64: 8,
-            size_32: 24,
-            align_32: Align32::Fixed(4),
-            rust_host_size: size_of::<BamQueryDesc>(),
-            rust_host_align: align_of::<BamQueryDesc>(),
-            fields: &[
-                FieldLayoutSpec {
-                    c_name: "struct_size",
-                    offset_64: 0,
-                    offset_32: 0,
-                    rust_host_offset: offset_of!(BamQueryDesc, struct_size),
-                },
-                FieldLayoutSpec {
-                    c_name: "flags",
-                    offset_64: 4,
-                    offset_32: 4,
-                    rust_host_offset: offset_of!(BamQueryDesc, flags),
-                },
-                FieldLayoutSpec {
-                    c_name: "terms",
-                    offset_64: 8,
-                    offset_32: 8,
-                    rust_host_offset: offset_of!(BamQueryDesc, terms),
-                },
-                FieldLayoutSpec {
-                    c_name: "term_count",
-                    offset_64: 16,
-                    offset_32: 12,
-                    rust_host_offset: offset_of!(BamQueryDesc, term_count),
-                },
-                FieldLayoutSpec {
-                    c_name: "param_set_group",
-                    offset_64: 24,
-                    offset_32: 16,
-                    rust_host_offset: offset_of!(BamQueryDesc, param_set_group),
-                },
-                FieldLayoutSpec {
-                    c_name: "reserved0",
-                    offset_64: 28,
-                    offset_32: 20,
-                    rust_host_offset: offset_of!(BamQueryDesc, reserved0),
-                },
-            ],
-        },
-        StructLayoutSpec {
-            c_name: "BamSystemDesc",
-            assert_stem: "bam_system_desc",
-            size_64: 192,
-            align_64: 8,
-            size_32: 104,
-            align_32: Align32::Fixed(4),
-            rust_host_size: size_of::<BamSystemDesc>(),
-            rust_host_align: align_of::<BamSystemDesc>(),
-            fields: &[
-                FieldLayoutSpec {
-                    c_name: "struct_size",
-                    offset_64: 0,
-                    offset_32: 0,
-                    rust_host_offset: offset_of!(BamSystemDesc, struct_size),
-                },
-                FieldLayoutSpec {
-                    c_name: "flags",
-                    offset_64: 4,
-                    offset_32: 4,
-                    rust_host_offset: offset_of!(BamSystemDesc, flags),
-                },
-                FieldLayoutSpec {
-                    c_name: "name",
-                    offset_64: 8,
-                    offset_32: 8,
-                    rust_host_offset: offset_of!(BamSystemDesc, name),
-                },
-                FieldLayoutSpec {
-                    c_name: "queries",
-                    offset_64: 16,
-                    offset_32: 12,
-                    rust_host_offset: offset_of!(BamSystemDesc, queries),
-                },
-                FieldLayoutSpec {
-                    c_name: "query_count",
-                    offset_64: 24,
-                    offset_32: 16,
-                    rust_host_offset: offset_of!(BamSystemDesc, query_count),
-                },
-                FieldLayoutSpec {
-                    c_name: "callback",
-                    offset_64: 32,
-                    offset_32: 20,
-                    rust_host_offset: offset_of!(BamSystemDesc, callback),
-                },
-                FieldLayoutSpec {
-                    c_name: "user_data",
-                    offset_64: 40,
-                    offset_32: 24,
-                    rust_host_offset: offset_of!(BamSystemDesc, user_data),
-                },
-                FieldLayoutSpec {
-                    c_name: "schedule",
-                    offset_64: 48,
-                    offset_32: 28,
-                    rust_host_offset: offset_of!(BamSystemDesc, schedule),
-                },
-                FieldLayoutSpec {
-                    c_name: "reserved0",
-                    offset_64: 52,
-                    offset_32: 32,
-                    rust_host_offset: offset_of!(BamSystemDesc, reserved0),
-                },
-                FieldLayoutSpec {
-                    c_name: "after",
-                    offset_64: 56,
-                    offset_32: 36,
-                    rust_host_offset: offset_of!(BamSystemDesc, after),
-                },
-                FieldLayoutSpec {
-                    c_name: "after_count",
-                    offset_64: 64,
-                    offset_32: 40,
-                    rust_host_offset: offset_of!(BamSystemDesc, after_count),
-                },
-                FieldLayoutSpec {
-                    c_name: "before",
-                    offset_64: 72,
-                    offset_32: 44,
-                    rust_host_offset: offset_of!(BamSystemDesc, before),
-                },
-                FieldLayoutSpec {
-                    c_name: "before_count",
-                    offset_64: 80,
-                    offset_32: 48,
-                    rust_host_offset: offset_of!(BamSystemDesc, before_count),
-                },
-                FieldLayoutSpec {
-                    c_name: "run_if",
-                    offset_64: 88,
-                    offset_32: 52,
-                    rust_host_offset: offset_of!(BamSystemDesc, run_if),
-                },
-                FieldLayoutSpec {
-                    c_name: "run_if_user_data",
-                    offset_64: 96,
-                    offset_32: 56,
-                    rust_host_offset: offset_of!(BamSystemDesc, run_if_user_data),
-                },
-                FieldLayoutSpec {
-                    c_name: "in_sets",
-                    offset_64: 104,
-                    offset_32: 60,
-                    rust_host_offset: offset_of!(BamSystemDesc, in_sets),
-                },
-                FieldLayoutSpec {
-                    c_name: "in_set_count",
-                    offset_64: 112,
-                    offset_32: 64,
-                    rust_host_offset: offset_of!(BamSystemDesc, in_set_count),
-                },
-                FieldLayoutSpec {
-                    c_name: "after_weak",
-                    offset_64: 120,
-                    offset_32: 68,
-                    rust_host_offset: offset_of!(BamSystemDesc, after_weak),
-                },
-                FieldLayoutSpec {
-                    c_name: "after_weak_count",
-                    offset_64: 128,
-                    offset_32: 72,
-                    rust_host_offset: offset_of!(BamSystemDesc, after_weak_count),
-                },
-                FieldLayoutSpec {
-                    c_name: "before_weak",
-                    offset_64: 136,
-                    offset_32: 76,
-                    rust_host_offset: offset_of!(BamSystemDesc, before_weak),
-                },
-                FieldLayoutSpec {
-                    c_name: "before_weak_count",
-                    offset_64: 144,
-                    offset_32: 80,
-                    rust_host_offset: offset_of!(BamSystemDesc, before_weak_count),
-                },
-                FieldLayoutSpec {
-                    c_name: "ambiguous_with",
-                    offset_64: 152,
-                    offset_32: 84,
-                    rust_host_offset: offset_of!(BamSystemDesc, ambiguous_with),
-                },
-                FieldLayoutSpec {
-                    c_name: "ambiguous_with_count",
-                    offset_64: 160,
-                    offset_32: 88,
-                    rust_host_offset: offset_of!(BamSystemDesc, ambiguous_with_count),
-                },
-                FieldLayoutSpec {
-                    c_name: "run_if_ctx",
-                    offset_64: 168,
-                    offset_32: 92,
-                    rust_host_offset: offset_of!(BamSystemDesc, run_if_ctx),
-                },
-                FieldLayoutSpec {
-                    c_name: "run_if_query",
-                    offset_64: 176,
-                    offset_32: 96,
-                    rust_host_offset: offset_of!(BamSystemDesc, run_if_query),
-                },
-                FieldLayoutSpec {
-                    c_name: "run_if_ctx_user_data",
-                    offset_64: 184,
-                    offset_32: 100,
-                    rust_host_offset: offset_of!(BamSystemDesc, run_if_ctx_user_data),
-                },
-            ],
-        },
-        StructLayoutSpec {
-            c_name: "BamObserverDesc",
-            assert_stem: "bam_observer_desc",
-            size_64: 112,
-            align_64: 8,
-            size_32: 76,
-            align_32: Align32::Fixed(4),
-            rust_host_size: size_of::<BamObserverDesc>(),
-            rust_host_align: align_of::<BamObserverDesc>(),
-            fields: &[
-                FieldLayoutSpec {
-                    c_name: "struct_size",
-                    offset_64: 0,
-                    offset_32: 0,
-                    rust_host_offset: offset_of!(BamObserverDesc, struct_size),
-                },
-                FieldLayoutSpec {
-                    c_name: "flags",
-                    offset_64: 4,
-                    offset_32: 4,
-                    rust_host_offset: offset_of!(BamObserverDesc, flags),
-                },
-                FieldLayoutSpec {
-                    c_name: "name",
-                    offset_64: 8,
-                    offset_32: 8,
-                    rust_host_offset: offset_of!(BamObserverDesc, name),
-                },
-                FieldLayoutSpec {
-                    c_name: "event",
-                    offset_64: 16,
-                    offset_32: 12,
-                    rust_host_offset: offset_of!(BamObserverDesc, event),
-                },
-                FieldLayoutSpec {
-                    c_name: "entity_lo",
-                    offset_64: 20,
-                    offset_32: 16,
-                    rust_host_offset: offset_of!(BamObserverDesc, entity_lo),
-                },
-                FieldLayoutSpec {
-                    c_name: "entity_hi",
-                    offset_64: 24,
-                    offset_32: 20,
-                    rust_host_offset: offset_of!(BamObserverDesc, entity_hi),
-                },
-                FieldLayoutSpec {
-                    c_name: "reserved0",
-                    offset_64: 28,
-                    offset_32: 24,
-                    rust_host_offset: offset_of!(BamObserverDesc, reserved0),
-                },
-                FieldLayoutSpec {
-                    c_name: "callback",
-                    offset_64: 32,
-                    offset_32: 28,
-                    rust_host_offset: offset_of!(BamObserverDesc, callback),
-                },
-                FieldLayoutSpec {
-                    c_name: "user_data",
-                    offset_64: 40,
-                    offset_32: 32,
-                    rust_host_offset: offset_of!(BamObserverDesc, user_data),
-                },
-                FieldLayoutSpec {
-                    c_name: "event_kind",
-                    offset_64: 48,
-                    offset_32: 36,
-                    rust_host_offset: offset_of!(BamObserverDesc, event_kind),
-                },
-                FieldLayoutSpec {
-                    c_name: "reserved1",
-                    offset_64: 52,
-                    offset_32: 40,
-                    rust_host_offset: offset_of!(BamObserverDesc, reserved1),
-                },
-                FieldLayoutSpec {
-                    c_name: "watched_components",
-                    offset_64: 56,
-                    offset_32: 44,
-                    rust_host_offset: offset_of!(BamObserverDesc, watched_components),
-                },
-                FieldLayoutSpec {
-                    c_name: "watched_component_count",
-                    offset_64: 64,
-                    offset_32: 48,
-                    rust_host_offset: offset_of!(BamObserverDesc, watched_component_count),
-                },
-                FieldLayoutSpec {
-                    c_name: "mut_callback",
-                    offset_64: 72,
-                    offset_32: 52,
-                    rust_host_offset: offset_of!(BamObserverDesc, mut_callback),
-                },
-                FieldLayoutSpec {
-                    c_name: "propagate_relationship",
-                    offset_64: 80,
-                    offset_32: 56,
-                    rust_host_offset: offset_of!(BamObserverDesc, propagate_relationship),
-                },
-                FieldLayoutSpec {
-                    c_name: "reserved2",
-                    offset_64: 84,
-                    offset_32: 60,
-                    rust_host_offset: offset_of!(BamObserverDesc, reserved2),
-                },
-                FieldLayoutSpec {
-                    c_name: "ctx_callback",
-                    offset_64: 88,
-                    offset_32: 64,
-                    rust_host_offset: offset_of!(BamObserverDesc, ctx_callback),
-                },
-                FieldLayoutSpec {
-                    c_name: "queries",
-                    offset_64: 96,
-                    offset_32: 68,
-                    rust_host_offset: offset_of!(BamObserverDesc, queries),
-                },
-                FieldLayoutSpec {
-                    c_name: "query_count",
-                    offset_64: 104,
-                    offset_32: 72,
-                    rust_host_offset: offset_of!(BamObserverDesc, query_count),
-                },
-            ],
-        },
-        StructLayoutSpec {
-            c_name: "BamTriggerDesc",
-            assert_stem: "bam_trigger_desc",
-            size_64: 64,
-            align_64: 8,
-            size_32: 48,
-            align_32: Align32::Fixed(4),
-            rust_host_size: size_of::<BamTriggerDesc>(),
-            rust_host_align: align_of::<BamTriggerDesc>(),
-            fields: &[
-                FieldLayoutSpec {
-                    c_name: "struct_size",
-                    offset_64: 0,
-                    offset_32: 0,
-                    rust_host_offset: offset_of!(BamTriggerDesc, struct_size),
-                },
-                FieldLayoutSpec {
-                    c_name: "flags",
-                    offset_64: 4,
-                    offset_32: 4,
-                    rust_host_offset: offset_of!(BamTriggerDesc, flags),
-                },
-                FieldLayoutSpec {
-                    c_name: "event",
-                    offset_64: 8,
-                    offset_32: 8,
-                    rust_host_offset: offset_of!(BamTriggerDesc, event),
-                },
-                FieldLayoutSpec {
-                    c_name: "event_kind",
-                    offset_64: 12,
-                    offset_32: 12,
-                    rust_host_offset: offset_of!(BamTriggerDesc, event_kind),
-                },
-                FieldLayoutSpec {
-                    c_name: "entity_lo",
-                    offset_64: 16,
-                    offset_32: 16,
-                    rust_host_offset: offset_of!(BamTriggerDesc, entity_lo),
-                },
-                FieldLayoutSpec {
-                    c_name: "entity_hi",
-                    offset_64: 20,
-                    offset_32: 20,
-                    rust_host_offset: offset_of!(BamTriggerDesc, entity_hi),
-                },
-                FieldLayoutSpec {
-                    c_name: "data_ptr",
-                    offset_64: 24,
-                    offset_32: 24,
-                    rust_host_offset: offset_of!(BamTriggerDesc, data_ptr),
-                },
-                FieldLayoutSpec {
-                    c_name: "data_len",
-                    offset_64: 32,
-                    offset_32: 28,
-                    rust_host_offset: offset_of!(BamTriggerDesc, data_len),
-                },
-                FieldLayoutSpec {
-                    c_name: "watched_components",
-                    offset_64: 40,
-                    offset_32: 32,
-                    rust_host_offset: offset_of!(BamTriggerDesc, watched_components),
-                },
-                FieldLayoutSpec {
-                    c_name: "watched_component_count",
-                    offset_64: 48,
-                    offset_32: 36,
-                    rust_host_offset: offset_of!(BamTriggerDesc, watched_component_count),
-                },
-                FieldLayoutSpec {
-                    c_name: "propagate_relationship",
-                    offset_64: 56,
-                    offset_32: 40,
-                    rust_host_offset: offset_of!(BamTriggerDesc, propagate_relationship),
-                },
-                FieldLayoutSpec {
-                    c_name: "reserved0",
-                    offset_64: 60,
-                    offset_32: 44,
-                    rust_host_offset: offset_of!(BamTriggerDesc, reserved0),
-                },
-            ],
-        },
-        StructLayoutSpec {
-            c_name: "BamChangeTicks",
-            assert_stem: "bam_change_ticks",
-            size_64: 16,
-            align_64: 4,
-            size_32: 16,
-            align_32: Align32::Fixed(4),
-            rust_host_size: size_of::<BamChangeTicks>(),
-            rust_host_align: align_of::<BamChangeTicks>(),
-            fields: &[
-                FieldLayoutSpec {
-                    c_name: "added",
-                    offset_64: 0,
-                    offset_32: 0,
-                    rust_host_offset: offset_of!(BamChangeTicks, added),
-                },
-                FieldLayoutSpec {
-                    c_name: "changed",
-                    offset_64: 4,
-                    offset_32: 4,
-                    rust_host_offset: offset_of!(BamChangeTicks, changed),
-                },
-                FieldLayoutSpec {
-                    c_name: "last_run",
-                    offset_64: 8,
-                    offset_32: 8,
-                    rust_host_offset: offset_of!(BamChangeTicks, last_run),
-                },
-                FieldLayoutSpec {
-                    c_name: "this_run",
-                    offset_64: 12,
-                    offset_32: 12,
-                    rust_host_offset: offset_of!(BamChangeTicks, this_run),
-                },
-            ],
-        },
-        StructLayoutSpec {
-            c_name: "BamFieldDesc",
-            assert_stem: "bam_field_desc",
-            size_64: 64,
-            align_64: 8,
-            size_32: 36,
-            align_32: Align32::Fixed(4),
-            rust_host_size: size_of::<BamFieldDesc>(),
-            rust_host_align: align_of::<BamFieldDesc>(),
-            fields: &[
-                FieldLayoutSpec {
-                    c_name: "struct_size",
-                    offset_64: 0,
-                    offset_32: 0,
-                    rust_host_offset: offset_of!(BamFieldDesc, struct_size),
-                },
-                FieldLayoutSpec {
-                    c_name: "kind",
-                    offset_64: 4,
-                    offset_32: 4,
-                    rust_host_offset: offset_of!(BamFieldDesc, kind),
-                },
-                FieldLayoutSpec {
-                    c_name: "name",
-                    offset_64: 8,
-                    offset_32: 8,
-                    rust_host_offset: offset_of!(BamFieldDesc, name),
-                },
-                FieldLayoutSpec {
-                    c_name: "type_tag",
-                    offset_64: 24,
-                    offset_32: 16,
-                    rust_host_offset: offset_of!(BamFieldDesc, type_tag),
-                },
-                FieldLayoutSpec {
-                    c_name: "offset",
-                    offset_64: 40,
-                    offset_32: 24,
-                    rust_host_offset: offset_of!(BamFieldDesc, offset),
-                },
-                FieldLayoutSpec {
-                    c_name: "size",
-                    offset_64: 48,
-                    offset_32: 28,
-                    rust_host_offset: offset_of!(BamFieldDesc, size),
-                },
-                FieldLayoutSpec {
-                    c_name: "align",
-                    offset_64: 56,
-                    offset_32: 32,
-                    rust_host_offset: offset_of!(BamFieldDesc, align),
-                },
-            ],
-        },
-        StructLayoutSpec {
-            c_name: "BamRequiredComponent",
-            assert_stem: "bam_required_component",
-            size_64: 64,
-            align_64: 8,
-            size_32: 48,
-            align_32: Align32::Fixed(4),
-            rust_host_size: size_of::<BamRequiredComponent>(),
-            rust_host_align: align_of::<BamRequiredComponent>(),
-            fields: &[
-                FieldLayoutSpec {
-                    c_name: "struct_size",
-                    offset_64: 0,
-                    offset_32: 0,
-                    rust_host_offset: offset_of!(BamRequiredComponent, struct_size),
-                },
-                FieldLayoutSpec {
-                    c_name: "flags",
-                    offset_64: 4,
-                    offset_32: 4,
-                    rust_host_offset: offset_of!(BamRequiredComponent, flags),
-                },
-                FieldLayoutSpec {
-                    c_name: "component",
-                    offset_64: 8,
-                    offset_32: 8,
-                    rust_host_offset: offset_of!(BamRequiredComponent, component),
-                },
-                FieldLayoutSpec {
-                    c_name: "reserved0",
-                    offset_64: 12,
-                    offset_32: 12,
-                    rust_host_offset: offset_of!(BamRequiredComponent, reserved0),
-                },
-                FieldLayoutSpec {
-                    c_name: "uuid",
-                    offset_64: 16,
-                    offset_32: 16,
-                    rust_host_offset: offset_of!(BamRequiredComponent, uuid),
-                },
-                FieldLayoutSpec {
-                    c_name: "init_bytes",
-                    offset_64: 32,
-                    offset_32: 32,
-                    rust_host_offset: offset_of!(BamRequiredComponent, init_bytes),
-                },
-                FieldLayoutSpec {
-                    c_name: "init_size",
-                    offset_64: 40,
-                    offset_32: 36,
-                    rust_host_offset: offset_of!(BamRequiredComponent, init_size),
-                },
-                FieldLayoutSpec {
-                    c_name: "init_fn",
-                    offset_64: 48,
-                    offset_32: 40,
-                    rust_host_offset: offset_of!(BamRequiredComponent, init_fn),
-                },
-                FieldLayoutSpec {
-                    c_name: "user_data",
-                    offset_64: 56,
-                    offset_32: 44,
-                    rust_host_offset: offset_of!(BamRequiredComponent, user_data),
-                },
-            ],
-        },
-        StructLayoutSpec {
-            c_name: "BamRelationDesc",
-            assert_stem: "bam_relation_desc",
-            size_64: 56,
-            align_64: 8,
-            size_32: 44,
-            align_32: Align32::Fixed(4),
-            rust_host_size: size_of::<BamRelationDesc>(),
-            rust_host_align: align_of::<BamRelationDesc>(),
-            fields: &[
-                FieldLayoutSpec {
-                    c_name: "struct_size",
-                    offset_64: 0,
-                    offset_32: 0,
-                    rust_host_offset: offset_of!(BamRelationDesc, struct_size),
-                },
-                FieldLayoutSpec {
-                    c_name: "flags",
-                    offset_64: 4,
-                    offset_32: 4,
-                    rust_host_offset: offset_of!(BamRelationDesc, flags),
-                },
-                FieldLayoutSpec {
-                    c_name: "name",
-                    offset_64: 8,
-                    offset_32: 8,
-                    rust_host_offset: offset_of!(BamRelationDesc, name),
-                },
-                FieldLayoutSpec {
-                    c_name: "uuid",
-                    offset_64: 16,
-                    offset_32: 12,
-                    rust_host_offset: offset_of!(BamRelationDesc, uuid),
-                },
-                FieldLayoutSpec {
-                    c_name: "data_size",
-                    offset_64: 32,
-                    offset_32: 28,
-                    rust_host_offset: offset_of!(BamRelationDesc, data_size),
-                },
-                FieldLayoutSpec {
-                    c_name: "data_align",
-                    offset_64: 40,
-                    offset_32: 32,
-                    rust_host_offset: offset_of!(BamRelationDesc, data_align),
-                },
-                FieldLayoutSpec {
-                    c_name: "max_degree",
-                    offset_64: 48,
-                    offset_32: 36,
-                    rust_host_offset: offset_of!(BamRelationDesc, max_degree),
-                },
-                FieldLayoutSpec {
-                    c_name: "reserved0",
-                    offset_64: 52,
-                    offset_32: 40,
-                    rust_host_offset: offset_of!(BamRelationDesc, reserved0),
-                },
-            ],
-        },
-        StructLayoutSpec {
-            c_name: "BamLayoutInfo",
-            assert_stem: "bam_layout_info",
-            size_64: 64,
-            align_64: 8,
-            size_32: 48,
-            align_32: Align32::U64,
-            rust_host_size: size_of::<BamLayoutInfo>(),
-            rust_host_align: align_of::<BamLayoutInfo>(),
-            fields: &[
-                FieldLayoutSpec {
-                    c_name: "struct_size",
-                    offset_64: 0,
-                    offset_32: 0,
-                    rust_host_offset: offset_of!(BamLayoutInfo, struct_size),
-                },
-                FieldLayoutSpec {
-                    c_name: "flags",
-                    offset_64: 4,
-                    offset_32: 4,
-                    rust_host_offset: offset_of!(BamLayoutInfo, flags),
-                },
-                FieldLayoutSpec {
-                    c_name: "uuid",
-                    offset_64: 8,
-                    offset_32: 8,
-                    rust_host_offset: offset_of!(BamLayoutInfo, uuid),
-                },
-                FieldLayoutSpec {
-                    c_name: "schema_fingerprint",
-                    offset_64: 24,
-                    offset_32: 24,
-                    rust_host_offset: offset_of!(BamLayoutInfo, schema_fingerprint),
-                },
-                FieldLayoutSpec {
-                    c_name: "size",
-                    offset_64: 32,
-                    offset_32: 32,
-                    rust_host_offset: offset_of!(BamLayoutInfo, size),
-                },
-                FieldLayoutSpec {
-                    c_name: "align",
-                    offset_64: 40,
-                    offset_32: 36,
-                    rust_host_offset: offset_of!(BamLayoutInfo, align),
-                },
-                FieldLayoutSpec {
-                    c_name: "fields",
-                    offset_64: 48,
-                    offset_32: 40,
-                    rust_host_offset: offset_of!(BamLayoutInfo, fields),
-                },
-                FieldLayoutSpec {
-                    c_name: "field_count",
-                    offset_64: 56,
-                    offset_32: 44,
-                    rust_host_offset: offset_of!(BamLayoutInfo, field_count),
-                },
-            ],
-        },
-        StructLayoutSpec {
-            c_name: "BamScheduleSetDesc",
-            assert_stem: "bam_schedule_set_desc",
-            size_64: 48,
-            align_64: 8,
-            size_32: 36,
-            align_32: Align32::Fixed(4),
-            rust_host_size: size_of::<BamScheduleSetDesc>(),
-            rust_host_align: align_of::<BamScheduleSetDesc>(),
-            fields: &[
-                FieldLayoutSpec {
-                    c_name: "struct_size",
-                    offset_64: 0,
-                    offset_32: 0,
-                    rust_host_offset: offset_of!(BamScheduleSetDesc, struct_size),
-                },
-                FieldLayoutSpec {
-                    c_name: "flags",
-                    offset_64: 4,
-                    offset_32: 4,
-                    rust_host_offset: offset_of!(BamScheduleSetDesc, flags),
-                },
-                FieldLayoutSpec {
-                    c_name: "schedule",
-                    offset_64: 8,
-                    offset_32: 8,
-                    rust_host_offset: offset_of!(BamScheduleSetDesc, schedule),
-                },
-                FieldLayoutSpec {
-                    c_name: "before_count",
-                    offset_64: 12,
-                    offset_32: 12,
-                    rust_host_offset: offset_of!(BamScheduleSetDesc, before_count),
-                },
-                FieldLayoutSpec {
-                    c_name: "after_count",
-                    offset_64: 16,
-                    offset_32: 16,
-                    rust_host_offset: offset_of!(BamScheduleSetDesc, after_count),
-                },
-                FieldLayoutSpec {
-                    c_name: "reserved0",
-                    offset_64: 20,
-                    offset_32: 20,
-                    rust_host_offset: offset_of!(BamScheduleSetDesc, reserved0),
-                },
-                FieldLayoutSpec {
-                    c_name: "name",
-                    offset_64: 24,
-                    offset_32: 24,
-                    rust_host_offset: offset_of!(BamScheduleSetDesc, name),
-                },
-                FieldLayoutSpec {
-                    c_name: "before_sets",
-                    offset_64: 32,
-                    offset_32: 28,
-                    rust_host_offset: offset_of!(BamScheduleSetDesc, before_sets),
-                },
-                FieldLayoutSpec {
-                    c_name: "after_sets",
-                    offset_64: 40,
-                    offset_32: 32,
-                    rust_host_offset: offset_of!(BamScheduleSetDesc, after_sets),
-                },
-            ],
-        },
-        StructLayoutSpec {
-            c_name: "BamComponentDesc",
-            assert_stem: "bam_component_desc",
-            size_64: 176,
-            align_64: 8,
-            size_32: 104,
-            align_32: Align32::U64,
-            rust_host_size: size_of::<ComponentDesc>(),
-            rust_host_align: align_of::<ComponentDesc>(),
-            fields: &[
-                FieldLayoutSpec {
-                    c_name: "struct_size",
-                    offset_64: 0,
-                    offset_32: 0,
-                    rust_host_offset: offset_of!(ComponentDesc, struct_size),
-                },
-                FieldLayoutSpec {
-                    c_name: "flags",
-                    offset_64: 4,
-                    offset_32: 4,
-                    rust_host_offset: offset_of!(ComponentDesc, flags),
-                },
-                FieldLayoutSpec {
-                    c_name: "name",
-                    offset_64: 8,
-                    offset_32: 8,
-                    rust_host_offset: offset_of!(ComponentDesc, name),
-                },
-                FieldLayoutSpec {
-                    c_name: "uuid",
-                    offset_64: 16,
-                    offset_32: 12,
-                    rust_host_offset: offset_of!(ComponentDesc, uuid),
-                },
-                FieldLayoutSpec {
-                    c_name: "size",
-                    offset_64: 32,
-                    offset_32: 28,
-                    rust_host_offset: offset_of!(ComponentDesc, size),
-                },
-                FieldLayoutSpec {
-                    c_name: "align",
-                    offset_64: 40,
-                    offset_32: 32,
-                    rust_host_offset: offset_of!(ComponentDesc, align),
-                },
-                FieldLayoutSpec {
-                    c_name: "drop_fn",
-                    offset_64: 48,
-                    offset_32: 36,
-                    rust_host_offset: offset_of!(ComponentDesc, drop_fn),
-                },
-                FieldLayoutSpec {
-                    c_name: "vtable_ptr",
-                    offset_64: 56,
-                    offset_32: 40,
-                    rust_host_offset: offset_of!(ComponentDesc, vtable_ptr),
-                },
-                FieldLayoutSpec {
-                    c_name: "on_add",
-                    offset_64: 64,
-                    offset_32: 44,
-                    rust_host_offset: offset_of!(ComponentDesc, on_add),
-                },
-                FieldLayoutSpec {
-                    c_name: "on_remove",
-                    offset_64: 72,
-                    offset_32: 48,
-                    rust_host_offset: offset_of!(ComponentDesc, on_remove),
-                },
-                FieldLayoutSpec {
-                    c_name: "hook_user_data",
-                    offset_64: 80,
-                    offset_32: 52,
-                    rust_host_offset: offset_of!(ComponentDesc, hook_user_data),
-                },
-                FieldLayoutSpec {
-                    c_name: "on_insert",
-                    offset_64: 88,
-                    offset_32: 56,
-                    rust_host_offset: offset_of!(ComponentDesc, on_insert),
-                },
-                FieldLayoutSpec {
-                    c_name: "on_discard",
-                    offset_64: 96,
-                    offset_32: 60,
-                    rust_host_offset: offset_of!(ComponentDesc, on_discard),
-                },
-                FieldLayoutSpec {
-                    c_name: "on_despawn",
-                    offset_64: 104,
-                    offset_32: 64,
-                    rust_host_offset: offset_of!(ComponentDesc, on_despawn),
-                },
-                FieldLayoutSpec {
-                    c_name: "clone_fn",
-                    offset_64: 112,
-                    offset_32: 68,
-                    rust_host_offset: offset_of!(ComponentDesc, clone_fn),
-                },
-                FieldLayoutSpec {
-                    c_name: "required_components",
-                    offset_64: 120,
-                    offset_32: 72,
-                    rust_host_offset: offset_of!(ComponentDesc, required_components),
-                },
-                FieldLayoutSpec {
-                    c_name: "required_component_count",
-                    offset_64: 128,
-                    offset_32: 76,
-                    rust_host_offset: offset_of!(ComponentDesc, required_component_count),
-                },
-                FieldLayoutSpec {
-                    c_name: "schema_fingerprint",
-                    offset_64: 136,
-                    offset_32: 80,
-                    rust_host_offset: offset_of!(ComponentDesc, schema_fingerprint),
-                },
-                FieldLayoutSpec {
-                    c_name: "fields",
-                    offset_64: 144,
-                    offset_32: 88,
-                    rust_host_offset: offset_of!(ComponentDesc, fields),
-                },
-                FieldLayoutSpec {
-                    c_name: "field_count",
-                    offset_64: 152,
-                    offset_32: 92,
-                    rust_host_offset: offset_of!(ComponentDesc, field_count),
-                },
-                FieldLayoutSpec {
-                    c_name: "required_init_descs",
-                    offset_64: 160,
-                    offset_32: 96,
-                    rust_host_offset: offset_of!(ComponentDesc, required_init_descs),
-                },
-                FieldLayoutSpec {
-                    c_name: "required_init_desc_count",
-                    offset_64: 168,
-                    offset_32: 100,
-                    rust_host_offset: offset_of!(ComponentDesc, required_init_desc_count),
-                },
-            ],
-        },
-        StructLayoutSpec {
-            c_name: "BamColumnInfo",
-            assert_stem: "bam_column_info",
-            size_64: 48,
-            align_64: 8,
-            size_32: 40,
-            align_32: Align32::Fixed(4),
-            rust_host_size: size_of::<BamColumnInfo>(),
-            rust_host_align: align_of::<BamColumnInfo>(),
-            fields: &[
-                FieldLayoutSpec {
-                    c_name: "component",
-                    offset_64: 0,
-                    offset_32: 0,
-                    rust_host_offset: offset_of!(BamColumnInfo, component),
-                },
-                FieldLayoutSpec {
-                    c_name: "mode",
-                    offset_64: 4,
-                    offset_32: 4,
-                    rust_host_offset: offset_of!(BamColumnInfo, mode),
-                },
-                FieldLayoutSpec {
-                    c_name: "uuid",
-                    offset_64: 8,
-                    offset_32: 8,
-                    rust_host_offset: offset_of!(BamColumnInfo, uuid),
-                },
-                FieldLayoutSpec {
-                    c_name: "size",
-                    offset_64: 24,
-                    offset_32: 24,
-                    rust_host_offset: offset_of!(BamColumnInfo, size),
-                },
-                FieldLayoutSpec {
-                    c_name: "align",
-                    offset_64: 32,
-                    offset_32: 28,
-                    rust_host_offset: offset_of!(BamColumnInfo, align),
-                },
-                FieldLayoutSpec {
-                    c_name: "storage_flags",
-                    offset_64: 40,
-                    offset_32: 32,
-                    rust_host_offset: offset_of!(BamColumnInfo, storage_flags),
-                },
-                FieldLayoutSpec {
-                    c_name: "reserved0",
-                    offset_64: 44,
-                    offset_32: 36,
-                    rust_host_offset: offset_of!(BamColumnInfo, reserved0),
-                },
-            ],
-        },
-        StructLayoutSpec {
-            c_name: "BamVTableHeader",
-            assert_stem: "bam_vtable_header",
-            size_64: 40,
-            align_64: 8,
-            size_32: 32,
-            align_32: Align32::Fixed(4),
-            rust_host_size: size_of::<VTableHeader>(),
-            rust_host_align: align_of::<VTableHeader>(),
-            fields: &[
-                FieldLayoutSpec {
-                    c_name: "struct_size",
-                    offset_64: 0,
-                    offset_32: 0,
-                    rust_host_offset: offset_of!(VTableHeader, struct_size),
-                },
-                FieldLayoutSpec {
-                    c_name: "abi_version",
-                    offset_64: 4,
-                    offset_32: 4,
-                    rust_host_offset: offset_of!(VTableHeader, abi_version),
-                },
-                FieldLayoutSpec {
-                    c_name: "uuid",
-                    offset_64: 8,
-                    offset_32: 8,
-                    rust_host_offset: offset_of!(VTableHeader, uuid),
-                },
-                FieldLayoutSpec {
-                    c_name: "size",
-                    offset_64: 24,
-                    offset_32: 24,
-                    rust_host_offset: offset_of!(VTableHeader, size),
-                },
-                FieldLayoutSpec {
-                    c_name: "align",
-                    offset_64: 32,
-                    offset_32: 28,
-                    rust_host_offset: offset_of!(VTableHeader, align),
-                },
-            ],
-        },
-        StructLayoutSpec {
-            c_name: "BamMappedStringVTable",
-            assert_stem: "bam_mapped_string_vtable",
-            size_64: 56,
-            align_64: 8,
-            size_32: 40,
-            align_32: Align32::Fixed(4),
-            rust_host_size: size_of::<MappedStringVTable>(),
-            rust_host_align: align_of::<MappedStringVTable>(),
-            fields: &[
-                FieldLayoutSpec {
-                    c_name: "header",
-                    offset_64: 0,
-                    offset_32: 0,
-                    rust_host_offset: offset_of!(MappedStringVTable, header),
-                },
-                FieldLayoutSpec {
-                    c_name: "get",
-                    offset_64: 40,
-                    offset_32: 32,
-                    rust_host_offset: offset_of!(MappedStringVTable, get),
-                },
-                FieldLayoutSpec {
-                    c_name: "set",
-                    offset_64: 48,
-                    offset_32: 36,
-                    rust_host_offset: offset_of!(MappedStringVTable, set),
-                },
-            ],
-        },
-        StructLayoutSpec {
-            c_name: "BamHostApi",
-            assert_stem: "bam_host_api",
-            size_64: host_api_offsets::SIZE_64,
-            align_64: 8,
-            size_32: host_api_offsets::SIZE_32,
-            align_32: Align32::Fixed(4),
-            rust_host_size: size_of::<BamHostApi>(),
-            rust_host_align: align_of::<BamHostApi>(),
-            fields: &[
-                FieldLayoutSpec {
-                    c_name: "struct_size",
-                    offset_64: host_api_offsets::OFF64_STRUCT_SIZE,
-                    offset_32: host_api_offsets::OFF32_STRUCT_SIZE,
-                    rust_host_offset: host_api_offsets::STRUCT_SIZE,
-                },
-                FieldLayoutSpec {
-                    c_name: "abi_version",
-                    offset_64: host_api_offsets::OFF64_ABI_VERSION,
-                    offset_32: host_api_offsets::OFF32_ABI_VERSION,
-                    rust_host_offset: host_api_offsets::ABI_VERSION,
-                },
-                FieldLayoutSpec {
-                    c_name: "get_proc_address",
-                    offset_64: host_api_offsets::OFF64_GET_PROC_ADDRESS,
-                    offset_32: host_api_offsets::OFF32_GET_PROC_ADDRESS,
-                    rust_host_offset: host_api_offsets::GET_PROC_ADDRESS,
-                },
-                FieldLayoutSpec {
-                    c_name: "last_error",
-                    offset_64: host_api_offsets::OFF64_LAST_ERROR,
-                    offset_32: host_api_offsets::OFF32_LAST_ERROR,
-                    rust_host_offset: host_api_offsets::LAST_ERROR,
-                },
-                FieldLayoutSpec {
-                    c_name: "load_host_ctx",
-                    offset_64: host_api_offsets::OFF64_LOAD_HOST_CTX,
-                    offset_32: host_api_offsets::OFF32_LOAD_HOST_CTX,
-                    rust_host_offset: host_api_offsets::LOAD_HOST_CTX,
-                },
-                FieldLayoutSpec {
-                    c_name: "register_component",
-                    offset_64: host_api_offsets::OFF64_REGISTER_COMPONENT,
-                    offset_32: host_api_offsets::OFF32_REGISTER_COMPONENT,
-                    rust_host_offset: host_api_offsets::REGISTER_COMPONENT,
-                },
-                FieldLayoutSpec {
-                    c_name: "resolve_component",
-                    offset_64: host_api_offsets::OFF64_RESOLVE_COMPONENT,
-                    offset_32: host_api_offsets::OFF32_RESOLVE_COMPONENT,
-                    rust_host_offset: host_api_offsets::RESOLVE_COMPONENT,
-                },
-                FieldLayoutSpec {
-                    c_name: "register_system",
-                    offset_64: host_api_offsets::OFF64_REGISTER_SYSTEM,
-                    offset_32: host_api_offsets::OFF32_REGISTER_SYSTEM,
-                    rust_host_offset: host_api_offsets::REGISTER_SYSTEM,
-                },
-                FieldLayoutSpec {
-                    c_name: "sys_host_ctx",
-                    offset_64: host_api_offsets::OFF64_SYS_HOST_CTX,
-                    offset_32: host_api_offsets::OFF32_SYS_HOST_CTX,
-                    rust_host_offset: host_api_offsets::SYS_HOST_CTX,
-                },
-                FieldLayoutSpec {
-                    c_name: "sys_query",
-                    offset_64: host_api_offsets::OFF64_SYS_QUERY,
-                    offset_32: host_api_offsets::OFF32_SYS_QUERY,
-                    rust_host_offset: host_api_offsets::SYS_QUERY,
-                },
-                FieldLayoutSpec {
-                    c_name: "sys_commands",
-                    offset_64: host_api_offsets::OFF64_SYS_COMMANDS,
-                    offset_32: host_api_offsets::OFF32_SYS_COMMANDS,
-                    rust_host_offset: host_api_offsets::SYS_COMMANDS,
-                },
-                FieldLayoutSpec {
-                    c_name: "iter_next_chunk",
-                    offset_64: host_api_offsets::OFF64_ITER_NEXT_CHUNK,
-                    offset_32: host_api_offsets::OFF32_ITER_NEXT_CHUNK,
-                    rust_host_offset: host_api_offsets::ITER_NEXT_CHUNK,
-                },
-                FieldLayoutSpec {
-                    c_name: "iter_reset",
-                    offset_64: host_api_offsets::OFF64_ITER_RESET,
-                    offset_32: host_api_offsets::OFF32_ITER_RESET,
-                    rust_host_offset: host_api_offsets::ITER_RESET,
-                },
-                FieldLayoutSpec {
-                    c_name: "iter_entities",
-                    offset_64: host_api_offsets::OFF64_ITER_ENTITIES,
-                    offset_32: host_api_offsets::OFF32_ITER_ENTITIES,
-                    rust_host_offset: host_api_offsets::ITER_ENTITIES,
-                },
-                FieldLayoutSpec {
-                    c_name: "iter_column_readonly",
-                    offset_64: host_api_offsets::OFF64_ITER_COLUMN_READONLY,
-                    offset_32: host_api_offsets::OFF32_ITER_COLUMN_READONLY,
-                    rust_host_offset: host_api_offsets::ITER_COLUMN_READONLY,
-                },
-                FieldLayoutSpec {
-                    c_name: "iter_column_mutable",
-                    offset_64: host_api_offsets::OFF64_ITER_COLUMN_MUTABLE,
-                    offset_32: host_api_offsets::OFF32_ITER_COLUMN_MUTABLE,
-                    rust_host_offset: host_api_offsets::ITER_COLUMN_MUTABLE,
-                },
-                FieldLayoutSpec {
-                    c_name: "iter_column_mutable_untracked",
-                    offset_64: host_api_offsets::OFF64_ITER_COLUMN_MUTABLE_UNTRACKED,
-                    offset_32: host_api_offsets::OFF32_ITER_COLUMN_MUTABLE_UNTRACKED,
-                    rust_host_offset: host_api_offsets::ITER_COLUMN_MUTABLE_UNTRACKED,
-                },
-                FieldLayoutSpec {
-                    c_name: "iter_mark_changed_range",
-                    offset_64: host_api_offsets::OFF64_ITER_MARK_CHANGED_RANGE,
-                    offset_32: host_api_offsets::OFF32_ITER_MARK_CHANGED_RANGE,
-                    rust_host_offset: host_api_offsets::ITER_MARK_CHANGED_RANGE,
-                },
-                FieldLayoutSpec {
-                    c_name: "iter_column_rows_readonly",
-                    offset_64: host_api_offsets::OFF64_ITER_COLUMN_ROWS_READONLY,
-                    offset_32: host_api_offsets::OFF32_ITER_COLUMN_ROWS_READONLY,
-                    rust_host_offset: host_api_offsets::ITER_COLUMN_ROWS_READONLY,
-                },
-                FieldLayoutSpec {
-                    c_name: "iter_column_rows_mutable",
-                    offset_64: host_api_offsets::OFF64_ITER_COLUMN_ROWS_MUTABLE,
-                    offset_32: host_api_offsets::OFF32_ITER_COLUMN_ROWS_MUTABLE,
-                    rust_host_offset: host_api_offsets::ITER_COLUMN_ROWS_MUTABLE,
-                },
-                FieldLayoutSpec {
-                    c_name: "iter_column_info",
-                    offset_64: host_api_offsets::OFF64_ITER_COLUMN_INFO,
-                    offset_32: host_api_offsets::OFF32_ITER_COLUMN_INFO,
-                    rust_host_offset: host_api_offsets::ITER_COLUMN_INFO,
-                },
-                FieldLayoutSpec {
-                    c_name: "res_ptr",
-                    offset_64: host_api_offsets::OFF64_RES_PTR,
-                    offset_32: host_api_offsets::OFF32_RES_PTR,
-                    rust_host_offset: host_api_offsets::RES_PTR,
-                },
-                FieldLayoutSpec {
-                    c_name: "res_mut_ptr",
-                    offset_64: host_api_offsets::OFF64_RES_MUT_PTR,
-                    offset_32: host_api_offsets::OFF32_RES_MUT_PTR,
-                    rust_host_offset: host_api_offsets::RES_MUT_PTR,
-                },
-                FieldLayoutSpec {
-                    c_name: "cmd_spawn_empty",
-                    offset_64: host_api_offsets::OFF64_CMD_SPAWN_EMPTY,
-                    offset_32: host_api_offsets::OFF32_CMD_SPAWN_EMPTY,
-                    rust_host_offset: host_api_offsets::CMD_SPAWN_EMPTY,
-                },
-                FieldLayoutSpec {
-                    c_name: "cmd_spawn",
-                    offset_64: host_api_offsets::OFF64_CMD_SPAWN,
-                    offset_32: host_api_offsets::OFF32_CMD_SPAWN,
-                    rust_host_offset: host_api_offsets::CMD_SPAWN,
-                },
-                FieldLayoutSpec {
-                    c_name: "cmd_despawn",
-                    offset_64: host_api_offsets::OFF64_CMD_DESPAWN,
-                    offset_32: host_api_offsets::OFF32_CMD_DESPAWN,
-                    rust_host_offset: host_api_offsets::CMD_DESPAWN,
-                },
-                FieldLayoutSpec {
-                    c_name: "cmd_insert",
-                    offset_64: host_api_offsets::OFF64_CMD_INSERT,
-                    offset_32: host_api_offsets::OFF32_CMD_INSERT,
-                    rust_host_offset: host_api_offsets::CMD_INSERT,
-                },
-                FieldLayoutSpec {
-                    c_name: "cmd_insert_default",
-                    offset_64: host_api_offsets::OFF64_CMD_INSERT_DEFAULT,
-                    offset_32: host_api_offsets::OFF32_CMD_INSERT_DEFAULT,
-                    rust_host_offset: host_api_offsets::CMD_INSERT_DEFAULT,
-                },
-                FieldLayoutSpec {
-                    c_name: "cmd_remove",
-                    offset_64: host_api_offsets::OFF64_CMD_REMOVE,
-                    offset_32: host_api_offsets::OFF32_CMD_REMOVE,
-                    rust_host_offset: host_api_offsets::CMD_REMOVE,
-                },
-                FieldLayoutSpec {
-                    c_name: "par_for_each_chunk",
-                    offset_64: host_api_offsets::OFF64_PAR_FOR_EACH_CHUNK,
-                    offset_32: host_api_offsets::OFF32_PAR_FOR_EACH_CHUNK,
-                    rust_host_offset: host_api_offsets::PAR_FOR_EACH_CHUNK,
-                },
-                FieldLayoutSpec {
-                    c_name: "sys_entity_get",
-                    offset_64: host_api_offsets::OFF64_SYS_ENTITY_GET,
-                    offset_32: host_api_offsets::OFF32_SYS_ENTITY_GET,
-                    rust_host_offset: host_api_offsets::SYS_ENTITY_GET,
-                },
-                FieldLayoutSpec {
-                    c_name: "sys_entity_get_mut",
-                    offset_64: host_api_offsets::OFF64_SYS_ENTITY_GET_MUT,
-                    offset_32: host_api_offsets::OFF32_SYS_ENTITY_GET_MUT,
-                    rust_host_offset: host_api_offsets::SYS_ENTITY_GET_MUT,
-                },
-                FieldLayoutSpec {
-                    c_name: "msg_read_batch",
-                    offset_64: host_api_offsets::OFF64_MSG_READ_BATCH,
-                    offset_32: host_api_offsets::OFF32_MSG_READ_BATCH,
-                    rust_host_offset: host_api_offsets::MSG_READ_BATCH,
-                },
-                FieldLayoutSpec {
-                    c_name: "msg_send",
-                    offset_64: host_api_offsets::OFF64_MSG_SEND,
-                    offset_32: host_api_offsets::OFF32_MSG_SEND,
-                    rust_host_offset: host_api_offsets::MSG_SEND,
-                },
-                FieldLayoutSpec {
-                    c_name: "msg_write_batch",
-                    offset_64: host_api_offsets::OFF64_MSG_WRITE_BATCH,
-                    offset_32: host_api_offsets::OFF32_MSG_WRITE_BATCH,
-                    rust_host_offset: host_api_offsets::MSG_WRITE_BATCH,
-                },
-                FieldLayoutSpec {
-                    c_name: "res_ticks",
-                    offset_64: host_api_offsets::OFF64_RES_TICKS,
-                    offset_32: host_api_offsets::OFF32_RES_TICKS,
-                    rust_host_offset: host_api_offsets::RES_TICKS,
-                },
-                FieldLayoutSpec {
-                    c_name: "sys_res_ptr",
-                    offset_64: host_api_offsets::OFF64_SYS_RES_PTR,
-                    offset_32: host_api_offsets::OFF32_SYS_RES_PTR,
-                    rust_host_offset: host_api_offsets::SYS_RES_PTR,
-                },
-                FieldLayoutSpec {
-                    c_name: "sys_res_mut_ptr",
-                    offset_64: host_api_offsets::OFF64_SYS_RES_MUT_PTR,
-                    offset_32: host_api_offsets::OFF32_SYS_RES_MUT_PTR,
-                    rust_host_offset: host_api_offsets::SYS_RES_MUT_PTR,
-                },
-                FieldLayoutSpec {
-                    c_name: "register_observer",
-                    offset_64: host_api_offsets::OFF64_REGISTER_OBSERVER,
-                    offset_32: host_api_offsets::OFF32_REGISTER_OBSERVER,
-                    rust_host_offset: host_api_offsets::REGISTER_OBSERVER,
-                },
-                FieldLayoutSpec {
-                    c_name: "cmd_trigger",
-                    offset_64: host_api_offsets::OFF64_CMD_TRIGGER,
-                    offset_32: host_api_offsets::OFF32_CMD_TRIGGER,
-                    rust_host_offset: host_api_offsets::CMD_TRIGGER,
-                },
-                FieldLayoutSpec {
-                    c_name: "cmd_spawn_persistent",
-                    offset_64: host_api_offsets::OFF64_CMD_SPAWN_PERSISTENT,
-                    offset_32: host_api_offsets::OFF32_CMD_SPAWN_PERSISTENT,
-                    rust_host_offset: host_api_offsets::CMD_SPAWN_PERSISTENT,
-                },
-                FieldLayoutSpec {
-                    c_name: "cmd_spawn_batch",
-                    offset_64: host_api_offsets::OFF64_CMD_SPAWN_BATCH,
-                    offset_32: host_api_offsets::OFF32_CMD_SPAWN_BATCH,
-                    rust_host_offset: host_api_offsets::CMD_SPAWN_BATCH,
-                },
-                FieldLayoutSpec {
-                    c_name: "cmd_despawn_all",
-                    offset_64: host_api_offsets::OFF64_CMD_DESPAWN_ALL,
-                    offset_32: host_api_offsets::OFF32_CMD_DESPAWN_ALL,
-                    rust_host_offset: host_api_offsets::CMD_DESPAWN_ALL,
-                },
-                FieldLayoutSpec {
-                    c_name: "cmd_insert_if_new",
-                    offset_64: host_api_offsets::OFF64_CMD_INSERT_IF_NEW,
-                    offset_32: host_api_offsets::OFF32_CMD_INSERT_IF_NEW,
-                    rust_host_offset: host_api_offsets::CMD_INSERT_IF_NEW,
-                },
-                FieldLayoutSpec {
-                    c_name: "cmd_trigger_ex",
-                    offset_64: host_api_offsets::OFF64_CMD_TRIGGER_EX,
-                    offset_32: host_api_offsets::OFF32_CMD_TRIGGER_EX,
-                    rust_host_offset: host_api_offsets::CMD_TRIGGER_EX,
-                },
-                FieldLayoutSpec {
-                    c_name: "cmd_observe",
-                    offset_64: host_api_offsets::OFF64_CMD_OBSERVE,
-                    offset_32: host_api_offsets::OFF32_CMD_OBSERVE,
-                    rust_host_offset: host_api_offsets::CMD_OBSERVE,
-                },
-                FieldLayoutSpec {
-                    c_name: "iter_read_removed",
-                    offset_64: host_api_offsets::OFF64_ITER_READ_REMOVED,
-                    offset_32: host_api_offsets::OFF32_ITER_READ_REMOVED,
-                    rust_host_offset: host_api_offsets::ITER_READ_REMOVED,
-                },
-                FieldLayoutSpec {
-                    c_name: "sys_entity_children",
-                    offset_64: host_api_offsets::OFF64_SYS_ENTITY_CHILDREN,
-                    offset_32: host_api_offsets::OFF32_SYS_ENTITY_CHILDREN,
-                    rust_host_offset: host_api_offsets::SYS_ENTITY_CHILDREN,
-                },
-                FieldLayoutSpec {
-                    c_name: "asset_load",
-                    offset_64: host_api_offsets::OFF64_ASSET_LOAD,
-                    offset_32: host_api_offsets::OFF32_ASSET_LOAD,
-                    rust_host_offset: host_api_offsets::ASSET_LOAD,
-                },
-                FieldLayoutSpec {
-                    c_name: "asset_get_load_state",
-                    offset_64: host_api_offsets::OFF64_ASSET_GET_LOAD_STATE,
-                    offset_32: host_api_offsets::OFF32_ASSET_GET_LOAD_STATE,
-                    rust_host_offset: host_api_offsets::ASSET_GET_LOAD_STATE,
-                },
-                FieldLayoutSpec {
-                    c_name: "asset_release",
-                    offset_64: host_api_offsets::OFF64_ASSET_RELEASE,
-                    offset_32: host_api_offsets::OFF32_ASSET_RELEASE,
-                    rust_host_offset: host_api_offsets::ASSET_RELEASE,
-                },
-                FieldLayoutSpec {
-                    c_name: "cmd_spawn_scene",
-                    offset_64: host_api_offsets::OFF64_CMD_SPAWN_SCENE,
-                    offset_32: host_api_offsets::OFF32_CMD_SPAWN_SCENE,
-                    rust_host_offset: host_api_offsets::CMD_SPAWN_SCENE,
-                },
-                FieldLayoutSpec {
-                    c_name: "log_diagnostic",
-                    offset_64: host_api_offsets::OFF64_LOG_DIAGNOSTIC,
-                    offset_32: host_api_offsets::OFF32_LOG_DIAGNOSTIC,
-                    rust_host_offset: host_api_offsets::LOG_DIAGNOSTIC,
-                },
-                FieldLayoutSpec {
-                    c_name: "report_guest_fault",
-                    offset_64: host_api_offsets::OFF64_REPORT_GUEST_FAULT,
-                    offset_32: host_api_offsets::OFF32_REPORT_GUEST_FAULT,
-                    rust_host_offset: host_api_offsets::REPORT_GUEST_FAULT,
-                },
-                FieldLayoutSpec {
-                    c_name: "resolve_component_by_uuid",
-                    offset_64: host_api_offsets::OFF64_RESOLVE_COMPONENT_BY_UUID,
-                    offset_32: host_api_offsets::OFF32_RESOLVE_COMPONENT_BY_UUID,
-                    rust_host_offset: host_api_offsets::RESOLVE_COMPONENT_BY_UUID,
-                },
-                FieldLayoutSpec {
-                    c_name: "component_layout_info",
-                    offset_64: host_api_offsets::OFF64_COMPONENT_LAYOUT_INFO,
-                    offset_32: host_api_offsets::OFF32_COMPONENT_LAYOUT_INFO,
-                    rust_host_offset: host_api_offsets::COMPONENT_LAYOUT_INFO,
-                },
-                FieldLayoutSpec {
-                    c_name: "register_relation",
-                    offset_64: host_api_offsets::OFF64_REGISTER_RELATION,
-                    offset_32: host_api_offsets::OFF32_REGISTER_RELATION,
-                    rust_host_offset: host_api_offsets::REGISTER_RELATION,
-                },
-                FieldLayoutSpec {
-                    c_name: "intern_symbol",
-                    offset_64: host_api_offsets::OFF64_INTERN_SYMBOL,
-                    offset_32: host_api_offsets::OFF32_INTERN_SYMBOL,
-                    rust_host_offset: host_api_offsets::INTERN_SYMBOL,
-                },
-                FieldLayoutSpec {
-                    c_name: "bind_named_object",
-                    offset_64: host_api_offsets::OFF64_BIND_NAMED_OBJECT,
-                    offset_32: host_api_offsets::OFF32_BIND_NAMED_OBJECT,
-                    rust_host_offset: host_api_offsets::BIND_NAMED_OBJECT,
-                },
-                FieldLayoutSpec {
-                    c_name: "iter_count",
-                    offset_64: host_api_offsets::OFF64_ITER_COUNT,
-                    offset_32: host_api_offsets::OFF32_ITER_COUNT,
-                    rust_host_offset: host_api_offsets::ITER_COUNT,
-                },
-                FieldLayoutSpec {
-                    c_name: "iter_up_cascade",
-                    offset_64: host_api_offsets::OFF64_ITER_UP_CASCADE,
-                    offset_32: host_api_offsets::OFF32_ITER_UP_CASCADE,
-                    rust_host_offset: host_api_offsets::ITER_UP_CASCADE,
-                },
-                FieldLayoutSpec {
-                    c_name: "par_for_each_chunk_readonly",
-                    offset_64: host_api_offsets::OFF64_PAR_FOR_EACH_CHUNK_READONLY,
-                    offset_32: host_api_offsets::OFF32_PAR_FOR_EACH_CHUNK_READONLY,
-                    rust_host_offset: host_api_offsets::PAR_FOR_EACH_CHUNK_READONLY,
-                },
-                FieldLayoutSpec {
-                    c_name: "register_system_handle",
-                    offset_64: host_api_offsets::OFF64_REGISTER_SYSTEM_HANDLE,
-                    offset_32: host_api_offsets::OFF32_REGISTER_SYSTEM_HANDLE,
-                    rust_host_offset: host_api_offsets::REGISTER_SYSTEM_HANDLE,
-                },
-                FieldLayoutSpec {
-                    c_name: "configure_schedule_set",
-                    offset_64: host_api_offsets::OFF64_CONFIGURE_SCHEDULE_SET,
-                    offset_32: host_api_offsets::OFF32_CONFIGURE_SCHEDULE_SET,
-                    rust_host_offset: host_api_offsets::CONFIGURE_SCHEDULE_SET,
-                },
-                FieldLayoutSpec {
-                    c_name: "mount_system_in_schedule",
-                    offset_64: host_api_offsets::OFF64_MOUNT_SYSTEM_IN_SCHEDULE,
-                    offset_32: host_api_offsets::OFF32_MOUNT_SYSTEM_IN_SCHEDULE,
-                    rust_host_offset: host_api_offsets::MOUNT_SYSTEM_IN_SCHEDULE,
-                },
-                FieldLayoutSpec {
-                    c_name: "cmd_checkpoint",
-                    offset_64: host_api_offsets::OFF64_CMD_CHECKPOINT,
-                    offset_32: host_api_offsets::OFF32_CMD_CHECKPOINT,
-                    rust_host_offset: host_api_offsets::CMD_CHECKPOINT,
-                },
-                FieldLayoutSpec {
-                    c_name: "cmd_rollback",
-                    offset_64: host_api_offsets::OFF64_CMD_ROLLBACK,
-                    offset_32: host_api_offsets::OFF32_CMD_ROLLBACK,
-                    rust_host_offset: host_api_offsets::CMD_ROLLBACK,
-                },
-                FieldLayoutSpec {
-                    c_name: "cmd_insert_relation",
-                    offset_64: host_api_offsets::OFF64_CMD_INSERT_RELATION,
-                    offset_32: host_api_offsets::OFF32_CMD_INSERT_RELATION,
-                    rust_host_offset: host_api_offsets::CMD_INSERT_RELATION,
-                },
-                FieldLayoutSpec {
-                    c_name: "cmd_remove_relation",
-                    offset_64: host_api_offsets::OFF64_CMD_REMOVE_RELATION,
-                    offset_32: host_api_offsets::OFF32_CMD_REMOVE_RELATION,
-                    rust_host_offset: host_api_offsets::CMD_REMOVE_RELATION,
-                },
-                FieldLayoutSpec {
-                    c_name: "migrate_component_column",
-                    offset_64: host_api_offsets::OFF64_MIGRATE_COMPONENT_COLUMN,
-                    offset_32: host_api_offsets::OFF32_MIGRATE_COMPONENT_COLUMN,
-                    rust_host_offset: host_api_offsets::MIGRATE_COMPONENT_COLUMN,
-                },
-                FieldLayoutSpec {
-                    c_name: "iter_next_chunk_batch",
-                    offset_64: host_api_offsets::OFF64_ITER_NEXT_CHUNK_BATCH,
-                    offset_32: host_api_offsets::OFF32_ITER_NEXT_CHUNK_BATCH,
-                    rust_host_offset: host_api_offsets::ITER_NEXT_CHUNK_BATCH,
-                },
-                FieldLayoutSpec {
-                    c_name: "iter_column_ticks",
-                    offset_64: host_api_offsets::OFF64_ITER_COLUMN_TICKS,
-                    offset_32: host_api_offsets::OFF32_ITER_COLUMN_TICKS,
-                    rust_host_offset: host_api_offsets::ITER_COLUMN_TICKS,
-                },
-                FieldLayoutSpec {
-                    c_name: "cmd_clone_entity",
-                    offset_64: host_api_offsets::OFF64_CMD_CLONE_ENTITY,
-                    offset_32: host_api_offsets::OFF32_CMD_CLONE_ENTITY,
-                    rust_host_offset: host_api_offsets::CMD_CLONE_ENTITY,
-                },
-                FieldLayoutSpec {
-                    c_name: "cmd_insert_resource",
-                    offset_64: host_api_offsets::OFF64_CMD_INSERT_RESOURCE,
-                    offset_32: host_api_offsets::OFF32_CMD_INSERT_RESOURCE,
-                    rust_host_offset: host_api_offsets::CMD_INSERT_RESOURCE,
-                },
-                FieldLayoutSpec {
-                    c_name: "cmd_remove_resource",
-                    offset_64: host_api_offsets::OFF64_CMD_REMOVE_RESOURCE,
-                    offset_32: host_api_offsets::OFF32_CMD_REMOVE_RESOURCE,
-                    rust_host_offset: host_api_offsets::CMD_REMOVE_RESOURCE,
-                },
-            ],
-        },
-    ]
+fn verify_struct_against_rust(
+    specs: &[StructLayoutSpec],
+    c_name: &str,
+    rust_size: usize,
+    rust_align: usize,
+    rust_fields: &[(&str, usize)],
+) -> Result<(), String> {
+    let spec = specs
+        .iter()
+        .find(|s| s.c_name == c_name)
+        .ok_or_else(|| format!("missing layout spec for `{c_name}` in bamabi_sys::abi_meta"))?;
+    let expected_size = spec.size_for(TargetLayout::HOST);
+    let expected_align = spec.align_for(TargetLayout::HOST);
+    if rust_size != expected_size {
+        return Err(format!(
+            "size_of::<{c_name}>() is {rust_size} on {}-bit host, expected {expected_size}",
+            usize::BITS
+        ));
+    }
+    if rust_align != expected_align {
+        return Err(format!(
+            "align_of::<{c_name}>() is {rust_align} on {}-bit host, expected {expected_align}",
+            usize::BITS
+        ));
+    }
+    if rust_fields.len() != spec.fields.len() {
+        return Err(format!(
+            "field count mismatch for {c_name}: verified {} fields vs {} in abi_meta",
+            rust_fields.len(),
+            spec.fields.len()
+        ));
+    }
+    for (spec_field, &(field_name, rust_off)) in spec.fields.iter().zip(rust_fields.iter()) {
+        if spec_field.c_name != field_name {
+            return Err(format!(
+                "field name mismatch in {c_name}: expected `{}`, got `{field_name}`",
+                spec_field.c_name
+            ));
+        }
+        let expected_off = spec_field.offset_for(TargetLayout::HOST);
+        if rust_off != expected_off {
+            return Err(format!(
+                "offset_of!({c_name}, {field_name}) is {rust_off} on {}-bit host, expected {expected_off}",
+                usize::BITS
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// Verifies that the host Rust compiler's `bamabi_sys` primitive and struct layouts match `specs`.
@@ -1790,12 +100,10 @@ fn wire_struct_specs() -> Vec<StructLayoutSpec> {
 /// guaranteeing that no Rust struct change can silently diverge from the frozen C99 ABI contract.
 ///
 /// What it does: checks sizes and offsets of all `bamabi_sys` primitive newtypes (`FfiBool`,
-/// handle types, `FfiEntity`, `FfiResult`, `FfiOption<u32>`, etc.), then compares each
-/// [`StructLayoutSpec`]'s `rust_host_size`, `rust_host_align`, and per-field `rust_host_offset`
-/// against the expected 64-bit or 32-bit values for the current `usize::BITS` target, returning
-/// `Err(String)` on the first mismatch.
+/// handle types, `FfiEntity`, `FfiResult`, `FfiOption<u32>`, `SystemTelemetryDigest64`), then
+/// compares `size_of`, `align_of`, and per-field `offset_of!` for every [`StructLayoutSpec`] in
+/// [`WIRE_STRUCT_SPECS`] against [`TargetLayout::HOST`].
 fn verify_host_rust_layouts(specs: &[StructLayoutSpec]) -> Result<(), String> {
-    let ptr_bits = usize::BITS as usize;
     if size_of::<FfiBool>() != 1
         || size_of::<BamComponent>() != 4
         || size_of::<BamSystem>() != 4
@@ -1812,50 +120,483 @@ fn verify_host_rust_layouts(specs: &[StructLayoutSpec]) -> Result<(), String> {
         || size_of::<FfiOption<u32>>() != 8
         || offset_of!(FfiOption<u32>, is_some) != 0
         || offset_of!(FfiOption<u32>, value) != 4
+        || size_of::<SystemTelemetryDigest64>() != SYSTEM_TELEMETRY_DIGEST_SIZE
+        || align_of::<SystemTelemetryDigest64>() != align_of::<u64>()
+        || offset_of!(SystemTelemetryDigest64, magic) != 0
+        || offset_of!(SystemTelemetryDigest64, version) != 4
+        || offset_of!(SystemTelemetryDigest64, flags) != 6
+        || offset_of!(SystemTelemetryDigest64, mod_id) != 8
+        || offset_of!(SystemTelemetryDigest64, system_hash) != 16
+        || offset_of!(SystemTelemetryDigest64, frame_seq) != 24
+        || offset_of!(SystemTelemetryDigest64, matched_entities) != 32
+        || offset_of!(SystemTelemetryDigest64, matched_tables) != 36
+        || offset_of!(SystemTelemetryDigest64, skipped_summary_tick_tables) != 40
+        || offset_of!(SystemTelemetryDigest64, chunks) != 44
+        || offset_of!(SystemTelemetryDigest64, p50_us) != 48
+        || offset_of!(SystemTelemetryDigest64, p99_us) != 52
+        || offset_of!(SystemTelemetryDigest64, commands_queued) != 56
+        || offset_of!(SystemTelemetryDigest64, reserved) != 60
     {
-        return Err("primitive newtype layout mismatch in bamabi_sys".to_owned());
+        return Err("primitive or telemetry layout mismatch in bamabi_sys".to_owned());
     }
 
-    for spec in specs {
-        let (expected_sz, expected_al) = match ptr_bits {
-            64 => (spec.size_64, spec.align_64),
-            32 => (
-                spec.size_32,
-                match spec.align_32 {
-                    Align32::Fixed(a) => a,
-                    Align32::U64 => align_of::<u64>(),
-                },
+    verify_struct_against_rust(
+        specs,
+        "BamComponentUuid",
+        size_of::<ComponentUuid>(),
+        align_of::<ComponentUuid>(),
+        &[("bytes", offset_of!(ComponentUuid, bytes))],
+    )?;
+    verify_struct_against_rust(
+        specs,
+        "BamStrView",
+        size_of::<StrView>(),
+        align_of::<StrView>(),
+        &[
+            ("ptr", offset_of!(StrView, ptr)),
+            ("len", offset_of!(StrView, len)),
+        ],
+    )?;
+    verify_struct_against_rust(
+        specs,
+        "BamManifest",
+        size_of::<BamManifest>(),
+        align_of::<BamManifest>(),
+        &[
+            ("struct_size", offset_of!(BamManifest, struct_size)),
+            ("abi_version", offset_of!(BamManifest, abi_version)),
+            ("name", offset_of!(BamManifest, name)),
+            ("version", offset_of!(BamManifest, version)),
+            ("flags", offset_of!(BamManifest, flags)),
+            ("reserved0", offset_of!(BamManifest, reserved0)),
+            ("save_state", offset_of!(BamManifest, save_state)),
+            ("restore_state", offset_of!(BamManifest, restore_state)),
+        ],
+    )?;
+    verify_struct_against_rust(
+        specs,
+        "BamAssetHandle",
+        size_of::<FfiAssetHandle>(),
+        align_of::<FfiAssetHandle>(),
+        &[
+            ("kind", offset_of!(FfiAssetHandle, kind)),
+            ("reserved0", offset_of!(FfiAssetHandle, reserved0)),
+            ("asset_type", offset_of!(FfiAssetHandle, asset_type)),
+            ("index", offset_of!(FfiAssetHandle, index)),
+            ("generation", offset_of!(FfiAssetHandle, generation)),
+            ("uuid", offset_of!(FfiAssetHandle, uuid)),
+        ],
+    )?;
+    verify_struct_against_rust(
+        specs,
+        "BamTermDesc",
+        size_of::<BamTermDesc>(),
+        align_of::<BamTermDesc>(),
+        &[
+            ("component", offset_of!(BamTermDesc, component)),
+            ("mode", offset_of!(BamTermDesc, mode)),
+            ("flags", offset_of!(BamTermDesc, flags)),
+            ("or_group", offset_of!(BamTermDesc, or_group)),
+            ("reserved0", offset_of!(BamTermDesc, reserved0)),
+        ],
+    )?;
+    verify_struct_against_rust(
+        specs,
+        "BamQueryDesc",
+        size_of::<BamQueryDesc>(),
+        align_of::<BamQueryDesc>(),
+        &[
+            ("struct_size", offset_of!(BamQueryDesc, struct_size)),
+            ("flags", offset_of!(BamQueryDesc, flags)),
+            ("terms", offset_of!(BamQueryDesc, terms)),
+            ("term_count", offset_of!(BamQueryDesc, term_count)),
+            ("param_set_group", offset_of!(BamQueryDesc, param_set_group)),
+            ("reserved0", offset_of!(BamQueryDesc, reserved0)),
+        ],
+    )?;
+    verify_struct_against_rust(
+        specs,
+        "BamSystemDesc",
+        size_of::<BamSystemDesc>(),
+        align_of::<BamSystemDesc>(),
+        &[
+            ("struct_size", offset_of!(BamSystemDesc, struct_size)),
+            ("flags", offset_of!(BamSystemDesc, flags)),
+            ("name", offset_of!(BamSystemDesc, name)),
+            ("queries", offset_of!(BamSystemDesc, queries)),
+            ("query_count", offset_of!(BamSystemDesc, query_count)),
+            ("callback", offset_of!(BamSystemDesc, callback)),
+            ("user_data", offset_of!(BamSystemDesc, user_data)),
+            ("schedule", offset_of!(BamSystemDesc, schedule)),
+            ("reserved0", offset_of!(BamSystemDesc, reserved0)),
+            ("after", offset_of!(BamSystemDesc, after)),
+            ("after_count", offset_of!(BamSystemDesc, after_count)),
+            ("before", offset_of!(BamSystemDesc, before)),
+            ("before_count", offset_of!(BamSystemDesc, before_count)),
+            ("run_if", offset_of!(BamSystemDesc, run_if)),
+            (
+                "run_if_user_data",
+                offset_of!(BamSystemDesc, run_if_user_data),
             ),
-            other => return Err(format!("unsupported host pointer width {other} bits")),
-        };
+            ("in_sets", offset_of!(BamSystemDesc, in_sets)),
+            ("in_set_count", offset_of!(BamSystemDesc, in_set_count)),
+            ("after_weak", offset_of!(BamSystemDesc, after_weak)),
+            (
+                "after_weak_count",
+                offset_of!(BamSystemDesc, after_weak_count),
+            ),
+            ("before_weak", offset_of!(BamSystemDesc, before_weak)),
+            (
+                "before_weak_count",
+                offset_of!(BamSystemDesc, before_weak_count),
+            ),
+            ("ambiguous_with", offset_of!(BamSystemDesc, ambiguous_with)),
+            (
+                "ambiguous_with_count",
+                offset_of!(BamSystemDesc, ambiguous_with_count),
+            ),
+            ("run_if_ctx", offset_of!(BamSystemDesc, run_if_ctx)),
+            ("run_if_query", offset_of!(BamSystemDesc, run_if_query)),
+            (
+                "run_if_ctx_user_data",
+                offset_of!(BamSystemDesc, run_if_ctx_user_data),
+            ),
+        ],
+    )?;
+    verify_struct_against_rust(
+        specs,
+        "BamObserverDesc",
+        size_of::<BamObserverDesc>(),
+        align_of::<BamObserverDesc>(),
+        &[
+            ("struct_size", offset_of!(BamObserverDesc, struct_size)),
+            ("flags", offset_of!(BamObserverDesc, flags)),
+            ("name", offset_of!(BamObserverDesc, name)),
+            ("event", offset_of!(BamObserverDesc, event)),
+            ("entity_lo", offset_of!(BamObserverDesc, entity_lo)),
+            ("entity_hi", offset_of!(BamObserverDesc, entity_hi)),
+            ("reserved0", offset_of!(BamObserverDesc, reserved0)),
+            ("callback", offset_of!(BamObserverDesc, callback)),
+            ("user_data", offset_of!(BamObserverDesc, user_data)),
+            ("event_kind", offset_of!(BamObserverDesc, event_kind)),
+            ("reserved1", offset_of!(BamObserverDesc, reserved1)),
+            (
+                "watched_components",
+                offset_of!(BamObserverDesc, watched_components),
+            ),
+            (
+                "watched_component_count",
+                offset_of!(BamObserverDesc, watched_component_count),
+            ),
+            ("mut_callback", offset_of!(BamObserverDesc, mut_callback)),
+            (
+                "propagate_relationship",
+                offset_of!(BamObserverDesc, propagate_relationship),
+            ),
+            ("reserved2", offset_of!(BamObserverDesc, reserved2)),
+            ("ctx_callback", offset_of!(BamObserverDesc, ctx_callback)),
+            ("queries", offset_of!(BamObserverDesc, queries)),
+            ("query_count", offset_of!(BamObserverDesc, query_count)),
+            (
+                "ctx_mut_callback",
+                offset_of!(BamObserverDesc, ctx_mut_callback),
+            ),
+        ],
+    )?;
+    verify_struct_against_rust(
+        specs,
+        "BamTriggerDesc",
+        size_of::<BamTriggerDesc>(),
+        align_of::<BamTriggerDesc>(),
+        &[
+            ("struct_size", offset_of!(BamTriggerDesc, struct_size)),
+            ("flags", offset_of!(BamTriggerDesc, flags)),
+            ("event", offset_of!(BamTriggerDesc, event)),
+            ("event_kind", offset_of!(BamTriggerDesc, event_kind)),
+            ("entity_lo", offset_of!(BamTriggerDesc, entity_lo)),
+            ("entity_hi", offset_of!(BamTriggerDesc, entity_hi)),
+            ("data_ptr", offset_of!(BamTriggerDesc, data_ptr)),
+            ("data_len", offset_of!(BamTriggerDesc, data_len)),
+            (
+                "watched_components",
+                offset_of!(BamTriggerDesc, watched_components),
+            ),
+            (
+                "watched_component_count",
+                offset_of!(BamTriggerDesc, watched_component_count),
+            ),
+            (
+                "propagate_relationship",
+                offset_of!(BamTriggerDesc, propagate_relationship),
+            ),
+            ("reserved0", offset_of!(BamTriggerDesc, reserved0)),
+        ],
+    )?;
+    verify_struct_against_rust(
+        specs,
+        "BamChangeTicks",
+        size_of::<BamChangeTicks>(),
+        align_of::<BamChangeTicks>(),
+        &[
+            ("added", offset_of!(BamChangeTicks, added)),
+            ("changed", offset_of!(BamChangeTicks, changed)),
+            ("last_run", offset_of!(BamChangeTicks, last_run)),
+            ("this_run", offset_of!(BamChangeTicks, this_run)),
+        ],
+    )?;
+    verify_struct_against_rust(
+        specs,
+        "BamFieldDesc",
+        size_of::<BamFieldDesc>(),
+        align_of::<BamFieldDesc>(),
+        &[
+            ("struct_size", offset_of!(BamFieldDesc, struct_size)),
+            ("kind", offset_of!(BamFieldDesc, kind)),
+            ("name", offset_of!(BamFieldDesc, name)),
+            ("type_tag", offset_of!(BamFieldDesc, type_tag)),
+            ("offset", offset_of!(BamFieldDesc, offset)),
+            ("size", offset_of!(BamFieldDesc, size)),
+            ("align", offset_of!(BamFieldDesc, align)),
+        ],
+    )?;
+    verify_struct_against_rust(
+        specs,
+        "BamRequiredComponent",
+        size_of::<BamRequiredComponent>(),
+        align_of::<BamRequiredComponent>(),
+        &[
+            ("struct_size", offset_of!(BamRequiredComponent, struct_size)),
+            ("flags", offset_of!(BamRequiredComponent, flags)),
+            ("component", offset_of!(BamRequiredComponent, component)),
+            ("reserved0", offset_of!(BamRequiredComponent, reserved0)),
+            ("uuid", offset_of!(BamRequiredComponent, uuid)),
+            ("init_bytes", offset_of!(BamRequiredComponent, init_bytes)),
+            ("init_size", offset_of!(BamRequiredComponent, init_size)),
+            ("init_fn", offset_of!(BamRequiredComponent, init_fn)),
+            ("user_data", offset_of!(BamRequiredComponent, user_data)),
+        ],
+    )?;
+    verify_struct_against_rust(
+        specs,
+        "BamRelationDesc",
+        size_of::<BamRelationDesc>(),
+        align_of::<BamRelationDesc>(),
+        &[
+            ("struct_size", offset_of!(BamRelationDesc, struct_size)),
+            ("flags", offset_of!(BamRelationDesc, flags)),
+            ("name", offset_of!(BamRelationDesc, name)),
+            ("uuid", offset_of!(BamRelationDesc, uuid)),
+            ("data_size", offset_of!(BamRelationDesc, data_size)),
+            ("data_align", offset_of!(BamRelationDesc, data_align)),
+            ("max_degree", offset_of!(BamRelationDesc, max_degree)),
+            ("reserved0", offset_of!(BamRelationDesc, reserved0)),
+        ],
+    )?;
+    verify_struct_against_rust(
+        specs,
+        "BamLayoutInfo",
+        size_of::<BamLayoutInfo>(),
+        align_of::<BamLayoutInfo>(),
+        &[
+            ("struct_size", offset_of!(BamLayoutInfo, struct_size)),
+            ("flags", offset_of!(BamLayoutInfo, flags)),
+            ("uuid", offset_of!(BamLayoutInfo, uuid)),
+            (
+                "schema_fingerprint",
+                offset_of!(BamLayoutInfo, schema_fingerprint),
+            ),
+            ("size", offset_of!(BamLayoutInfo, size)),
+            ("align", offset_of!(BamLayoutInfo, align)),
+            ("fields", offset_of!(BamLayoutInfo, fields)),
+            ("field_count", offset_of!(BamLayoutInfo, field_count)),
+        ],
+    )?;
+    verify_struct_against_rust(
+        specs,
+        "BamScheduleSetDesc",
+        size_of::<BamScheduleSetDesc>(),
+        align_of::<BamScheduleSetDesc>(),
+        &[
+            ("struct_size", offset_of!(BamScheduleSetDesc, struct_size)),
+            ("flags", offset_of!(BamScheduleSetDesc, flags)),
+            ("schedule", offset_of!(BamScheduleSetDesc, schedule)),
+            ("before_count", offset_of!(BamScheduleSetDesc, before_count)),
+            ("after_count", offset_of!(BamScheduleSetDesc, after_count)),
+            ("reserved0", offset_of!(BamScheduleSetDesc, reserved0)),
+            ("name", offset_of!(BamScheduleSetDesc, name)),
+            ("before_sets", offset_of!(BamScheduleSetDesc, before_sets)),
+            ("after_sets", offset_of!(BamScheduleSetDesc, after_sets)),
+            ("run_if_ctx", offset_of!(BamScheduleSetDesc, run_if_ctx)),
+            ("run_if_query", offset_of!(BamScheduleSetDesc, run_if_query)),
+            (
+                "run_if_ctx_user_data",
+                offset_of!(BamScheduleSetDesc, run_if_ctx_user_data),
+            ),
+            ("parent_sets", offset_of!(BamScheduleSetDesc, parent_sets)),
+            (
+                "parent_set_count",
+                offset_of!(BamScheduleSetDesc, parent_set_count),
+            ),
+            ("reserved1", offset_of!(BamScheduleSetDesc, reserved1)),
+        ],
+    )?;
+    verify_struct_against_rust(
+        specs,
+        "BamComponentDesc",
+        size_of::<ComponentDesc>(),
+        align_of::<ComponentDesc>(),
+        &[
+            ("struct_size", offset_of!(ComponentDesc, struct_size)),
+            ("flags", offset_of!(ComponentDesc, flags)),
+            ("name", offset_of!(ComponentDesc, name)),
+            ("uuid", offset_of!(ComponentDesc, uuid)),
+            ("size", offset_of!(ComponentDesc, size)),
+            ("align", offset_of!(ComponentDesc, align)),
+            ("drop_fn", offset_of!(ComponentDesc, drop_fn)),
+            ("vtable_ptr", offset_of!(ComponentDesc, vtable_ptr)),
+            ("on_add", offset_of!(ComponentDesc, on_add)),
+            ("on_remove", offset_of!(ComponentDesc, on_remove)),
+            ("hook_user_data", offset_of!(ComponentDesc, hook_user_data)),
+            ("on_insert", offset_of!(ComponentDesc, on_insert)),
+            ("on_discard", offset_of!(ComponentDesc, on_discard)),
+            ("on_despawn", offset_of!(ComponentDesc, on_despawn)),
+            ("clone_fn", offset_of!(ComponentDesc, clone_fn)),
+            (
+                "required_components",
+                offset_of!(ComponentDesc, required_components),
+            ),
+            (
+                "required_component_count",
+                offset_of!(ComponentDesc, required_component_count),
+            ),
+            (
+                "schema_fingerprint",
+                offset_of!(ComponentDesc, schema_fingerprint),
+            ),
+            ("fields", offset_of!(ComponentDesc, fields)),
+            ("field_count", offset_of!(ComponentDesc, field_count)),
+            (
+                "required_init_descs",
+                offset_of!(ComponentDesc, required_init_descs),
+            ),
+            (
+                "required_init_desc_count",
+                offset_of!(ComponentDesc, required_init_desc_count),
+            ),
+        ],
+    )?;
+    verify_struct_against_rust(
+        specs,
+        "BamColumnInfo",
+        size_of::<BamColumnInfo>(),
+        align_of::<BamColumnInfo>(),
+        &[
+            ("component", offset_of!(BamColumnInfo, component)),
+            ("mode", offset_of!(BamColumnInfo, mode)),
+            ("uuid", offset_of!(BamColumnInfo, uuid)),
+            ("size", offset_of!(BamColumnInfo, size)),
+            ("align", offset_of!(BamColumnInfo, align)),
+            ("storage_flags", offset_of!(BamColumnInfo, storage_flags)),
+            ("reserved0", offset_of!(BamColumnInfo, reserved0)),
+        ],
+    )?;
+    verify_struct_against_rust(
+        specs,
+        "BamVTableHeader",
+        size_of::<VTableHeader>(),
+        align_of::<VTableHeader>(),
+        &[
+            ("struct_size", offset_of!(VTableHeader, struct_size)),
+            ("abi_version", offset_of!(VTableHeader, abi_version)),
+            ("uuid", offset_of!(VTableHeader, uuid)),
+            ("size", offset_of!(VTableHeader, size)),
+            ("align", offset_of!(VTableHeader, align)),
+        ],
+    )?;
+    verify_struct_against_rust(
+        specs,
+        "BamMappedStringVTable",
+        size_of::<MappedStringVTable>(),
+        align_of::<MappedStringVTable>(),
+        &[
+            ("header", offset_of!(MappedStringVTable, header)),
+            ("get", offset_of!(MappedStringVTable, get)),
+            ("set", offset_of!(MappedStringVTable, set)),
+        ],
+    )?;
+    verify_struct_against_rust(
+        specs,
+        "BamRowRange",
+        size_of::<BamRowRange>(),
+        align_of::<BamRowRange>(),
+        &[
+            ("start_row", offset_of!(BamRowRange, start_row)),
+            ("row_count", offset_of!(BamRowRange, row_count)),
+        ],
+    )?;
+    verify_struct_against_rust(
+        specs,
+        "BamTimeInfo",
+        size_of::<BamTimeInfo>(),
+        align_of::<BamTimeInfo>(),
+        &[
+            ("struct_size", offset_of!(BamTimeInfo, struct_size)),
+            ("flags", offset_of!(BamTimeInfo, flags)),
+            ("delta_secs", offset_of!(BamTimeInfo, delta_secs)),
+            (
+                "fixed_delta_secs",
+                offset_of!(BamTimeInfo, fixed_delta_secs),
+            ),
+            ("elapsed_secs", offset_of!(BamTimeInfo, elapsed_secs)),
+            (
+                "elapsed_secs_wrapped",
+                offset_of!(BamTimeInfo, elapsed_secs_wrapped),
+            ),
+            (
+                "overstep_fraction",
+                offset_of!(BamTimeInfo, overstep_fraction),
+            ),
+        ],
+    )?;
+    verify_struct_against_rust(
+        specs,
+        "BamParOptions",
+        size_of::<BamParOptions>(),
+        align_of::<BamParOptions>(),
+        &[
+            ("struct_size", offset_of!(BamParOptions, struct_size)),
+            ("flags", offset_of!(BamParOptions, flags)),
+            ("chunk_size", offset_of!(BamParOptions, chunk_size)),
+            ("max_partitions", offset_of!(BamParOptions, max_partitions)),
+        ],
+    )?;
+    verify_struct_against_rust(
+        specs,
+        "BamSpawnColumnDesc",
+        size_of::<BamSpawnColumnDesc>(),
+        align_of::<BamSpawnColumnDesc>(),
+        &[
+            ("component", offset_of!(BamSpawnColumnDesc, component)),
+            ("flags", offset_of!(BamSpawnColumnDesc, flags)),
+            ("column_ptr", offset_of!(BamSpawnColumnDesc, column_ptr)),
+            ("elem_size", offset_of!(BamSpawnColumnDesc, elem_size)),
+        ],
+    )?;
 
-        if spec.rust_host_size != expected_sz {
-            return Err(format!(
-                "size_of::<{}>() is {} on {ptr_bits}-bit host, expected {expected_sz}",
-                spec.c_name, spec.rust_host_size
-            ));
-        }
-        if spec.rust_host_align != expected_al {
-            return Err(format!(
-                "align_of::<{}>() is {} on {ptr_bits}-bit host, expected {expected_al}",
-                spec.c_name, spec.rust_host_align
-            ));
-        }
-
-        for field in spec.fields {
-            let expected_off = if ptr_bits == 64 {
-                field.offset_64
-            } else {
-                field.offset_32
-            };
-            if field.rust_host_offset != expected_off {
-                return Err(format!(
-                    "offset_of!({}, {}) is {} on {ptr_bits}-bit host, expected {expected_off}",
-                    spec.c_name, field.c_name, field.rust_host_offset
-                ));
-            }
-        }
+    let mut host_api_fields: Vec<(&'static str, usize)> =
+        Vec::with_capacity(2 + HOST_API_SLOTS.len());
+    host_api_fields.push(("struct_size", offset_of!(BamHostApi, struct_size)));
+    host_api_fields.push(("abi_version", offset_of!(BamHostApi, abi_version)));
+    for slot in &HOST_API_SLOTS {
+        host_api_fields.push((slot.name, host_api_offsets::ALL_SLOT_OFFSETS[slot.index]));
     }
+    verify_struct_against_rust(
+        specs,
+        "BamHostApi",
+        size_of::<BamHostApi>(),
+        align_of::<BamHostApi>(),
+        &host_api_fields,
+    )?;
 
     Ok(())
 }
@@ -1866,14 +607,14 @@ fn verify_host_rust_layouts(specs: &[StructLayoutSpec]) -> Result<(), String> {
 /// bindings so `include/bamabi.h` is always byte-for-byte consistent with `bamabi_sys`.
 ///
 /// What it does: validates host Rust layouts via `verify_host_rust_layouts`, verifies that
-/// `BamHostApi` contains exactly `BAM_HOST_API_SLOT_COUNT` (73) function-pointer slots, and
+/// `BamHostApi` contains exactly `BAM_HOST_API_SLOT_COUNT` (90) function-pointer slots, and
 /// emits six ordered sections: portability macros (`BAM_EXPORT`, `BAM_RESTRICT`, `BAM_STATIC_ASSERT`),
 /// ABI version/limits, primitive/flag constants, wire structs and function-pointer typedefs,
-/// inline C99 helpers (`bam_*` including SipHash-2-4-128 UUID computation), and 64-bit/32-bit
-/// compile-time layout assertions.
+/// inline C99 helpers (`bam_*` including SipHash-2-4-128 UUID, FNV-1a telemetry, and constructor
+/// helpers), and 64-bit/32-bit compile-time layout assertions.
 pub fn render_c99_header() -> Result<String, String> {
-    let specs = wire_struct_specs();
-    verify_host_rust_layouts(&specs)?;
+    let specs = WIRE_STRUCT_SPECS;
+    verify_host_rust_layouts(specs)?;
 
     let host_api_spec = specs
         .iter()
@@ -1890,14 +631,14 @@ pub fn render_c99_header() -> Result<String, String> {
         ));
     }
 
-    let mut out = String::with_capacity(48 * 1024);
+    let mut out = String::with_capacity(64 * 1024);
 
     out.push_str(
         "/*\n\
          * AUTO-GENERATED BY `cargo xtask header` FROM `crates/bamabi_sys`.\n\
          * DO NOT EDIT MANUALLY — run `cargo xtask header` to regenerate.\n\
          *\n\
-         * `bamabi` C99 ABI Wire Header (`0.3.0`)\n\
+         * `bamabi` C99 ABI Wire Header (`0.4.0`)\n\
          * Zero-serialization, asymmetric `extern \"C\"` modding interface for Bevy ECS.\n\
          *\n\
          * Threading & Concurrency Model:\n\
@@ -1969,7 +710,7 @@ pub fn render_c99_header() -> Result<String, String> {
          #elif defined(__STDC_VERSION__) && (__STDC_VERSION__ >= 201112L)\n\
          #  define BAM_ALIGNOF(type) _Alignof(type)\n\
          #elif defined(__GNUC__) || defined(__clang__)\n\
-         #  define BAM_ALIGNOF(type) (__extension__ __alignof__(type))\n\
+         #  define BAM_ALIGNOF(type) (__extension__ offsetof(struct { char _bam_pad; type _bam_val; }, _bam_val))\n\
          #elif defined(_MSC_VER)\n\
          #  define BAM_ALIGNOF(type) __alignof(type)\n\
          #else\n\
@@ -2006,7 +747,19 @@ pub fn render_c99_header() -> Result<String, String> {
          #define BAM_MAX_CHANGE_AGE 0x{BAM_MAX_CHANGE_AGE:08X}u\n\
          #define BAM_CHILD_OF_NAME \"{BAM_CHILD_OF_NAME}\"\n\
          #define BAM_CHILDREN_NAME \"{BAM_CHILDREN_NAME}\"\n\
-         #define BAM_DISABLED_NAME \"{BAM_DISABLED_NAME}\"\n"
+         #define BAM_DISABLED_NAME \"{BAM_DISABLED_NAME}\"\n\n\
+         #define BAM_FNV1A_64_OFFSET_BASIS 0xCBF29CE484222325ull\n\
+         #define BAM_FNV1A_64_PRIME        0x00000100000001B3ull\n\
+         #define BAM_SYSTEM_TELEMETRY_MAGIC_0 ((uint8_t)0x{:02X}u)\n\
+         #define BAM_SYSTEM_TELEMETRY_MAGIC_1 ((uint8_t)0x{:02X}u)\n\
+         #define BAM_SYSTEM_TELEMETRY_MAGIC_2 ((uint8_t)0x{:02X}u)\n\
+         #define BAM_SYSTEM_TELEMETRY_MAGIC_3 ((uint8_t)0x{:02X}u)\n\
+         #define BAM_SYSTEM_TELEMETRY_DIGEST_VERSION {SYSTEM_TELEMETRY_DIGEST_VERSION}u\n\
+         #define BAM_SYSTEM_TELEMETRY_DIGEST_SIZE    {SYSTEM_TELEMETRY_DIGEST_SIZE}u\n",
+        SYSTEM_TELEMETRY_MAGIC[0],
+        SYSTEM_TELEMETRY_MAGIC[1],
+        SYSTEM_TELEMETRY_MAGIC[2],
+        SYSTEM_TELEMETRY_MAGIC[3],
     );
 
     // 3. Primitives, Result taxonomy, AccessMode, ScheduleId, FieldKind, LogLevel, Flags
@@ -2105,13 +858,23 @@ pub fn render_c99_header() -> Result<String, String> {
          #define BAM_ASSET_LOAD_STATE_LOADED     ((BamAssetLoadState){}u)\n\
          #define BAM_ASSET_LOAD_STATE_FAILED     ((BamAssetLoadState){}u)\n\n\
          typedef uint32_t BamScheduleId;\n\
-         #define BAM_SCHEDULE_UPDATE       ((BamScheduleId){}u)\n\
-         #define BAM_SCHEDULE_STARTUP      ((BamScheduleId){}u)\n\
-         #define BAM_SCHEDULE_PRE_UPDATE   ((BamScheduleId){}u)\n\
-         #define BAM_SCHEDULE_POST_UPDATE  ((BamScheduleId){}u)\n\
-         #define BAM_SCHEDULE_FIXED_UPDATE ((BamScheduleId){}u)\n\
-         #define BAM_SCHEDULE_LAST         ((BamScheduleId){}u)\n\
-         #define BAM_SCHEDULE_CUSTOM_BASE  ((BamScheduleId){}u)\n\n\
+         #define BAM_SCHEDULE_UPDATE              ((BamScheduleId){}u)\n\
+         #define BAM_SCHEDULE_STARTUP             ((BamScheduleId){}u)\n\
+         #define BAM_SCHEDULE_PRE_UPDATE          ((BamScheduleId){}u)\n\
+         #define BAM_SCHEDULE_POST_UPDATE         ((BamScheduleId){}u)\n\
+         #define BAM_SCHEDULE_FIXED_UPDATE        ((BamScheduleId){}u)\n\
+         #define BAM_SCHEDULE_LAST                ((BamScheduleId){}u)\n\
+         #define BAM_SCHEDULE_CUSTOM_BASE         ((BamScheduleId){}u)\n\
+         #define BAM_SCHEDULE_PRE_STARTUP         ((BamScheduleId)({}u + 0u))\n\
+         #define BAM_SCHEDULE_POST_STARTUP        ((BamScheduleId)({}u + 1u))\n\
+         #define BAM_SCHEDULE_FIRST               ((BamScheduleId)({}u + 2u))\n\
+         #define BAM_SCHEDULE_STATE_TRANSITION    ((BamScheduleId)({}u + 3u))\n\
+         #define BAM_SCHEDULE_RUN_FIXED_MAIN_LOOP ((BamScheduleId)({}u + 4u))\n\
+         #define BAM_SCHEDULE_FIXED_FIRST         ((BamScheduleId)({}u + 5u))\n\
+         #define BAM_SCHEDULE_FIXED_PRE_UPDATE    ((BamScheduleId)({}u + 6u))\n\
+         #define BAM_SCHEDULE_FIXED_POST_UPDATE   ((BamScheduleId)({}u + 7u))\n\
+         #define BAM_SCHEDULE_FIXED_LAST          ((BamScheduleId)({}u + 8u))\n\
+         #define BAM_SCHEDULE_SPAWN_SCENE         ((BamScheduleId)({}u + 9u))\n\n\
          #define BAM_MANIFEST_KNOWN_FLAGS            0x{BAM_MANIFEST_KNOWN_FLAGS:08X}u\n\
          #define BAM_TERM_FLAG_CHANGED               0x{BAM_TERM_FLAG_CHANGED:04X}u\n\
          #define BAM_TERM_FLAG_ADDED                 0x{BAM_TERM_FLAG_ADDED:04X}u\n\
@@ -2146,13 +909,19 @@ pub fn render_c99_header() -> Result<String, String> {
          #define BAM_SCHEDULE_SET_FLAG_BEFORE_WEAK   0x{BAM_SCHEDULE_SET_FLAG_BEFORE_WEAK:08X}u\n\
          #define BAM_SCHEDULE_SET_FLAG_AFTER_WEAK    0x{BAM_SCHEDULE_SET_FLAG_AFTER_WEAK:08X}u\n\
          #define BAM_SCHEDULE_SET_KNOWN_FLAGS        0x{BAM_SCHEDULE_SET_KNOWN_FLAGS:08X}u\n\
+         #define BAM_SPAWN_COL_FLAG_SPLAT            0x{BAM_SPAWN_COL_FLAG_SPLAT:08X}u\n\
+         #define BAM_SPAWN_COL_KNOWN_FLAGS           0x{BAM_SPAWN_COL_KNOWN_FLAGS:08X}u\n\
          #define BAM_STORAGE_FLAG_SPARSE_SET         0x{BAM_STORAGE_FLAG_SPARSE_SET:08X}u\n\
          #define BAM_STORAGE_FLAG_IMMUTABLE          0x{BAM_STORAGE_FLAG_IMMUTABLE:08X}u\n\
          #define BAM_STORAGE_FLAG_RESOURCE           0x{BAM_STORAGE_FLAG_RESOURCE:08X}u\n\
          #define BAM_STORAGE_FLAG_MESSAGE            0x{BAM_STORAGE_FLAG_MESSAGE:08X}u\n\
          #define BAM_STORAGE_FLAG_EVENT              0x{BAM_STORAGE_FLAG_EVENT:08X}u\n\
          #define BAM_STORAGE_FLAG_ENTITY_EVENT       0x{BAM_STORAGE_FLAG_ENTITY_EVENT:08X}u\n\
-         #define BAM_STORAGE_FLAG_SUMMARY_TICK       0x{BAM_STORAGE_FLAG_SUMMARY_TICK:08X}u\n",
+         #define BAM_STORAGE_FLAG_SUMMARY_TICK       0x{BAM_STORAGE_FLAG_SUMMARY_TICK:08X}u\n\
+         #define BAM_TELEMETRY_FLAG_QUARANTINED        ((uint16_t)0x{TELEMETRY_FLAG_QUARANTINED:04X}u)\n\
+         #define BAM_TELEMETRY_FLAG_FAULTED            ((uint16_t)0x{TELEMETRY_FLAG_FAULTED:04X}u)\n\
+         #define BAM_TELEMETRY_FLAG_SUMMARY_TICK_ACTIVE ((uint16_t)0x{TELEMETRY_FLAG_SUMMARY_TICK_ACTIVE:04X}u)\n\
+         #define BAM_TELEMETRY_FLAG_BUDGET_BREACHED    ((uint16_t)0x{TELEMETRY_FLAG_BUDGET_BREACHED:04X}u)\n",
         FfiBool::FALSE.0,
         FfiBool::TRUE.0,
         BamComponent::INVALID.0,
@@ -2233,6 +1002,16 @@ pub fn render_c99_header() -> Result<String, String> {
         ScheduleId::FIXED_UPDATE.0,
         ScheduleId::LAST.0,
         ScheduleId::CUSTOM_BASE,
+        ScheduleId::CUSTOM_BASE,
+        ScheduleId::CUSTOM_BASE,
+        ScheduleId::CUSTOM_BASE,
+        ScheduleId::CUSTOM_BASE,
+        ScheduleId::CUSTOM_BASE,
+        ScheduleId::CUSTOM_BASE,
+        ScheduleId::CUSTOM_BASE,
+        ScheduleId::CUSTOM_BASE,
+        ScheduleId::CUSTOM_BASE,
+        ScheduleId::CUSTOM_BASE,
     );
 
     // 4. Opaque handles, structs, and function pointers
@@ -2279,6 +1058,47 @@ pub fn render_c99_header() -> Result<String, String> {
              uint32_t last_run;\n\
              uint32_t this_run;\n\
          }} BamChangeTicks;\n\n\
+         typedef struct BamRowRange {{\n\
+             size_t start_row;\n\
+             size_t row_count;\n\
+         }} BamRowRange;\n\n\
+         typedef struct BamTimeInfo {{\n\
+             uint32_t struct_size;\n\
+             uint32_t flags;\n\
+             float    delta_secs;\n\
+             float    fixed_delta_secs;\n\
+             double   elapsed_secs;\n\
+             float    elapsed_secs_wrapped;\n\
+             float    overstep_fraction;\n\
+         }} BamTimeInfo;\n\n\
+         typedef struct BamParOptions {{\n\
+             uint32_t struct_size;\n\
+             uint32_t flags;\n\
+             size_t   chunk_size;\n\
+             size_t   max_partitions;\n\
+         }} BamParOptions;\n\n\
+         typedef struct BamSpawnColumnDesc {{\n\
+             BamComponent   component;\n\
+             uint32_t       flags;\n\
+             const uint8_t* column_ptr;\n\
+             size_t         elem_size;\n\
+         }} BamSpawnColumnDesc;\n\n\
+         typedef struct BamSystemTelemetryDigest64 {{\n\
+             uint8_t  magic[4];\n\
+             uint16_t version;\n\
+             uint16_t flags;\n\
+             uint64_t mod_id;\n\
+             uint64_t system_hash;\n\
+             uint64_t frame_seq;\n\
+             uint32_t matched_entities;\n\
+             uint32_t matched_tables;\n\
+             uint32_t skipped_summary_tick_tables;\n\
+             uint32_t chunks;\n\
+             uint32_t p50_us;\n\
+             uint32_t p99_us;\n\
+             uint32_t commands_queued;\n\
+             uint32_t reserved;\n\
+         }} BamSystemTelemetryDigest64;\n\n\
          typedef BamResult (*BamStateWriterFn)(void* ctx, const uint8_t* bytes, size_t len);\n\
          typedef BamResult (*BamSaveStateFn)(BamInstance* instance, BamStateWriterFn writer, void* writer_ctx);\n\
          typedef BamResult (*BamRestoreStateFn)(BamInstance* instance, const uint8_t* bytes, size_t len);\n\n\
@@ -2306,7 +1126,8 @@ pub fn render_c99_header() -> Result<String, String> {
          typedef BamBool   (*BamRunIfFn)(void* user_data);\n\
          typedef BamResult (*BamObserverFn)(BamEntity entity, const void* event_data, BamCommands* commands, void* user_data);\n\
          typedef BamResult (*BamObserverMutFn)(BamEntity entity, uint8_t* event_data, BamBool* propagate, BamCommands* commands, void* user_data);\n\
-         typedef BamResult (*BamObserverCtxFn)(BamEntity entity, const void* event_data, BamSystemCtx* ctx, void* user_data);\n\n\
+         typedef BamResult (*BamObserverCtxFn)(BamEntity entity, const void* event_data, BamSystemCtx* ctx, void* user_data);\n\
+         typedef BamResult (*BamObserverCtxMutFn)(BamEntity entity, uint8_t* event_data, BamBool* propagate, BamSystemCtx* ctx, void* user_data);\n\n\
          typedef struct BamTermDesc {{\n\
              BamComponent  component;\n\
              BamAccessMode mode;\n\
@@ -2390,6 +1211,7 @@ pub fn render_c99_header() -> Result<String, String> {
              BamObserverCtxFn    ctx_callback            = nullptr;\n\
              const BamQueryDesc* queries                 = nullptr;\n\
              size_t              query_count             = 0;\n\
+             BamObserverCtxMutFn ctx_mut_callback        = nullptr;\n\
          #else\n\
              BamEventKind        event_kind;\n\
              uint32_t            reserved1;\n\
@@ -2401,6 +1223,7 @@ pub fn render_c99_header() -> Result<String, String> {
              BamObserverCtxFn    ctx_callback;\n\
              const BamQueryDesc* queries;\n\
              size_t              query_count;\n\
+             BamObserverCtxMutFn ctx_mut_callback;\n\
          #endif\n\
          }} BamObserverDesc;\n\n\
          typedef struct BamTriggerDesc {{\n\
@@ -2467,6 +1290,21 @@ pub fn render_c99_header() -> Result<String, String> {
              const char*         name;\n\
              const BamSystemSet* before_sets;\n\
              const BamSystemSet* after_sets;\n\
+         {cpp14_guard}\n\
+             BamSystemFn         run_if_ctx           = nullptr;\n\
+             const BamQueryDesc* run_if_query         = nullptr;\n\
+             void*               run_if_ctx_user_data = nullptr;\n\
+             const BamSystemSet* parent_sets          = nullptr;\n\
+             uint32_t            parent_set_count     = 0;\n\
+             uint32_t            reserved1            = 0;\n\
+         #else\n\
+             BamSystemFn         run_if_ctx;\n\
+             const BamQueryDesc* run_if_query;\n\
+             void*               run_if_ctx_user_data;\n\
+             const BamSystemSet* parent_sets;\n\
+             uint32_t            parent_set_count;\n\
+             uint32_t            reserved1;\n\
+         #endif\n\
          }} BamScheduleSetDesc;\n\n\
          typedef struct BamComponentDesc {{\n\
              uint32_t           struct_size;\n\
@@ -2531,8 +1369,8 @@ pub fn render_c99_header() -> Result<String, String> {
                  BamResult (*get)(const void* ptr, WireType* out);   \\\n\
                  BamResult (*set)(void* ptr, const WireType* in_v);  \\\n\
              }} StructName\n\n\
-         typedef BamStrView (*BamMappedStringGetFn)(const void* ptr);\n\
-         typedef BamResult  (*BamMappedStringSetFn)(void* ptr, BamStrView view);\n\n\
+         typedef BamResult (*BamMappedStringGetFn)(const void* ptr, BamStrView* out_view);\n\
+         typedef BamResult (*BamMappedStringSetFn)(void* ptr, const BamStrView* view);\n\n\
          typedef struct BamMappedStringVTable {{\n\
              BamVTableHeader      header;\n\
              BamMappedStringGetFn get;\n\
@@ -2540,7 +1378,7 @@ pub fn render_c99_header() -> Result<String, String> {
          }} BamMappedStringVTable;\n"
     );
 
-    // BamHostApi function pointer typedefs + 73-slot struct + MIN_SIZE + OFFSET macros
+    // BamHostApi function pointer typedefs + 90-slot struct + MIN_SIZE + OFFSET macros
     out.push_str(
         "/* --- Mandatory Guest Entry-Point Typedefs --- */\n\
          typedef const BamManifest* (*BamManifestFn)(void);\n\
@@ -2559,20 +1397,20 @@ pub fn render_c99_header() -> Result<String, String> {
          typedef BamResult         (*BamSysQueryFn)(BamSystemCtx* sys_ctx, size_t query_index, BamIter** out_iter);\n\
          typedef BamResult         (*BamSysCommandsFn)(BamSystemCtx* sys_ctx, BamCommands** out_commands);\n\n\
          /* --- 4. Chunk & Sparse-Row Iteration --- */\n\
-         typedef BamBool            (*BamIterNextChunkFn)(BamIter* iter, size_t* out_len);\n\
-         typedef BamResult          (*BamIterResetFn)(BamIter* iter);\n\
-         typedef const BamEntity*   (*BamIterEntitiesFn)(const BamIter* iter);\n\
-         typedef const uint8_t*     (*BamIterColumnReadonlyFn)(const BamIter* iter, size_t term_index);\n\
-         typedef uint8_t*           (*BamIterColumnMutableFn)(BamIter* iter, size_t term_index);\n\
-         typedef uint8_t*           (*BamIterColumnMutableUntrackedFn)(BamIter* iter, size_t term_index);\n\
-         typedef BamResult          (*BamIterMarkChangedRangeFn)(BamIter* iter, size_t term_index, size_t start_row, size_t row_count);\n\
+         typedef BamBool               (*BamIterNextChunkFn)(BamIter* iter, size_t* out_len);\n\
+         typedef BamResult             (*BamIterResetFn)(BamIter* iter);\n\
+         typedef const BamEntity*      (*BamIterEntitiesFn)(const BamIter* iter);\n\
+         typedef const uint8_t*        (*BamIterColumnReadonlyFn)(const BamIter* iter, size_t term_index);\n\
+         typedef uint8_t*              (*BamIterColumnMutableFn)(BamIter* iter, size_t term_index);\n\
+         typedef uint8_t*              (*BamIterColumnMutableUntrackedFn)(BamIter* iter, size_t term_index);\n\
+         typedef BamResult             (*BamIterMarkChangedRangeFn)(BamIter* iter, size_t term_index, size_t start_row, size_t row_count);\n\
          typedef const uint8_t* const* (*BamIterColumnRowsReadonlyFn)(BamIter* iter, size_t term_index);\n\
-         typedef uint8_t* const*    (*BamIterColumnRowsMutableFn)(BamIter* iter, size_t term_index);\n\
+         typedef uint8_t* const*       (*BamIterColumnRowsMutableFn)(BamIter* iter, size_t term_index);\n\
          /* Per-system invariance: for any registered BamSystemDesc, BamColumnInfo\n\
           * (component, mode, uuid, size, align, storage_flags) at (query_index, term_index)\n\
           * is invariant across all chunks and BamSystemFn ticks for that system's lifetime,\n\
           * permitting guests to validate and cache BamColumnInfo once per query slot. */\n\
-         typedef BamResult          (*BamIterColumnInfoFn)(const BamIter* iter, size_t term_index, BamColumnInfo* out_info);\n\n\
+         typedef BamResult             (*BamIterColumnInfoFn)(const BamIter* iter, size_t term_index, BamColumnInfo* out_info);\n\n\
          /* --- 5. Declaration-Indexed Singleton Resource Access --- */\n\
          typedef const uint8_t* (*BamResPtrFn)(const BamIter* iter, size_t term_index);\n\
          typedef uint8_t*       (*BamResMutPtrFn)(BamIter* iter, size_t term_index);\n\n\
@@ -2602,18 +1440,18 @@ pub fn render_c99_header() -> Result<String, String> {
          typedef BamResult      (*BamCmdObserveFn)(BamCommands* commands, const BamObserverDesc* desc, BamEntity* out_entity);\n\
          typedef BamResult      (*BamIterReadRemovedFn)(BamIter* iter, size_t term_index, BamEntity* out_entities, size_t max_count, size_t* out_read);\n\
          typedef BamResult      (*BamSysEntityChildrenFn)(const BamSystemCtx* sys_ctx, BamEntity entity, BamComponent relationship_target, const BamEntity** out_entities, size_t* out_len);\n\
-         typedef BamResult      (*BamAssetLoadFn)(const BamHostCtx* ctx, BamComponent asset_type, BamStrView path, BamAssetHandle* out_handle);\n\
+         typedef BamResult      (*BamAssetLoadFn)(const BamHostCtx* ctx, BamComponent asset_type, const BamStrView* path, BamAssetHandle* out_handle);\n\
          typedef BamResult      (*BamAssetGetLoadStateFn)(const BamHostCtx* ctx, const BamAssetHandle* handle, BamAssetLoadState* out_state);\n\
          typedef BamResult      (*BamAssetReleaseFn)(const BamHostCtx* ctx, const BamAssetHandle* handle);\n\
          typedef BamResult      (*BamCmdSpawnSceneFn)(BamCommands* commands, const BamAssetHandle* scene_handle, BamEntity parent, BamEntity* out_entity);\n\n\
          /* --- 8. ABI 0.3.0 Diagnostics, Schema Reflection, Relations, Scheduling & Checkpoints --- */\n\
-         typedef BamResult (*BamLogDiagnosticFn)(const BamHostCtx* ctx, uint32_t level, BamStrView message);\n\
-         typedef BamResult (*BamReportGuestFaultFn)(const BamHostCtx* ctx, BamStrView message);\n\
+         typedef BamResult (*BamLogDiagnosticFn)(const BamHostCtx* ctx, uint32_t level, const BamStrView* message);\n\
+         typedef BamResult (*BamReportGuestFaultFn)(const BamHostCtx* ctx, const BamStrView* message);\n\
          typedef BamResult (*BamResolveComponentByUuidFn)(const BamHostCtx* ctx, const BamComponentUuid* uuid, BamComponent* out_component);\n\
          typedef BamResult (*BamComponentLayoutInfoFn)(const BamHostCtx* ctx, BamComponent component, BamLayoutInfo* out_info);\n\
          typedef BamResult (*BamRegisterRelationFn)(BamLoadCtx* load_ctx, const BamRelationDesc* desc, BamComponent* out_component);\n\
-         typedef BamResult (*BamInternSymbolFn)(const BamHostCtx* ctx, BamStrView symbol, BamSymbol* out_symbol);\n\
-         typedef BamResult (*BamBindNamedObjectFn)(const BamHostCtx* ctx, BamStrView name, BamEntity entity);\n\
+         typedef BamResult (*BamInternSymbolFn)(const BamHostCtx* ctx, const BamStrView* symbol, BamSymbol* out_symbol);\n\
+         typedef BamResult (*BamBindNamedObjectFn)(const BamHostCtx* ctx, const BamStrView* name, BamEntity entity);\n\
          typedef BamResult (*BamIterCountFn)(BamIter* iter, size_t* out_count);\n\
          typedef BamResult (*BamIterUpCascadeFn)(BamIter* iter, BamComponent relation, BamEntity entity, size_t term_index, const void** out_ptr, BamEntity* out_owner);\n\
          typedef BamResult (*BamRegisterSystemHandleFn)(BamLoadCtx* load_ctx, const BamSystemDesc* desc, BamSystem* out_system);\n\
@@ -2635,6 +1473,23 @@ pub fn render_c99_header() -> Result<String, String> {
          typedef BamResult (*BamCmdCloneEntityFn)(BamCommands* commands, BamEntity src_entity, BamEntity dst_entity);\n\
          typedef BamResult (*BamCmdInsertResourceFn)(BamCommands* commands, BamComponent resource, const uint8_t* data_ptr, size_t data_len);\n\
          typedef BamResult (*BamCmdRemoveResourceFn)(BamCommands* commands, BamComponent resource);\n\n\
+         /* --- 9. ABI 0.4.0 Resources/Messages, SelectiveDirty, Time, Relations, Batches --- */\n\
+         typedef BamResult       (*BamResolveNamedObjectFn)(const BamHostCtx* ctx, const BamStrView* name, BamEntity* out_entity);\n\
+         typedef BamResult       (*BamResolveSymbolStrFn)(const BamHostCtx* ctx, BamSymbol symbol, BamStrView* out_str);\n\
+         typedef uint8_t* const* (*BamIterColumnRowsMutableUntrackedFn)(BamIter* iter, size_t term_index);\n\
+         typedef BamResult       (*BamIterMarkChangedRangesFn)(BamIter* iter, size_t term_index, const BamRowRange* ranges_ptr, size_t range_count);\n\
+         typedef BamResult       (*BamSysCurrentTicksFn)(const BamSystemCtx* sys_ctx, uint32_t* out_last_run, uint32_t* out_this_run);\n\
+         typedef BamResult       (*BamSysTimeInfoFn)(const BamSystemCtx* sys_ctx, BamTimeInfo* out_info);\n\
+         typedef BamResult       (*BamChunkTaskExFn)(BamIter* iter, BamCommands* commands, size_t partition_index, void* user_data);\n\
+         typedef BamResult       (*BamParForEachChunkExFn)(BamIter* iter, BamChunkTaskExFn chunk_fn, void* user_data, const BamParOptions* options);\n\
+         typedef BamResult       (*BamSysRelationTargetsFn)(const BamSystemCtx* sys_ctx, BamEntity entity, BamComponent relation, const BamEntity** out_targets, size_t* out_len);\n\
+         typedef BamResult       (*BamSysRelationSourcesFn)(const BamSystemCtx* sys_ctx, BamEntity target, BamComponent relation, const BamEntity** out_sources, size_t* out_len);\n\
+         typedef BamResult       (*BamSysRelationEdgeDataFn)(const BamSystemCtx* sys_ctx, BamEntity entity, BamComponent relation, BamEntity target, const void** out_ptr, size_t* out_size);\n\
+         typedef BamResult       (*BamCmdDespawnBatchFn)(BamCommands* commands, const BamEntity* entities, size_t count);\n\
+         typedef BamResult       (*BamCmdInsertBatchFn)(BamCommands* commands, const BamEntity* entities, size_t entity_count, BamComponent component, const uint8_t* data_ptr, size_t elem_size, uint32_t flags);\n\
+         typedef BamResult       (*BamCmdRemoveBatchFn)(BamCommands* commands, const BamEntity* entities, size_t entity_count, BamComponent component);\n\
+         typedef BamResult       (*BamMsgReadSliceFn)(BamIter* iter, size_t term_index, const uint8_t** out_ptr, size_t* out_count);\n\
+         typedef BamResult       (*BamCmdSpawnBatchExFn)(BamCommands* commands, const BamSpawnColumnDesc* columns, size_t column_count, size_t entity_count, BamEntity* out_entities);\n\n\
          struct BamHostApi {\n\
              uint32_t struct_size;\n\
              uint32_t abi_version;\n\n\
@@ -2718,12 +1573,31 @@ pub fn render_c99_header() -> Result<String, String> {
              BamIterColumnTicksFn        iter_column_ticks;\n\
              BamCmdCloneEntityFn         cmd_clone_entity;\n\
              BamCmdInsertResourceFn      cmd_insert_resource;\n\
-             BamCmdRemoveResourceFn      cmd_remove_resource;\n\
+             BamCmdRemoveResourceFn      cmd_remove_resource;\n\n\
+             /* ABI 0.4.0 resources/messages, selective dirty, time, relations & batches */\n\
+             BamRegisterComponentFn             register_resource;\n\
+             BamRegisterComponentFn             register_message;\n\
+             BamResolveNamedObjectFn            resolve_named_object;\n\
+             BamResolveSymbolStrFn              resolve_symbol_str;\n\
+             BamIterColumnRowsMutableUntrackedFn iter_column_rows_mutable_untracked;\n\
+             BamIterMarkChangedRangesFn         iter_mark_changed_ranges;\n\
+             BamSysCurrentTicksFn               sys_current_ticks;\n\
+             BamSysTimeInfoFn                   sys_time_info;\n\
+             BamParForEachChunkExFn             par_for_each_chunk_ex;\n\
+             BamSysRelationTargetsFn            sys_relation_targets;\n\
+             BamSysRelationSourcesFn            sys_relation_sources;\n\
+             BamSysRelationEdgeDataFn           sys_relation_edge_data;\n\
+             BamCmdDespawnBatchFn               cmd_despawn_batch;\n\
+             BamCmdInsertBatchFn                cmd_insert_batch;\n\
+             BamCmdRemoveBatchFn                cmd_remove_batch;\n\
+             BamMsgReadSliceFn                  msg_read_slice;\n\
+             BamCmdSpawnBatchExFn               cmd_spawn_batch_ex;\n\
          };\n\n\
          #define BAM_MANIFEST_MIN_V0_2_SIZE            (offsetof(BamManifest, reserved0) + sizeof(uint32_t))\n\
          #define BAM_QUERY_DESC_MIN_V0_2_SIZE          (offsetof(BamQueryDesc, term_count) + sizeof(size_t))\n\
          #define BAM_SYSTEM_DESC_MIN_V0_2_SIZE         (offsetof(BamSystemDesc, run_if_user_data) + sizeof(void*))\n\
          #define BAM_OBSERVER_DESC_MIN_V0_2_SIZE       (offsetof(BamObserverDesc, user_data) + sizeof(void*))\n\
+         #define BAM_OBSERVER_DESC_MIN_V0_4_SIZE       sizeof(BamObserverDesc)\n\
          #define BAM_TRIGGER_DESC_MIN_V0_2_SIZE        (offsetof(BamTriggerDesc, reserved0) + sizeof(uint32_t))\n\
          #define BAM_COMPONENT_DESC_MIN_V0_2_SIZE      (offsetof(BamComponentDesc, vtable_ptr) + sizeof(const void*))\n\
          #define BAM_COMPONENT_DESC_MIN_V0_3_SIZE      sizeof(BamComponentDesc)\n\
@@ -2731,11 +1605,15 @@ pub fn render_c99_header() -> Result<String, String> {
          #define BAM_REQUIRED_COMPONENT_MIN_V0_3_SIZE  sizeof(BamRequiredComponent)\n\
          #define BAM_RELATION_DESC_MIN_V0_3_SIZE       sizeof(BamRelationDesc)\n\
          #define BAM_LAYOUT_INFO_MIN_V0_3_SIZE         sizeof(BamLayoutInfo)\n\
-         #define BAM_SCHEDULE_SET_DESC_MIN_V0_3_SIZE   sizeof(BamScheduleSetDesc)\n\
+         #define BAM_SCHEDULE_SET_DESC_MIN_V0_3_SIZE   (offsetof(BamScheduleSetDesc, after_sets) + sizeof(const BamSystemSet*))\n\
+         #define BAM_SCHEDULE_SET_DESC_MIN_V0_4_SIZE   sizeof(BamScheduleSetDesc)\n\
+         #define BAM_TIME_INFO_MIN_V0_4_SIZE           sizeof(BamTimeInfo)\n\
+         #define BAM_PAR_OPTIONS_MIN_V0_4_SIZE         sizeof(BamParOptions)\n\
          #define BAM_VTABLE_HEADER_MIN_V0_2_SIZE       (offsetof(BamVTableHeader, align) + sizeof(size_t))\n\
          #define BAM_HOST_API_MIN_V0_2_SIZE            (offsetof(BamHostApi, cmd_remove) + sizeof(BamCmdRemoveFn))\n\
-         #define BAM_HOST_API_MIN_V0_3_SIZE            (offsetof(BamHostApi, migrate_component_column) + sizeof(BamMigrateComponentColumnFn))\n\n\
-         /* Byte offset constants for every BamHostApi function-pointer slot (0..72): */\n",
+         #define BAM_HOST_API_MIN_V0_3_SIZE            (offsetof(BamHostApi, migrate_component_column) + sizeof(BamMigrateComponentColumnFn))\n\
+         #define BAM_HOST_API_MIN_V0_4_SIZE            (offsetof(BamHostApi, cmd_spawn_batch_ex) + sizeof(BamCmdSpawnBatchExFn))\n\n\
+         /* Byte offset constants for every BamHostApi function-pointer slot (0..89): */\n",
     );
 
     for field in host_api_spec.fields {
@@ -2978,19 +1856,16 @@ pub fn render_c99_header() -> Result<String, String> {
              uint64_t v1;\n\
              uint64_t v2;\n\
              uint64_t v3;\n\
-             uint8_t  tail[8];\n\
+             uint64_t tail_word;\n\
              size_t   tail_len;\n\
              size_t   total_len;\n\
          } BamSipHasher128;\n\n\
          static BAM_UNUSED inline void bam_siphash128_init(BamSipHasher128* st, uint64_t k0, uint64_t k1) {\n\
-             size_t i;\n\
              st->v0 = 0x736f6d6570736575ull ^ k0;\n\
              st->v1 = (0x646f72616e646f6dull ^ k1) ^ 0xeeull;\n\
              st->v2 = 0x6c7967656e657261ull ^ k0;\n\
              st->v3 = 0x7465646279746573ull ^ k1;\n\
-             for (i = 0u; i < 8u; ++i) {\n\
-                 st->tail[i] = 0u;\n\
-             }\n\
+             st->tail_word = 0ull;\n\
              st->tail_len = 0u;\n\
              st->total_len = 0u;\n\
          }\n\n\
@@ -3000,16 +1875,17 @@ pub fn render_c99_header() -> Result<String, String> {
              st->total_len += len;\n\
              if (st->tail_len > 0u) {\n\
                  while (idx < len && st->tail_len < 8u) {\n\
-                     st->tail[st->tail_len] = bytes[idx];\n\
+                     st->tail_word |= ((uint64_t)bytes[idx]) << (8u * (unsigned int)st->tail_len);\n\
                      st->tail_len += 1u;\n\
                      idx += 1u;\n\
                  }\n\
                  if (st->tail_len == 8u) {\n\
-                     m = bam_read_le64(st->tail);\n\
+                     m = st->tail_word;\n\
                      st->v3 ^= m;\n\
                      bam_sipround(&st->v0, &st->v1, &st->v2, &st->v3);\n\
                      bam_sipround(&st->v0, &st->v1, &st->v2, &st->v3);\n\
                      st->v0 ^= m;\n\
+                     st->tail_word = 0ull;\n\
                      st->tail_len = 0u;\n\
                  }\n\
              }\n\
@@ -3022,19 +1898,15 @@ pub fn render_c99_header() -> Result<String, String> {
                  idx += 8u;\n\
              }\n\
              while (idx < len && st->tail_len < 8u) {\n\
-                 st->tail[st->tail_len] = bytes[idx];\n\
+                 st->tail_word |= ((uint64_t)bytes[idx]) << (8u * (unsigned int)st->tail_len);\n\
                  st->tail_len += 1u;\n\
                  idx += 1u;\n\
              }\n\
          }\n\n\
          static BAM_UNUSED inline void bam_siphash128_finish(BamSipHasher128* st, uint8_t out_tag[16]) {\n\
-             uint64_t b = (((uint64_t)st->total_len) & 0xFFull) << 56;\n\
+             uint64_t b = ((((uint64_t)st->total_len) & 0xFFull) << 56) | st->tail_word;\n\
              uint64_t h0;\n\
              uint64_t h1;\n\
-             size_t i;\n\
-             for (i = 0u; i < st->tail_len; ++i) {\n\
-                 b |= ((uint64_t)st->tail[i]) << (8u * i);\n\
-             }\n\
              st->v3 ^= b;\n\
              bam_sipround(&st->v0, &st->v1, &st->v2, &st->v3);\n\
              bam_sipround(&st->v0, &st->v1, &st->v2, &st->v3);\n\
@@ -3053,6 +1925,35 @@ pub fn render_c99_header() -> Result<String, String> {
              h1 = st->v0 ^ st->v1 ^ st->v2 ^ st->v3;\n\
              bam_write_le64(out_tag, h0);\n\
              bam_write_le64(out_tag + 8, h1);\n\
+         }\n\n\
+         static BAM_UNUSED inline uint64_t bam_hash_field_schema(\n\
+             uint64_t prev_hash,\n\
+             const char* field_name,\n\
+             const char* field_type_tag,\n\
+             uint64_t field_offset\n\
+         ) {\n\
+             BamSipHasher128 st;\n\
+             uint8_t out_tag[16];\n\
+             uint8_t le_buf[8];\n\
+             uint8_t sep_fe = 0xFEu;\n\
+             uint8_t sep_fd = 0xFDu;\n\
+             size_t name_len = (field_name != NULL) ? strlen(field_name) : 0u;\n\
+             size_t tag_len = (field_type_tag != NULL) ? strlen(field_type_tag) : 0u;\n\
+             bam_siphash128_init(&st, BAM_SIPHASH_KEY_0, BAM_SIPHASH_KEY_1);\n\
+             bam_write_le64(le_buf, prev_hash);\n\
+             bam_siphash128_write(&st, le_buf, 8u);\n\
+             if (name_len > 0u) {\n\
+                 bam_siphash128_write(&st, (const uint8_t*)field_name, name_len);\n\
+             }\n\
+             bam_siphash128_write(&st, &sep_fe, 1u);\n\
+             if (tag_len > 0u) {\n\
+                 bam_siphash128_write(&st, (const uint8_t*)field_type_tag, tag_len);\n\
+             }\n\
+             bam_siphash128_write(&st, &sep_fd, 1u);\n\
+             bam_write_le64(le_buf, field_offset);\n\
+             bam_siphash128_write(&st, le_buf, 8u);\n\
+             bam_siphash128_finish(&st, out_tag);\n\
+             return bam_read_le64(out_tag);\n\
          }\n\n\
          static BAM_UNUSED inline BamComponentUuid bam_uuid_from_parts(\n\
              const char* canonical_name,\n\
@@ -3088,6 +1989,43 @@ pub fn render_c99_header() -> Result<String, String> {
          static BAM_UNUSED inline int bam_uuid_equals(BamComponentUuid a, BamComponentUuid b) {\n\
              return memcmp(a.bytes, b.bytes, 16u) == 0;\n\
          }\n\n\
+         static BAM_UNUSED inline uint64_t bam_fnv1a_64_init(void) {\n\
+             return BAM_FNV1A_64_OFFSET_BASIS;\n\
+         }\n\n\
+         static BAM_UNUSED inline uint64_t bam_fnv1a_64_update_bytes(uint64_t hash, const uint8_t* bytes, size_t len) {\n\
+             size_t i;\n\
+             if (bytes == NULL) {\n\
+                 return hash;\n\
+             }\n\
+             for (i = 0u; i < len; ++i) {\n\
+                 hash ^= (uint64_t)bytes[i];\n\
+                 hash *= BAM_FNV1A_64_PRIME;\n\
+             }\n\
+             return hash;\n\
+         }\n\n\
+         static BAM_UNUSED inline uint64_t bam_fnv1a_64_update_u64(uint64_t hash, uint64_t value) {\n\
+             uint8_t le_buf[8];\n\
+             bam_write_le64(le_buf, value);\n\
+             return bam_fnv1a_64_update_bytes(hash, le_buf, 8u);\n\
+         }\n\n\
+         static BAM_UNUSED inline uint64_t bam_fnv1a_64_str(const char* cstr) {\n\
+             if (cstr == NULL) {\n\
+                 return bam_fnv1a_64_init();\n\
+             }\n\
+             return bam_fnv1a_64_update_bytes(bam_fnv1a_64_init(), (const uint8_t*)cstr, strlen(cstr));\n\
+         }\n\n\
+         static BAM_UNUSED inline uint64_t bam_fnv1a_64_hash_system(const char* mod_name, const char* system_name) {\n\
+             uint64_t h = bam_fnv1a_64_init();\n\
+             static const uint8_t sep[2] = { (uint8_t)':', (uint8_t)':' };\n\
+             if (mod_name != NULL) {\n\
+                 h = bam_fnv1a_64_update_bytes(h, (const uint8_t*)mod_name, strlen(mod_name));\n\
+             }\n\
+             h = bam_fnv1a_64_update_bytes(h, sep, 2u);\n\
+             if (system_name != NULL) {\n\
+                 h = bam_fnv1a_64_update_bytes(h, (const uint8_t*)system_name, strlen(system_name));\n\
+             }\n\
+             return h;\n\
+         }\n\n\
          static BAM_UNUSED inline int bam_ticks_is_newer(uint32_t tick, uint32_t last_run, uint32_t this_run) {\n\
              uint32_t ticks_since_insert = this_run - tick;\n\
              uint32_t clamped_insert = (ticks_since_insert < BAM_MAX_CHANGE_AGE) ? ticks_since_insert : BAM_MAX_CHANGE_AGE;\n\
@@ -3106,6 +2044,124 @@ pub fn render_c99_header() -> Result<String, String> {
                  return 0;\n\
              }\n\
              return bam_ticks_is_newer(ticks->changed, ticks->last_run, ticks->this_run);\n\
+         }\n\n\
+         static BAM_UNUSED inline BamManifest bam_manifest(const char* name, const char* version) {\n\
+             BamManifest m;\n\
+             memset(&m, 0, sizeof(BamManifest));\n\
+             m.struct_size = (uint32_t)sizeof(BamManifest);\n\
+             m.abi_version = BAM_ABI_VERSION;\n\
+             m.name = name;\n\
+             m.version = version;\n\
+             return m;\n\
+         }\n\n\
+         static BAM_UNUSED inline BamQueryDesc bam_query_desc(const BamTermDesc* terms, size_t term_count) {\n\
+             BamQueryDesc q;\n\
+             memset(&q, 0, sizeof(BamQueryDesc));\n\
+             q.struct_size = (uint32_t)sizeof(BamQueryDesc);\n\
+             q.terms = terms;\n\
+             q.term_count = term_count;\n\
+             return q;\n\
+         }\n\n\
+         static BAM_UNUSED inline BamSystemDesc bam_system_desc(\n\
+             const char* name,\n\
+             const BamQueryDesc* queries,\n\
+             size_t query_count,\n\
+             BamSystemFn callback,\n\
+             void* user_data\n\
+         ) {\n\
+             BamSystemDesc s;\n\
+             memset(&s, 0, sizeof(BamSystemDesc));\n\
+             s.struct_size = (uint32_t)sizeof(BamSystemDesc);\n\
+             s.name = name;\n\
+             s.queries = queries;\n\
+             s.query_count = query_count;\n\
+             s.callback = callback;\n\
+             s.user_data = user_data;\n\
+             s.schedule = BAM_SCHEDULE_UPDATE;\n\
+             return s;\n\
+         }\n\n\
+         static BAM_UNUSED inline BamFieldDesc bam_field_desc(\n\
+             BamFieldKind kind,\n\
+             BamStrView name,\n\
+             BamStrView type_tag,\n\
+             size_t offset,\n\
+             size_t size,\n\
+             size_t align\n\
+         ) {\n\
+             BamFieldDesc f;\n\
+             f.struct_size = (uint32_t)sizeof(BamFieldDesc);\n\
+             f.kind = kind;\n\
+             f.name = name;\n\
+             f.type_tag = type_tag;\n\
+             f.offset = offset;\n\
+             f.size = size;\n\
+             f.align = align;\n\
+             return f;\n\
+         }\n\n\
+         static BAM_UNUSED inline BamRequiredComponent bam_required_component(BamComponent component) {\n\
+             BamRequiredComponent r;\n\
+             memset(&r, 0, sizeof(BamRequiredComponent));\n\
+             r.struct_size = (uint32_t)sizeof(BamRequiredComponent);\n\
+             r.component = component;\n\
+             return r;\n\
+         }\n\n\
+         static BAM_UNUSED inline BamRelationDesc bam_relation_desc(\n\
+             const char* name,\n\
+             size_t data_size,\n\
+             size_t data_align,\n\
+             uint32_t max_degree\n\
+         ) {\n\
+             BamRelationDesc r;\n\
+             memset(&r, 0, sizeof(BamRelationDesc));\n\
+             r.struct_size = (uint32_t)sizeof(BamRelationDesc);\n\
+             r.name = name;\n\
+             r.uuid = bam_uuid_from_parts(name, data_size, data_align, 0ull);\n\
+             r.data_size = data_size;\n\
+             r.data_align = data_align;\n\
+             r.max_degree = max_degree;\n\
+             return r;\n\
+         }\n\n\
+         static BAM_UNUSED inline BamScheduleSetDesc bam_schedule_set_desc(\n\
+             const char* name,\n\
+             BamScheduleId schedule\n\
+         ) {\n\
+             BamScheduleSetDesc s;\n\
+             memset(&s, 0, sizeof(BamScheduleSetDesc));\n\
+             s.struct_size = (uint32_t)sizeof(BamScheduleSetDesc);\n\
+             s.schedule = schedule;\n\
+             s.name = name;\n\
+             return s;\n\
+         }\n\n\
+         static BAM_UNUSED inline BamRowRange bam_row_range(size_t start_row, size_t row_count) {\n\
+             BamRowRange r;\n\
+             r.start_row = start_row;\n\
+             r.row_count = row_count;\n\
+             return r;\n\
+         }\n\n\
+         static BAM_UNUSED inline BamTimeInfo bam_time_info(void) {\n\
+             BamTimeInfo t;\n\
+             memset(&t, 0, sizeof(BamTimeInfo));\n\
+             t.struct_size = (uint32_t)sizeof(BamTimeInfo);\n\
+             return t;\n\
+         }\n\n\
+         static BAM_UNUSED inline BamParOptions bam_par_options(void) {\n\
+             BamParOptions o;\n\
+             memset(&o, 0, sizeof(BamParOptions));\n\
+             o.struct_size = (uint32_t)sizeof(BamParOptions);\n\
+             return o;\n\
+         }\n\n\
+         static BAM_UNUSED inline BamSpawnColumnDesc bam_spawn_column_desc(\n\
+             BamComponent component,\n\
+             uint32_t flags,\n\
+             const uint8_t* column_ptr,\n\
+             size_t elem_size\n\
+         ) {\n\
+             BamSpawnColumnDesc c;\n\
+             c.component = component;\n\
+             c.flags = flags;\n\
+             c.column_ptr = column_ptr;\n\
+             c.elem_size = elem_size;\n\
+             return c;\n\
          }\n\n\
          static BAM_UNUSED inline BamComponentDesc bam_desc_component_with_layout(\n\
              const char* name,\n\
@@ -3164,6 +2220,7 @@ pub fn render_c99_header() -> Result<String, String> {
              d.ctx_callback = NULL;\n\
              d.queries = NULL;\n\
              d.query_count = 0u;\n\
+             d.ctx_mut_callback = NULL;\n\
              return d;\n\
          }\n\n\
          static BAM_UNUSED inline BamObserverDesc bam_observer_desc_ctx(\n\
@@ -3176,6 +2233,20 @@ pub fn render_c99_header() -> Result<String, String> {
          ) {\n\
              BamObserverDesc d = bam_observer_desc(event, entity, NULL, user_data);\n\
              d.ctx_callback = ctx_callback;\n\
+             d.queries = queries;\n\
+             d.query_count = query_count;\n\
+             return d;\n\
+         }\n\n\
+         static BAM_UNUSED inline BamObserverDesc bam_observer_desc_ctx_mut(\n\
+             BamComponent event,\n\
+             BamEntity entity,\n\
+             BamObserverCtxMutFn ctx_mut_callback,\n\
+             const BamQueryDesc* queries,\n\
+             size_t query_count,\n\
+             void* user_data\n\
+         ) {\n\
+             BamObserverDesc d = bam_observer_desc(event, entity, NULL, user_data);\n\
+             d.ctx_mut_callback = ctx_mut_callback;\n\
              d.queries = queries;\n\
              d.query_count = query_count;\n\
              return d;\n\
@@ -3232,12 +2303,14 @@ pub fn render_c99_header() -> Result<String, String> {
          BAM_STATIC_ASSERT(sizeof(BamEventKind) == 4u, bam_event_kind_size);\n\
          BAM_STATIC_ASSERT(BAM_ALIGNOF(BamEventKind) == 4u, bam_event_kind_align);\n\
          BAM_STATIC_ASSERT(sizeof(BamAssetLoadState) == 4u, bam_asset_load_state_size);\n\
-         BAM_STATIC_ASSERT(BAM_ALIGNOF(BamAssetLoadState) == 4u, bam_asset_load_state_align);\n\n",
+         BAM_STATIC_ASSERT(BAM_ALIGNOF(BamAssetLoadState) == 4u, bam_asset_load_state_align);\n\
+         BAM_STATIC_ASSERT(sizeof(BamSystemTelemetryDigest64) == 64u, bam_system_telemetry_digest64_size);\n\
+         BAM_STATIC_ASSERT(BAM_ALIGNOF(BamSystemTelemetryDigest64) == BAM_ALIGNOF(uint64_t), bam_system_telemetry_digest64_align);\n\n",
     );
 
     // 64-bit assertions
     out.push_str("#if UINTPTR_MAX == 0xffffffffffffffffULL\n");
-    for spec in &specs {
+    for spec in specs {
         let _ = writeln!(
             out,
             "BAM_STATIC_ASSERT(sizeof({}) == {}u, {}_size_64);",
@@ -3261,6 +2334,7 @@ pub fn render_c99_header() -> Result<String, String> {
          BAM_STATIC_ASSERT(BAM_QUERY_DESC_MIN_V0_2_SIZE == 24u, bam_query_desc_min_64);\n\
          BAM_STATIC_ASSERT(BAM_SYSTEM_DESC_MIN_V0_2_SIZE == 104u, bam_system_desc_min_64);\n\
          BAM_STATIC_ASSERT(BAM_OBSERVER_DESC_MIN_V0_2_SIZE == 48u, bam_observer_desc_min_64);\n\
+         BAM_STATIC_ASSERT(BAM_OBSERVER_DESC_MIN_V0_4_SIZE == 120u, bam_observer_desc_min_v0_4_64);\n\
          BAM_STATIC_ASSERT(BAM_TRIGGER_DESC_MIN_V0_2_SIZE == 64u, bam_trigger_desc_min_64);\n\
          BAM_STATIC_ASSERT(BAM_COMPONENT_DESC_MIN_V0_2_SIZE == 64u, bam_component_desc_min_64);\n\
          BAM_STATIC_ASSERT(BAM_COMPONENT_DESC_MIN_V0_3_SIZE == 176u, bam_component_desc_min_v0_3_64);\n\
@@ -3269,15 +2343,19 @@ pub fn render_c99_header() -> Result<String, String> {
          BAM_STATIC_ASSERT(BAM_RELATION_DESC_MIN_V0_3_SIZE == 56u, bam_relation_desc_min_v0_3_64);\n\
          BAM_STATIC_ASSERT(BAM_LAYOUT_INFO_MIN_V0_3_SIZE == 64u, bam_layout_info_min_v0_3_64);\n\
          BAM_STATIC_ASSERT(BAM_SCHEDULE_SET_DESC_MIN_V0_3_SIZE == 48u, bam_schedule_set_desc_min_v0_3_64);\n\
+         BAM_STATIC_ASSERT(BAM_SCHEDULE_SET_DESC_MIN_V0_4_SIZE == 88u, bam_schedule_set_desc_min_v0_4_64);\n\
+         BAM_STATIC_ASSERT(BAM_TIME_INFO_MIN_V0_4_SIZE == 32u, bam_time_info_min_v0_4_64);\n\
+         BAM_STATIC_ASSERT(BAM_PAR_OPTIONS_MIN_V0_4_SIZE == 24u, bam_par_options_min_v0_4_64);\n\
          BAM_STATIC_ASSERT(BAM_VTABLE_HEADER_MIN_V0_2_SIZE == 40u, bam_vtable_header_min_64);\n\
          BAM_STATIC_ASSERT(BAM_HOST_API_MIN_V0_2_SIZE == 224u, bam_host_api_min_64);\n\
          BAM_STATIC_ASSERT(BAM_HOST_API_MIN_V0_3_SIZE == 552u, bam_host_api_min_v0_3_64);\n\
+         BAM_STATIC_ASSERT(BAM_HOST_API_MIN_V0_4_SIZE == 728u, bam_host_api_min_v0_4_64);\n\
          BAM_STATIC_ASSERT(BAM_ALIGNOF(BamChildOf) == 8u, bam_child_of_align_64);\n",
     );
 
     // 32-bit assertions
     out.push_str("#elif UINTPTR_MAX == 0xffffffffUL\n");
-    for spec in &specs {
+    for spec in specs {
         let _ = writeln!(
             out,
             "BAM_STATIC_ASSERT(sizeof({}) == {}u, {}_size_32);",
@@ -3312,6 +2390,7 @@ pub fn render_c99_header() -> Result<String, String> {
          BAM_STATIC_ASSERT(BAM_QUERY_DESC_MIN_V0_2_SIZE == 16u, bam_query_desc_min_32);\n\
          BAM_STATIC_ASSERT(BAM_SYSTEM_DESC_MIN_V0_2_SIZE == 60u, bam_system_desc_min_32);\n\
          BAM_STATIC_ASSERT(BAM_OBSERVER_DESC_MIN_V0_2_SIZE == 36u, bam_observer_desc_min_32);\n\
+         BAM_STATIC_ASSERT(BAM_OBSERVER_DESC_MIN_V0_4_SIZE == 80u, bam_observer_desc_min_v0_4_32);\n\
          BAM_STATIC_ASSERT(BAM_TRIGGER_DESC_MIN_V0_2_SIZE == 48u, bam_trigger_desc_min_32);\n\
          BAM_STATIC_ASSERT(BAM_COMPONENT_DESC_MIN_V0_2_SIZE == 44u, bam_component_desc_min_32);\n\
          BAM_STATIC_ASSERT(BAM_COMPONENT_DESC_MIN_V0_3_SIZE == 104u, bam_component_desc_min_v0_3_32);\n\
@@ -3320,9 +2399,13 @@ pub fn render_c99_header() -> Result<String, String> {
          BAM_STATIC_ASSERT(BAM_RELATION_DESC_MIN_V0_3_SIZE == 44u, bam_relation_desc_min_v0_3_32);\n\
          BAM_STATIC_ASSERT(BAM_LAYOUT_INFO_MIN_V0_3_SIZE == 48u, bam_layout_info_min_v0_3_32);\n\
          BAM_STATIC_ASSERT(BAM_SCHEDULE_SET_DESC_MIN_V0_3_SIZE == 36u, bam_schedule_set_desc_min_v0_3_32);\n\
+         BAM_STATIC_ASSERT(BAM_SCHEDULE_SET_DESC_MIN_V0_4_SIZE == 60u, bam_schedule_set_desc_min_v0_4_32);\n\
+         BAM_STATIC_ASSERT(BAM_TIME_INFO_MIN_V0_4_SIZE == 32u, bam_time_info_min_v0_4_32);\n\
+         BAM_STATIC_ASSERT(BAM_PAR_OPTIONS_MIN_V0_4_SIZE == 16u, bam_par_options_min_v0_4_32);\n\
          BAM_STATIC_ASSERT(BAM_VTABLE_HEADER_MIN_V0_2_SIZE == 32u, bam_vtable_header_min_32);\n\
          BAM_STATIC_ASSERT(BAM_HOST_API_MIN_V0_2_SIZE == 116u, bam_host_api_min_32);\n\
-         BAM_STATIC_ASSERT(BAM_HOST_API_MIN_V0_3_SIZE == 280u, bam_host_api_min_v0_3_32);\n",
+         BAM_STATIC_ASSERT(BAM_HOST_API_MIN_V0_3_SIZE == 280u, bam_host_api_min_v0_3_32);\n\
+         BAM_STATIC_ASSERT(BAM_HOST_API_MIN_V0_4_SIZE == 368u, bam_host_api_min_v0_4_32);\n",
     );
     out.push_str("#endif\n\n");
 
@@ -3382,22 +2465,13 @@ pub fn write_or_check_header(root: &Path, check_only: bool) -> Result<(), String
 /// Returns the canonical ordered C field names for all `BamHostApi` function-pointer slots.
 ///
 /// Intended purpose: gives SDK synthesizers and parity tests a single authoritative slot list
-/// derived from [`wire_struct_specs`] so C99, C++17, and Zig offset macros cannot drift.
+/// derived from [`bamabi_sys::abi_meta::WIRE_STRUCT_SPECS`] so C99, C++17, and Zig offset macros
+/// cannot drift.
 ///
-/// What it does: locates the `BamHostApi` entry in [`wire_struct_specs`] and collects every
+/// What it does: locates the `BamHostApi` entry in [`WIRE_STRUCT_SPECS`] and collects every
 /// field name after the `struct_size` and `abi_version` header fields.
 pub(crate) fn host_api_slot_names() -> Vec<&'static str> {
-    let specs = wire_struct_specs();
-    let host_api = specs
-        .iter()
-        .find(|s| s.c_name == "BamHostApi")
-        .expect("BamHostApi spec must exist");
-    host_api
-        .fields
-        .iter()
-        .map(|f| f.c_name)
-        .filter(|&name| name != "struct_size" && name != "abi_version")
-        .collect()
+    HOST_API_SLOTS.iter().map(|s| s.name).collect()
 }
 
 #[cfg(test)]
@@ -3405,24 +2479,27 @@ mod tests {
     use super::*;
 
     /// Test scenario: verifies that `render_c99_header()` is byte-for-byte deterministic across
-    /// repeated calls, emits `ABI_VERSION = 0x00030000u`, 73 `BAM_HOST_API_OFFSET_*` macros,
+    /// repeated calls, emits `ABI_VERSION = 0x00040000u`, 90 `BAM_HOST_API_OFFSET_*` macros,
     /// `BAM_EXPORT`/`BAM_RESTRICT` portability definitions, 64-bit/32-bit `BAM_STATIC_ASSERT`
-    /// checks (592 B / 300 B for `BamHostApi`, 176 B / 104 B for `BamComponentDesc`), excludes
-    /// removed v0.1 unprefixed typedefs, and matches the golden SipHash-2-4-128 UUID vectors
-    /// tested identically in `tests/standalone_c_test.c`.
+    /// checks (728 B / 368 B for `BamHostApi`, 88 B / 60 B for `BamScheduleSetDesc`,
+    /// 120 B / 80 B for `BamObserverDesc`), excludes removed v0.1 unprefixed typedefs, and matches
+    /// the golden SipHash-2-4-128 UUID and FNV-1a vectors tested in `tests/standalone_c_test.c`.
     #[test]
     fn header_generation_is_deterministic_and_bam_prefixed() {
         let first = render_c99_header().expect("first render must succeed");
         let second = render_c99_header().expect("second render must succeed");
         assert_eq!(first, second);
-        assert!(first.contains("#define BAM_ABI_VERSION 0x00030000u"));
+        assert!(first.contains("#define BAM_ABI_VERSION 0x00040000u"));
         assert!(first.contains("#define BAM_MAX_QUERIES_PER_SYSTEM 16u"));
-        assert!(first.contains("#define BAM_HOST_API_SLOT_COUNT    73u"));
+        assert!(first.contains("#define BAM_HOST_API_SLOT_COUNT    90u"));
         assert!(first.contains("#define BAM_TERM_FLAG_CHANGED               0x0001u"));
         assert!(first.contains("#define BAM_TERM_FLAG_ADDED                 0x0002u"));
         assert!(first.contains("#define BAM_TERM_KNOWN_FLAGS                0x0003u"));
         assert!(first.contains("#define BAM_QUERY_FLAG_PARAM_SET            0x00000001u"));
         assert!(first.contains("#define BAM_QUERY_KNOWN_FLAGS               0x00000001u"));
+        assert!(first.contains("#define BAM_SPAWN_COL_FLAG_SPLAT            0x00000001u"));
+        assert!(first.contains("#define BAM_SCHEDULE_PRE_STARTUP"));
+        assert!(first.contains("#define BAM_SCHEDULE_SPAWN_SCENE"));
         assert!(
             first.contains("#define BAM_DISABLED_NAME \"bevy_ecs::entity_disabling::Disabled\"")
         );
@@ -3430,6 +2507,10 @@ mod tests {
         assert!(first.contains("bam_event_kind_is_lifecycle("));
         assert!(first.contains("bam_schedule_is_valid("));
         assert!(first.contains("bam_disabled_uuid(void)"));
+        assert!(first.contains("bam_hash_field_schema("));
+        assert!(first.contains("bam_fnv1a_64_hash_system("));
+        assert!(first.contains("bam_manifest("));
+        assert!(first.contains("bam_schedule_set_desc("));
         assert!(first.contains("define BAM_EXPORT"));
         assert!(first.contains("__declspec(dllexport)"));
         assert!(first.contains("#if defined(_MSC_VER)\n#  define BAM_RESTRICT __restrict\n"));
@@ -3454,22 +2535,16 @@ mod tests {
         assert!(first.contains(
             "#define BAM_HOST_API_OFFSET_LOG_DIAGNOSTIC offsetof(BamHostApi, log_diagnostic)"
         ));
-        assert!(first.contains("#define BAM_HOST_API_OFFSET_MIGRATE_COMPONENT_COLUMN offsetof(BamHostApi, migrate_component_column)"));
-        assert!(first.contains("#define BAM_HOST_API_OFFSET_ITER_NEXT_CHUNK_BATCH offsetof(BamHostApi, iter_next_chunk_batch)"));
         assert!(first.contains(
-            "#define BAM_HOST_API_OFFSET_ITER_COLUMN_TICKS offsetof(BamHostApi, iter_column_ticks)"
+            "#define BAM_HOST_API_OFFSET_REGISTER_RESOURCE offsetof(BamHostApi, register_resource)"
         ));
-        assert!(first.contains(
-            "#define BAM_HOST_API_OFFSET_CMD_CLONE_ENTITY offsetof(BamHostApi, cmd_clone_entity)"
-        ));
-        assert!(first.contains("#define BAM_HOST_API_OFFSET_CMD_INSERT_RESOURCE offsetof(BamHostApi, cmd_insert_resource)"));
-        assert!(first.contains("#define BAM_HOST_API_OFFSET_CMD_REMOVE_RESOURCE offsetof(BamHostApi, cmd_remove_resource)"));
+        assert!(first.contains("#define BAM_HOST_API_OFFSET_CMD_SPAWN_BATCH_EX offsetof(BamHostApi, cmd_spawn_batch_ex)"));
         assert!(first.contains("typedef struct BamHostApi   BamHostApi;"));
         assert!(
-            first.contains("BAM_STATIC_ASSERT(sizeof(BamHostApi) == 592u, bam_host_api_size_64);")
+            first.contains("BAM_STATIC_ASSERT(sizeof(BamHostApi) == 728u, bam_host_api_size_64);")
         );
         assert!(
-            first.contains("BAM_STATIC_ASSERT(sizeof(BamHostApi) == 300u, bam_host_api_size_32);")
+            first.contains("BAM_STATIC_ASSERT(sizeof(BamHostApi) == 368u, bam_host_api_size_32);")
         );
         assert!(
             first.contains(
@@ -3493,8 +2568,15 @@ mod tests {
         assert!(first.contains(
             "BAM_STATIC_ASSERT(sizeof(BamComponentDesc) == 104u, bam_component_desc_size_32);"
         ));
+        assert!(first.contains(
+            "BAM_STATIC_ASSERT(sizeof(BamScheduleSetDesc) == 88u, bam_schedule_set_desc_size_64);"
+        ));
+        assert!(first.contains(
+            "BAM_STATIC_ASSERT(sizeof(BamObserverDesc) == 120u, bam_observer_desc_size_64);"
+        ));
         assert!(first.contains("BAM_STATIC_ASSERT(BAM_HOST_API_MIN_V0_2_SIZE == 224u"));
         assert!(first.contains("BAM_STATIC_ASSERT(BAM_HOST_API_MIN_V0_3_SIZE == 552u"));
+        assert!(first.contains("BAM_STATIC_ASSERT(BAM_HOST_API_MIN_V0_4_SIZE == 728u"));
         // Verify old v0.1 unprefixed C typedefs are completely absent:
         assert!(!first.contains("typedef struct HostApi"));
         assert!(!first.contains("SystemDescriptor"));

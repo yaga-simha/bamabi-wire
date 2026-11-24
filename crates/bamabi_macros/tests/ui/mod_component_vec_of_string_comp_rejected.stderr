@@ -14,10 +14,10 @@ help: the trait `AbiPod` is not implemented for `NamedComp`
              BamComponent
              BamEventKind
              BamFieldKind
+             BamRowRange
              BamSymbol
              BamSystem
              BamSystemSet
-             ComponentUuid
            and $N others
 note: required by a bound in `assert_abi_pod`
   --> $WORKSPACE/crates/bamabi_sys/src/traits.rs
@@ -41,10 +41,10 @@ help: the trait `AbiPod` is not implemented for `NamedComp`
              BamComponent
              BamEventKind
              BamFieldKind
+             BamRowRange
              BamSymbol
              BamSystem
              BamSystemSet
-             ComponentUuid
            and $N others
 note: required by a bound in `_::__bam_read_vec`
   --> tests/ui/mod_component_vec_of_string_comp_rejected.rs:8:17
@@ -69,10 +69,10 @@ help: the trait `AbiPod` is not implemented for `NamedComp`
              BamComponent
              BamEventKind
              BamFieldKind
+             BamRowRange
              BamSymbol
              BamSystem
              BamSystemSet
-             ComponentUuid
            and $N others
 note: required by a bound in `_::__bam_write_vec`
   --> tests/ui/mod_component_vec_of_string_comp_rejected.rs:8:17
@@ -97,10 +97,10 @@ help: the trait `AbiPod` is not implemented for `NamedComp`
              BamComponent
              BamEventKind
              BamFieldKind
+             BamRowRange
              BamSymbol
              BamSystem
              BamSystemSet
-             ComponentUuid
            and $N others
 note: required by a bound in `_::__bam_len_vec`
   --> tests/ui/mod_component_vec_of_string_comp_rejected.rs:8:17
@@ -125,10 +125,10 @@ help: the trait `AbiPod` is not implemented for `NamedComp`
              BamComponent
              BamEventKind
              BamFieldKind
+             BamRowRange
              BamSymbol
              BamSystem
              BamSystemSet
-             ComponentUuid
            and $N others
 note: required by a bound in `_::__bam_clear_vec`
   --> tests/ui/mod_component_vec_of_string_comp_rejected.rs:8:17
@@ -153,10 +153,10 @@ help: the trait `AbiPod` is not implemented for `NamedComp`
              BamComponent
              BamEventKind
              BamFieldKind
+             BamRowRange
              BamSymbol
              BamSystem
              BamSystemSet
-             ComponentUuid
            and $N others
 note: required by a bound in `_::__bam_push_vec`
   --> tests/ui/mod_component_vec_of_string_comp_rejected.rs:8:17
@@ -181,10 +181,10 @@ help: the trait `AbiPod` is not implemented for `NamedComp`
              BamComponent
              BamEventKind
              BamFieldKind
+             BamRowRange
              BamSymbol
              BamSystem
              BamSystemSet
-             ComponentUuid
            and $N others
 note: required by a bound in `_::__bam_pop_vec`
   --> tests/ui/mod_component_vec_of_string_comp_rejected.rs:8:17
@@ -209,10 +209,10 @@ help: the trait `AbiPod` is not implemented for `NamedComp`
              BamComponent
              BamEventKind
              BamFieldKind
+             BamRowRange
              BamSymbol
              BamSystem
              BamSystemSet
-             ComponentUuid
            and $N others
 note: required by a bound in `_::__bam_remove_vec`
   --> tests/ui/mod_component_vec_of_string_comp_rejected.rs:8:17
@@ -237,10 +237,10 @@ help: the trait `AbiPod` is not implemented for `NamedComp`
              BamComponent
              BamEventKind
              BamFieldKind
+             BamRowRange
              BamSymbol
              BamSystem
              BamSystemSet
-             ComponentUuid
            and $N others
 note: required by a bound in `_::__bam_swap_remove_vec`
   --> tests/ui/mod_component_vec_of_string_comp_rejected.rs:8:17
@@ -265,10 +265,10 @@ help: the trait `AbiPod` is not implemented for `NamedComp`
              BamComponent
              BamEventKind
              BamFieldKind
+             BamRowRange
              BamSymbol
              BamSystem
              BamSystemSet
-             ComponentUuid
            and $N others
 note: required by a bound in `_::__bam_truncate_vec`
   --> tests/ui/mod_component_vec_of_string_comp_rejected.rs:8:17
@@ -293,10 +293,10 @@ help: the trait `AbiPod` is not implemented for `NamedComp`
              BamComponent
              BamEventKind
              BamFieldKind
+             BamRowRange
              BamSymbol
              BamSystem
              BamSystemSet
-             ComponentUuid
            and $N others
 note: required by a bound in `_::__bam_reserve_vec`
   --> tests/ui/mod_component_vec_of_string_comp_rejected.rs:8:17
@@ -321,10 +321,10 @@ help: the trait `AbiPod` is not implemented for `NamedComp`
              BamComponent
              BamEventKind
              BamFieldKind
+             BamRowRange
              BamSymbol
              BamSystem
              BamSystemSet
-             ComponentUuid
            and $N others
 note: required by a bound in `_::__bam_as_mut_slice_vec`
   --> tests/ui/mod_component_vec_of_string_comp_rejected.rs:8:17

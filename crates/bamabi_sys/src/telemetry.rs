@@ -50,6 +50,7 @@ pub const fn fnv1a_64_hash_system(mod_name: &str, system_name: &str) -> u64 {
 
 /// Errors returned when decoding a 64-byte [`SystemTelemetryDigest64`] wire frame.
 #[derive(Clone, Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub enum TelemetryFrameError {
     /// Leading 4-byte magic did not match [`SYSTEM_TELEMETRY_MAGIC`] (`"BAMT"`).
     InvalidMagic([u8; 4]),
@@ -78,6 +79,7 @@ impl Error for TelemetryFrameError {}
 
 /// Errors returned when decoding a [`SystemTelemetryDigest64`] from a variable-length byte slice.
 #[derive(Clone, Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub enum TelemetrySliceError {
     /// Byte slice length did not equal [`SYSTEM_TELEMETRY_DIGEST_SIZE`] (`64`).
     InvalidLength(usize),
@@ -133,6 +135,7 @@ impl From<TelemetryFrameError> for TelemetrySliceError {
 /// - `60..64`: `reserved` (`u32` LE, always `0`)
 #[repr(C)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct SystemTelemetryDigest64 {
     /// Wire magic prefix (`b"BAMT"`).
     pub magic: [u8; 4],
@@ -407,3 +410,118 @@ impl SystemTelemetryDigest64 {
         }
     }
 }
+
+#[cfg(feature = "serde")]
+mod brp_dtos {
+    extern crate alloc;
+
+    use crate::primitives::ComponentUuid;
+    use alloc::{string::String, vec::Vec};
+
+    /// Typed BRP payload for `bam/list_mods` describing a loaded native mod.
+    #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+    pub struct BrpModInfo {
+        /// Host-assigned runtime mod identifier (`ModId`).
+        pub mod_id: u64,
+        /// Canonical mod name from `BamManifest`.
+        pub name: String,
+        /// SemVer mod version string from `BamManifest`.
+        pub version: String,
+        /// Packed ABI version integer (`ABI_VERSION`).
+        pub abi_version: u32,
+        /// Number of registered systems belonging to this mod.
+        pub system_count: u32,
+        /// Number of registered components/resources belonging to this mod.
+        pub component_count: u32,
+        /// Recorded recoverable fault count for this mod.
+        pub fault_count: u32,
+        /// `true` if the mod is currently quarantined by the host watchdog.
+        pub quarantined: bool,
+    }
+
+    /// Typed BRP payload for `bam/system_metrics` reporting per-system execution & budget telemetry.
+    #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+    pub struct BrpSystemMetrics {
+        /// Owning runtime `ModId`.
+        pub mod_id: u64,
+        /// Owning mod canonical name.
+        pub mod_name: String,
+        /// System canonical name.
+        pub system_name: String,
+        /// Deterministic 64-bit FNV-1a system identifier hash (`fnv1a_64_hash_system`).
+        pub system_hash: u64,
+        /// Monotonic frame sequence number.
+        pub frame_seq: u64,
+        /// Entities matched/visited by the system on the latest sample.
+        pub matched_entities: u32,
+        /// ECS tables matched by the query.
+        pub matched_tables: u32,
+        /// Matched tables skipped via Bevy `0.20` `summary_tick`.
+        pub skipped_summary_tick_tables: u32,
+        /// Contiguous chunk iterations executed.
+        pub chunks: u32,
+        /// Rolling median (`p50`) duration in microseconds.
+        pub p50_us: u32,
+        /// Rolling 99th-percentile (`p99`) duration in microseconds.
+        pub p99_us: u32,
+        /// Deferred host commands queued on the latest sample.
+        pub commands_queued: u32,
+        /// Telemetry status flags (`TELEMETRY_FLAG_*`).
+        pub flags: u16,
+    }
+
+    /// Typed BRP field schema entry nested inside [`BrpComponentSchema`].
+    #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+    pub struct BrpFieldSchema {
+        /// Field identifier.
+        pub name: String,
+        /// Canonical normalized field type tag.
+        pub type_tag: String,
+        /// Numeric `BamFieldKind` code.
+        pub kind: u32,
+        /// Byte offset inside the enclosing component.
+        pub offset: usize,
+        /// Field byte size.
+        pub size: usize,
+        /// Field byte alignment.
+        pub align: usize,
+    }
+
+    /// Typed BRP payload for `bam/component_schemas` inspecting registered component reflection metadata.
+    #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+    pub struct BrpComponentSchema {
+        /// Canonical namespaced component name (`"<namespace>::<Name>"`).
+        pub canonical_name: String,
+        /// Deterministic component UUID (serialized as canonical hyphenated `"8-4-4-4-12"` hex).
+        pub uuid: ComponentUuid,
+        /// Deterministic 64-bit FNV-1a `SCHEMA_FINGERPRINT`.
+        pub schema_fingerprint: u64,
+        /// Component byte size.
+        pub size: usize,
+        /// Component byte alignment.
+        pub align: usize,
+        /// `BAM_STORAGE_FLAG_*` bitflags.
+        pub storage_flags: u32,
+        /// Reflected fields (`BamFieldDesc`).
+        pub fields: Vec<BrpFieldSchema>,
+    }
+
+    /// Typed BRP request payload for `bam/hot_reload`.
+    #[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+    pub struct BrpHotReloadRequest {
+        /// Optional target `ModId` to reload.
+        pub mod_id: Option<u64>,
+        /// Optional target mod name to reload.
+        pub mod_name: Option<String>,
+        /// Optional replacement shared-library / `.bampack` path override.
+        pub path: Option<String>,
+        /// Force reload even if timestamps/hashes appear unchanged.
+        #[serde(default)]
+        pub force: bool,
+    }
+}
+
+#[cfg(feature = "serde")]
+pub use brp_dtos::{
+    BrpComponentSchema, BrpFieldSchema, BrpHotReloadRequest, BrpModInfo, BrpSystemMetrics,
+};

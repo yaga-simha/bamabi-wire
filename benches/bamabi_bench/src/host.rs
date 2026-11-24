@@ -1,4 +1,4 @@
-//! Layer-0 concrete C-ABI `0.3.0` (`0x0003_0000`) host world and 73-slot [`BamHostApi`] table.
+//! Layer-0 concrete C-ABI `0.4.0` (`0x0004_0000`) host world and 90-slot [`BamHostApi`] table.
 //!
 //! Provides zero-Bevy, zero-external-dependency dense SoA chunk storage, singleton resource
 //! storage with [`BamChangeTicks`], a rollback-capable deferred [`CommandQueue`], symbol
@@ -20,12 +20,13 @@ use bamabi_sys::{
     ABI_VERSION, AbiPod, AccessMode, BAM_COMPONENT_FLAG_IMMUTABLE, BAM_COMPONENT_FLAG_SPARSE_SET,
     BAM_COMPONENT_FLAG_SUMMARY_TICK, BAM_STORAGE_FLAG_IMMUTABLE, BAM_STORAGE_FLAG_MESSAGE,
     BAM_STORAGE_FLAG_RESOURCE, BAM_STORAGE_FLAG_SPARSE_SET, BAM_STORAGE_FLAG_SUMMARY_TICK,
-    BamChangeTicks, BamChunkTaskFn, BamColumnInfo, BamCommands, BamComponent, BamHostApi,
-    BamHostCtx, BamIter, BamLayoutInfo, BamLoadCtx, BamObserverDesc, BamQueryDesc, BamRelationDesc,
-    BamRowMigrateFn, BamRunIfFn, BamScheduleSetDesc, BamSymbol, BamSystem, BamSystemCtx,
-    BamSystemDesc, BamSystemFn, BamSystemSet, BamTermDesc, BamTriggerDesc, ComponentDesc,
-    ComponentDropFn, ComponentHookFn, ComponentUuid, FfiAssetHandle, FfiAssetLoadState, FfiBool,
-    FfiEntity, FfiResult, RawInsertable, ScheduleId, StrView, read_descriptor,
+    BamChangeTicks, BamChunkTaskExFn, BamChunkTaskFn, BamColumnInfo, BamCommands, BamComponent,
+    BamHostApi, BamHostCtx, BamIter, BamLayoutInfo, BamLoadCtx, BamObserverDesc, BamParOptions,
+    BamQueryDesc, BamRelationDesc, BamRowMigrateFn, BamRowRange, BamRunIfFn, BamScheduleSetDesc,
+    BamSpawnColumnDesc, BamSymbol, BamSystem, BamSystemCtx, BamSystemDesc, BamSystemFn,
+    BamSystemSet, BamTermDesc, BamTimeInfo, BamTriggerDesc, ComponentDesc, ComponentDropFn,
+    ComponentHookFn, ComponentUuid, FfiAssetHandle, FfiAssetLoadState, FfiBool, FfiEntity,
+    FfiResult, RawInsertable, ScheduleId, StrView, read_descriptor,
 };
 
 /// Canonical component name for entity positions.
@@ -854,7 +855,7 @@ impl HostSharedState {
     }
 }
 
-/// Concrete Layer-0 C-ABI `0.3.0` host ECS world for benchmarking and verifying polyglot guests.
+/// Concrete Layer-0 C-ABI `0.4.0` host ECS world for benchmarking and verifying polyglot guests.
 pub(crate) struct HostWorld {
     pub(crate) api: BamHostApi,
     pub(crate) shared: HostSharedState,
@@ -1465,7 +1466,7 @@ fn storage_flags_for_meta(meta: &RegisteredComp, mode: Option<AccessMode>) -> u3
 }
 
 // ============================================================================
-// All 68 C-ABI `0.3.0` Host VTable Functions
+// All C-ABI `0.4.0` Host VTable Functions
 // ============================================================================
 
 /// Slot 0: `get_proc_address`.
@@ -3261,10 +3262,10 @@ unsafe extern "C" fn host_sys_entity_children(
 unsafe extern "C" fn host_asset_load(
     ctx: *const BamHostCtx,
     _asset_type: BamComponent,
-    _path: StrView,
+    path: *const StrView,
     _out_handle: *mut FfiAssetHandle,
 ) -> FfiResult {
-    if ctx.is_null() {
+    if ctx.is_null() || path.is_null() {
         return FfiResult::NULL_POINTER;
     }
     FfiResult::UNSUPPORTED
@@ -3310,13 +3311,13 @@ unsafe extern "C" fn host_cmd_spawn_scene(
 unsafe extern "C" fn host_log_diagnostic(
     ctx: *const BamHostCtx,
     _level: u32,
-    message: StrView,
+    message: *const StrView,
 ) -> FfiResult {
-    if ctx.is_null() {
+    if ctx.is_null() || message.is_null() {
         return FfiResult::NULL_POINTER;
     }
     // SAFETY: `message` is borrowed for this synchronous call per `BamLogDiagnosticFn` contract.
-    if let Err(err) = unsafe { message.try_as_str() } {
+    if let Err(err) = unsafe { (*message).try_as_str() } {
         return err;
     }
     // SAFETY: `ctx` points to an active `HostSharedState`.
@@ -3328,13 +3329,13 @@ unsafe extern "C" fn host_log_diagnostic(
 /// Slot 51: `report_guest_fault`.
 unsafe extern "C" fn host_report_guest_fault(
     ctx: *const BamHostCtx,
-    message: StrView,
+    message: *const StrView,
 ) -> FfiResult {
-    if ctx.is_null() {
+    if ctx.is_null() || message.is_null() {
         return FfiResult::NULL_POINTER;
     }
     // SAFETY: `message` is borrowed for this synchronous call per `BamReportGuestFaultFn` contract.
-    let msg = match unsafe { message.try_as_str() } {
+    let msg = match unsafe { (*message).try_as_str() } {
         Ok(s) => s,
         Err(err) => return err,
     };
@@ -3485,17 +3486,19 @@ unsafe extern "C" fn host_register_relation(
 /// Slot 55: `intern_symbol`.
 unsafe extern "C" fn host_intern_symbol(
     ctx: *const BamHostCtx,
-    symbol: StrView,
+    symbol: *const StrView,
     out_symbol: *mut BamSymbol,
 ) -> FfiResult {
-    if ctx.is_null() || out_symbol.is_null() {
+    if ctx.is_null() || symbol.is_null() || out_symbol.is_null() {
         return FfiResult::NULL_POINTER;
     }
-    if symbol.len == 0 {
+    // SAFETY: `symbol` points to a readable `StrView` for this synchronous call.
+    let sym_view = unsafe { *symbol };
+    if sym_view.len == 0 {
         return FfiResult::INVALID_ARGUMENT;
     }
-    // SAFETY: `symbol` points to valid bytes for the duration of this synchronous call.
-    let sym_str = match unsafe { symbol.try_as_str() } {
+    // SAFETY: `sym_view` points to valid bytes for the duration of this synchronous call.
+    let sym_str = match unsafe { sym_view.try_as_str() } {
         Ok(s) => s,
         Err(err) => return err,
     };
@@ -3512,17 +3515,17 @@ unsafe extern "C" fn host_intern_symbol(
 /// Slot 56: `bind_named_object`.
 unsafe extern "C" fn host_bind_named_object(
     ctx: *const BamHostCtx,
-    name: StrView,
+    name: *const StrView,
     entity: FfiEntity,
 ) -> FfiResult {
-    if ctx.is_null() {
+    if ctx.is_null() || name.is_null() {
         return FfiResult::NULL_POINTER;
     }
     if entity.is_null() {
         return FfiResult::INVALID_ENTITY;
     }
     // SAFETY: `name` points to valid bytes for the duration of this synchronous call.
-    let name_str = match unsafe { name.try_as_str() } {
+    let name_str = match unsafe { (*name).try_as_str() } {
         Ok(s) => s,
         Err(err) => return err,
     };
@@ -3906,7 +3909,262 @@ unsafe extern "C" fn host_cmd_remove_resource(
     FfiResult::OK
 }
 
-/// Constructs a complete 73-slot ABI `0.3.0` [`BamHostApi`] table wired to [`HostWorld`].
+/// Slot 73: `register_resource`.
+unsafe extern "C" fn host_register_resource(
+    load_ctx: *mut BamLoadCtx,
+    desc: *const ComponentDesc,
+    out_resource: *mut BamComponent,
+) -> FfiResult {
+    if load_ctx.is_null() || desc.is_null() || out_resource.is_null() {
+        return FfiResult::NULL_POINTER;
+    }
+    FfiResult::UNSUPPORTED
+}
+
+/// Slot 74: `register_message`.
+unsafe extern "C" fn host_register_message(
+    load_ctx: *mut BamLoadCtx,
+    desc: *const ComponentDesc,
+    out_message: *mut BamComponent,
+) -> FfiResult {
+    if load_ctx.is_null() || desc.is_null() || out_message.is_null() {
+        return FfiResult::NULL_POINTER;
+    }
+    FfiResult::UNSUPPORTED
+}
+
+/// Slot 75: `resolve_named_object`.
+unsafe extern "C" fn host_resolve_named_object(
+    ctx: *const BamHostCtx,
+    name: *const StrView,
+    out_entity: *mut FfiEntity,
+) -> FfiResult {
+    if ctx.is_null() || name.is_null() || out_entity.is_null() {
+        return FfiResult::NULL_POINTER;
+    }
+    // SAFETY: `name` is borrowed for this synchronous call.
+    let name_str = match unsafe { (*name).try_as_str() } {
+        Ok(s) => s,
+        Err(err) => return err,
+    };
+    // SAFETY: `ctx` points to `HostSharedState`.
+    let shared = unsafe { &*ctx.cast::<HostSharedState>() };
+    let map = shared
+        .named_objects
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if let Some(&ent) = map.get(name_str) {
+        // SAFETY: `out_entity` is valid writable storage.
+        unsafe { *out_entity = ent };
+        FfiResult::OK
+    } else {
+        FfiResult::NOT_FOUND
+    }
+}
+
+/// Slot 76: `resolve_symbol_str`.
+unsafe extern "C" fn host_resolve_symbol_str(
+    ctx: *const BamHostCtx,
+    _symbol: BamSymbol,
+    out_str: *mut StrView,
+) -> FfiResult {
+    if ctx.is_null() || out_str.is_null() {
+        return FfiResult::NULL_POINTER;
+    }
+    FfiResult::NOT_FOUND
+}
+
+/// Slot 77: `iter_column_rows_mutable_untracked`.
+unsafe extern "C" fn host_iter_column_rows_mutable_untracked(
+    _iter: *mut BamIter,
+    _term_index: usize,
+) -> *const *mut u8 {
+    core::ptr::null()
+}
+
+/// Slot 78: `iter_mark_changed_ranges`.
+unsafe extern "C" fn host_iter_mark_changed_ranges(
+    iter: *mut BamIter,
+    term_index: usize,
+    ranges_ptr: *const BamRowRange,
+    range_count: usize,
+) -> FfiResult {
+    if iter.is_null() {
+        return FfiResult::NULL_POINTER;
+    }
+    if range_count > 0 && ranges_ptr.is_null() {
+        return FfiResult::NULL_POINTER;
+    }
+    // SAFETY: Caller guarantees `ranges_ptr` spans `range_count` `BamRowRange` entries.
+    let ranges = unsafe { core::slice::from_raw_parts(ranges_ptr, range_count) };
+    for r in ranges {
+        // SAFETY: Forwards single-range validation/marking to `host_iter_mark_changed_range`.
+        let res =
+            unsafe { host_iter_mark_changed_range(iter, term_index, r.start_row, r.row_count) };
+        if !res.is_ok() {
+            return res;
+        }
+    }
+    FfiResult::OK
+}
+
+/// Slot 79: `sys_current_ticks`.
+unsafe extern "C" fn host_sys_current_ticks(
+    sys_ctx: *const BamSystemCtx,
+    out_last_run: *mut u32,
+    out_this_run: *mut u32,
+) -> FfiResult {
+    if sys_ctx.is_null() || out_last_run.is_null() || out_this_run.is_null() {
+        return FfiResult::NULL_POINTER;
+    }
+    // SAFETY: Caller supplies valid writable `u32` pointers.
+    unsafe {
+        *out_last_run = 0;
+        *out_this_run = 1;
+    }
+    FfiResult::OK
+}
+
+/// Slot 80: `sys_time_info`.
+unsafe extern "C" fn host_sys_time_info(
+    sys_ctx: *const BamSystemCtx,
+    out_info: *mut BamTimeInfo,
+) -> FfiResult {
+    if sys_ctx.is_null() || out_info.is_null() {
+        return FfiResult::NULL_POINTER;
+    }
+    // SAFETY: Caller supplies writable `BamTimeInfo` storage.
+    unsafe {
+        *out_info = BamTimeInfo::new();
+    }
+    FfiResult::OK
+}
+
+/// Slot 81: `par_for_each_chunk_ex`.
+unsafe extern "C" fn host_par_for_each_chunk_ex(
+    iter: *mut BamIter,
+    _chunk_fn: Option<BamChunkTaskExFn>,
+    _user_data: *mut c_void,
+    _options: *const BamParOptions,
+) -> FfiResult {
+    if iter.is_null() {
+        return FfiResult::NULL_POINTER;
+    }
+    FfiResult::UNSUPPORTED
+}
+
+/// Slot 82: `sys_relation_targets`.
+unsafe extern "C" fn host_sys_relation_targets(
+    sys_ctx: *const BamSystemCtx,
+    _entity: FfiEntity,
+    _relation: BamComponent,
+    out_targets: *mut *const FfiEntity,
+    out_len: *mut usize,
+) -> FfiResult {
+    if sys_ctx.is_null() || out_targets.is_null() || out_len.is_null() {
+        return FfiResult::NULL_POINTER;
+    }
+    FfiResult::UNSUPPORTED
+}
+
+/// Slot 83: `sys_relation_sources`.
+unsafe extern "C" fn host_sys_relation_sources(
+    sys_ctx: *const BamSystemCtx,
+    _target: FfiEntity,
+    _relation: BamComponent,
+    out_sources: *mut *const FfiEntity,
+    out_len: *mut usize,
+) -> FfiResult {
+    if sys_ctx.is_null() || out_sources.is_null() || out_len.is_null() {
+        return FfiResult::NULL_POINTER;
+    }
+    FfiResult::UNSUPPORTED
+}
+
+/// Slot 84: `sys_relation_edge_data`.
+unsafe extern "C" fn host_sys_relation_edge_data(
+    sys_ctx: *const BamSystemCtx,
+    _entity: FfiEntity,
+    _relation: BamComponent,
+    _target: FfiEntity,
+    out_ptr: *mut *const c_void,
+    out_size: *mut usize,
+) -> FfiResult {
+    if sys_ctx.is_null() || out_ptr.is_null() || out_size.is_null() {
+        return FfiResult::NULL_POINTER;
+    }
+    FfiResult::UNSUPPORTED
+}
+
+/// Slot 85: `cmd_despawn_batch`.
+unsafe extern "C" fn host_cmd_despawn_batch(
+    cmds: *mut BamCommands,
+    _entities: *const FfiEntity,
+    _count: usize,
+) -> FfiResult {
+    if cmds.is_null() {
+        return FfiResult::NULL_POINTER;
+    }
+    FfiResult::UNSUPPORTED
+}
+
+/// Slot 86: `cmd_insert_batch`.
+unsafe extern "C" fn host_cmd_insert_batch(
+    cmds: *mut BamCommands,
+    _entities: *const FfiEntity,
+    _entity_count: usize,
+    _component: BamComponent,
+    _data_ptr: *const u8,
+    _elem_size: usize,
+    _flags: u32,
+) -> FfiResult {
+    if cmds.is_null() {
+        return FfiResult::NULL_POINTER;
+    }
+    FfiResult::UNSUPPORTED
+}
+
+/// Slot 87: `cmd_remove_batch`.
+unsafe extern "C" fn host_cmd_remove_batch(
+    cmds: *mut BamCommands,
+    _entities: *const FfiEntity,
+    _entity_count: usize,
+    _component: BamComponent,
+) -> FfiResult {
+    if cmds.is_null() {
+        return FfiResult::NULL_POINTER;
+    }
+    FfiResult::UNSUPPORTED
+}
+
+/// Slot 88: `msg_read_slice`.
+unsafe extern "C" fn host_msg_read_slice(
+    iter: *mut BamIter,
+    _term_index: usize,
+    out_ptr: *mut *const u8,
+    out_count: *mut usize,
+) -> FfiResult {
+    if iter.is_null() || out_ptr.is_null() || out_count.is_null() {
+        return FfiResult::NULL_POINTER;
+    }
+    FfiResult::UNSUPPORTED
+}
+
+/// Slot 89: `cmd_spawn_batch_ex`.
+unsafe extern "C" fn host_cmd_spawn_batch_ex(
+    cmds: *mut BamCommands,
+    _columns: *const BamSpawnColumnDesc,
+    _column_count: usize,
+    _entity_count: usize,
+    _out_entities: *mut FfiEntity,
+) -> FfiResult {
+    if cmds.is_null() {
+        return FfiResult::NULL_POINTER;
+    }
+    FfiResult::UNSUPPORTED
+}
+
+/// Constructs a complete 90-slot ABI `0.4.0` [`BamHostApi`] table wired to [`HostWorld`].
 pub(crate) fn make_host_api() -> BamHostApi {
     let api = BamHostApi {
         struct_size: core::mem::size_of::<BamHostApi>() as u32,
@@ -3984,6 +4242,23 @@ pub(crate) fn make_host_api() -> BamHostApi {
         cmd_clone_entity: Some(host_cmd_clone_entity),
         cmd_insert_resource: Some(host_cmd_insert_resource),
         cmd_remove_resource: Some(host_cmd_remove_resource),
+        register_resource: Some(host_register_resource),
+        register_message: Some(host_register_message),
+        resolve_named_object: Some(host_resolve_named_object),
+        resolve_symbol_str: Some(host_resolve_symbol_str),
+        iter_column_rows_mutable_untracked: Some(host_iter_column_rows_mutable_untracked),
+        iter_mark_changed_ranges: Some(host_iter_mark_changed_ranges),
+        sys_current_ticks: Some(host_sys_current_ticks),
+        sys_time_info: Some(host_sys_time_info),
+        par_for_each_chunk_ex: Some(host_par_for_each_chunk_ex),
+        sys_relation_targets: Some(host_sys_relation_targets),
+        sys_relation_sources: Some(host_sys_relation_sources),
+        sys_relation_edge_data: Some(host_sys_relation_edge_data),
+        cmd_despawn_batch: Some(host_cmd_despawn_batch),
+        cmd_insert_batch: Some(host_cmd_insert_batch),
+        cmd_remove_batch: Some(host_cmd_remove_batch),
+        msg_read_slice: Some(host_msg_read_slice),
+        cmd_spawn_batch_ex: Some(host_cmd_spawn_batch_ex),
     };
     debug_assert!(api.has_all_slots());
     api

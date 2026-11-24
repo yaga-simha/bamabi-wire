@@ -257,11 +257,13 @@ pub use bamabi_sys::{BamSystemCtx, FfiBool, FfiResult};
 
 pub use commands::{SpawnBatchColumn, SpawnEntry, TypedComponent, ValidatedCommands};
 pub use component::{
-    PodComponentHooks, generic_drop_trampoline, migrate_component_column_pod,
-    migrate_component_column_raw, migrate_mod_component_column, migrate_pod_component_column,
-    pod_clone_trampoline, register_component_raw, register_component_with_layout,
-    register_dynamic_component_with_drop, register_pod_component,
-    register_pod_component_with_hooks, register_relation, register_relation_raw, resolve_component,
+    PodComponentHooks, PodMigrationConfig, RelationRegistrationConfig, generic_drop_trampoline,
+    migrate_component_column_pod, migrate_component_column_raw, migrate_mod_component_column,
+    migrate_pod_component_column, pod_clone_trampoline, register_component_raw,
+    register_component_with_layout, register_dynamic_component_with_drop, register_message_raw,
+    register_pod_component, register_pod_component_with_hooks, register_pod_message,
+    register_pod_resource, register_relation, register_relation_raw, register_resource_raw,
+    resolve_component,
 };
 pub use host::{
     CUSTOM_SYMBOL_PREFIX, Host, ValidatedLoadCtx, ValidatedStringVTable, ValidatedWireVTable,
@@ -272,21 +274,23 @@ pub use instance::{
     resolve_mod_component, shutdown_guest_instance,
 };
 pub use iter::{
-    BatchColCache, ChunkColumnDispenser, DrainOptions, QuerySlotScratch, SparseRows,
-    SparseRowsIter, SparseRowsMut, UuidFilter, ValidatedIter, ValidatedSlice, ValidatedSliceMut,
+    BatchColCache, ChunkColumnDispenser, DrainOptions, QuerySlotScratch, SelectiveMutSlice,
+    SparseRows, SparseRowsIter, SparseRowsMut, UuidFilter, ValidatedIter, ValidatedSlice,
+    ValidatedSliceMut,
 };
 pub use panic::{catch_guest_bool, catch_guest_result, catch_guest_unit};
 pub use trampoline::{
-    LazyCommands, ObserverCtxRegistrationConfig, PreparedRunIf, ReentrantCell,
-    SystemRegistrationConfig, ValidatedSystemInvocation, ValidatedSystemRef, ValidatedSystemSlice,
-    allocate_run_if_ctx_query, allocate_run_if_ctx_trampoline, allocate_run_if_trampoline,
-    allocate_system_slice_trampoline, allocate_system_trampoline, configure_schedule_set,
-    configure_schedule_set_raw, iter_dynamic_slice, iter_dynamic_slice_mut,
+    LazyCommands, ObserverCtxRegistrationConfig, ObserverRegistrationConfig, PreparedRunIf,
+    ReentrantCell, ScheduleSetConfig, SystemRegistrationConfig, ValidatedSystemInvocation,
+    ValidatedSystemRef, ValidatedSystemSlice, allocate_run_if_ctx_query,
+    allocate_run_if_ctx_trampoline, allocate_run_if_trampoline, allocate_system_slice_trampoline,
+    allocate_system_trampoline, configure_schedule_set, configure_schedule_set_raw,
+    configure_schedule_set_with_parents, iter_dynamic_slice, iter_dynamic_slice_mut,
     iter_entities_and_dynamic_slice_mut, mount_system_in_schedule,
     register_lifecycle_observer_closure, register_observer_closure,
     register_observer_closure_with_options, register_observer_closure_with_watched,
-    register_observer_ctx_slice_closure, register_observer_mut_closure,
-    register_observer_mut_closure_with_watched, register_system_closure,
-    register_system_handle_closure, register_system_handle_slice_closure,
+    register_observer_ctx_mut_slice_closure, register_observer_ctx_slice_closure,
+    register_observer_mut_closure, register_observer_mut_closure_with_watched,
+    register_system_closure, register_system_handle_closure, register_system_handle_slice_closure,
     register_system_slice_closure, verify_same_mod_dynamic_component,
 };

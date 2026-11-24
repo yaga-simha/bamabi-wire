@@ -5,17 +5,22 @@ edition.workspace = true
 rust-version = "1.87"
 license.workspace = true
 authors.workspace = true
-description = "`#![no_std]`, zero-dependency C-ABI `0.3.0` wire contract, descriptors, and POD traits for `bamabi`"
+description = "`#![no_std]` C-ABI `0.4.0` wire contract, descriptors, ABI metadata, and POD traits for `bamabi`"
 readme = "README.md"
 repository.workspace = true
 keywords.workspace = true
 categories = ["game-development", "api-bindings", "no-std"]
 
+[features]
+default = []
+serde = ["dep:serde"]
+
 [lints]
 workspace = true
 
 [dependencies]
-# Zero external dependencies. Strictly no_std.
+bamabi_schema = { workspace = true }
+serde = { workspace = true, optional = true }
 
 [dev-dependencies]
 proptest = { workspace = true }

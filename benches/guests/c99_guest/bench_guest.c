@@ -1,5 +1,5 @@
 /*
- * ISO C99 Benchmark Guest Mod (`ABI 0.3.0`)
+ * ISO C99 Benchmark Guest Mod (`ABI 0.4.0`)
  * Compiled with: `-std=c99 -Wall -Wextra -Werror -pedantic` (`-O3` and `-O0 -g`).
  */
 
@@ -56,7 +56,7 @@ static const BamManifest g_manifest = {
     (uint32_t)sizeof(BamManifest),
     BAM_ABI_VERSION,
     "bench_guest_c99",
-    "0.3.0",
+    "0.4.0",
     0u,
     0u,
     NULL,
@@ -251,7 +251,7 @@ static BamResult sys_host_api_roundtrip(BamSystemCtx* sys_ctx, void* user_data) 
         if (rc != BAM_RESULT_OK) {
             return rc;
         }
-        rc = inst->api.intern_symbol(host_ctx, sym_name, &sym);
+        rc = inst->api.intern_symbol(host_ctx, &sym_name, &sym);
         if (rc != BAM_RESULT_OK) {
             return rc;
         }

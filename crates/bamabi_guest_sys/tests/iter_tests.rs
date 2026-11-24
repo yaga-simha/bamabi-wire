@@ -29,9 +29,9 @@ unsafe extern "C" fn mock_export_fields(
     sink: Option<
         unsafe extern "C" fn(
             sink_ctx: *mut c_void,
-            field_name: StrView,
-            type_tag: StrView,
-            payload: FfiSlice<u8>,
+            field_name: *const StrView,
+            type_tag: *const StrView,
+            payload: *const FfiSlice<u8>,
         ) -> FfiResult,
     >,
     sink_ctx: *mut c_void,
@@ -41,13 +41,16 @@ unsafe extern "C" fn mock_export_fields(
     let Some(sink_fn) = sink else {
         return FfiResult::NULL_POINTER;
     };
+    let label_name = StrView::from_str("label");
+    let label_tag = StrView::from_str("String");
+    let label_payload = FfiSlice::from_slice(msg.label.as_bytes());
     // SAFETY: Forwarding live UTF-8 field slice into `sink_fn`.
     let rc = unsafe {
         sink_fn(
             sink_ctx,
-            StrView::from_str("label"),
-            StrView::from_str("String"),
-            FfiSlice::from_slice(msg.label.as_bytes()),
+            &raw const label_name,
+            &raw const label_tag,
+            &raw const label_payload,
         )
     };
     if !rc.is_ok() {
@@ -58,13 +61,16 @@ unsafe extern "C" fn mock_export_fields(
     for &n in &msg.nums {
         raw_nums.extend_from_slice(&n.to_le_bytes());
     }
+    let nums_name = StrView::from_str("nums");
+    let nums_tag = StrView::from_str("Vec<u32>");
+    let nums_payload = FfiSlice::from_slice(&raw_nums);
     // SAFETY: Forwarding encoded `Vec<u32>` slice into `sink_fn`.
     unsafe {
         sink_fn(
             sink_ctx,
-            StrView::from_str("nums"),
-            StrView::from_str("Vec<u32>"),
-            FfiSlice::from_slice(&raw_nums),
+            &raw const nums_name,
+            &raw const nums_tag,
+            &raw const nums_payload,
         )
     }
 }
@@ -72,18 +78,21 @@ unsafe extern "C" fn mock_export_fields(
 /// Mock `import_field` witness symbol reconstructing `label` and `nums` on a guest `MockNonPodMsg`.
 unsafe extern "C" fn mock_import_field(
     dst_ptr: *mut c_void,
-    field_name: StrView,
-    _type_tag: StrView,
-    payload: FfiSlice<u8>,
+    field_name: *const StrView,
+    _type_tag: *const StrView,
+    payload: *const FfiSlice<u8>,
 ) -> FfiResult {
+    if field_name.is_null() || payload.is_null() {
+        return FfiResult::NULL_POINTER;
+    }
     // SAFETY: `dst_ptr` points to a valid `MockNonPodMsg`.
     let dst = unsafe { &mut *dst_ptr.cast::<MockNonPodMsg>() };
     // SAFETY: `field_name` and `payload` borrow live slices for this synchronous callback.
-    let Ok(name) = (unsafe { field_name.try_as_str() }) else {
+    let Ok(name) = (unsafe { (*field_name).try_as_str() }) else {
         return FfiResult::INVALID_UTF8;
     };
     // SAFETY: Same as above for `payload`.
-    let Ok(bytes) = (unsafe { payload.try_as_slice() }) else {
+    let Ok(bytes) = (unsafe { (*payload).try_as_slice() }) else {
         return FfiResult::NULL_POINTER;
     };
     match name {

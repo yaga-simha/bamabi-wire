@@ -25,12 +25,13 @@ use core::{
 };
 
 use bamabi_sys::{
-    ABI_VERSION, AccessMode, BamChangeTicks, BamColumnInfo, BamCommands, BamComponent, BamHostApi,
-    BamHostCtx, BamInstance, BamIter, BamLayoutInfo, BamLoadCtx, BamObserverDesc, BamRelationDesc,
-    BamScheduleSetDesc, BamSymbol, BamSystem, BamSystemCtx, BamSystemDesc, BamSystemSet,
-    BamTermDesc, BamTriggerDesc, ComponentDesc, ComponentUuid, FfiAssetHandle, FfiAssetLoadState,
-    FfiBool, FfiEntity, FfiResult, FfiSlice, MAX_QUERIES_PER_SYSTEM, MAX_TERMS_PER_QUERY,
-    MappedStringVTable, MappedWireVTable, ScheduleId, StrView, VTableHeader,
+    ABI_VERSION, AccessMode, BamChangeTicks, BamChunkTaskExFn, BamColumnInfo, BamCommands,
+    BamComponent, BamHostApi, BamHostCtx, BamInstance, BamIter, BamLayoutInfo, BamLoadCtx,
+    BamObserverDesc, BamParOptions, BamRelationDesc, BamRowRange, BamScheduleSetDesc,
+    BamSpawnColumnDesc, BamSymbol, BamSystem, BamSystemCtx, BamSystemDesc, BamSystemSet,
+    BamTermDesc, BamTimeInfo, BamTriggerDesc, ComponentDesc, ComponentUuid, FfiAssetHandle,
+    FfiAssetLoadState, FfiBool, FfiEntity, FfiResult, FfiSlice, MAX_QUERIES_PER_SYSTEM,
+    MAX_TERMS_PER_QUERY, MappedStringVTable, MappedWireVTable, ScheduleId, StrView, VTableHeader,
     abi_version_is_compatible,
 };
 
@@ -319,7 +320,7 @@ unsafe extern "C" fn stub_sys_children(
 unsafe extern "C" fn stub_asset_load(
     _: *const BamHostCtx,
     _: BamComponent,
-    _: StrView,
+    _: *const StrView,
     _: *mut FfiAssetHandle,
 ) -> FfiResult {
     FfiResult::OK
@@ -345,10 +346,10 @@ unsafe extern "C" fn stub_cmd_spawn_scene(
 ) -> FfiResult {
     FfiResult::OK
 }
-unsafe extern "C" fn stub_log_diag(_: *const BamHostCtx, _: u32, _: StrView) -> FfiResult {
+unsafe extern "C" fn stub_log_diag(_: *const BamHostCtx, _: u32, _: *const StrView) -> FfiResult {
     FfiResult::OK
 }
-unsafe extern "C" fn stub_report_fault(_: *const BamHostCtx, _: StrView) -> FfiResult {
+unsafe extern "C" fn stub_report_fault(_: *const BamHostCtx, _: *const StrView) -> FfiResult {
     FfiResult::OK
 }
 unsafe extern "C" fn stub_resolve_uuid(
@@ -374,12 +375,16 @@ unsafe extern "C" fn stub_register_rel(
 }
 unsafe extern "C" fn stub_intern_sym(
     _: *const BamHostCtx,
-    _: StrView,
+    _: *const StrView,
     _: *mut BamSymbol,
 ) -> FfiResult {
     FfiResult::OK
 }
-unsafe extern "C" fn stub_bind_named(_: *const BamHostCtx, _: StrView, _: FfiEntity) -> FfiResult {
+unsafe extern "C" fn stub_bind_named(
+    _: *const BamHostCtx,
+    _: *const StrView,
+    _: FfiEntity,
+) -> FfiResult {
     FfiResult::OK
 }
 unsafe extern "C" fn stub_iter_count(_: *mut BamIter, _: *mut usize) -> FfiResult {
@@ -489,9 +494,123 @@ unsafe extern "C" fn stub_cmd_insert_resource(
 unsafe extern "C" fn stub_cmd_remove_resource(_: *mut BamCommands, _: BamComponent) -> FfiResult {
     FfiResult::OK
 }
+unsafe extern "C" fn stub_resolve_named_object(
+    _: *const BamHostCtx,
+    _: *const StrView,
+    _: *mut FfiEntity,
+) -> FfiResult {
+    FfiResult::OK
+}
+unsafe extern "C" fn stub_resolve_symbol_str(
+    _: *const BamHostCtx,
+    _: BamSymbol,
+    _: *mut StrView,
+) -> FfiResult {
+    FfiResult::OK
+}
+unsafe extern "C" fn stub_iter_rows_mut_untracked(_: *mut BamIter, _: usize) -> *const *mut u8 {
+    core::ptr::null()
+}
+unsafe extern "C" fn stub_iter_mark_changed_ranges(
+    _: *mut BamIter,
+    _: usize,
+    _: *const BamRowRange,
+    _: usize,
+) -> FfiResult {
+    FfiResult::OK
+}
+unsafe extern "C" fn stub_sys_current_ticks(
+    _: *const BamSystemCtx,
+    _: *mut u32,
+    _: *mut u32,
+) -> FfiResult {
+    FfiResult::OK
+}
+unsafe extern "C" fn stub_sys_time_info(_: *const BamSystemCtx, _: *mut BamTimeInfo) -> FfiResult {
+    FfiResult::OK
+}
+unsafe extern "C" fn stub_par_chunks_ex(
+    _: *mut BamIter,
+    _: Option<BamChunkTaskExFn>,
+    _: *mut c_void,
+    _: *const BamParOptions,
+) -> FfiResult {
+    FfiResult::OK
+}
+unsafe extern "C" fn stub_sys_relation_targets(
+    _: *const BamSystemCtx,
+    _: FfiEntity,
+    _: BamComponent,
+    _: *mut *const FfiEntity,
+    _: *mut usize,
+) -> FfiResult {
+    FfiResult::OK
+}
+unsafe extern "C" fn stub_sys_relation_sources(
+    _: *const BamSystemCtx,
+    _: FfiEntity,
+    _: BamComponent,
+    _: *mut *const FfiEntity,
+    _: *mut usize,
+) -> FfiResult {
+    FfiResult::OK
+}
+unsafe extern "C" fn stub_sys_relation_edge_data(
+    _: *const BamSystemCtx,
+    _: FfiEntity,
+    _: BamComponent,
+    _: FfiEntity,
+    _: *mut *const c_void,
+    _: *mut usize,
+) -> FfiResult {
+    FfiResult::OK
+}
+unsafe extern "C" fn stub_cmd_despawn_batch(
+    _: *mut BamCommands,
+    _: *const FfiEntity,
+    _: usize,
+) -> FfiResult {
+    FfiResult::OK
+}
+unsafe extern "C" fn stub_cmd_insert_batch(
+    _: *mut BamCommands,
+    _: *const FfiEntity,
+    _: usize,
+    _: BamComponent,
+    _: *const u8,
+    _: usize,
+    _: u32,
+) -> FfiResult {
+    FfiResult::OK
+}
+unsafe extern "C" fn stub_cmd_remove_batch(
+    _: *mut BamCommands,
+    _: *const FfiEntity,
+    _: usize,
+    _: BamComponent,
+) -> FfiResult {
+    FfiResult::OK
+}
+unsafe extern "C" fn stub_msg_read_slice(
+    _: *mut BamIter,
+    _: usize,
+    _: *mut *const u8,
+    _: *mut usize,
+) -> FfiResult {
+    FfiResult::OK
+}
+unsafe extern "C" fn stub_cmd_spawn_batch_ex(
+    _: *mut BamCommands,
+    _: *const BamSpawnColumnDesc,
+    _: usize,
+    _: usize,
+    _: *mut FfiEntity,
+) -> FfiResult {
+    FfiResult::OK
+}
 
-/// Builds a minimal `BamHostApi` populating only the 27 core ABI `0.2` slots and leaving all 46
-/// extended/ABI-`0.3.0` slots as `None`.
+/// Builds a minimal `BamHostApi` populating only the 27 core ABI `0.2` slots and leaving all 63
+/// extended/ABI-`0.3`/`0.4` slots as `None`.
 fn make_core_api(struct_size: u32, abi_version: u32) -> BamHostApi {
     BamHostApi {
         struct_size,
@@ -569,10 +688,27 @@ fn make_core_api(struct_size: u32, abi_version: u32) -> BamHostApi {
         cmd_clone_entity: None,
         cmd_insert_resource: None,
         cmd_remove_resource: None,
+        register_resource: None,
+        register_message: None,
+        resolve_named_object: None,
+        resolve_symbol_str: None,
+        iter_column_rows_mutable_untracked: None,
+        iter_mark_changed_ranges: None,
+        sys_current_ticks: None,
+        sys_time_info: None,
+        par_for_each_chunk_ex: None,
+        sys_relation_targets: None,
+        sys_relation_sources: None,
+        sys_relation_edge_data: None,
+        cmd_despawn_batch: None,
+        cmd_insert_batch: None,
+        cmd_remove_batch: None,
+        msg_read_slice: None,
+        cmd_spawn_batch_ex: None,
     }
 }
 
-/// Builds a complete 73-slot `BamHostApi` populating all 27 core slots plus all 46 extended/ABI-`0.3.0`
+/// Builds a complete 90-slot `BamHostApi` populating all 27 core slots plus all 63 extended/ABI-`0.3`/`0.4`
 /// slots with zero-side-effect stubs.
 fn make_full_api(struct_size: u32, abi_version: u32) -> BamHostApi {
     let mut api = make_core_api(struct_size, abi_version);
@@ -622,6 +758,23 @@ fn make_full_api(struct_size: u32, abi_version: u32) -> BamHostApi {
     api.cmd_clone_entity = Some(stub_cmd_clone_entity);
     api.cmd_insert_resource = Some(stub_cmd_insert_resource);
     api.cmd_remove_resource = Some(stub_cmd_remove_resource);
+    api.register_resource = Some(stub_register_comp);
+    api.register_message = Some(stub_register_comp);
+    api.resolve_named_object = Some(stub_resolve_named_object);
+    api.resolve_symbol_str = Some(stub_resolve_symbol_str);
+    api.iter_column_rows_mutable_untracked = Some(stub_iter_rows_mut_untracked);
+    api.iter_mark_changed_ranges = Some(stub_iter_mark_changed_ranges);
+    api.sys_current_ticks = Some(stub_sys_current_ticks);
+    api.sys_time_info = Some(stub_sys_time_info);
+    api.par_for_each_chunk_ex = Some(stub_par_chunks_ex);
+    api.sys_relation_targets = Some(stub_sys_relation_targets);
+    api.sys_relation_sources = Some(stub_sys_relation_sources);
+    api.sys_relation_edge_data = Some(stub_sys_relation_edge_data);
+    api.cmd_despawn_batch = Some(stub_cmd_despawn_batch);
+    api.cmd_insert_batch = Some(stub_cmd_insert_batch);
+    api.cmd_remove_batch = Some(stub_cmd_remove_batch);
+    api.msg_read_slice = Some(stub_msg_read_slice);
+    api.cmd_spawn_batch_ex = Some(stub_cmd_spawn_batch_ex);
     api
 }
 
@@ -684,9 +837,26 @@ fn assert_all_41_extended_slots_none(api: &BamHostApi) {
     assert!(host_slot!(api, cmd_clone_entity).is_none());
     assert!(host_slot!(api, cmd_insert_resource).is_none());
     assert!(host_slot!(api, cmd_remove_resource).is_none());
+    assert!(host_slot!(api, register_resource).is_none());
+    assert!(host_slot!(api, register_message).is_none());
+    assert!(host_slot!(api, resolve_named_object).is_none());
+    assert!(host_slot!(api, resolve_symbol_str).is_none());
+    assert!(host_slot!(api, iter_column_rows_mutable_untracked).is_none());
+    assert!(host_slot!(api, iter_mark_changed_ranges).is_none());
+    assert!(host_slot!(api, sys_current_ticks).is_none());
+    assert!(host_slot!(api, sys_time_info).is_none());
+    assert!(host_slot!(api, par_for_each_chunk_ex).is_none());
+    assert!(host_slot!(api, sys_relation_targets).is_none());
+    assert!(host_slot!(api, sys_relation_sources).is_none());
+    assert!(host_slot!(api, sys_relation_edge_data).is_none());
+    assert!(host_slot!(api, cmd_despawn_batch).is_none());
+    assert!(host_slot!(api, cmd_insert_batch).is_none());
+    assert!(host_slot!(api, cmd_remove_batch).is_none());
+    assert!(host_slot!(api, msg_read_slice).is_none());
+    assert!(host_slot!(api, cmd_spawn_batch_ex).is_none());
 }
 
-/// PO-G1: `host_slot!` across all 46 extended/ABI-0.3 slots returns `Some` iff `populated` and
+/// PO-G1: `host_slot!` across all 63 extended/ABI-0.3/0.4 slots returns `Some` iff `populated` and
 /// `struct_size >= offset_of!(BamHostApi, slot) + size_of::<usize>()`, with zero overflow.
 #[kani::proof]
 fn po_g1_host_slot_bounds_all_41_extended_slots() {
@@ -752,6 +922,23 @@ fn po_g1_host_slot_bounds_all_41_extended_slots() {
     check_slot!(cmd_clone_entity);
     check_slot!(cmd_insert_resource);
     check_slot!(cmd_remove_resource);
+    check_slot!(register_resource);
+    check_slot!(register_message);
+    check_slot!(resolve_named_object);
+    check_slot!(resolve_symbol_str);
+    check_slot!(iter_column_rows_mutable_untracked);
+    check_slot!(iter_mark_changed_ranges);
+    check_slot!(sys_current_ticks);
+    check_slot!(sys_time_info);
+    check_slot!(par_for_each_chunk_ex);
+    check_slot!(sys_relation_targets);
+    check_slot!(sys_relation_sources);
+    check_slot!(sys_relation_edge_data);
+    check_slot!(cmd_despawn_batch);
+    check_slot!(cmd_insert_batch);
+    check_slot!(cmd_remove_batch);
+    check_slot!(msg_read_slice);
+    check_slot!(cmd_spawn_batch_ex);
 
     kani::cover!(host_slot!(&api, par_for_each_chunk).is_some());
     kani::cover!(host_slot!(&api, par_for_each_chunk).is_none());
@@ -759,6 +946,8 @@ fn po_g1_host_slot_bounds_all_41_extended_slots() {
     kani::cover!(host_slot!(&api, iter_next_chunk_batch).is_none());
     kani::cover!(host_slot!(&api, cmd_remove_resource).is_some());
     kani::cover!(host_slot!(&api, cmd_remove_resource).is_none());
+    kani::cover!(host_slot!(&api, cmd_spawn_batch_ex).is_some());
+    kani::cover!(host_slot!(&api, cmd_spawn_batch_ex).is_none());
 }
 
 /// PO-G1: `Host::from_raw` and `Host::from_load_ctx` reject null pointers, misaligned `api_ptr`,
@@ -2421,8 +2610,12 @@ fn po_g1_mapped_vtables_and_bridged_row_bounds() {
         unsafe { *out = 42 };
         FfiResult::OK
     }
-    unsafe extern "C" fn stub_str_get(_: *const c_void) -> StrView {
-        StrView::empty()
+    unsafe extern "C" fn stub_str_get(_: *const c_void, out: *mut StrView) -> FfiResult {
+        if !out.is_null() {
+            // SAFETY: Caller supplies writable `out`.
+            unsafe { *out = StrView::empty() };
+        }
+        FfiResult::OK
     }
 
     #[repr(C)]
@@ -3208,17 +3401,21 @@ fn po_g8_pod_component_hook_trampolines() {
 fn po_g8_non_pod_message_witness_callbacks() {
     unsafe extern "C" fn mock_import_field(
         dst_ptr: *mut c_void,
-        field_name: StrView,
-        _type_tag: StrView,
-        payload: FfiSlice<u8>,
+        field_name: *const StrView,
+        _type_tag: *const StrView,
+        payload: *const FfiSlice<u8>,
     ) -> FfiResult {
+        if field_name.is_null() || payload.is_null() {
+            return FfiResult::NULL_POINTER;
+        }
         // SAFETY: `dst_ptr` points to `u32`.
         let dst = unsafe { &mut *dst_ptr.cast::<u32>() };
-        if field_name.is_empty() {
+        // SAFETY: `field_name` points to a live `StrView`.
+        if unsafe { (*field_name).is_empty() } {
             return FfiResult::INVALID_ARGUMENT;
         }
         // SAFETY: `payload` is a valid slice for this synchronous callback.
-        let Ok(bytes) = (unsafe { payload.try_as_slice() }) else {
+        let Ok(bytes) = (unsafe { (*payload).try_as_slice() }) else {
             return FfiResult::NULL_POINTER;
         };
         if bytes.len() == 4 {
@@ -3244,14 +3441,22 @@ fn po_g8_non_pod_message_witness_callbacks() {
         .wrapping_add(misalign)
         .cast::<c_void>();
 
+    let sv_v = StrView::from_str("v");
+    let sv_u = StrView::from_str("u");
+    let sv_u32 = StrView::from_str("u32");
+    let sl_1234 = FfiSlice::from_slice(&[1, 2, 3, 4]);
+    let sl_42 = FfiSlice::from_slice(&[42, 0, 0, 0]);
+    let sl_1 = FfiSlice::from_slice(&[1]);
+    let sl_7 = FfiSlice::from_slice(&[7, 0, 0, 0]);
+
     // 1. `forward_field`: null/misaligned ctx, rejection from `import_fn`, and valid forwarding.
     // SAFETY: Null/alignment guards reject before dereferencing `ctx`.
     let fwd_null = unsafe {
         forward_field(
             core::ptr::null_mut(),
-            StrView::from_str("v"),
-            StrView::from_str("u32"),
-            FfiSlice::from_slice(&[1, 2, 3, 4]),
+            &raw const sv_v,
+            &raw const sv_u32,
+            &raw const sl_1234,
         )
     };
     assert_eq!(fwd_null, FfiResult::INVALID_ARGUMENT);
@@ -3259,22 +3464,22 @@ fn po_g8_non_pod_message_witness_callbacks() {
     let fwd_misaligned = unsafe {
         forward_field(
             bad_sink_ctx,
-            StrView::from_str("v"),
-            StrView::from_str("u32"),
-            FfiSlice::from_slice(&[1, 2, 3, 4]),
+            &raw const sv_v,
+            &raw const sv_u32,
+            &raw const sl_1234,
         )
     };
     assert_eq!(fwd_misaligned, FfiResult::INVALID_ARGUMENT);
 
     let fwd_want_err: bool = kani::any();
-    let fwd_name = if fwd_want_err { "" } else { "v" };
+    let fwd_name = StrView::from_str(if fwd_want_err { "" } else { "v" });
     // SAFETY: `sink_ctx_ptr` is aligned and points to live `ImportSinkCtx` for this call.
     let fwd_res = unsafe {
         forward_field(
             sink_ctx_ptr,
-            StrView::from_str(fwd_name),
-            StrView::from_str("u32"),
-            FfiSlice::from_slice(&[42, 0, 0, 0]),
+            &raw const fwd_name,
+            &raw const sv_u32,
+            &raw const sl_42,
         )
     };
     if fwd_want_err {
@@ -3298,9 +3503,9 @@ fn po_g8_non_pod_message_witness_callbacks() {
         unsafe {
             append_field(
                 core::ptr::null_mut(),
-                StrView::from_str("v"),
-                StrView::from_str("u32"),
-                FfiSlice::from_slice(&[1]),
+                &raw const sv_v,
+                &raw const sv_u32,
+                &raw const sl_1,
             )
         },
         FfiResult::INVALID_ARGUMENT
@@ -3310,9 +3515,9 @@ fn po_g8_non_pod_message_witness_callbacks() {
         unsafe {
             append_field(
                 bad_builder_ctx,
-                StrView::from_str("v"),
-                StrView::from_str("u32"),
-                FfiSlice::from_slice(&[1]),
+                &raw const sv_v,
+                &raw const sv_u32,
+                &raw const sl_1,
             )
         },
         FfiResult::INVALID_ARGUMENT
@@ -3325,15 +3530,25 @@ fn po_g8_non_pod_message_witness_callbacks() {
         len: 1,
     };
     let dummy_byte: u8 = 0;
+    let bad_sl_null = FfiSlice {
+        ptr: core::ptr::null(),
+        len: 4,
+    };
+    let bad_sl_len = FfiSlice {
+        ptr: &raw const dummy_byte,
+        len: (isize::MAX as usize) + 1,
+    };
+    let empty_sv = StrView::empty();
+    let empty_sl = FfiSlice::empty();
     let app_res = match app_case {
         0 => {
             // SAFETY: Null non-empty `field_name` rejected with NULL_POINTER.
             unsafe {
                 append_field(
                     builder_ptr,
-                    bad_str,
-                    StrView::from_str("u"),
-                    FfiSlice::from_slice(&[1]),
+                    &raw const bad_str,
+                    &raw const sv_u,
+                    &raw const sl_1,
                 )
             }
         }
@@ -3342,9 +3557,9 @@ fn po_g8_non_pod_message_witness_callbacks() {
             unsafe {
                 append_field(
                     builder_ptr,
-                    StrView::from_str("v"),
-                    bad_str,
-                    FfiSlice::from_slice(&[1]),
+                    &raw const sv_v,
+                    &raw const bad_str,
+                    &raw const sl_1,
                 )
             }
         }
@@ -3353,12 +3568,9 @@ fn po_g8_non_pod_message_witness_callbacks() {
             unsafe {
                 append_field(
                     builder_ptr,
-                    StrView::from_str("v"),
-                    StrView::from_str("u"),
-                    FfiSlice {
-                        ptr: core::ptr::null(),
-                        len: 4,
-                    },
+                    &raw const sv_v,
+                    &raw const sv_u,
+                    &raw const bad_sl_null,
                 )
             }
         }
@@ -3367,12 +3579,9 @@ fn po_g8_non_pod_message_witness_callbacks() {
             unsafe {
                 append_field(
                     builder_ptr,
-                    StrView::from_str("v"),
-                    StrView::from_str("u"),
-                    FfiSlice {
-                        ptr: &raw const dummy_byte,
-                        len: (isize::MAX as usize) + 1,
-                    },
+                    &raw const sv_v,
+                    &raw const sv_u,
+                    &raw const bad_sl_len,
                 )
             }
         }
@@ -3382,9 +3591,9 @@ fn po_g8_non_pod_message_witness_callbacks() {
             unsafe {
                 append_field(
                     builder_ptr,
-                    StrView::from_str("v"),
-                    StrView::from_str("u"),
-                    FfiSlice::from_slice(&[7, 0, 0, 0]),
+                    &raw const sv_v,
+                    &raw const sv_u,
+                    &raw const sl_7,
                 )
             }
         }
@@ -3393,9 +3602,9 @@ fn po_g8_non_pod_message_witness_callbacks() {
             unsafe {
                 append_field(
                     builder_ptr,
-                    StrView::empty(),
-                    StrView::empty(),
-                    FfiSlice::empty(),
+                    &raw const empty_sv,
+                    &raw const empty_sv,
+                    &raw const empty_sl,
                 )
             }
         }
@@ -3404,9 +3613,9 @@ fn po_g8_non_pod_message_witness_callbacks() {
             unsafe {
                 append_field(
                     builder_ptr,
-                    StrView::from_str("v"),
-                    StrView::from_str("u"),
-                    FfiSlice::from_slice(&[7, 0, 0, 0]),
+                    &raw const sv_v,
+                    &raw const sv_u,
+                    &raw const sl_7,
                 )
             }
         }

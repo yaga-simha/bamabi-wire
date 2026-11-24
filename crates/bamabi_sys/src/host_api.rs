@@ -8,9 +8,10 @@ use core::{
 use crate::{
     access::ScheduleId,
     commands::{
-        BamCmdCloneEntityFn, BamCmdDespawnAllFn, BamCmdDespawnFn, BamCmdInsertDefaultFn,
-        BamCmdInsertFn, BamCmdInsertResourceFn, BamCmdObserveFn, BamCmdRemoveFn,
-        BamCmdRemoveResourceFn, BamCmdSpawnBatchFn, BamCmdSpawnEmptyFn, BamCmdSpawnFn,
+        BamCmdCloneEntityFn, BamCmdDespawnAllFn, BamCmdDespawnBatchFn, BamCmdDespawnFn,
+        BamCmdInsertBatchFn, BamCmdInsertDefaultFn, BamCmdInsertFn, BamCmdInsertResourceFn,
+        BamCmdObserveFn, BamCmdRemoveBatchFn, BamCmdRemoveFn, BamCmdRemoveResourceFn,
+        BamCmdSpawnBatchExFn, BamCmdSpawnBatchFn, BamCmdSpawnEmptyFn, BamCmdSpawnFn,
         BamCmdSpawnSceneFn, BamCmdTriggerExFn, BamCmdTriggerFn, BamCommands,
     },
     component::{
@@ -20,16 +21,21 @@ use crate::{
     iter::{
         BamChangeTicks, BamIter, BamIterColumnInfoFn, BamIterColumnMutableFn,
         BamIterColumnMutableUntrackedFn, BamIterColumnReadonlyFn, BamIterColumnRowsMutableFn,
-        BamIterColumnRowsReadonlyFn, BamIterColumnTicksFn, BamIterEntitiesFn,
-        BamIterMarkChangedRangeFn, BamIterNextChunkBatchFn, BamIterNextChunkFn,
-        BamIterReadRemovedFn, BamIterResetFn, BamMsgReadBatchFn, BamMsgSendFn, BamMsgWriteBatchFn,
-        BamParForEachChunkFn, BamResMutPtrFn, BamResPtrFn, BamResTicksFn,
+        BamIterColumnRowsMutableUntrackedFn, BamIterColumnRowsReadonlyFn, BamIterColumnTicksFn,
+        BamIterEntitiesFn, BamIterMarkChangedRangeFn, BamIterMarkChangedRangesFn,
+        BamIterNextChunkBatchFn, BamIterNextChunkFn, BamIterReadRemovedFn, BamIterResetFn,
+        BamMsgReadBatchFn, BamMsgReadSliceFn, BamMsgSendFn, BamMsgWriteBatchFn,
+        BamParForEachChunkExFn, BamParForEachChunkFn, BamResMutPtrFn, BamResPtrFn, BamResTicksFn,
     },
     primitives::{
         BamComponent, BamSymbol, BamSystem, BamSystemSet, ComponentUuid, FfiAssetHandle,
         FfiAssetLoadState, FfiEntity, FfiResult, StrView,
     },
-    system::{BamHostCtx, BamLoadCtx, BamObserverDesc, BamSystemCtx, BamSystemDesc},
+    system::{
+        BamHostCtx, BamLoadCtx, BamObserverDesc, BamSysCurrentTicksFn, BamSysRelationEdgeDataFn,
+        BamSysRelationSourcesFn, BamSysRelationTargetsFn, BamSysTimeInfoFn, BamSystemCtx,
+        BamSystemDesc,
+    },
     version::{ABI_VERSION, abi_version_is_compatible},
 };
 
@@ -462,18 +468,18 @@ pub type BamSysEntityChildrenFn = unsafe extern "C" fn(
     out_len: *mut usize,
 ) -> FfiResult;
 
-/// Requests asynchronous asset loading for `path` (`StrView`, e.g. `"mod://combat/sword.png"`) of
+/// Requests asynchronous asset loading for `*path` (`*const StrView`, e.g. `"mod://combat/sword.png"`) of
 /// pre-resolved `asset_type` (`BamComponent::INVALID` for untyped load when supported), retaining a
 /// strong handle on the host and writing its [`FfiAssetHandle`] into `*out_handle`.
 ///
 /// # Safety
 /// - `ctx` must point to an active [`BamHostCtx`].
-/// - `path` must point to valid UTF-8 bytes when `path.len > 0`.
+/// - `path` must point to a readable [`StrView`] whose slice is valid UTF-8 when `len > 0`.
 /// - `out_handle` must point to writable [`FfiAssetHandle`] storage.
 pub type BamAssetLoadFn = unsafe extern "C" fn(
     ctx: *const BamHostCtx,
     asset_type: BamComponent,
-    path: StrView,
+    path: *const StrView,
     out_handle: *mut FfiAssetHandle,
 ) -> FfiResult;
 
@@ -510,14 +516,14 @@ pub const BAM_LOG_WARN: u32 = 3;
 pub const BAM_LOG_ERROR: u32 = 4;
 
 /// Emits a structured guest diagnostic message via the host `tracing` subscriber
-/// (`typedef BamResult (*BamLogDiagnosticFn)(const BamHostCtx* ctx, uint32_t level, BamStrView message);`).
+/// (`typedef BamResult (*BamLogDiagnosticFn)(const BamHostCtx* ctx, uint32_t level, const BamStrView* message);`).
 pub type BamLogDiagnosticFn =
-    unsafe extern "C" fn(ctx: *const BamHostCtx, level: u32, message: StrView) -> FfiResult;
+    unsafe extern "C" fn(ctx: *const BamHostCtx, level: u32, message: *const StrView) -> FfiResult;
 
 /// Records a guest-side fatal or recoverable fault on `ctx` without unwinding across FFI
-/// (`typedef BamResult (*BamReportGuestFaultFn)(const BamHostCtx* ctx, BamStrView message);`).
+/// (`typedef BamResult (*BamReportGuestFaultFn)(const BamHostCtx* ctx, const BamStrView* message);`).
 pub type BamReportGuestFaultFn =
-    unsafe extern "C" fn(ctx: *const BamHostCtx, message: StrView) -> FfiResult;
+    unsafe extern "C" fn(ctx: *const BamHostCtx, message: *const StrView) -> FfiResult;
 
 /// Resolves a registered component or resource strictly by its 128-bit [`ComponentUuid`]
 /// (`typedef BamResult (*BamResolveComponentByUuidFn)(const BamHostCtx* ctx, const BamComponentUuid* uuid, BamComponent* out_component);`).
@@ -544,17 +550,45 @@ pub type BamRegisterRelationFn = unsafe extern "C" fn(
 ) -> FfiResult;
 
 /// Interns an arbitrary UTF-8 symbol string to an `O(1)` comparable [`BamSymbol`] handle
-/// (`typedef BamResult (*BamInternSymbolFn)(const BamHostCtx* ctx, BamStrView symbol, BamSymbol* out_symbol);`).
+/// (`typedef BamResult (*BamInternSymbolFn)(const BamHostCtx* ctx, const BamStrView* symbol, BamSymbol* out_symbol);`).
 pub type BamInternSymbolFn = unsafe extern "C" fn(
     ctx: *const BamHostCtx,
-    symbol: StrView,
+    symbol: *const StrView,
     out_symbol: *mut BamSymbol,
 ) -> FfiResult;
 
 /// Binds a canonical lookup name to an entity in the host symbol registry
-/// (`typedef BamResult (*BamBindNamedObjectFn)(const BamHostCtx* ctx, BamStrView name, BamEntity entity);`).
-pub type BamBindNamedObjectFn =
-    unsafe extern "C" fn(ctx: *const BamHostCtx, name: StrView, entity: FfiEntity) -> FfiResult;
+/// (`typedef BamResult (*BamBindNamedObjectFn)(const BamHostCtx* ctx, const BamStrView* name, BamEntity entity);`).
+pub type BamBindNamedObjectFn = unsafe extern "C" fn(
+    ctx: *const BamHostCtx,
+    name: *const StrView,
+    entity: FfiEntity,
+) -> FfiResult;
+
+/// Resolves a named object previously bound via [`BamBindNamedObjectFn`] back to its [`FfiEntity`]
+/// (`typedef BamResult (*BamResolveNamedObjectFn)(const BamHostCtx* ctx, const BamStrView* name, BamEntity* out_entity);`).
+///
+/// # Safety
+/// - `ctx` must point to an active [`BamHostCtx`].
+/// - `name` must point to a readable [`StrView`].
+/// - `out_entity` must point to writable [`FfiEntity`] storage.
+pub type BamResolveNamedObjectFn = unsafe extern "C" fn(
+    ctx: *const BamHostCtx,
+    name: *const StrView,
+    out_entity: *mut FfiEntity,
+) -> FfiResult;
+
+/// Resolves an interned [`BamSymbol`] back to its UTF-8 string slice in `*out_str`
+/// (`typedef BamResult (*BamResolveSymbolStrFn)(const BamHostCtx* ctx, BamSymbol symbol, BamStrView* out_str);`).
+///
+/// # Safety
+/// - `ctx` must point to an active [`BamHostCtx`].
+/// - `out_str` must point to writable [`StrView`] storage.
+pub type BamResolveSymbolStrFn = unsafe extern "C" fn(
+    ctx: *const BamHostCtx,
+    symbol: BamSymbol,
+    out_str: *mut StrView,
+) -> FfiResult;
 
 /// Counts matching entities in an active query iterator without destroying chunks
 /// (`typedef BamResult (*BamIterCountFn)(BamIter* iter, size_t* out_count);`).
@@ -660,8 +694,8 @@ pub type BamMigrateComponentColumnFn = unsafe extern "C" fn(
     user_data: *mut c_void,
 ) -> FfiResult;
 
-/// Total number of function-pointer slots in the ABI `0.3.0` [`BamHostApi`] table (`73`).
-pub const BAM_HOST_API_SLOT_COUNT: usize = 73;
+/// Total number of function-pointer slots in the ABI `0.4.0` [`BamHostApi`] table (`90`).
+pub const BAM_HOST_API_SLOT_COUNT: usize = 90;
 
 /// Complete versioned host function table passed to `bamabi_init`
 /// (`typedef struct BamHostApi BamHostApi;`).
@@ -670,8 +704,8 @@ pub const BAM_HOST_API_SLOT_COUNT: usize = 73;
 /// null-pointer checks are sound without raw pointer byte-probing.
 ///
 /// Layout:
-/// - 64-bit: `MIN_V0_2_SIZE = 224` bytes (`8`B header + `27 * 8`B core slots; `MIN_V0_3_SIZE = 552` bytes for the first 68 slots; `size_of = 592` bytes with all 73 slots), `8`-byte alignment.
-/// - 32-bit: `MIN_V0_2_SIZE = 116` bytes (`8`B header + `27 * 4`B core slots; `MIN_V0_3_SIZE = 280` bytes for the first 68 slots; `size_of = 300` bytes with all 73 slots), `4`-byte alignment.
+/// - 64-bit: `MIN_V0_2_SIZE = 224` bytes (`MIN_V0_3_SIZE = 552`; `MIN_V0_4_SIZE = size_of = 728` bytes with all 90 slots), `8`-byte alignment.
+/// - 32-bit: `MIN_V0_2_SIZE = 116` bytes (`MIN_V0_3_SIZE = 280`; `MIN_V0_4_SIZE = size_of = 368` bytes with all 90 slots), `4`-byte alignment.
 #[repr(C)]
 #[derive(Debug, Copy, Clone)]
 pub struct BamHostApi {
@@ -843,6 +877,42 @@ pub struct BamHostApi {
     pub cmd_insert_resource: Option<BamCmdInsertResourceFn>,
     /// Queue deferred singleton resource removal (`offset 584` / `296`).
     pub cmd_remove_resource: Option<BamCmdRemoveResourceFn>,
+
+    // ABI `0.4.0` extended registration, zero-copy messaging, time, relations, and batch commands
+    /// Register a singleton `Resource` descriptor -> [`BamComponent`] (`offset 592` / `300`).
+    pub register_resource: Option<BamRegisterComponentFn>,
+    /// Register a buffered `Messages<M>` descriptor -> [`BamComponent`] (`offset 600` / `304`).
+    pub register_message: Option<BamRegisterComponentFn>,
+    /// Resolve a named object back to its [`FfiEntity`] (`offset 608` / `308`).
+    pub resolve_named_object: Option<BamResolveNamedObjectFn>,
+    /// Resolve an interned [`BamSymbol`] back to its UTF-8 [`StrView`] (`offset 616` / `312`).
+    pub resolve_symbol_str: Option<BamResolveSymbolStrFn>,
+    /// Borrow indirect `[ *mut u8; chunk_len ]` pointers without marking ticks (`offset 624` / `316`).
+    pub iter_column_rows_mutable_untracked: Option<BamIterColumnRowsMutableUntrackedFn>,
+    /// Mark multiple [`BamRowRange`](crate::BamRowRange) spans changed in one FFI call (`offset 632` / `320`).
+    pub iter_mark_changed_ranges: Option<BamIterMarkChangedRangesFn>,
+    /// Query active system's `(last_run, this_run)` ticks (`offset 640` / `324`).
+    pub sys_current_ticks: Option<BamSysCurrentTicksFn>,
+    /// Query frame and fixed-timestep [`BamTimeInfo`](crate::BamTimeInfo) (`offset 648` / `328`).
+    pub sys_time_info: Option<BamSysTimeInfoFn>,
+    /// Extended parallel chunk iteration with [`BamParOptions`](crate::BamParOptions) and partition commands (`offset 656` / `332`).
+    pub par_for_each_chunk_ex: Option<BamParForEachChunkExFn>,
+    /// Query outgoing relationship target entities (`offset 664` / `336`).
+    pub sys_relation_targets: Option<BamSysRelationTargetsFn>,
+    /// Query incoming relationship source entities (`offset 672` / `340`).
+    pub sys_relation_sources: Option<BamSysRelationSourcesFn>,
+    /// Query relationship edge payload bytes (`offset 680` / `344`).
+    pub sys_relation_edge_data: Option<BamSysRelationEdgeDataFn>,
+    /// Queue batched entity despawning (`offset 688` / `348`).
+    pub cmd_despawn_batch: Option<BamCmdDespawnBatchFn>,
+    /// Queue batched component insertion (`offset 696` / `352`).
+    pub cmd_insert_batch: Option<BamCmdInsertBatchFn>,
+    /// Queue batched component removal (`offset 704` / `356`).
+    pub cmd_remove_batch: Option<BamCmdRemoveBatchFn>,
+    /// Zero-copy slice reader for buffered `Messages<M>` (`offset 712` / `360`).
+    pub msg_read_slice: Option<BamMsgReadSliceFn>,
+    /// Extended SoA batch spawning supporting dense and splat columns (`offset 720` / `364`).
+    pub cmd_spawn_batch_ex: Option<BamCmdSpawnBatchExFn>,
 }
 
 impl BamHostApi {
@@ -853,6 +923,9 @@ impl BamHostApi {
     /// Frozen minimum valid `BamHostApi` size in ABI `0.3` (`552` on 64-bit, `280` on 32-bit, first 68 slots).
     pub const MIN_V0_3_SIZE: usize = core::mem::offset_of!(Self, migrate_component_column)
         + core::mem::size_of::<Option<BamMigrateComponentColumnFn>>();
+
+    /// Frozen full `BamHostApi` size in ABI `0.4` (`728` on 64-bit, `368` on 32-bit, all 90 slots).
+    pub const MIN_V0_4_SIZE: usize = core::mem::size_of::<Self>();
 
     /// Safely reads the `struct_size` header at offset `0` from a potentially smaller `BamHostApi`
     /// allocation without forming a full `&BamHostApi` reference.
@@ -978,7 +1051,29 @@ impl BamHostApi {
             && self.migrate_component_column.is_some()
     }
 
-    /// Returns `true` if all 73 ABI `0.3` function-pointer slots are `Some`.
+    /// Returns `true` if all 17 ABI `0.4` tail slots (`73..=89`) are `Some`.
+    #[inline]
+    pub const fn has_all_v0_4_slots(&self) -> bool {
+        self.register_resource.is_some()
+            && self.register_message.is_some()
+            && self.resolve_named_object.is_some()
+            && self.resolve_symbol_str.is_some()
+            && self.iter_column_rows_mutable_untracked.is_some()
+            && self.iter_mark_changed_ranges.is_some()
+            && self.sys_current_ticks.is_some()
+            && self.sys_time_info.is_some()
+            && self.par_for_each_chunk_ex.is_some()
+            && self.sys_relation_targets.is_some()
+            && self.sys_relation_sources.is_some()
+            && self.sys_relation_edge_data.is_some()
+            && self.cmd_despawn_batch.is_some()
+            && self.cmd_insert_batch.is_some()
+            && self.cmd_remove_batch.is_some()
+            && self.msg_read_slice.is_some()
+            && self.cmd_spawn_batch_ex.is_some()
+    }
+
+    /// Returns `true` if all 90 ABI `0.4` function-pointer slots (`0..=89`) are `Some`.
     #[inline]
     pub const fn has_all_slots(&self) -> bool {
         self.has_all_v0_2_extended_slots()
@@ -988,6 +1083,7 @@ impl BamHostApi {
             && self.cmd_clone_entity.is_some()
             && self.cmd_insert_resource.is_some()
             && self.cmd_remove_resource.is_some()
+            && self.has_all_v0_4_slots()
     }
 
     /// Validates `struct_size >= MIN_V0_2_SIZE`, SemVer compatibility against `guest_version`,
@@ -1009,12 +1105,14 @@ impl BamHostApi {
 
 const _: () = {
     assert!(BamHostApi::MIN_V0_2_SIZE <= BamHostApi::MIN_V0_3_SIZE);
-    assert!(BamHostApi::MIN_V0_3_SIZE <= core::mem::size_of::<BamHostApi>());
+    assert!(BamHostApi::MIN_V0_3_SIZE <= BamHostApi::MIN_V0_4_SIZE);
+    assert!(BamHostApi::MIN_V0_4_SIZE == core::mem::size_of::<BamHostApi>());
     #[cfg(target_pointer_width = "64")]
     {
         assert!(BamHostApi::MIN_V0_2_SIZE == 224);
         assert!(BamHostApi::MIN_V0_3_SIZE == 552);
-        assert!(core::mem::size_of::<BamHostApi>() == 592);
+        assert!(BamHostApi::MIN_V0_4_SIZE == 728);
+        assert!(core::mem::size_of::<BamHostApi>() == 728);
         assert!(core::mem::align_of::<BamHostApi>() == 8);
         assert!(core::mem::offset_of!(BamHostApi, struct_size) == 0);
         assert!(core::mem::offset_of!(BamHostApi, abi_version) == 4);
@@ -1091,12 +1189,30 @@ const _: () = {
         assert!(core::mem::offset_of!(BamHostApi, cmd_clone_entity) == 568);
         assert!(core::mem::offset_of!(BamHostApi, cmd_insert_resource) == 576);
         assert!(core::mem::offset_of!(BamHostApi, cmd_remove_resource) == 584);
+        assert!(core::mem::offset_of!(BamHostApi, register_resource) == 592);
+        assert!(core::mem::offset_of!(BamHostApi, register_message) == 600);
+        assert!(core::mem::offset_of!(BamHostApi, resolve_named_object) == 608);
+        assert!(core::mem::offset_of!(BamHostApi, resolve_symbol_str) == 616);
+        assert!(core::mem::offset_of!(BamHostApi, iter_column_rows_mutable_untracked) == 624);
+        assert!(core::mem::offset_of!(BamHostApi, iter_mark_changed_ranges) == 632);
+        assert!(core::mem::offset_of!(BamHostApi, sys_current_ticks) == 640);
+        assert!(core::mem::offset_of!(BamHostApi, sys_time_info) == 648);
+        assert!(core::mem::offset_of!(BamHostApi, par_for_each_chunk_ex) == 656);
+        assert!(core::mem::offset_of!(BamHostApi, sys_relation_targets) == 664);
+        assert!(core::mem::offset_of!(BamHostApi, sys_relation_sources) == 672);
+        assert!(core::mem::offset_of!(BamHostApi, sys_relation_edge_data) == 680);
+        assert!(core::mem::offset_of!(BamHostApi, cmd_despawn_batch) == 688);
+        assert!(core::mem::offset_of!(BamHostApi, cmd_insert_batch) == 696);
+        assert!(core::mem::offset_of!(BamHostApi, cmd_remove_batch) == 704);
+        assert!(core::mem::offset_of!(BamHostApi, msg_read_slice) == 712);
+        assert!(core::mem::offset_of!(BamHostApi, cmd_spawn_batch_ex) == 720);
     }
     #[cfg(target_pointer_width = "32")]
     {
         assert!(BamHostApi::MIN_V0_2_SIZE == 116);
         assert!(BamHostApi::MIN_V0_3_SIZE == 280);
-        assert!(core::mem::size_of::<BamHostApi>() == 300);
+        assert!(BamHostApi::MIN_V0_4_SIZE == 368);
+        assert!(core::mem::size_of::<BamHostApi>() == 368);
         assert!(core::mem::align_of::<BamHostApi>() == 4);
         assert!(core::mem::offset_of!(BamHostApi, struct_size) == 0);
         assert!(core::mem::offset_of!(BamHostApi, abi_version) == 4);
@@ -1173,6 +1289,23 @@ const _: () = {
         assert!(core::mem::offset_of!(BamHostApi, cmd_clone_entity) == 288);
         assert!(core::mem::offset_of!(BamHostApi, cmd_insert_resource) == 292);
         assert!(core::mem::offset_of!(BamHostApi, cmd_remove_resource) == 296);
+        assert!(core::mem::offset_of!(BamHostApi, register_resource) == 300);
+        assert!(core::mem::offset_of!(BamHostApi, register_message) == 304);
+        assert!(core::mem::offset_of!(BamHostApi, resolve_named_object) == 308);
+        assert!(core::mem::offset_of!(BamHostApi, resolve_symbol_str) == 312);
+        assert!(core::mem::offset_of!(BamHostApi, iter_column_rows_mutable_untracked) == 316);
+        assert!(core::mem::offset_of!(BamHostApi, iter_mark_changed_ranges) == 320);
+        assert!(core::mem::offset_of!(BamHostApi, sys_current_ticks) == 324);
+        assert!(core::mem::offset_of!(BamHostApi, sys_time_info) == 328);
+        assert!(core::mem::offset_of!(BamHostApi, par_for_each_chunk_ex) == 332);
+        assert!(core::mem::offset_of!(BamHostApi, sys_relation_targets) == 336);
+        assert!(core::mem::offset_of!(BamHostApi, sys_relation_sources) == 340);
+        assert!(core::mem::offset_of!(BamHostApi, sys_relation_edge_data) == 344);
+        assert!(core::mem::offset_of!(BamHostApi, cmd_despawn_batch) == 348);
+        assert!(core::mem::offset_of!(BamHostApi, cmd_insert_batch) == 352);
+        assert!(core::mem::offset_of!(BamHostApi, cmd_remove_batch) == 356);
+        assert!(core::mem::offset_of!(BamHostApi, msg_read_slice) == 360);
+        assert!(core::mem::offset_of!(BamHostApi, cmd_spawn_batch_ex) == 364);
     }
 };
 
@@ -1184,15 +1317,15 @@ unsafe impl ExtensibleStruct for BamHostApi {
 
 /// Compile-time byte offsets for every header field and function-pointer slot of [`BamHostApi`].
 ///
-/// Exports three constant families for all 75 fields of [`BamHostApi`] (`struct_size`,
-/// `abi_version`, and all 73 function-pointer slots):
+/// Exports three constant families for all 92 fields of [`BamHostApi`] (`struct_size`,
+/// `abi_version`, and all 90 function-pointer slots):
 ///
 /// - `<FIELD>`: Pointer-width-native byte offset (`core::mem::offset_of!(BamHostApi, <field>)`)
 ///   for the active compilation target.
 /// - `OFF64_<FIELD>`: Architecture-independent 64-bit byte offset (`struct_size` at `0`,
-///   `abi_version` at `4`, slot `k` at `8 + 8 * k`, total [`offsets::SIZE_64`] = `592` bytes).
+///   `abi_version` at `4`, slot `k` at `8 + 8 * k`, total [`offsets::SIZE_64`] = `728` bytes).
 /// - `OFF32_<FIELD>`: Architecture-independent 32-bit byte offset (`struct_size` at `0`,
-///   `abi_version` at `4`, slot `k` at `8 + 4 * k`, total [`offsets::SIZE_32`] = `300` bytes).
+///   `abi_version` at `4`, slot `k` at `8 + 4 * k`, total [`offsets::SIZE_32`] = `368` bytes).
 ///
 /// Cross-target code generators and JIT backends (such as `bql_jit`) can import exact slot
 /// offsets without hardcoding magic numbers, while compile-time assertions guarantee agreement
@@ -1200,14 +1333,14 @@ unsafe impl ExtensibleStruct for BamHostApi {
 pub mod offsets {
     use super::{BAM_HOST_API_SLOT_COUNT, BamHostApi};
 
-    /// Total number of function-pointer slots in ABI `0.3.0` [`BamHostApi`] (`73`).
+    /// Total number of function-pointer slots in ABI `0.4.0` [`BamHostApi`] (`90`).
     pub const SLOT_COUNT: usize = BAM_HOST_API_SLOT_COUNT;
 
-    /// Total byte size of ABI `0.3.0` [`BamHostApi`] on 64-bit targets (`592` bytes).
-    pub const SIZE_64: usize = 592;
+    /// Total byte size of ABI `0.4.0` [`BamHostApi`] on 64-bit targets (`728` bytes).
+    pub const SIZE_64: usize = 728;
 
-    /// Total byte size of ABI `0.3.0` [`BamHostApi`] on 32-bit targets (`300` bytes).
-    pub const SIZE_32: usize = 300;
+    /// Total byte size of ABI `0.4.0` [`BamHostApi`] on 32-bit targets (`368` bytes).
+    pub const SIZE_32: usize = 368;
 
     macro_rules! define_host_api_offsets {
         (
@@ -1286,8 +1419,11 @@ pub mod offsets {
                 pub const $s_off32: usize = $s_val32;
             )*
 
+            /// Ordered native byte offsets for all 90 `BamHostApi` slots (`0..90`).
+            pub const ALL_SLOT_OFFSETS: [usize; SLOT_COUNT] = [ $($s_native),* ];
+
             const _: () = {
-                assert!(SLOT_COUNT == 73);
+                assert!(SLOT_COUNT == 90);
                 assert!(SIZE_64 == 8 + 8 * SLOT_COUNT);
                 assert!(SIZE_32 == 8 + 4 * SLOT_COUNT);
                 $(
@@ -1399,6 +1535,23 @@ pub mod offsets {
             (70, cmd_clone_entity, CMD_CLONE_ENTITY, OFF64_CMD_CLONE_ENTITY, 568, OFF32_CMD_CLONE_ENTITY, 288),
             (71, cmd_insert_resource, CMD_INSERT_RESOURCE, OFF64_CMD_INSERT_RESOURCE, 576, OFF32_CMD_INSERT_RESOURCE, 292),
             (72, cmd_remove_resource, CMD_REMOVE_RESOURCE, OFF64_CMD_REMOVE_RESOURCE, 584, OFF32_CMD_REMOVE_RESOURCE, 296),
+            (73, register_resource, REGISTER_RESOURCE, OFF64_REGISTER_RESOURCE, 592, OFF32_REGISTER_RESOURCE, 300),
+            (74, register_message, REGISTER_MESSAGE, OFF64_REGISTER_MESSAGE, 600, OFF32_REGISTER_MESSAGE, 304),
+            (75, resolve_named_object, RESOLVE_NAMED_OBJECT, OFF64_RESOLVE_NAMED_OBJECT, 608, OFF32_RESOLVE_NAMED_OBJECT, 308),
+            (76, resolve_symbol_str, RESOLVE_SYMBOL_STR, OFF64_RESOLVE_SYMBOL_STR, 616, OFF32_RESOLVE_SYMBOL_STR, 312),
+            (77, iter_column_rows_mutable_untracked, ITER_COLUMN_ROWS_MUTABLE_UNTRACKED, OFF64_ITER_COLUMN_ROWS_MUTABLE_UNTRACKED, 624, OFF32_ITER_COLUMN_ROWS_MUTABLE_UNTRACKED, 316),
+            (78, iter_mark_changed_ranges, ITER_MARK_CHANGED_RANGES, OFF64_ITER_MARK_CHANGED_RANGES, 632, OFF32_ITER_MARK_CHANGED_RANGES, 320),
+            (79, sys_current_ticks, SYS_CURRENT_TICKS, OFF64_SYS_CURRENT_TICKS, 640, OFF32_SYS_CURRENT_TICKS, 324),
+            (80, sys_time_info, SYS_TIME_INFO, OFF64_SYS_TIME_INFO, 648, OFF32_SYS_TIME_INFO, 328),
+            (81, par_for_each_chunk_ex, PAR_FOR_EACH_CHUNK_EX, OFF64_PAR_FOR_EACH_CHUNK_EX, 656, OFF32_PAR_FOR_EACH_CHUNK_EX, 332),
+            (82, sys_relation_targets, SYS_RELATION_TARGETS, OFF64_SYS_RELATION_TARGETS, 664, OFF32_SYS_RELATION_TARGETS, 336),
+            (83, sys_relation_sources, SYS_RELATION_SOURCES, OFF64_SYS_RELATION_SOURCES, 672, OFF32_SYS_RELATION_SOURCES, 340),
+            (84, sys_relation_edge_data, SYS_RELATION_EDGE_DATA, OFF64_SYS_RELATION_EDGE_DATA, 680, OFF32_SYS_RELATION_EDGE_DATA, 344),
+            (85, cmd_despawn_batch, CMD_DESPAWN_BATCH, OFF64_CMD_DESPAWN_BATCH, 688, OFF32_CMD_DESPAWN_BATCH, 348),
+            (86, cmd_insert_batch, CMD_INSERT_BATCH, OFF64_CMD_INSERT_BATCH, 696, OFF32_CMD_INSERT_BATCH, 352),
+            (87, cmd_remove_batch, CMD_REMOVE_BATCH, OFF64_CMD_REMOVE_BATCH, 704, OFF32_CMD_REMOVE_BATCH, 356),
+            (88, msg_read_slice, MSG_READ_SLICE, OFF64_MSG_READ_SLICE, 712, OFF32_MSG_READ_SLICE, 360),
+            (89, cmd_spawn_batch_ex, CMD_SPAWN_BATCH_EX, OFF64_CMD_SPAWN_BATCH_EX, 720, OFF32_CMD_SPAWN_BATCH_EX, 364),
         ]
     }
 }
@@ -1407,17 +1560,17 @@ pub mod offsets {
 mod offset_tests {
     use super::{BAM_HOST_API_SLOT_COUNT, BamHostApi, offsets};
 
-    /// Test scenario (Proof Obligation PO-W6): verifies that `BAM_HOST_API_SLOT_COUNT == 73`,
-    /// `SIZE_64 == 592`, `SIZE_32 == 300`, header offsets sit at `0`/`4`, every slot `k` in
-    /// `0..73` satisfies `OFF64_k == 8 + 8*k` and `OFF32_k == 8 + 4*k` matching native
-    /// `offset_of!`, and `MIN_V0_2_SIZE`/`MIN_V0_3_SIZE` terminate exactly after `cmd_remove`
-    /// and `migrate_component_column` respectively.
+    /// Test scenario (Proof Obligation PO-W6): verifies that `BAM_HOST_API_SLOT_COUNT == 90`,
+    /// `SIZE_64 == 728`, `SIZE_32 == 368`, header offsets sit at `0`/`4`, every slot `k` in
+    /// `0..90` satisfies `OFF64_k == 8 + 8*k` and `OFF32_k == 8 + 4*k` matching native
+    /// `offset_of!`, and `MIN_V0_2_SIZE`/`MIN_V0_3_SIZE`/`MIN_V0_4_SIZE` match expected boundaries.
     #[test]
-    fn host_api_offset_constants_cover_all_73_slots_monotonically() {
-        assert_eq!(BAM_HOST_API_SLOT_COUNT, 73);
-        assert_eq!(offsets::SLOT_COUNT, 73);
-        assert_eq!(offsets::SIZE_64, 592);
-        assert_eq!(offsets::SIZE_32, 300);
+    fn host_api_offset_constants_cover_all_90_slots_monotonically() {
+        assert_eq!(BAM_HOST_API_SLOT_COUNT, 90);
+        assert_eq!(offsets::SLOT_COUNT, 90);
+        assert_eq!(offsets::SIZE_64, 728);
+        assert_eq!(offsets::SIZE_32, 368);
+        assert_eq!(offsets::ALL_SLOT_OFFSETS.len(), 90);
         assert_eq!(offsets::STRUCT_SIZE, 0);
         assert_eq!(offsets::OFF64_STRUCT_SIZE, 0);
         assert_eq!(offsets::OFF32_STRUCT_SIZE, 0);
@@ -1791,11 +1944,97 @@ mod offset_tests {
                 offsets::OFF64_CMD_REMOVE_RESOURCE,
                 offsets::OFF32_CMD_REMOVE_RESOURCE,
             ),
+            (
+                offsets::REGISTER_RESOURCE,
+                offsets::OFF64_REGISTER_RESOURCE,
+                offsets::OFF32_REGISTER_RESOURCE,
+            ),
+            (
+                offsets::REGISTER_MESSAGE,
+                offsets::OFF64_REGISTER_MESSAGE,
+                offsets::OFF32_REGISTER_MESSAGE,
+            ),
+            (
+                offsets::RESOLVE_NAMED_OBJECT,
+                offsets::OFF64_RESOLVE_NAMED_OBJECT,
+                offsets::OFF32_RESOLVE_NAMED_OBJECT,
+            ),
+            (
+                offsets::RESOLVE_SYMBOL_STR,
+                offsets::OFF64_RESOLVE_SYMBOL_STR,
+                offsets::OFF32_RESOLVE_SYMBOL_STR,
+            ),
+            (
+                offsets::ITER_COLUMN_ROWS_MUTABLE_UNTRACKED,
+                offsets::OFF64_ITER_COLUMN_ROWS_MUTABLE_UNTRACKED,
+                offsets::OFF32_ITER_COLUMN_ROWS_MUTABLE_UNTRACKED,
+            ),
+            (
+                offsets::ITER_MARK_CHANGED_RANGES,
+                offsets::OFF64_ITER_MARK_CHANGED_RANGES,
+                offsets::OFF32_ITER_MARK_CHANGED_RANGES,
+            ),
+            (
+                offsets::SYS_CURRENT_TICKS,
+                offsets::OFF64_SYS_CURRENT_TICKS,
+                offsets::OFF32_SYS_CURRENT_TICKS,
+            ),
+            (
+                offsets::SYS_TIME_INFO,
+                offsets::OFF64_SYS_TIME_INFO,
+                offsets::OFF32_SYS_TIME_INFO,
+            ),
+            (
+                offsets::PAR_FOR_EACH_CHUNK_EX,
+                offsets::OFF64_PAR_FOR_EACH_CHUNK_EX,
+                offsets::OFF32_PAR_FOR_EACH_CHUNK_EX,
+            ),
+            (
+                offsets::SYS_RELATION_TARGETS,
+                offsets::OFF64_SYS_RELATION_TARGETS,
+                offsets::OFF32_SYS_RELATION_TARGETS,
+            ),
+            (
+                offsets::SYS_RELATION_SOURCES,
+                offsets::OFF64_SYS_RELATION_SOURCES,
+                offsets::OFF32_SYS_RELATION_SOURCES,
+            ),
+            (
+                offsets::SYS_RELATION_EDGE_DATA,
+                offsets::OFF64_SYS_RELATION_EDGE_DATA,
+                offsets::OFF32_SYS_RELATION_EDGE_DATA,
+            ),
+            (
+                offsets::CMD_DESPAWN_BATCH,
+                offsets::OFF64_CMD_DESPAWN_BATCH,
+                offsets::OFF32_CMD_DESPAWN_BATCH,
+            ),
+            (
+                offsets::CMD_INSERT_BATCH,
+                offsets::OFF64_CMD_INSERT_BATCH,
+                offsets::OFF32_CMD_INSERT_BATCH,
+            ),
+            (
+                offsets::CMD_REMOVE_BATCH,
+                offsets::OFF64_CMD_REMOVE_BATCH,
+                offsets::OFF32_CMD_REMOVE_BATCH,
+            ),
+            (
+                offsets::MSG_READ_SLICE,
+                offsets::OFF64_MSG_READ_SLICE,
+                offsets::OFF32_MSG_READ_SLICE,
+            ),
+            (
+                offsets::CMD_SPAWN_BATCH_EX,
+                offsets::OFF64_CMD_SPAWN_BATCH_EX,
+                offsets::OFF32_CMD_SPAWN_BATCH_EX,
+            ),
         ];
 
         for (slot_idx, (native, off64, off32)) in all_slots.iter().enumerate() {
             assert_eq!(*off64, 8 + 8 * slot_idx);
             assert_eq!(*off32, 8 + 4 * slot_idx);
+            assert_eq!(offsets::ALL_SLOT_OFFSETS[slot_idx], *native);
             #[cfg(target_pointer_width = "64")]
             assert_eq!(*native, *off64);
             #[cfg(target_pointer_width = "32")]
@@ -1809,6 +2048,10 @@ mod offset_tests {
         assert_eq!(
             BamHostApi::MIN_V0_3_SIZE,
             offsets::MIGRATE_COMPONENT_COLUMN + core::mem::size_of::<usize>()
+        );
+        assert_eq!(
+            BamHostApi::MIN_V0_4_SIZE,
+            offsets::CMD_SPAWN_BATCH_EX + core::mem::size_of::<usize>()
         );
     }
 }

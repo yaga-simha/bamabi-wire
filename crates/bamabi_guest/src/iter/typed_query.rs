@@ -1,6 +1,6 @@
 //! Typed tuple queries without magic column indices.
 //!
-//! Sealed over tuples of arity 1 through 16 (as well as single-term queries) covering `&T`,
+//! Sealed over flat tuples of arity 1 through 32 (as well as single-term queries) covering `&T`,
 //! `&mut T`, `Option<&T>`, `Option<&mut T>`, [`With<T>`], [`Without<T>`], [`Changed<T>`],
 //! [`Added<T>`], [`Allow<T>`], [`Has<T>`], [`Or<(T0, T1, ...)>`] (2..=8 filter terms, with
 //! [`Or2`] and [`Or3`] type aliases), and [`FfiEntity`] where `T: GuestComponent`.
@@ -10,9 +10,11 @@ use core::{
     ops::{Deref, DerefMut},
 };
 
-use bamabi_guest_sys::{BatchColCache, ChunkColumnDispenser, Host};
+use bamabi_guest_sys::{
+    BatchColCache, ChunkColumnDispenser, Host, SelectiveMutSlice, SparseRows, SparseRowsMut,
+};
 use bamabi_sys::{
-    AccessMode, BamChangeTicks, BamComponent, BamTermDesc, FfiEntity, FfiResult,
+    AccessMode, BamChangeTicks, BamComponent, BamParOptions, BamTermDesc, FfiEntity, FfiResult,
     MAX_TERMS_PER_QUERY,
 };
 
@@ -68,6 +70,19 @@ pub struct Ref<T>(PhantomData<fn() -> T>);
 /// Mutable column query term yielding a [`MutSlice<'chunk, T>`] with per-row change-detection
 /// inspection (`is_added`, `is_changed`, `row_ticks`) via `BamHostApi::iter_column_ticks` (slot 69).
 pub struct Mut<T>(PhantomData<fn() -> T>);
+
+/// Untracked mutable column query term (`AccessMode::WRITE` + `MARK_CHANGED_MASK = 0`) yielding
+/// `&'chunk mut [T]` **without** automatically marking change ticks on chunk fetch.
+pub struct UntrackedMut<T>(PhantomData<fn() -> T>);
+
+/// Selectively change-tracked mutable column query term yielding [`SelectiveMutSlice<'chunk, T>`]
+/// (backed by [`DirtyRunCoalescer`](bamabi_sys::DirtyRunCoalescer) +
+/// `BamHostApi::iter_mark_changed_ranges`).
+pub struct SelectiveMut<T>(PhantomData<fn() -> T>);
+
+/// Sparse-set / indirect row-pointer query wrapper (`Sparse<&T>`, `Sparse<&mut T>`,
+/// `Sparse<Option<&T>>`, `Sparse<Option<&mut T>>`) yielding [`SparseRows`] / [`SparseRowsMut`].
+pub struct Sparse<T>(PhantomData<fn() -> T>);
 
 /// Read-only dense column slice paired with optional per-row change-detection tick metadata
 /// retrieved via `BamHostApi::iter_column_ticks` (slot 69).
@@ -717,6 +732,165 @@ impl<T: GuestComponent> QueryTerm for AddedMut<T> {
     }
 }
 
+impl<T: GuestComponent> private::TermSealed for UntrackedMut<T> {}
+impl<T: GuestComponent> QueryTerm for UntrackedMut<T> {
+    type Slice<'chunk> = &'chunk mut [T];
+    type StaticKey = UntrackedMut<T>;
+    const IS_READ_ONLY: bool = false;
+    const MARK_CHANGED_MASK: u32 = 0;
+
+    /// Appends an [`AccessMode::WRITE`] descriptor for `T`.
+    #[inline]
+    fn push_desc(
+        host: &Host,
+        manifest_name: &str,
+        out: &mut Vec<BamTermDesc>,
+    ) -> Result<(), FfiResult> {
+        push_resolved_term::<T>(host, manifest_name, AccessMode::WRITE, out)
+    }
+
+    /// Dispenses the UUID-verified exclusive `&mut [T]` slice **without** marking change ticks.
+    #[inline]
+    fn fetch_slice<'chunk>(
+        dispenser: &mut ChunkColumnDispenser<'chunk, '_>,
+    ) -> Result<Self::Slice<'chunk>, FfiResult> {
+        let filter = guest_uuid_filter::<T>(dispenser.base_host().manifest_name());
+        dispenser.next_write_untracked::<T>(Some(filter))
+    }
+}
+
+impl<T: GuestComponent> private::TermSealed for SelectiveMut<T> {}
+impl<T: GuestComponent> QueryTerm for SelectiveMut<T> {
+    type Slice<'chunk> = SelectiveMutSlice<'chunk, T>;
+    type StaticKey = SelectiveMut<T>;
+    const IS_READ_ONLY: bool = false;
+    const MARK_CHANGED_MASK: u32 = 0;
+
+    /// Appends an [`AccessMode::WRITE`] descriptor for `T`.
+    #[inline]
+    fn push_desc(
+        host: &Host,
+        manifest_name: &str,
+        out: &mut Vec<BamTermDesc>,
+    ) -> Result<(), FfiResult> {
+        push_resolved_term::<T>(host, manifest_name, AccessMode::WRITE, out)
+    }
+
+    /// Dispenses a [`SelectiveMutSlice<'chunk, T>`] that coalesces dirty row runs and flushes via
+    /// `iter_mark_changed_ranges` (slot 78).
+    #[inline]
+    fn fetch_slice<'chunk>(
+        dispenser: &mut ChunkColumnDispenser<'chunk, '_>,
+    ) -> Result<Self::Slice<'chunk>, FfiResult> {
+        let filter = guest_uuid_filter::<T>(dispenser.base_host().manifest_name());
+        dispenser.next_selective_write::<T>(Some(filter))
+    }
+}
+
+impl<T: GuestComponent> private::TermSealed for Sparse<&T> {}
+impl<T: GuestComponent> QueryTerm for Sparse<&T> {
+    type Slice<'chunk> = SparseRows<'chunk, T>;
+    type StaticKey = Sparse<&'static T>;
+
+    /// Appends an [`AccessMode::READ`] descriptor for sparse component `T`.
+    #[inline]
+    fn push_desc(
+        host: &Host,
+        manifest_name: &str,
+        out: &mut Vec<BamTermDesc>,
+    ) -> Result<(), FfiResult> {
+        push_resolved_term::<T>(host, manifest_name, AccessMode::READ, out)
+    }
+
+    /// Dispenses the indirect read-only [`SparseRows`] view for `T`.
+    #[inline]
+    fn fetch_slice<'chunk>(
+        dispenser: &mut ChunkColumnDispenser<'chunk, '_>,
+    ) -> Result<Self::Slice<'chunk>, FfiResult> {
+        let filter = guest_uuid_filter::<T>(dispenser.base_host().manifest_name());
+        dispenser.next_sparse_read::<T>(AccessMode::READ, Some(filter))
+    }
+}
+
+impl<T: GuestComponent> private::TermSealed for Sparse<Option<&T>> {}
+impl<T: GuestComponent> QueryTerm for Sparse<Option<&T>> {
+    type Slice<'chunk> = SparseRows<'chunk, T>;
+    type StaticKey = Sparse<Option<&'static T>>;
+
+    /// Appends an [`AccessMode::OPTIONAL_READ`] descriptor for optional sparse component `T`.
+    #[inline]
+    fn push_desc(
+        host: &Host,
+        manifest_name: &str,
+        out: &mut Vec<BamTermDesc>,
+    ) -> Result<(), FfiResult> {
+        push_resolved_term::<T>(host, manifest_name, AccessMode::OPTIONAL_READ, out)
+    }
+
+    /// Dispenses the indirect read-only [`SparseRows`] view (null rows for absent entities).
+    #[inline]
+    fn fetch_slice<'chunk>(
+        dispenser: &mut ChunkColumnDispenser<'chunk, '_>,
+    ) -> Result<Self::Slice<'chunk>, FfiResult> {
+        let filter = guest_uuid_filter::<T>(dispenser.base_host().manifest_name());
+        dispenser.next_sparse_read::<T>(AccessMode::OPTIONAL_READ, Some(filter))
+    }
+}
+
+impl<T: GuestComponent> private::TermSealed for Sparse<&mut T> {}
+impl<T: GuestComponent> QueryTerm for Sparse<&mut T> {
+    type Slice<'chunk> = SparseRowsMut<'chunk, T>;
+    type StaticKey = Sparse<&'static mut T>;
+    const IS_READ_ONLY: bool = false;
+    const MARK_CHANGED_MASK: u32 = 1;
+
+    /// Appends an [`AccessMode::WRITE`] descriptor for mutable sparse component `T`.
+    #[inline]
+    fn push_desc(
+        host: &Host,
+        manifest_name: &str,
+        out: &mut Vec<BamTermDesc>,
+    ) -> Result<(), FfiResult> {
+        push_resolved_term::<T>(host, manifest_name, AccessMode::WRITE, out)
+    }
+
+    /// Dispenses the indirect mutable [`SparseRowsMut`] view for `T`.
+    #[inline]
+    fn fetch_slice<'chunk>(
+        dispenser: &mut ChunkColumnDispenser<'chunk, '_>,
+    ) -> Result<Self::Slice<'chunk>, FfiResult> {
+        let filter = guest_uuid_filter::<T>(dispenser.base_host().manifest_name());
+        dispenser.next_sparse_write::<T>(AccessMode::WRITE, Some(filter))
+    }
+}
+
+impl<T: GuestComponent> private::TermSealed for Sparse<Option<&mut T>> {}
+impl<T: GuestComponent> QueryTerm for Sparse<Option<&mut T>> {
+    type Slice<'chunk> = SparseRowsMut<'chunk, T>;
+    type StaticKey = Sparse<Option<&'static mut T>>;
+    const IS_READ_ONLY: bool = false;
+    const MARK_CHANGED_MASK: u32 = 1;
+
+    /// Appends an [`AccessMode::OPTIONAL_WRITE`] descriptor for optional mutable sparse component `T`.
+    #[inline]
+    fn push_desc(
+        host: &Host,
+        manifest_name: &str,
+        out: &mut Vec<BamTermDesc>,
+    ) -> Result<(), FfiResult> {
+        push_resolved_term::<T>(host, manifest_name, AccessMode::OPTIONAL_WRITE, out)
+    }
+
+    /// Dispenses the indirect mutable [`SparseRowsMut`] view (null rows for absent entities).
+    #[inline]
+    fn fetch_slice<'chunk>(
+        dispenser: &mut ChunkColumnDispenser<'chunk, '_>,
+    ) -> Result<Self::Slice<'chunk>, FfiResult> {
+        let filter = guest_uuid_filter::<T>(dispenser.base_host().manifest_name());
+        dispenser.next_sparse_write::<T>(AccessMode::OPTIONAL_WRITE, Some(filter))
+    }
+}
+
 impl<T: GuestComponent> private::TermSealed for WithChanged<T> {}
 impl<T: GuestComponent> QueryTerm for WithChanged<T> {
     type Slice<'chunk> = ();
@@ -1069,7 +1243,7 @@ impl<T: OrFilterTuple> QueryTerm for Or<T> {
     }
 }
 
-/// Sealed tuple trait over 1..=16 [`QueryTerm`] items (plus single-item shorthand).
+/// Sealed flat tuple trait over `1..=32` [`QueryTerm`] items (plus single-item shorthand).
 pub trait QueryTuple: private::TupleSealed {
     /// Tuple (or single item) of chunk slices yielded per chunk.
     type Slices<'chunk>;
@@ -1214,6 +1388,12 @@ impl_single_query_tuple!(T: GuestComponent => WithChanged<T>);
 impl_single_query_tuple!(T: GuestComponent => WithAdded<T>);
 impl_single_query_tuple!(T: GuestComponent => Ref<T>);
 impl_single_query_tuple!(T: GuestComponent => Mut<T>);
+impl_single_query_tuple!(T: GuestComponent => UntrackedMut<T>);
+impl_single_query_tuple!(T: GuestComponent => SelectiveMut<T>);
+impl_single_query_tuple!('q, T: GuestComponent => Sparse<&'q T>);
+impl_single_query_tuple!('q, T: GuestComponent => Sparse<&'q mut T>);
+impl_single_query_tuple!('q, T: GuestComponent => Sparse<Option<&'q T>>);
+impl_single_query_tuple!('q, T: GuestComponent => Sparse<Option<&'q mut T>>);
 impl_single_query_tuple!(T: GuestComponent => Allow<T>);
 impl_single_query_tuple!(T: GuestComponent => Has<T>);
 
@@ -1261,9 +1441,13 @@ impl<T: OrFilterTuple> QueryTuple for Or<T> {
     }
 }
 
-/// Implements [`QueryTuple`] for fixed-arity tuples of 1..=16 [`QueryTerm`] elements.
+/// Implements [`QueryTuple`] for flat fixed-arity tuples of `1..=32` [`QueryTerm`] elements.
+///
+/// Arities `1..=6` unpack slice fields via an `#[inline(never)]` scalar argument boundary so LLVM
+/// preserves per-slice `noalias`/`readonly` attributes; arities `7..=32` forward `slices` directly
+/// to stay below Clippy's 7-argument threshold without suppression attributes.
 macro_rules! impl_query_tuple {
-    ($cap:expr => $($slice:ident : $term:ident : $var:ident),+ $(,)?) => {
+    (small => $cap:expr => $($slice:ident : $term:ident : $var:ident),+ $(,)?) => {
         impl<$($term: QueryTerm),+> private::TupleSealed for ($($term,)+) {}
 
         impl<$($term: QueryTerm),+> QueryTuple for ($($term,)+) {
@@ -1317,7 +1501,6 @@ macro_rules! impl_query_tuple {
                 R: IntoSystemResult,
             {
                 #[inline(never)]
-                #[allow(clippy::too_many_arguments)]
                 fn call_unpacked<$($slice,)+ F, R>(f: &mut F, $($var: $slice,)+) -> FfiResult
                 where
                     F: FnMut(($($slice,)+)) -> R,
@@ -1330,24 +1513,104 @@ macro_rules! impl_query_tuple {
             }
         }
     };
+    (large => $cap:expr => $($slice:ident : $term:ident : $var:ident),+ $(,)?) => {
+        impl<$($term: QueryTerm),+> private::TupleSealed for ($($term,)+) {}
+
+        impl<$($term: QueryTerm),+> QueryTuple for ($($term,)+) {
+            type Slices<'chunk> = ($($term::Slice<'chunk>,)+);
+            type StaticKey = ($($term::StaticKey,)+);
+            const IS_READ_ONLY: bool = true $(&& $term::IS_READ_ONLY)+;
+            const TERM_COUNT: usize = 0 $(+ $term::TERM_COUNT)+;
+            const NEEDS_ENTITIES: bool = false $(|| $term::NEEDS_ENTITIES)+;
+            const MARK_CHANGED_MASK: u32 = {
+                let mut mask = 0u32;
+                let mut offset = 0usize;
+                $(
+                    if offset < 32 {
+                        mask |= $term::MARK_CHANGED_MASK << offset;
+                    }
+                    offset += $term::TERM_COUNT;
+                )+
+                let _ = offset;
+                mask
+            };
+
+            /// Collects descriptors for every tuple element in declaration order.
+            #[inline]
+            fn collect_descs(
+                host: &Host,
+                manifest_name: &str,
+            ) -> Result<Vec<BamTermDesc>, FfiResult> {
+                let mut out = Vec::with_capacity($cap);
+                $(
+                    $term::push_desc(host, manifest_name, &mut out)?;
+                )+
+                Ok(out)
+            }
+
+            /// Dispenses each tuple element's slice in declaration order from `dispenser`.
+            #[inline]
+            fn fetch_slices<'chunk>(
+                dispenser: &mut ChunkColumnDispenser<'chunk, '_>,
+            ) -> Result<Self::Slices<'chunk>, FfiResult> {
+                Ok(($(
+                    $term::fetch_slice(dispenser)?,
+                )+))
+            }
+
+            /// Invokes `f(slices)` behind an `#[inline(never)]` boundary for wide 7..=32 tuples.
+            #[inline]
+            fn invoke_unpacked<F, R>(f: &mut F, slices: Self::Slices<'_>) -> FfiResult
+            where
+                F: FnMut(Self::Slices<'_>) -> R,
+                R: IntoSystemResult,
+            {
+                #[inline(never)]
+                fn call_tuple<T, F, R>(f: &mut F, slices: T) -> FfiResult
+                where
+                    F: FnMut(T) -> R,
+                    R: IntoSystemResult,
+                {
+                    f(slices).into_ffi_result()
+                }
+                call_tuple(f, slices)
+            }
+        }
+    };
 }
 
-impl_query_tuple!(1 => S0: T0: s0);
-impl_query_tuple!(2 => S0: T0: s0, S1: T1: s1);
-impl_query_tuple!(3 => S0: T0: s0, S1: T1: s1, S2: T2: s2);
-impl_query_tuple!(4 => S0: T0: s0, S1: T1: s1, S2: T2: s2, S3: T3: s3);
-impl_query_tuple!(5 => S0: T0: s0, S1: T1: s1, S2: T2: s2, S3: T3: s3, S4: T4: s4);
-impl_query_tuple!(6 => S0: T0: s0, S1: T1: s1, S2: T2: s2, S3: T3: s3, S4: T4: s4, S5: T5: s5);
-impl_query_tuple!(7 => S0: T0: s0, S1: T1: s1, S2: T2: s2, S3: T3: s3, S4: T4: s4, S5: T5: s5, S6: T6: s6);
-impl_query_tuple!(8 => S0: T0: s0, S1: T1: s1, S2: T2: s2, S3: T3: s3, S4: T4: s4, S5: T5: s5, S6: T6: s6, S7: T7: s7);
-impl_query_tuple!(9 => S0: T0: s0, S1: T1: s1, S2: T2: s2, S3: T3: s3, S4: T4: s4, S5: T5: s5, S6: T6: s6, S7: T7: s7, S8: T8: s8);
-impl_query_tuple!(10 => S0: T0: s0, S1: T1: s1, S2: T2: s2, S3: T3: s3, S4: T4: s4, S5: T5: s5, S6: T6: s6, S7: T7: s7, S8: T8: s8, S9: T9: s9);
-impl_query_tuple!(11 => S0: T0: s0, S1: T1: s1, S2: T2: s2, S3: T3: s3, S4: T4: s4, S5: T5: s5, S6: T6: s6, S7: T7: s7, S8: T8: s8, S9: T9: s9, S10: T10: s10);
-impl_query_tuple!(12 => S0: T0: s0, S1: T1: s1, S2: T2: s2, S3: T3: s3, S4: T4: s4, S5: T5: s5, S6: T6: s6, S7: T7: s7, S8: T8: s8, S9: T9: s9, S10: T10: s10, S11: T11: s11);
-impl_query_tuple!(13 => S0: T0: s0, S1: T1: s1, S2: T2: s2, S3: T3: s3, S4: T4: s4, S5: T5: s5, S6: T6: s6, S7: T7: s7, S8: T8: s8, S9: T9: s9, S10: T10: s10, S11: T11: s11, S12: T12: s12);
-impl_query_tuple!(14 => S0: T0: s0, S1: T1: s1, S2: T2: s2, S3: T3: s3, S4: T4: s4, S5: T5: s5, S6: T6: s6, S7: T7: s7, S8: T8: s8, S9: T9: s9, S10: T10: s10, S11: T11: s11, S12: T12: s12, S13: T13: s13);
-impl_query_tuple!(15 => S0: T0: s0, S1: T1: s1, S2: T2: s2, S3: T3: s3, S4: T4: s4, S5: T5: s5, S6: T6: s6, S7: T7: s7, S8: T8: s8, S9: T9: s9, S10: T10: s10, S11: T11: s11, S12: T12: s12, S13: T13: s13, S14: T14: s14);
-impl_query_tuple!(16 => S0: T0: s0, S1: T1: s1, S2: T2: s2, S3: T3: s3, S4: T4: s4, S5: T5: s5, S6: T6: s6, S7: T7: s7, S8: T8: s8, S9: T9: s9, S10: T10: s10, S11: T11: s11, S12: T12: s12, S13: T13: s13, S14: T14: s14, S15: T15: s15);
+impl_query_tuple!(small => 1 => S0: T0: s0);
+impl_query_tuple!(small => 2 => S0: T0: s0, S1: T1: s1);
+impl_query_tuple!(small => 3 => S0: T0: s0, S1: T1: s1, S2: T2: s2);
+impl_query_tuple!(small => 4 => S0: T0: s0, S1: T1: s1, S2: T2: s2, S3: T3: s3);
+impl_query_tuple!(small => 5 => S0: T0: s0, S1: T1: s1, S2: T2: s2, S3: T3: s3, S4: T4: s4);
+impl_query_tuple!(small => 6 => S0: T0: s0, S1: T1: s1, S2: T2: s2, S3: T3: s3, S4: T4: s4, S5: T5: s5);
+impl_query_tuple!(large => 7 => S0: T0: s0, S1: T1: s1, S2: T2: s2, S3: T3: s3, S4: T4: s4, S5: T5: s5, S6: T6: s6);
+impl_query_tuple!(large => 8 => S0: T0: s0, S1: T1: s1, S2: T2: s2, S3: T3: s3, S4: T4: s4, S5: T5: s5, S6: T6: s6, S7: T7: s7);
+impl_query_tuple!(large => 9 => S0: T0: s0, S1: T1: s1, S2: T2: s2, S3: T3: s3, S4: T4: s4, S5: T5: s5, S6: T6: s6, S7: T7: s7, S8: T8: s8);
+impl_query_tuple!(large => 10 => S0: T0: s0, S1: T1: s1, S2: T2: s2, S3: T3: s3, S4: T4: s4, S5: T5: s5, S6: T6: s6, S7: T7: s7, S8: T8: s8, S9: T9: s9);
+impl_query_tuple!(large => 11 => S0: T0: s0, S1: T1: s1, S2: T2: s2, S3: T3: s3, S4: T4: s4, S5: T5: s5, S6: T6: s6, S7: T7: s7, S8: T8: s8, S9: T9: s9, S10: T10: s10);
+impl_query_tuple!(large => 12 => S0: T0: s0, S1: T1: s1, S2: T2: s2, S3: T3: s3, S4: T4: s4, S5: T5: s5, S6: T6: s6, S7: T7: s7, S8: T8: s8, S9: T9: s9, S10: T10: s10, S11: T11: s11);
+impl_query_tuple!(large => 13 => S0: T0: s0, S1: T1: s1, S2: T2: s2, S3: T3: s3, S4: T4: s4, S5: T5: s5, S6: T6: s6, S7: T7: s7, S8: T8: s8, S9: T9: s9, S10: T10: s10, S11: T11: s11, S12: T12: s12);
+impl_query_tuple!(large => 14 => S0: T0: s0, S1: T1: s1, S2: T2: s2, S3: T3: s3, S4: T4: s4, S5: T5: s5, S6: T6: s6, S7: T7: s7, S8: T8: s8, S9: T9: s9, S10: T10: s10, S11: T11: s11, S12: T12: s12, S13: T13: s13);
+impl_query_tuple!(large => 15 => S0: T0: s0, S1: T1: s1, S2: T2: s2, S3: T3: s3, S4: T4: s4, S5: T5: s5, S6: T6: s6, S7: T7: s7, S8: T8: s8, S9: T9: s9, S10: T10: s10, S11: T11: s11, S12: T12: s12, S13: T13: s13, S14: T14: s14);
+impl_query_tuple!(large => 16 => S0: T0: s0, S1: T1: s1, S2: T2: s2, S3: T3: s3, S4: T4: s4, S5: T5: s5, S6: T6: s6, S7: T7: s7, S8: T8: s8, S9: T9: s9, S10: T10: s10, S11: T11: s11, S12: T12: s12, S13: T13: s13, S14: T14: s14, S15: T15: s15);
+impl_query_tuple!(large => 17 => S0: T0: s0, S1: T1: s1, S2: T2: s2, S3: T3: s3, S4: T4: s4, S5: T5: s5, S6: T6: s6, S7: T7: s7, S8: T8: s8, S9: T9: s9, S10: T10: s10, S11: T11: s11, S12: T12: s12, S13: T13: s13, S14: T14: s14, S15: T15: s15, S16: T16: s16);
+impl_query_tuple!(large => 18 => S0: T0: s0, S1: T1: s1, S2: T2: s2, S3: T3: s3, S4: T4: s4, S5: T5: s5, S6: T6: s6, S7: T7: s7, S8: T8: s8, S9: T9: s9, S10: T10: s10, S11: T11: s11, S12: T12: s12, S13: T13: s13, S14: T14: s14, S15: T15: s15, S16: T16: s16, S17: T17: s17);
+impl_query_tuple!(large => 19 => S0: T0: s0, S1: T1: s1, S2: T2: s2, S3: T3: s3, S4: T4: s4, S5: T5: s5, S6: T6: s6, S7: T7: s7, S8: T8: s8, S9: T9: s9, S10: T10: s10, S11: T11: s11, S12: T12: s12, S13: T13: s13, S14: T14: s14, S15: T15: s15, S16: T16: s16, S17: T17: s17, S18: T18: s18);
+impl_query_tuple!(large => 20 => S0: T0: s0, S1: T1: s1, S2: T2: s2, S3: T3: s3, S4: T4: s4, S5: T5: s5, S6: T6: s6, S7: T7: s7, S8: T8: s8, S9: T9: s9, S10: T10: s10, S11: T11: s11, S12: T12: s12, S13: T13: s13, S14: T14: s14, S15: T15: s15, S16: T16: s16, S17: T17: s17, S18: T18: s18, S19: T19: s19);
+impl_query_tuple!(large => 21 => S0: T0: s0, S1: T1: s1, S2: T2: s2, S3: T3: s3, S4: T4: s4, S5: T5: s5, S6: T6: s6, S7: T7: s7, S8: T8: s8, S9: T9: s9, S10: T10: s10, S11: T11: s11, S12: T12: s12, S13: T13: s13, S14: T14: s14, S15: T15: s15, S16: T16: s16, S17: T17: s17, S18: T18: s18, S19: T19: s19, S20: T20: s20);
+impl_query_tuple!(large => 22 => S0: T0: s0, S1: T1: s1, S2: T2: s2, S3: T3: s3, S4: T4: s4, S5: T5: s5, S6: T6: s6, S7: T7: s7, S8: T8: s8, S9: T9: s9, S10: T10: s10, S11: T11: s11, S12: T12: s12, S13: T13: s13, S14: T14: s14, S15: T15: s15, S16: T16: s16, S17: T17: s17, S18: T18: s18, S19: T19: s19, S20: T20: s20, S21: T21: s21);
+impl_query_tuple!(large => 23 => S0: T0: s0, S1: T1: s1, S2: T2: s2, S3: T3: s3, S4: T4: s4, S5: T5: s5, S6: T6: s6, S7: T7: s7, S8: T8: s8, S9: T9: s9, S10: T10: s10, S11: T11: s11, S12: T12: s12, S13: T13: s13, S14: T14: s14, S15: T15: s15, S16: T16: s16, S17: T17: s17, S18: T18: s18, S19: T19: s19, S20: T20: s20, S21: T21: s21, S22: T22: s22);
+impl_query_tuple!(large => 24 => S0: T0: s0, S1: T1: s1, S2: T2: s2, S3: T3: s3, S4: T4: s4, S5: T5: s5, S6: T6: s6, S7: T7: s7, S8: T8: s8, S9: T9: s9, S10: T10: s10, S11: T11: s11, S12: T12: s12, S13: T13: s13, S14: T14: s14, S15: T15: s15, S16: T16: s16, S17: T17: s17, S18: T18: s18, S19: T19: s19, S20: T20: s20, S21: T21: s21, S22: T22: s22, S23: T23: s23);
+impl_query_tuple!(large => 25 => S0: T0: s0, S1: T1: s1, S2: T2: s2, S3: T3: s3, S4: T4: s4, S5: T5: s5, S6: T6: s6, S7: T7: s7, S8: T8: s8, S9: T9: s9, S10: T10: s10, S11: T11: s11, S12: T12: s12, S13: T13: s13, S14: T14: s14, S15: T15: s15, S16: T16: s16, S17: T17: s17, S18: T18: s18, S19: T19: s19, S20: T20: s20, S21: T21: s21, S22: T22: s22, S23: T23: s23, S24: T24: s24);
+impl_query_tuple!(large => 26 => S0: T0: s0, S1: T1: s1, S2: T2: s2, S3: T3: s3, S4: T4: s4, S5: T5: s5, S6: T6: s6, S7: T7: s7, S8: T8: s8, S9: T9: s9, S10: T10: s10, S11: T11: s11, S12: T12: s12, S13: T13: s13, S14: T14: s14, S15: T15: s15, S16: T16: s16, S17: T17: s17, S18: T18: s18, S19: T19: s19, S20: T20: s20, S21: T21: s21, S22: T22: s22, S23: T23: s23, S24: T24: s24, S25: T25: s25);
+impl_query_tuple!(large => 27 => S0: T0: s0, S1: T1: s1, S2: T2: s2, S3: T3: s3, S4: T4: s4, S5: T5: s5, S6: T6: s6, S7: T7: s7, S8: T8: s8, S9: T9: s9, S10: T10: s10, S11: T11: s11, S12: T12: s12, S13: T13: s13, S14: T14: s14, S15: T15: s15, S16: T16: s16, S17: T17: s17, S18: T18: s18, S19: T19: s19, S20: T20: s20, S21: T21: s21, S22: T22: s22, S23: T23: s23, S24: T24: s24, S25: T25: s25, S26: T26: s26);
+impl_query_tuple!(large => 28 => S0: T0: s0, S1: T1: s1, S2: T2: s2, S3: T3: s3, S4: T4: s4, S5: T5: s5, S6: T6: s6, S7: T7: s7, S8: T8: s8, S9: T9: s9, S10: T10: s10, S11: T11: s11, S12: T12: s12, S13: T13: s13, S14: T14: s14, S15: T15: s15, S16: T16: s16, S17: T17: s17, S18: T18: s18, S19: T19: s19, S20: T20: s20, S21: T21: s21, S22: T22: s22, S23: T23: s23, S24: T24: s24, S25: T25: s25, S26: T26: s26, S27: T27: s27);
+impl_query_tuple!(large => 29 => S0: T0: s0, S1: T1: s1, S2: T2: s2, S3: T3: s3, S4: T4: s4, S5: T5: s5, S6: T6: s6, S7: T7: s7, S8: T8: s8, S9: T9: s9, S10: T10: s10, S11: T11: s11, S12: T12: s12, S13: T13: s13, S14: T14: s14, S15: T15: s15, S16: T16: s16, S17: T17: s17, S18: T18: s18, S19: T19: s19, S20: T20: s20, S21: T21: s21, S22: T22: s22, S23: T23: s23, S24: T24: s24, S25: T25: s25, S26: T26: s26, S27: T27: s27, S28: T28: s28);
+impl_query_tuple!(large => 30 => S0: T0: s0, S1: T1: s1, S2: T2: s2, S3: T3: s3, S4: T4: s4, S5: T5: s5, S6: T6: s6, S7: T7: s7, S8: T8: s8, S9: T9: s9, S10: T10: s10, S11: T11: s11, S12: T12: s12, S13: T13: s13, S14: T14: s14, S15: T15: s15, S16: T16: s16, S17: T17: s17, S18: T18: s18, S19: T19: s19, S20: T20: s20, S21: T21: s21, S22: T22: s22, S23: T23: s23, S24: T24: s24, S25: T25: s25, S26: T26: s26, S27: T27: s27, S28: T28: s28, S29: T29: s29);
+impl_query_tuple!(large => 31 => S0: T0: s0, S1: T1: s1, S2: T2: s2, S3: T3: s3, S4: T4: s4, S5: T5: s5, S6: T6: s6, S7: T7: s7, S8: T8: s8, S9: T9: s9, S10: T10: s10, S11: T11: s11, S12: T12: s12, S13: T13: s13, S14: T14: s14, S15: T15: s15, S16: T16: s16, S17: T17: s17, S18: T18: s18, S19: T19: s19, S20: T20: s20, S21: T21: s21, S22: T22: s22, S23: T23: s23, S24: T24: s24, S25: T25: s25, S26: T26: s26, S27: T27: s27, S28: T28: s28, S29: T29: s29, S30: T30: s30);
+impl_query_tuple!(large => 32 => S0: T0: s0, S1: T1: s1, S2: T2: s2, S3: T3: s3, S4: T4: s4, S5: T5: s5, S6: T6: s6, S7: T7: s7, S8: T8: s8, S9: T9: s9, S10: T10: s10, S11: T11: s11, S12: T12: s12, S13: T13: s13, S14: T14: s14, S15: T15: s15, S16: T16: s16, S17: T17: s17, S18: T18: s18, S19: T19: s19, S20: T20: s20, S21: T21: s21, S22: T22: s22, S23: T23: s23, S24: T24: s24, S25: T25: s25, S26: T26: s26, S27: T27: s27, S28: T28: s28, S29: T29: s29, S30: T30: s30, S31: T31: s31);
 
 /// Error returned by [`TypedChunkIter::single_chunk`] (mirroring Bevy's `QuerySingleError`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1526,26 +1789,57 @@ impl<'iter, 'ctx, Q: QueryTuple> TypedChunkIter<'iter, 'ctx, Q> {
     }
 
     /// Iterates in parallel over disjoint chunk partitions on the host `ComputeTaskPool`, yielding
-    /// typed `Q::Slices<'_>` to `f`.
+    /// typed `Q::Slices<'_>` to `f` using `BamHostApi::iter_next_chunk_batch` (slot 68).
     pub fn par_for_each<F, R>(&mut self, f: F) -> FfiResult
     where
         F: Fn(Q::Slices<'_>) -> R + Sync,
         R: IntoSystemResult,
     {
-        self.iter.inner.par_for_each_chunk(|task_iter| {
-            let mut dispenser = ChunkColumnDispenser::new(task_iter);
-            let slices = match Q::fetch_slices(&mut dispenser) {
-                Ok(s) => s,
-                Err(err) => return err,
-            };
-            let mut adapter = &f;
-            Q::invoke_unpacked(&mut adapter, slices)
-        })
+        self.iter.inner.par_for_each_chunk_batch(
+            Q::TERM_COUNT,
+            Q::NEEDS_ENTITIES,
+            Q::MARK_CHANGED_MASK,
+            |task_iter, batch_cache| {
+                let mut dispenser = ChunkColumnDispenser::new_with_batch(task_iter, batch_cache);
+                let slices = match Q::fetch_slices(&mut dispenser) {
+                    Ok(s) => s,
+                    Err(err) => return err,
+                };
+                let mut adapter = &f;
+                Q::invoke_unpacked(&mut adapter, slices)
+            },
+        )
+    }
+
+    /// Iterates in parallel over disjoint chunk partitions via `BamHostApi::par_for_each_chunk_ex`
+    /// (slot 81) and `iter_next_chunk_batch` (slot 68), exposing partition index and per-partition
+    /// [`GuestCommands`](crate::GuestCommands).
+    pub fn par_for_each_with_options<F, R>(&mut self, options: &BamParOptions, f: F) -> FfiResult
+    where
+        F: Fn(Q::Slices<'_>, &mut crate::GuestCommands<'_>, usize) -> R + Sync,
+        R: IntoSystemResult,
+    {
+        self.iter.inner.par_for_each_chunk_ex_batch(
+            options,
+            Q::TERM_COUNT,
+            Q::NEEDS_ENTITIES,
+            Q::MARK_CHANGED_MASK,
+            |task_iter, batch_cache, cmds, partition_idx| {
+                let mut dispenser = ChunkColumnDispenser::new_with_batch(task_iter, batch_cache);
+                let slices = match Q::fetch_slices(&mut dispenser) {
+                    Ok(s) => s,
+                    Err(err) => return err,
+                };
+                crate::app::observers::with_guest_commands(cmds, |guest_cmds| {
+                    f(slices, guest_cmds, partition_idx).into_ffi_result()
+                })
+            },
+        )
     }
 
     /// Iterates in parallel over disjoint chunk partitions on the host `ComputeTaskPool` in
-    /// strictly read-only mode via `BamHostApi::par_for_each_chunk_readonly` (slot 59), yielding
-    /// typed `Q::Slices<'_>` to `f`.
+    /// strictly read-only mode via `BamHostApi::par_for_each_chunk_readonly` (slot 59) and
+    /// `iter_next_chunk_batch` (slot 68), yielding typed `Q::Slices<'_>` to `f`.
     ///
     /// Rejects any [`QueryTuple`] declaring writable terms (`&mut T` or `Option<&mut T>`) with
     /// [`FfiResult::PERMISSION_DENIED`] before crossing FFI, and the host also rejects queries
@@ -1558,15 +1852,20 @@ impl<'iter, 'ctx, Q: QueryTuple> TypedChunkIter<'iter, 'ctx, Q> {
         if !Q::IS_READ_ONLY {
             return FfiResult::PERMISSION_DENIED;
         }
-        self.iter.inner.par_for_each_chunk_readonly(|task_iter| {
-            let mut dispenser = ChunkColumnDispenser::new(task_iter);
-            let slices = match Q::fetch_slices(&mut dispenser) {
-                Ok(s) => s,
-                Err(err) => return err,
-            };
-            let mut adapter = &f;
-            Q::invoke_unpacked(&mut adapter, slices)
-        })
+        self.iter.inner.par_for_each_chunk_readonly_batch(
+            Q::TERM_COUNT,
+            Q::NEEDS_ENTITIES,
+            Q::MARK_CHANGED_MASK,
+            |task_iter, batch_cache| {
+                let mut dispenser = ChunkColumnDispenser::new_with_batch(task_iter, batch_cache);
+                let slices = match Q::fetch_slices(&mut dispenser) {
+                    Ok(s) => s,
+                    Err(err) => return err,
+                };
+                let mut adapter = &f;
+                Q::invoke_unpacked(&mut adapter, slices)
+            },
+        )
     }
 
     /// Iterates over all unordered `K`-combinations of matching entities across all chunks
@@ -1873,6 +2172,14 @@ impl_copyable_query_tuple!(T0: s0, T1: s1, T2: s2, T3: s3, T4: s4);
 impl_copyable_query_tuple!(T0: s0, T1: s1, T2: s2, T3: s3, T4: s4, T5: s5);
 impl_copyable_query_tuple!(T0: s0, T1: s1, T2: s2, T3: s3, T4: s4, T5: s5, T6: s6);
 impl_copyable_query_tuple!(T0: s0, T1: s1, T2: s2, T3: s3, T4: s4, T5: s5, T6: s6, T7: s7);
+impl_copyable_query_tuple!(T0: s0, T1: s1, T2: s2, T3: s3, T4: s4, T5: s5, T6: s6, T7: s7, T8: s8);
+impl_copyable_query_tuple!(T0: s0, T1: s1, T2: s2, T3: s3, T4: s4, T5: s5, T6: s6, T7: s7, T8: s8, T9: s9);
+impl_copyable_query_tuple!(T0: s0, T1: s1, T2: s2, T3: s3, T4: s4, T5: s5, T6: s6, T7: s7, T8: s8, T9: s9, T10: s10);
+impl_copyable_query_tuple!(T0: s0, T1: s1, T2: s2, T3: s3, T4: s4, T5: s5, T6: s6, T7: s7, T8: s8, T9: s9, T10: s10, T11: s11);
+impl_copyable_query_tuple!(T0: s0, T1: s1, T2: s2, T3: s3, T4: s4, T5: s5, T6: s6, T7: s7, T8: s8, T9: s9, T10: s10, T11: s11, T12: s12);
+impl_copyable_query_tuple!(T0: s0, T1: s1, T2: s2, T3: s3, T4: s4, T5: s5, T6: s6, T7: s7, T8: s8, T9: s9, T10: s10, T11: s11, T12: s12, T13: s13);
+impl_copyable_query_tuple!(T0: s0, T1: s1, T2: s2, T3: s3, T4: s4, T5: s5, T6: s6, T7: s7, T8: s8, T9: s9, T10: s10, T11: s11, T12: s12, T13: s13, T14: s14);
+impl_copyable_query_tuple!(T0: s0, T1: s1, T2: s2, T3: s3, T4: s4, T5: s5, T6: s6, T7: s7, T8: s8, T9: s9, T10: s10, T11: s11, T12: s12, T13: s13, T14: s14, T15: s15);
 
 /// Sealed trait for [`QueryTerm`] types supporting zero-allocation within-chunk pairwise
 /// splitting via `slice::split_at` / `slice::split_at_mut`.

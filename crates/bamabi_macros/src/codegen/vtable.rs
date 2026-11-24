@@ -13,7 +13,10 @@ use syn::Ident;
 /// component gets a `VTableHeader`-prefixed VTable, FNV-1a `SCHEMA_FINGERPRINT`, `BAM_FIELDS`,
 /// `REQUIRED_COMPONENTS`, `C_DECL`/`ZIG_DECL`, anti-spoofing trait checks (`__BamStdString`,
 /// `__BamStdVec`, `__BamFfiOption`, `__BamPrimBool`), and alias-safe `String`/`Vec` mutation helpers.
-pub(crate) fn emit_vtable_and_impls(state: &CodegenState, vtable_ident: &Ident) -> TokenStream {
+pub(crate) fn emit_vtable_and_impls(
+    state: &CodegenState,
+    vtable_ident: &Ident,
+) -> syn::Result<TokenStream> {
     let sys_crate = &state.sys_crate;
     let struct_ident = &state.struct_ident;
     let layout_assertions = &state.layout_assertions;
@@ -63,7 +66,7 @@ pub(crate) fn emit_vtable_and_impls(state: &CodegenState, vtable_ident: &Ident) 
             let init_fn_ident = format_ident!("__bam_req_init_{}", idx);
             let span = syn::spanned::Spanned::span(init_expr);
             req_init_fns.push(quote::quote_spanned! { span =>
-                #[allow(non_snake_case, clippy::undocumented_unsafe_blocks)]
+                #[allow(clippy::undocumented_unsafe_blocks)]
                 unsafe extern "C" fn #init_fn_ident(
                     dst: *mut ::core::ffi::c_void,
                     _user_data: *mut ::core::ffi::c_void,
@@ -100,6 +103,7 @@ pub(crate) fn emit_vtable_and_impls(state: &CodegenState, vtable_ident: &Ident) 
     }
 
     let mut bam_field_entries = Vec::new();
+    let mut bam_field_meta_entries = Vec::new();
     let mut schema_fp_updates = Vec::new();
     for field in &state.bam_fields {
         let f_name = &field.name;
@@ -116,6 +120,16 @@ pub(crate) fn emit_vtable_and_impls(state: &CodegenState, vtable_ident: &Ident) 
                 ::core::mem::size_of::<#f_ty>(),
                 ::core::mem::align_of::<#f_ty>(),
             )
+        });
+        bam_field_meta_entries.push(quote! {
+            #sys_crate::BamFieldMeta {
+                kind: #sys_crate::BamFieldKind::#kind_ident,
+                name: #f_name,
+                type_tag: #f_tag,
+                offset: ::core::mem::offset_of!(#struct_ident, #member_toks),
+                size: ::core::mem::size_of::<#f_ty>(),
+                align: ::core::mem::align_of::<#f_ty>(),
+            }
         });
         schema_fp_updates.push(quote! {
             h = #sys_crate::fnv1a_64_update_u64(h, (#sys_crate::BamFieldKind::#kind_ident).0 as u64);
@@ -150,6 +164,11 @@ pub(crate) fn emit_vtable_and_impls(state: &CodegenState, vtable_ident: &Ident) 
         }
     }
 
+    let custom_fp_opt_expr = match state.custom_schema_fingerprint {
+        Some(fp) => quote! { ::core::option::Option::Some(#fp) },
+        None => quote! { ::core::option::Option::None::<u64> },
+    };
+
     let witness_helpers = if state.opaque {
         quote! {}
     } else {
@@ -162,7 +181,7 @@ pub(crate) fn emit_vtable_and_impls(state: &CodegenState, vtable_ident: &Ident) 
         crate::codegen::c_decl::generate_decls(state, vtable_ident, is_abi_pod);
 
     let canonical_name_expr = state.canonical_name.as_str_expr();
-    let canonical_cstr_bytes_expr = state.canonical_name.as_nul_bytes_expr();
+    let canonical_cstr_expr = state.canonical_name.as_cstr_expr(struct_ident.span())?;
 
     let pod_schema_hash_expr = if is_abi_pod {
         let mut schema_expr = quote! { 0u64 };
@@ -182,23 +201,30 @@ pub(crate) fn emit_vtable_and_impls(state: &CodegenState, vtable_ident: &Ident) 
     };
 
     let uuid_expr = if let Some(hex_str) = state.custom_uuid.as_deref() {
-        quote! { #sys_crate::ComponentUuid::parse_hex(#hex_str) }
+        let bytes = bamabi_schema::try_parse_uuid_hex(hex_str).ok_or_else(|| {
+            syn::Error::new_spanned(struct_ident, "invalid `uuid` literal in `#[mod_component]`")
+        })?;
+        quote! { #sys_crate::ComponentUuid::from_bytes([#(#bytes),*]) }
     } else if let Some(ref enum_info) = state.decl_enum {
         let tag_str = enum_info.int_repr.rust_ty_str();
-        let mut schema_expr = quote! {
-            #sys_crate::ComponentUuid::hash_field_schema(0u64, "__enum_tag", #tag_str, 0usize)
-        };
+        let variant_inputs: Vec<bamabi_schema::EnumVariantSchemaInput<'_>> = enum_info
+            .variants
+            .iter()
+            .map(|v| bamabi_schema::EnumVariantSchemaInput {
+                name: v.name.as_str(),
+                discriminant: v.discriminant as i64,
+                fields: &[],
+            })
+            .collect();
+        let _ = &variant_inputs;
+        let mut schema_val = bamabi_schema::hash_field_schema(0u64, "__enum_tag", tag_str, 0);
         for var in &enum_info.variants {
-            let v_name = &var.name;
             let v_tag = format!("variant:{}", var.discriminant);
-            schema_expr = quote! {
-                #sys_crate::ComponentUuid::hash_field_schema(#schema_expr, #v_name, #v_tag, 0usize)
-            };
+            schema_val = bamabi_schema::hash_field_schema(schema_val, &var.name, &v_tag, 0);
             for (f_idx, (f_name, f_tag)) in var.schema_fields.iter().enumerate() {
-                let f_key = format!("{v_name}::{f_name}");
-                schema_expr = quote! {
-                    #sys_crate::ComponentUuid::hash_field_schema(#schema_expr, #f_key, #f_tag, #f_idx)
-                };
+                let f_key = format!("{}::{f_name}", var.name);
+                schema_val =
+                    bamabi_schema::hash_field_schema(schema_val, &f_key, f_tag, f_idx as u64);
             }
         }
         quote! {
@@ -206,7 +232,7 @@ pub(crate) fn emit_vtable_and_impls(state: &CodegenState, vtable_ident: &Ident) 
                 Self::CANONICAL_NAME,
                 ::core::mem::size_of::<#struct_ident>(),
                 ::core::mem::align_of::<#struct_ident>(),
-                #schema_expr,
+                #schema_val,
             )
         }
     } else if is_abi_pod {
@@ -233,6 +259,10 @@ pub(crate) fn emit_vtable_and_impls(state: &CodegenState, vtable_ident: &Ident) 
                 const FLAGS: u32 = <#struct_ident as #sys_crate::ModComponent>::COMPONENT_FLAGS;
                 const UUID: #sys_crate::ComponentUuid =
                     <#struct_ident as #sys_crate::ModComponent>::UUID;
+                const SCHEMA_FINGERPRINT: u64 =
+                    <#struct_ident as #sys_crate::ModComponent>::SCHEMA_FINGERPRINT;
+                const BAM_FIELDS: &'static [#sys_crate::BamFieldDesc] =
+                    <#struct_ident as #sys_crate::ModComponent>::BAM_FIELDS;
             }
         }
     } else {
@@ -278,7 +308,7 @@ pub(crate) fn emit_vtable_and_impls(state: &CodegenState, vtable_ident: &Ident) 
         quote! {}
     };
 
-    quote! {
+    Ok(quote! {
         /// Generated C-ABI `0.2` VTable for `#struct_ident`, prefixed at byte offset `0` by
         /// `VTableHeader` (`struct_size`, `abi_version`, `uuid`, `size`, `align`) followed by
         /// `Option<unsafe extern "C" fn(...)>` field accessor slots.
@@ -299,7 +329,6 @@ pub(crate) fn emit_vtable_and_impls(state: &CodegenState, vtable_ident: &Ident) 
             const MIN_V0_2_SIZE: usize = ::core::mem::size_of::<#vtable_ident>();
         }
 
-        #[allow(non_snake_case)]
         const _: () = {
             #[allow(dead_code)]
             #[diagnostic::on_unimplemented(
@@ -658,19 +687,19 @@ pub(crate) fn emit_vtable_and_impls(state: &CodegenState, vtable_ident: &Ident) 
 
             #[allow(dead_code)]
             #[inline]
-            fn __bam_none_option<Inner: #sys_crate::AbiPod>() -> #sys_crate::FfiOption<Inner> {
+            fn __bam_none_option<Inner: #sys_crate::RawInsertable>() -> #sys_crate::FfiOption<Inner> {
                 #sys_crate::FfiOption::<Inner>::none()
             }
 
             #[allow(dead_code)]
             #[inline]
-            fn __bam_some_option<Inner: #sys_crate::AbiPod>(val: Inner) -> #sys_crate::FfiOption<Inner> {
+            fn __bam_some_option<Inner: #sys_crate::RawInsertable>(val: Inner) -> #sys_crate::FfiOption<Inner> {
                 #sys_crate::FfiOption::<Inner>::some(val)
             }
 
             #[allow(dead_code, clippy::undocumented_unsafe_blocks)]
             #[inline]
-            unsafe fn __bam_read_option<Inner: #sys_crate::AbiPod, T: __BamFfiOption<Inner>>(
+            unsafe fn __bam_read_option<Inner: #sys_crate::RawInsertable, T: __BamFfiOption<Inner>>(
                 field_ptr: *const T,
             ) -> #sys_crate::FfiOption<Inner> {
                 let opt_ptr = <T as __BamFfiOption<Inner>>::cast_const_ptr(field_ptr);
@@ -679,7 +708,7 @@ pub(crate) fn emit_vtable_and_impls(state: &CodegenState, vtable_ident: &Ident) 
 
             #[allow(dead_code, clippy::undocumented_unsafe_blocks)]
             #[inline]
-            unsafe fn __bam_write_option<Inner: #sys_crate::AbiPod, T: __BamFfiOption<Inner>>(
+            unsafe fn __bam_write_option<Inner: #sys_crate::RawInsertable, T: __BamFfiOption<Inner>>(
                 field_ptr: *mut T,
                 val: #sys_crate::FfiOption<Inner>,
             ) -> #sys_crate::FfiResult {
@@ -695,7 +724,7 @@ pub(crate) fn emit_vtable_and_impls(state: &CodegenState, vtable_ident: &Ident) 
 
             #[allow(dead_code, clippy::undocumented_unsafe_blocks)]
             #[inline]
-            unsafe fn __bam_clear_option<Inner: #sys_crate::AbiPod, T: __BamFfiOption<Inner>>(
+            unsafe fn __bam_clear_option<Inner: #sys_crate::RawInsertable, T: __BamFfiOption<Inner>>(
                 field_ptr: *mut T,
             ) -> #sys_crate::FfiResult {
                 let opt_ptr = <T as __BamFfiOption<Inner>>::cast_mut_ptr(field_ptr);
@@ -713,11 +742,20 @@ pub(crate) fn emit_vtable_and_impls(state: &CodegenState, vtable_ident: &Ident) 
                 #(#bam_field_entries),*
             ];
 
+            static BAM_FIELD_META_DESC: &[#sys_crate::BamFieldMeta<'static>] = &[
+                #(#bam_field_meta_entries),*
+            ];
+
             static REQUIRED_COMPONENTS_DESC: &[#sys_crate::BamRequiredComponent] = &[
                 #(#req_desc_exprs),*
             ];
 
-            const SCHEMA_FINGERPRINT_VAL: u64 = {
+            const SCHEMA_FINGERPRINT_VAL: u64 = if let ::core::option::Option::Some(custom_fp) = {
+                // Evaluated at macro expansion time below when `#[mod_component(schema_fingerprint = ...)]` is provided.
+                #custom_fp_opt_expr
+            } {
+                custom_fp
+            } else {
                 let mut h = #sys_crate::fnv1a_64_init();
                 h = #sys_crate::fnv1a_64_update_bytes(
                     h,
@@ -778,19 +816,15 @@ pub(crate) fn emit_vtable_and_impls(state: &CodegenState, vtable_ident: &Ident) 
 
             impl #sys_crate::ModComponent for #struct_ident {
                 const CANONICAL_NAME: &'static str = #canonical_name_expr;
-                const COMPONENT_CSTR: &'static ::core::ffi::CStr =
-                    match ::core::ffi::CStr::from_bytes_with_nul(#canonical_cstr_bytes_expr) {
-                        ::core::result::Result::Ok(s) => s,
-                        ::core::result::Result::Err(_) => {
-                            panic!("component canonical name contains interior NUL byte")
-                        }
-                    };
+                const COMPONENT_CSTR: &'static ::core::ffi::CStr = #canonical_cstr_expr;
                 const UUID: #sys_crate::ComponentUuid = #uuid_expr;
                 const IS_ABI_POD: bool = #is_abi_pod;
                 const IS_RAW_INSERTABLE: bool = #is_raw_insertable;
                 const COMPONENT_FLAGS: u32 = #component_flags_expr;
                 const SCHEMA_FINGERPRINT: u64 = SCHEMA_FINGERPRINT_VAL;
                 const BAM_FIELDS: &'static [#sys_crate::BamFieldDesc] = BAM_FIELDS_DESC;
+                const BAM_FIELD_META: &'static [#sys_crate::BamFieldMeta<'static>] =
+                    BAM_FIELD_META_DESC;
                 const REQUIRED_COMPONENTS: &'static [#sys_crate::BamRequiredComponent] =
                     REQUIRED_COMPONENTS_DESC;
                 const C_DECL: &'static str = #c_decl_str;
@@ -811,5 +845,5 @@ pub(crate) fn emit_vtable_and_impls(state: &CodegenState, vtable_ident: &Ident) 
 
             #conditional_guest_component_impl
         };
-    }
+    })
 }

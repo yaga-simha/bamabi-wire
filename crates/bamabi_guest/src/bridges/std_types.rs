@@ -956,12 +956,12 @@ mod tests {
             set: Some(mock_name_set),
         };
 
-        /// Mock `MappedStringVTable::get` returning a constant `"MockName"` view.
-        extern "C" fn mock_name_get(_ptr: *const c_void) -> StrView {
-            StrView::from_str("MockName")
+        /// Mock `MappedStringVTable::get` stub.
+        extern "C" fn mock_name_get(_ptr: *const c_void, _out_view: *mut StrView) -> FfiResult {
+            FfiResult::OK
         }
         /// Mock `MappedStringVTable::set` unconditionally accepting writes with `FfiResult::OK`.
-        extern "C" fn mock_name_set(_ptr: *mut c_void, _view: StrView) -> FfiResult {
+        extern "C" fn mock_name_set(_ptr: *mut c_void, _view: *const StrView) -> FfiResult {
             FfiResult::OK
         }
         /// Mock `get_proc_addr` returning the static `NAME_VTABLE` pointer.

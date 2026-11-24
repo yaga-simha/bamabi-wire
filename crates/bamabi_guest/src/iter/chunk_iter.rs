@@ -6,8 +6,8 @@ use bamabi_guest_sys::{
     BatchColCache, DrainOptions, Host, SparseRows, SparseRowsMut, UuidFilter, ValidatedIter,
 };
 use bamabi_sys::{
-    AbiPod, BamChangeTicks, BamColumnInfo, BamComponent, BamIter, FfiEntity, FfiResult,
-    ModComponent,
+    AbiPod, BamChangeTicks, BamColumnInfo, BamComponent, BamIter, BamParOptions, BamRowRange,
+    FfiEntity, FfiResult, ModComponent,
 };
 
 use crate::{
@@ -90,6 +90,50 @@ impl<'a> ChunkIter<'a> {
     #[inline]
     pub fn next_chunk_view(&mut self) -> Option<Chunk<'_, 'a>> {
         let len = self.inner.next_chunk()?;
+        Some(Chunk {
+            iter: &mut self.inner,
+            len,
+        })
+    }
+
+    /// Advances to the next non-empty chunk via `BamHostApi::iter_next_chunk_batch` (slot 68),
+    /// pre-populating inline column pointers and marking ticks for `mark_changed_mask`.
+    #[inline]
+    pub fn next_chunk_batch(
+        &mut self,
+        col_count: usize,
+        needs_entities: bool,
+        mark_changed_mask: u32,
+    ) -> Option<usize> {
+        self.inner
+            .advance_batch(col_count, needs_entities, mark_changed_mask)
+    }
+
+    /// Advances to the next non-empty chunk via `BamHostApi::iter_next_chunk_batch` (slot 68)
+    /// into caller-owned `cache`.
+    #[inline]
+    pub fn next_chunk_batch_into(
+        &mut self,
+        cache: &mut BatchColCache<'a>,
+        col_count: usize,
+        needs_entities: bool,
+        mark_changed_mask: u32,
+    ) -> Option<usize> {
+        self.inner
+            .advance_batch_into(cache, col_count, needs_entities, mark_changed_mask)
+    }
+
+    /// Advances to the next non-empty chunk via slot 68 and returns a borrow-checked [`Chunk`] view.
+    #[inline]
+    pub fn next_chunk_batch_view(
+        &mut self,
+        col_count: usize,
+        needs_entities: bool,
+        mark_changed_mask: u32,
+    ) -> Option<Chunk<'_, 'a>> {
+        let len = self
+            .inner
+            .advance_batch(col_count, needs_entities, mark_changed_mask)?;
         Some(Chunk {
             iter: &mut self.inner,
             len,
@@ -203,15 +247,76 @@ impl<'a> ChunkIter<'a> {
         self.inner.mark_changed(col, row)
     }
 
+    /// Batch-marks multiple coalesced dirty row ranges on writable column `col` via
+    /// `BamHostApi::iter_mark_changed_ranges` (slot 78), falling back to slot 15 on older hosts.
+    #[inline]
+    pub fn mark_changed_ranges(&self, col: usize, ranges: &[BamRowRange]) -> FfiResult {
+        self.inner.mark_changed_ranges(col, ranges)
+    }
+
+    /// Simultaneously borrows `[FfiEntity; current_len]` and mutable dense column `write_col`
+    /// (`W: AbiPod`) for the active chunk.
+    #[inline]
+    pub fn entities_and_column_mut<W: AbiPod>(
+        &mut self,
+        write_col: usize,
+    ) -> Option<(&[FfiEntity], &mut [W])> {
+        self.inner
+            .entities_and_column_mut_checked::<W>(write_col, None)
+    }
+
+    /// Simultaneously borrows `[FfiEntity; current_len]` and mutable dense column `write_col`
+    /// (`W: GuestComponent`), verifying `W`'s UUID.
+    #[inline]
+    pub fn entities_and_component_mut<W: GuestComponent>(
+        &mut self,
+        write_col: usize,
+    ) -> Option<(&[FfiEntity], &mut [W])> {
+        let filter = guest_uuid_filter::<W>(self.inner.base_host().manifest_name());
+        self.inner
+            .entities_and_column_mut_checked::<W>(write_col, Some(filter))
+    }
+
+    /// Simultaneously borrows `[FfiEntity; current_len]`, read-only dense column `read_col`, and
+    /// disjoint mutable dense column `write_col`.
+    #[inline]
+    pub fn entities_and_read_write<R: AbiPod, W: AbiPod>(
+        &mut self,
+        read_col: usize,
+        write_col: usize,
+    ) -> Option<(&[FfiEntity], &[R], &mut [W])> {
+        self.inner
+            .entities_and_read_write_checked::<R, W>(read_col, None, write_col, None)
+    }
+
+    /// Simultaneously borrows `[FfiEntity; current_len]`, read-only dense column `read_col`, and
+    /// disjoint mutable dense column `write_col`, verifying `R`'s and `W`'s UUIDs.
+    #[inline]
+    pub fn entities_and_component_read_write<R: GuestComponent, W: GuestComponent>(
+        &mut self,
+        read_col: usize,
+        write_col: usize,
+    ) -> Option<(&[FfiEntity], &[R], &mut [W])> {
+        let manifest = self.inner.base_host().manifest_name();
+        let r_filter = guest_uuid_filter::<R>(manifest);
+        let w_filter = guest_uuid_filter::<W>(manifest);
+        self.inner.entities_and_read_write_checked::<R, W>(
+            read_col,
+            Some(r_filter),
+            write_col,
+            Some(w_filter),
+        )
+    }
+
     /// Materializes indirect read-only sparse-set row pointers `[ *const u8; current_len ]`.
     #[inline]
-    pub fn rows<T: AbiPod>(&mut self, col: usize) -> Option<SparseRows<'_, T>> {
+    pub fn rows<T: AbiPod>(&self, col: usize) -> Option<SparseRows<'_, T>> {
         self.inner.rows_checked::<T>(col, None)
     }
 
     /// Materializes indirect read-only sparse-set row pointers for `T: GuestComponent`.
     #[inline]
-    pub fn component_rows<T: GuestComponent>(&mut self, col: usize) -> Option<SparseRows<'_, T>> {
+    pub fn component_rows<T: GuestComponent>(&self, col: usize) -> Option<SparseRows<'_, T>> {
         let filter = guest_uuid_filter::<T>(self.inner.base_host().manifest_name());
         self.inner.rows_checked::<T>(col, Some(filter))
     }
@@ -230,6 +335,25 @@ impl<'a> ChunkIter<'a> {
     ) -> Option<SparseRowsMut<'_, T>> {
         let filter = guest_uuid_filter::<T>(self.inner.base_host().manifest_name());
         self.inner.rows_mut_checked::<T>(col, Some(filter))
+    }
+
+    /// Materializes indirect mutable sparse-set row pointers **without** marking change ticks via
+    /// `BamHostApi::iter_column_rows_mutable_untracked` (slot 77).
+    #[inline]
+    pub fn rows_mut_untracked<T: AbiPod>(&mut self, col: usize) -> Option<SparseRowsMut<'_, T>> {
+        self.inner.rows_mut_untracked_checked::<T>(col, None)
+    }
+
+    /// Materializes indirect mutable sparse-set row pointers for `T: GuestComponent` **without**
+    /// marking change ticks via slot 77.
+    #[inline]
+    pub fn component_rows_mut_untracked<T: GuestComponent>(
+        &mut self,
+        col: usize,
+    ) -> Option<SparseRowsMut<'_, T>> {
+        let filter = guest_uuid_filter::<T>(self.inner.base_host().manifest_name());
+        self.inner
+            .rows_mut_untracked_checked::<T>(col, Some(filter))
     }
 
     /// Borrows singleton resource `R` (`R: AbiPod`) declared at `term_index` in this query.
@@ -381,6 +505,32 @@ impl<'a> ChunkIter<'a> {
             batch_cache: BatchColCache::new(),
             _marker: PhantomData,
         }
+    }
+
+    /// Processes disjoint chunk partitions in parallel via `BamHostApi::par_for_each_chunk_ex`
+    /// (slot 81) with caller-configured [`BamParOptions`], exposing each partition's
+    /// [`GuestCommands`](crate::GuestCommands) and `partition_index`.
+    #[inline]
+    pub fn par_for_each_ex<F, R>(&mut self, options: &BamParOptions, f: F) -> FfiResult
+    where
+        F: Fn(Chunk<'_, '_>, &mut crate::GuestCommands<'_>, usize) -> R + Sync,
+        R: IntoSystemResult,
+    {
+        self.inner
+            .par_for_each_chunk_ex(options, |task_iter, cmds, partition_idx| {
+                let len = task_iter.current_len();
+                crate::app::observers::with_guest_commands(cmds, |guest_cmds| {
+                    f(
+                        Chunk {
+                            iter: task_iter,
+                            len,
+                        },
+                        guest_cmds,
+                        partition_idx,
+                    )
+                    .into_ffi_result()
+                })
+            })
     }
 
     /// Drains unread POD messages (`M: AbiPod`) from `term_index`.
@@ -562,6 +712,28 @@ impl<'a> ChunkIter<'a> {
         let filter = guest_uuid_filter::<M>(self.inner.base_host().manifest_name());
         self.inner
             .drain_messages_count_checked::<M>(term_index, Some(filter))
+    }
+
+    /// Borrows a contiguous `&[M]` slice of unread messages (`M: GuestComponent`) at `term_index`
+    /// with zero heap allocations and zero copies via `BamHostApi::msg_read_slice` (slot 88).
+    #[inline]
+    pub fn read_messages_slice<M: GuestComponent>(
+        &mut self,
+        term_index: usize,
+    ) -> Result<&[M], FfiResult> {
+        let filter = guest_uuid_filter::<M>(self.inner.base_host().manifest_name());
+        self.inner
+            .msg_read_slice_checked::<M>(term_index, Some(filter))
+    }
+
+    /// Borrows a contiguous `&[M]` slice of unread POD messages (`M: AbiPod`) at `term_index`
+    /// with zero heap allocations and zero copies via `BamHostApi::msg_read_slice` (slot 88).
+    #[inline]
+    pub fn read_pod_messages_slice<M: AbiPod>(
+        &mut self,
+        term_index: usize,
+    ) -> Result<&[M], FfiResult> {
+        self.inner.msg_read_slice_checked::<M>(term_index, None)
     }
 
     /// Drains the unread POD message cursor (`M: AbiPod`) at `term_index` with zero heap

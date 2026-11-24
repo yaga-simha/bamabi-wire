@@ -4,9 +4,10 @@
 use core::mem::MaybeUninit;
 
 use bamabi_guest_sys::{
-    ChunkColumnDispenser, DrainOptions, SparseRows, SparseRowsMut, UuidFilter, ValidatedIter,
+    BatchColCache, ChunkColumnDispenser, DrainOptions, SparseRows, SparseRowsMut, UuidFilter,
+    ValidatedIter,
 };
-use bamabi_sys::{AbiPod, BamColumnInfo, FfiEntity, FfiResult, ModComponent};
+use bamabi_sys::{AbiPod, BamColumnInfo, BamRowRange, FfiEntity, FfiResult, ModComponent};
 
 use crate::{
     component::{GuestComponent, guest_uuid_filter},
@@ -172,6 +173,30 @@ impl<'iter, 'ctx> Chunk<'iter, 'ctx> {
         self.iter.mark_changed(col, row)
     }
 
+    /// Batch-marks multiple coalesced dirty row ranges on writable column `col` via
+    /// `BamHostApi::iter_mark_changed_ranges` (slot 78), falling back to slot 15 on older hosts.
+    #[inline]
+    pub fn mark_changed_ranges(&self, col: usize, ranges: &[BamRowRange]) -> FfiResult {
+        self.iter.mark_changed_ranges(col, ranges)
+    }
+
+    /// Creates a sequential multi-column [`ChunkColumnDispenser`] over this chunk so multiple
+    /// disjoint read/write columns can be borrowed safely in Safe Rust.
+    #[inline]
+    pub fn columns_dispenser(&mut self) -> ChunkColumnDispenser<'_, 'ctx> {
+        ChunkColumnDispenser::new(self.iter)
+    }
+
+    /// Creates a [`ChunkColumnDispenser`] backed by an explicit [`BatchColCache`] populated via
+    /// [`ChunkIter::next_chunk_batch_into`](crate::ChunkIter::next_chunk_batch_into).
+    #[inline]
+    pub fn columns_dispenser_with_batch<'b>(
+        &'b mut self,
+        cache: &'b BatchColCache<'ctx>,
+    ) -> ChunkColumnDispenser<'b, 'ctx> {
+        ChunkColumnDispenser::new_with_batch(self.iter, cache)
+    }
+
     /// Simultaneously borrows read-only dense column `read_col` (`&[R]`) and disjoint mutable dense
     /// column `write_col` (`&mut [W]`).
     #[inline]
@@ -280,14 +305,14 @@ impl<'iter, 'ctx> Chunk<'iter, 'ctx> {
 
     /// Materializes indirect read-only sparse-set row pointers `[ *const u8; len ]` for column `col`.
     #[inline]
-    pub fn rows<T: AbiPod>(&mut self, col: usize) -> Option<SparseRows<'_, T>> {
+    pub fn rows<T: AbiPod>(&self, col: usize) -> Option<SparseRows<'_, T>> {
         self.iter.rows_checked::<T>(col, None)
     }
 
     /// Materializes indirect read-only sparse-set row pointers for `T: GuestComponent`, validating
-    /// `T`'s UUID.
+    /// `T`'s UUID (works on `&Chunk`, including `@sparse` components in read-only parallel closures).
     #[inline]
-    pub fn component_rows<T: GuestComponent>(&mut self, col: usize) -> Option<SparseRows<'_, T>> {
+    pub fn component_rows<T: GuestComponent>(&self, col: usize) -> Option<SparseRows<'_, T>> {
         let filter = guest_uuid_filter::<T>(self.iter.base_host().manifest_name());
         self.iter.rows_checked::<T>(col, Some(filter))
     }
@@ -308,6 +333,24 @@ impl<'iter, 'ctx> Chunk<'iter, 'ctx> {
     ) -> Option<SparseRowsMut<'_, T>> {
         let filter = guest_uuid_filter::<T>(self.iter.base_host().manifest_name());
         self.iter.rows_mut_checked::<T>(col, Some(filter))
+    }
+
+    /// Materializes indirect mutable sparse-set row pointers **without** marking change ticks via
+    /// `BamHostApi::iter_column_rows_mutable_untracked` (slot 77).
+    #[inline]
+    pub fn rows_mut_untracked<T: AbiPod>(&mut self, col: usize) -> Option<SparseRowsMut<'_, T>> {
+        self.iter.rows_mut_untracked_checked::<T>(col, None)
+    }
+
+    /// Materializes indirect mutable sparse-set row pointers for `T: GuestComponent` **without**
+    /// marking change ticks via slot 77.
+    #[inline]
+    pub fn component_rows_mut_untracked<T: GuestComponent>(
+        &mut self,
+        col: usize,
+    ) -> Option<SparseRowsMut<'_, T>> {
+        let filter = guest_uuid_filter::<T>(self.iter.base_host().manifest_name());
+        self.iter.rows_mut_untracked_checked::<T>(col, Some(filter))
     }
 
     /// Returns a low-level [`ChunkSlice`] view over dense read column `col` (useful with opaque

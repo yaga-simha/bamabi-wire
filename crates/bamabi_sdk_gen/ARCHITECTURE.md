@@ -79,7 +79,7 @@ Before formatting any C99 text, `render_c99_header()` builds `wire_struct_specs(
    - `BAM_EXPORT`: `__declspec(dllexport)` on Windows/Cygwin, `__attribute__((visibility("default")))` on GCC/Clang, and `extern "C"` prefix under `__cplusplus`.
    - `BAM_UNUSED`: `__attribute__((unused))` on GCC/Clang for `static inline` helpers.
    - `BAM_RESTRICT`: `__restrict` on `_MSC_VER`, `restrict` in C99+ (`!defined(__cplusplus) && __STDC_VERSION__ >= 199901L`), and empty otherwise (since ISO C++ has no standard `restrict` keyword).
-   - `BAM_ALIGNOF(type)`: uses C++11 `alignof`, C11 `_Alignof`, GCC/Clang `__extension__ __alignof__`, MSVC `__alignof`, or an ISO C99 `offsetof(struct { char _bam_pad; type _bam_val; }, _bam_val)` fallback.
+   - `BAM_ALIGNOF(type)`: uses C++11 `alignof`, C11 `_Alignof`, GCC/Clang `(__extension__ offsetof(struct { char _bam_pad; type _bam_val; }, _bam_val))` (matching C target ABI struct alignment rather than GCC's preferred `__alignof__(uint64_t) == 8` on 32-bit `i686`), MSVC `__alignof`, or an ISO C99 `offsetof` fallback.
    - `BAM_STATIC_ASSERT(cond, name)`: uses C++11 `static_assert`, C11 `_Static_assert`, GCC/Clang `__extension__ _Static_assert`, or a `typedef char bam_static_assert_##name[(cond) ? 1 : -1]` fallback.
 2. **ABI SemVer Version, Architectural Limits & Domain Constants:**
    - `BAM_ABI_VERSION` (`0x00030000u`), `BAM_PACK_ABI_VERSION`, `BAM_MAX_TERMS_PER_QUERY`, `BAM_MAX_QUERIES_PER_SYSTEM` (`16u`), `BAM_HOST_API_SLOT_COUNT` (`73u`), `BAM_SIPHASH_KEY_0`/`1`, `BAM_MAX_CHANGE_AGE`, and canonical names `BAM_CHILD_OF_NAME`, `BAM_CHILDREN_NAME`, `BAM_DISABLED_NAME`.

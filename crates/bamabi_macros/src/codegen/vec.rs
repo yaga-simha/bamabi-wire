@@ -43,17 +43,25 @@ pub(crate) fn spec(
             SlotSpec {
                 prefix: "get",
                 receiver: ReceiverKind::Const {
-                    on_invalid: quote! { #sys_crate::FfiSlice::empty() },
+                    on_invalid: quote! { #sys_crate::FfiResult::NULL_POINTER },
                 },
-                extra_params_fn: quote! {},
-                extra_params_vt: quote! {},
-                ret_ty: quote! { #sys_crate::FfiSlice<#elem_ty> },
+                extra_params_fn: quote! { , out_slice: *mut #sys_crate::FfiSlice<#elem_ty> },
+                extra_params_vt: quote! { , *mut #sys_crate::FfiSlice<#elem_ty> },
+                ret_ty: quote! { #sys_crate::FfiResult },
                 valid_body: quote! {
-                    unsafe {
+                    if out_slice.is_null() {
+                        return #sys_crate::FfiResult::NULL_POINTER;
+                    }
+                    if !out_slice.is_aligned() {
+                        return #sys_crate::FfiResult::INVALID_ARGUMENT;
+                    }
+                    let slice = unsafe {
                         __bam_read_vec::<#elem_ty, #field_ty>(
                             ::core::ptr::addr_of!((*typed_ptr).#member_tokens),
                         )
-                    }
+                    };
+                    unsafe { ::core::ptr::write(out_slice, slice) };
+                    #sys_crate::FfiResult::OK
                 },
             },
             SlotSpec {
@@ -61,20 +69,24 @@ pub(crate) fn spec(
                 receiver: ReceiverKind::Mut {
                     on_null: quote! { #sys_crate::FfiResult::NULL_POINTER },
                     pre_align_check: Some(quote! {
-                        if slice.len > 0 && slice.ptr.is_null() {
+                        if slice.is_null() {
                             return #sys_crate::FfiResult::NULL_POINTER;
+                        }
+                        if !slice.is_aligned() {
+                            return #sys_crate::FfiResult::INVALID_ARGUMENT;
                         }
                     }),
                     on_unaligned: quote! { #sys_crate::FfiResult::INVALID_ARGUMENT },
                 },
-                extra_params_fn: quote! { , slice: #sys_crate::FfiSlice<#elem_ty> },
-                extra_params_vt: quote! { , #sys_crate::FfiSlice<#elem_ty> },
+                extra_params_fn: quote! { , slice: *const #sys_crate::FfiSlice<#elem_ty> },
+                extra_params_vt: quote! { , *const #sys_crate::FfiSlice<#elem_ty> },
                 ret_ty: quote! { #sys_crate::FfiResult },
                 valid_body: quote! {
+                    let slice_val = unsafe { ::core::ptr::read(slice) };
                     unsafe {
                         __bam_write_vec::<#elem_ty, #field_ty>(
                             ::core::ptr::addr_of_mut!((*typed_ptr).#member_tokens),
-                            slice,
+                            slice_val,
                         )
                     }
                 },

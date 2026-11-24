@@ -7,6 +7,7 @@ use core::{
 
 use crate::{
     access::AccessMode,
+    commands::BamCommands,
     primitives::{BamComponent, ComponentUuid, FfiBool, FfiEntity, FfiResult},
 };
 
@@ -479,4 +480,337 @@ pub type BamIterColumnTicksFn = unsafe extern "C" fn(
     out_changed: *mut *const u32,
     out_last_run: *mut u32,
     out_this_run: *mut u32,
+) -> FfiResult;
+
+/// Contiguous row range `[start_row .. start_row + row_count)` within the current table chunk
+/// (`typedef struct BamRowRange BamRowRange;`).
+///
+/// Layout:
+/// - 64-bit: `16` bytes, `8`-byte alignment, zero implicit padding.
+/// - 32-bit: `8` bytes, `4`-byte alignment, zero implicit padding.
+#[repr(C)]
+#[derive(Debug, Copy, Clone, Default, PartialEq, Eq, Hash)]
+pub struct BamRowRange {
+    /// Zero-based starting row index inside the current chunk (`offset 0`).
+    pub start_row: usize,
+    /// Number of contiguous rows starting at `start_row` (`offset 8` / `4`).
+    pub row_count: usize,
+}
+
+impl BamRowRange {
+    /// Constructs a [`BamRowRange`] spanning `start_row .. start_row + row_count`.
+    #[inline]
+    #[must_use]
+    pub const fn new(start_row: usize, row_count: usize) -> Self {
+        Self {
+            start_row,
+            row_count,
+        }
+    }
+
+    /// Returns the exclusive end row `start_row + row_count`, or `None` on overflow.
+    #[inline]
+    #[must_use]
+    pub const fn end_row(&self) -> Option<usize> {
+        self.start_row.checked_add(self.row_count)
+    }
+
+    /// Returns `true` if `row_count == 0`.
+    #[inline]
+    #[must_use]
+    pub const fn is_empty(&self) -> bool {
+        self.row_count == 0
+    }
+}
+
+// SAFETY: `BamRowRange` is a `#[repr(C)]` struct of two `usize` scalars with zero implicit padding,
+// `Copy + Send + Sync + 'static`, no drop glue, and every bit pattern valid within the process.
+unsafe impl crate::traits::RawInsertable for BamRowRange {}
+// SAFETY: On each target ABI, `BamRowRange` has zero uninitialized padding bytes, no interior
+// mutability, and matches C `{ size_t start_row; size_t row_count; }`.
+unsafe impl crate::traits::AbiPod for BamRowRange {}
+
+const _: () = {
+    #[cfg(target_pointer_width = "64")]
+    {
+        assert!(core::mem::size_of::<BamRowRange>() == 16);
+        assert!(core::mem::align_of::<BamRowRange>() == 8);
+        assert!(core::mem::offset_of!(BamRowRange, start_row) == 0);
+        assert!(core::mem::offset_of!(BamRowRange, row_count) == 8);
+    }
+    #[cfg(target_pointer_width = "32")]
+    {
+        assert!(core::mem::size_of::<BamRowRange>() == 8);
+        assert!(core::mem::align_of::<BamRowRange>() == 4);
+        assert!(core::mem::offset_of!(BamRowRange, start_row) == 0);
+        assert!(core::mem::offset_of!(BamRowRange, row_count) == 4);
+    }
+};
+
+/// Zero-allocation `#![no_std]` run coalescer merging adjacent dirty row indices into
+/// [`BamRowRange`] spans for batch change-tick marking (`BamHostApi::iter_mark_changed_ranges`).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct DirtyRunCoalescer {
+    current: Option<BamRowRange>,
+}
+
+impl DirtyRunCoalescer {
+    /// Creates an empty [`DirtyRunCoalescer`].
+    #[inline]
+    #[must_use]
+    pub const fn new() -> Self {
+        Self { current: None }
+    }
+
+    /// Feeds one ascending row index into the coalescer.
+    ///
+    /// If `row` extends or falls within the active run, returns `None`. If `row` begins a new
+    /// disjoint run, returns the completed previous [`BamRowRange`] and starts a new run at `row`.
+    #[inline]
+    pub fn push_row(&mut self, row: usize) -> Option<BamRowRange> {
+        let Some(mut active) = self.current else {
+            self.current = Some(BamRowRange::new(row, 1));
+            return None;
+        };
+        if let Some(end) = active.end_row() {
+            if row == end
+                && let Some(next_count) = active.row_count.checked_add(1)
+            {
+                active.row_count = next_count;
+                self.current = Some(active);
+                return None;
+            }
+            if row >= active.start_row && row < end {
+                return None;
+            }
+        }
+        self.current = Some(BamRowRange::new(row, 1));
+        Some(active)
+    }
+
+    /// Feeds a [`BamRowRange`] into the coalescer, merging adjacent/overlapping runs.
+    ///
+    /// Empty ranges (`row_count == 0`) are ignored. When `range` cannot merge with the active run,
+    /// the prior run is returned and `range` becomes the new active run.
+    #[inline]
+    pub fn push_range(&mut self, range: BamRowRange) -> Option<BamRowRange> {
+        if range.is_empty() {
+            return None;
+        }
+        let Some(active) = self.current else {
+            self.current = Some(range);
+            return None;
+        };
+        if let (Some(a_end), Some(r_end)) = (active.end_row(), range.end_row())
+            && range.start_row <= a_end
+            && active.start_row <= r_end
+        {
+            let merged_start = active.start_row.min(range.start_row);
+            let merged_end = a_end.max(r_end);
+            self.current = Some(BamRowRange::new(merged_start, merged_end - merged_start));
+            return None;
+        }
+        self.current = Some(range);
+        Some(active)
+    }
+
+    /// Returns the currently buffered run without flushing it.
+    #[inline]
+    #[must_use]
+    pub const fn current(&self) -> Option<BamRowRange> {
+        self.current
+    }
+
+    /// Flushes and resets the final pending [`BamRowRange`], if any.
+    #[inline]
+    pub const fn finish(&mut self) -> Option<BamRowRange> {
+        self.current.take()
+    }
+
+    /// Coalesces a slice of ascending row indices into caller-owned `out` storage without
+    /// allocation, returning `Ok(written)` on success or `Err(total_runs)` if `out` was too small.
+    pub fn coalesce_into(rows: &[usize], out: &mut [BamRowRange]) -> Result<usize, usize> {
+        let mut state = Self::new();
+        let mut total = 0usize;
+        let mut overflow = false;
+        for &row in rows {
+            if let Some(done) = state.push_row(row) {
+                if let Some(slot) = out.get_mut(total) {
+                    *slot = done;
+                } else {
+                    overflow = true;
+                }
+                total += 1;
+            }
+        }
+        if let Some(last) = state.finish() {
+            if let Some(slot) = out.get_mut(total) {
+                *slot = last;
+            } else {
+                overflow = true;
+            }
+            total += 1;
+        }
+        if overflow { Err(total) } else { Ok(total) }
+    }
+}
+
+/// Extensible tuning parameters for `BamHostApi::par_for_each_chunk_ex`
+/// (`typedef struct BamParOptions BamParOptions;`).
+///
+/// Layout:
+/// - 64-bit: `24` bytes, `8`-byte alignment, zero implicit padding.
+/// - 32-bit: `16` bytes, `4`-byte alignment, zero implicit padding.
+#[repr(C)]
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+pub struct BamParOptions {
+    /// Size of this struct in bytes (`offset 0`).
+    pub struct_size: u32,
+    /// Bitflags (`must be 0` in ABI `0.4`, `offset 4`).
+    pub flags: u32,
+    /// Preferred rows per worker sub-chunk (`0` uses host default, `offset 8`).
+    pub chunk_size: usize,
+    /// Maximum worker partitions (`0` uses task-pool default, `offset 16` / `12`).
+    pub max_partitions: usize,
+}
+
+impl BamParOptions {
+    /// Minimum valid size of [`BamParOptions`] in ABI `0.4` (`24` on 64-bit, `16` on 32-bit).
+    pub const MIN_V0_4_SIZE: usize = core::mem::size_of::<Self>();
+
+    /// Constructs default parallel chunk options stamped with `struct_size = size_of::<Self>()`.
+    #[inline]
+    #[must_use]
+    pub const fn new() -> Self {
+        Self {
+            struct_size: core::mem::size_of::<Self>() as u32,
+            flags: 0,
+            chunk_size: 0,
+            max_partitions: 0,
+        }
+    }
+
+    /// Sets `chunk_size` hint.
+    #[inline]
+    #[must_use]
+    pub const fn with_chunk_size(mut self, chunk_size: usize) -> Self {
+        self.chunk_size = chunk_size;
+        self
+    }
+
+    /// Sets `max_partitions` limit.
+    #[inline]
+    #[must_use]
+    pub const fn with_max_partitions(mut self, max_partitions: usize) -> Self {
+        self.max_partitions = max_partitions;
+        self
+    }
+
+    /// Validates `struct_size` and unknown `flags`.
+    #[inline]
+    #[must_use]
+    pub const fn validate(&self) -> FfiResult {
+        if (self.struct_size as usize) < Self::MIN_V0_4_SIZE {
+            return FfiResult::INVALID_VERSION;
+        }
+        if self.flags != 0 {
+            return FfiResult::UNSUPPORTED;
+        }
+        FfiResult::OK
+    }
+}
+
+impl Default for BamParOptions {
+    #[inline]
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+// SAFETY: `BamParOptions` begins with `struct_size: u32` at offset 0 and contains only integer scalars.
+unsafe impl crate::extensible::ExtensibleStruct for BamParOptions {
+    const MIN_V0_2_SIZE: usize = Self::MIN_V0_4_SIZE;
+}
+
+const _: () = {
+    #[cfg(target_pointer_width = "64")]
+    {
+        assert!(core::mem::size_of::<BamParOptions>() == 24);
+        assert!(core::mem::align_of::<BamParOptions>() == 8);
+        assert!(core::mem::offset_of!(BamParOptions, struct_size) == 0);
+        assert!(core::mem::offset_of!(BamParOptions, flags) == 4);
+        assert!(core::mem::offset_of!(BamParOptions, chunk_size) == 8);
+        assert!(core::mem::offset_of!(BamParOptions, max_partitions) == 16);
+    }
+    #[cfg(target_pointer_width = "32")]
+    {
+        assert!(core::mem::size_of::<BamParOptions>() == 16);
+        assert!(core::mem::align_of::<BamParOptions>() == 4);
+        assert!(core::mem::offset_of!(BamParOptions, struct_size) == 0);
+        assert!(core::mem::offset_of!(BamParOptions, flags) == 4);
+        assert!(core::mem::offset_of!(BamParOptions, chunk_size) == 8);
+        assert!(core::mem::offset_of!(BamParOptions, max_partitions) == 12);
+    }
+};
+
+/// Extended parallel chunk-task callback receiving a thread-local [`BamCommands`] queue and
+/// `partition_index` (`typedef BamResult (*BamChunkTaskExFn)(BamIter*, BamCommands*, size_t, void*);`).
+///
+/// # Safety
+/// - `iter` and `commands` point to host-managed partition handles valid only during the invocation.
+/// - Must never unwind across the `extern "C"` boundary.
+pub type BamChunkTaskExFn = unsafe extern "C" fn(
+    iter: *mut BamIter,
+    commands: *mut BamCommands,
+    partition_index: usize,
+    user_data: *mut c_void,
+) -> FfiResult;
+
+/// Returns `[ *mut u8; chunk_len ]` row pointers for a mutable sparse-set column at `term_index`
+/// without marking change ticks (`typedef uint8_t* const* (*BamIterColumnRowsMutableUntrackedFn)(BamIter*, size_t);`).
+///
+/// # Safety
+/// `iter` must point to an active [`BamIter`] positioned at a valid chunk whose `term_index`
+/// was declared with mutable access.
+pub type BamIterColumnRowsMutableUntrackedFn =
+    unsafe extern "C" fn(iter: *mut BamIter, term_index: usize) -> *const *mut u8;
+
+/// Marks all [`BamRowRange`] spans in `ranges_ptr[0..range_count]` as changed on `term_index`
+/// (`typedef BamResult (*BamIterMarkChangedRangesFn)(BamIter*, size_t, const BamRowRange*, size_t);`).
+///
+/// # Safety
+/// - `iter` must point to an active [`BamIter`] positioned at a valid chunk.
+/// - When `range_count > 0`, `ranges_ptr` must point to `range_count` readable [`BamRowRange`] entries.
+pub type BamIterMarkChangedRangesFn = unsafe extern "C" fn(
+    iter: *mut BamIter,
+    term_index: usize,
+    ranges_ptr: *const BamRowRange,
+    range_count: usize,
+) -> FfiResult;
+
+/// Invokes host-driven parallel chunk iteration with explicit [`BamParOptions`] and per-partition
+/// `commands` support (`typedef BamResult (*BamParForEachChunkExFn)(BamIter*, BamChunkTaskExFn, void*, const BamParOptions*);`).
+///
+/// # Safety
+/// - `iter` must point to an active [`BamIter`] owning exclusive query access.
+/// - `chunk_fn` must be thread-safe (`Send + Sync` captures in `user_data`).
+/// - If `options` is non-null, it must point to a valid [`BamParOptions`].
+pub type BamParForEachChunkExFn = unsafe extern "C" fn(
+    iter: *mut BamIter,
+    chunk_fn: Option<BamChunkTaskExFn>,
+    user_data: *mut c_void,
+    options: *const BamParOptions,
+) -> FfiResult;
+
+/// Borrows the contiguous underlying `Messages<M>` read slice `(out_ptr, out_count)` in zero-copy
+/// form (`typedef BamResult (*BamMsgReadSliceFn)(BamIter*, size_t, const uint8_t**, size_t*);`).
+///
+/// # Safety
+/// - `iter` must point to an active [`BamIter`] with `MESSAGE_READ` at `term_index`.
+/// - `out_ptr` and `out_count` must point to valid writable pointers.
+pub type BamMsgReadSliceFn = unsafe extern "C" fn(
+    iter: *mut BamIter,
+    term_index: usize,
+    out_ptr: *mut *const u8,
+    out_count: *mut usize,
 ) -> FfiResult;

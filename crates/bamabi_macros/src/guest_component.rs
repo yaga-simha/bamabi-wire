@@ -5,12 +5,13 @@
 
 use std::ffi::CString;
 
+use crate::attrs::FieldAttrOverride;
 use crate::attrs::{
     parse_guest_component_attrs, parse_repr_flags, resolve_guest_crate_path, resolve_sys_crate_path,
 };
-use crate::classify::canonical_field_type_tag;
+use crate::classify::{canonical_bam_field_kind_ident, canonical_field_type_tag, classify_type};
 use proc_macro2::TokenStream;
-use quote::quote;
+use quote::{format_ident, quote};
 use syn::{Data, DeriveInput, Fields, Index, LitCStr};
 
 /// Entry point for `#[derive(GuestComponent)]` proc-macro expansion.
@@ -109,46 +110,75 @@ fn expand_guest_component_inner(
     })?;
     let name_lit = LitCStr::new(&name_cstr, struct_ident.span());
 
+    let mut bam_field_entries = Vec::new();
+    let mut schema_fp_updates = Vec::new();
+    let mut schema_hash_expr = quote! { 0u64 };
+
+    let mut push_field = |field_name: String, member_toks: TokenStream, field: &syn::Field| {
+        let field_ty = &field.ty;
+        let field_tag = canonical_field_type_tag(field_ty);
+        let kind_ident_str = match classify_type(field_ty, FieldAttrOverride::None) {
+            Ok(ref kind) => canonical_bam_field_kind_ident(kind, field_ty),
+            Err(_) => "NESTED",
+        };
+        let kind_ident = format_ident!("{}", kind_ident_str);
+
+        if !attrs.no_schema_hash {
+            schema_hash_expr = quote! {
+                #sys_crate::ComponentUuid::hash_field_schema(
+                    #schema_hash_expr,
+                    #field_name,
+                    #field_tag,
+                    ::core::mem::offset_of!(#struct_ident, #member_toks),
+                )
+            };
+        }
+
+        bam_field_entries.push(quote! {
+            #sys_crate::BamFieldDesc::new(
+                #sys_crate::BamFieldKind::#kind_ident,
+                #sys_crate::StrView::from_str(#field_name),
+                #sys_crate::StrView::from_str(#field_tag),
+                ::core::mem::offset_of!(#struct_ident, #member_toks),
+                ::core::mem::size_of::<#field_ty>(),
+                ::core::mem::align_of::<#field_ty>(),
+            )
+        });
+        schema_fp_updates.push(quote! {
+            h = #sys_crate::fnv1a_64_update_u64(h, (#sys_crate::BamFieldKind::#kind_ident).0 as u64);
+            h = #sys_crate::fnv1a_64_update_bytes(h, #field_name.as_bytes());
+            h = #sys_crate::fnv1a_64_update_bytes(h, #field_tag.as_bytes());
+            h = #sys_crate::fnv1a_64_update_u64(
+                h,
+                ::core::mem::offset_of!(#struct_ident, #member_toks) as u64,
+            );
+            h = #sys_crate::fnv1a_64_update_u64(h, ::core::mem::size_of::<#field_ty>() as u64);
+            h = #sys_crate::fnv1a_64_update_u64(h, ::core::mem::align_of::<#field_ty>() as u64);
+        });
+    };
+
+    match fields {
+        Fields::Named(named) => {
+            for field in &named.named {
+                let Some(ident) = field.ident.as_ref() else {
+                    continue;
+                };
+                push_field(ident.to_string(), quote! { #ident }, field);
+            }
+        }
+        Fields::Unnamed(unnamed) => {
+            for (idx, field) in unnamed.unnamed.iter().enumerate() {
+                let index = Index::from(idx);
+                push_field(idx.to_string(), quote! { #index }, field);
+            }
+        }
+        Fields::Unit => {}
+    }
+
     let schema_expr = if attrs.no_schema_hash {
         quote! { 0u64 }
     } else {
-        let mut expr = quote! { 0u64 };
-        match fields {
-            Fields::Named(named) => {
-                for field in &named.named {
-                    let Some(ident) = field.ident.as_ref() else {
-                        continue;
-                    };
-                    let field_name = ident.to_string();
-                    let field_tag = canonical_field_type_tag(&field.ty);
-                    expr = quote! {
-                        #sys_crate::ComponentUuid::hash_field_schema(
-                            #expr,
-                            #field_name,
-                            #field_tag,
-                            ::core::mem::offset_of!(#struct_ident, #ident),
-                        )
-                    };
-                }
-            }
-            Fields::Unnamed(unnamed) => {
-                for (idx, field) in unnamed.unnamed.iter().enumerate() {
-                    let field_name = idx.to_string();
-                    let field_tag = canonical_field_type_tag(&field.ty);
-                    let index = Index::from(idx);
-                    expr = quote! {
-                        #sys_crate::ComponentUuid::hash_field_schema(
-                            #expr,
-                            #field_name,
-                            #field_tag,
-                            ::core::mem::offset_of!(#struct_ident, #index),
-                        )
-                    };
-                }
-            }
-            Fields::Unit => {}
-        }
-        expr
+        schema_hash_expr
     };
 
     let mut flag_terms = Vec::new();
@@ -168,19 +198,51 @@ fn expand_guest_component_inner(
     };
 
     let uuid_item = match attrs.custom_uuid.as_deref() {
-        Some(hex_str) => quote! {
-            const UUID: #sys_crate::ComponentUuid = #sys_crate::ComponentUuid::parse_hex(#hex_str);
-        },
+        Some(hex_str) => {
+            let bytes = bamabi_schema::try_parse_uuid_hex(hex_str).ok_or_else(|| {
+                syn::Error::new_spanned(
+                    &input.ident,
+                    "invalid `uuid` literal in `#[guest_component]`",
+                )
+            })?;
+            quote! {
+                const UUID: #sys_crate::ComponentUuid =
+                    #sys_crate::ComponentUuid::from_bytes([#(#bytes),*]);
+            }
+        }
         None => quote! {},
+    };
+
+    let fingerprint_expr = match attrs.custom_schema_fingerprint {
+        Some(custom_fp) => quote! { #custom_fp },
+        None => quote! {
+            {
+                let mut h = #sys_crate::fnv1a_64_init();
+                h = #sys_crate::fnv1a_64_update_bytes(h, #full_name.as_bytes());
+                h = #sys_crate::fnv1a_64_update_u64(h, ::core::mem::size_of::<#struct_ident>() as u64);
+                h = #sys_crate::fnv1a_64_update_u64(h, ::core::mem::align_of::<#struct_ident>() as u64);
+                h = #sys_crate::fnv1a_64_update_u64(h, (#flags_expr) as u64);
+                #(#schema_fp_updates)*
+                h
+            }
+        },
     };
 
     Ok(quote! {
         const _: () = {
+            static GUEST_BAM_FIELDS: &[#sys_crate::BamFieldDesc] = &[
+                #(#bam_field_entries),*
+            ];
+
+            const GUEST_SCHEMA_FINGERPRINT: u64 = #fingerprint_expr;
+
             impl #guest_crate::GuestComponent for #struct_ident {
                 const NAME: &'static ::core::ffi::CStr = #name_lit;
                 const FIELD_SCHEMA_HASH: u64 = #schema_expr;
                 const FLAGS: u32 = #flags_expr;
                 #uuid_item
+                const SCHEMA_FINGERPRINT: u64 = GUEST_SCHEMA_FINGERPRINT;
+                const BAM_FIELDS: &'static [#sys_crate::BamFieldDesc] = GUEST_BAM_FIELDS;
             }
         };
     })

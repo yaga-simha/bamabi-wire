@@ -128,7 +128,8 @@
 //! let ptr = (&raw mut actor).cast::<core::ffi::c_void>();
 //! unsafe {
 //!     assert_eq!((vt.set_active.unwrap())(ptr, FfiBool::TRUE), FfiResult::OK);
-//!     assert_eq!((vt.set_name.unwrap())(ptr, StrView::from_str("paladin")), FfiResult::OK);
+//!     let new_name = StrView::from_str("paladin");
+//!     assert_eq!((vt.set_name.unwrap())(ptr, &raw const new_name), FfiResult::OK);
 //!     assert_eq!((vt.push_scores.unwrap())(ptr, 25), FfiResult::OK);
 //! }
 //! assert!(actor.active);
@@ -180,7 +181,7 @@
 //! - `namespace = "..."`: Explicit namespace prefix overriding `module_path!()` (cannot be
 //!   combined with an already-namespaced `name = "ns::Name"`).
 //! - `uuid = "..."`: Explicit 36-char hyphenated (`8-4-4-4-12`) or 32-char hex UUID literal
-//!   validated at macro-expansion time and parsed via `ComponentUuid::parse_hex`.
+//!   validated at macro-expansion time and materialized via `ComponentUuid::from_bytes`.
 //! - `prefix = "..."`: Custom C export symbol stem for `export_symbols` (auto-prefixed with `bam_`
 //!   if not already starting with `bam_`).
 //! - `crate = path` / `"path"`: Explicit path to `bamabi_sys` (also supported on `#[derive(AbiPod)]`).
@@ -232,7 +233,7 @@
 //!    `Foo::vtable()`.
 //! 3. **`impl ModComponent for Foo`:**
 //!    - `CANONICAL_NAME` & `COMPONENT_CSTR`.
-//!    - `UUID`: `parse_hex` if `uuid = "..."` is specified; `ComponentUuid::from_parts` with
+//!    - `UUID`: `ComponentUuid::from_bytes` if `uuid = "..."` is specified; `ComponentUuid::from_parts` with
 //!      `hash_field_schema` chain over `(field_name, type_tag, offset_of!)` for `AbiPod` structs
 //!      (or enum tag + variants); or `ComponentUuid::from_canonical_name` for non-POD structs.
 //!    - `SCHEMA_FINGERPRINT`: 64-bit FNV-1a (`fnv1a_64_init`) hashing `CANONICAL_NAME`,

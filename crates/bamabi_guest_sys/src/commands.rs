@@ -3,8 +3,9 @@
 use core::{ffi::c_void, marker::PhantomData};
 
 use bamabi_sys::{
-    AbiPod, BamCommands, BamComponent, BamEventKind, BamHostApi, BamHostCtx, BamObserverDesc,
-    BamTermDesc, BamTriggerDesc, FfiAssetHandle, FfiEntity, FfiResult,
+    AbiPod, BAM_SPAWN_COL_FLAG_SPLAT, BAM_SPAWN_COL_KNOWN_FLAGS, BamCommands, BamComponent,
+    BamEventKind, BamHostApi, BamHostCtx, BamObserverDesc, BamSpawnColumnDesc, BamTermDesc,
+    BamTriggerDesc, FfiAssetHandle, FfiEntity, FfiResult,
 };
 
 use crate::{
@@ -248,8 +249,8 @@ pub(crate) fn validate_spawn_entry(host: &Host, entry: &SpawnEntry<'_>) -> Resul
     unsafe { validate_spawn_entry_with_ctx(host.api(), || host.host_ctx(), entry) }
 }
 
-/// Columnar slice descriptor `(BamComponent, *const u8, len)` for multi-entity
-/// [`ValidatedCommands::spawn_batch_columns`].
+/// Columnar slice descriptor `(BamComponent, *const u8, len, flags)` for multi-entity
+/// [`ValidatedCommands::spawn_batch_columns`] and [`ValidatedCommands::spawn_batch_ex`].
 #[derive(Clone, Copy, Debug)]
 pub struct SpawnBatchColumn<'a> {
     component: BamComponent,
@@ -258,6 +259,7 @@ pub struct SpawnBatchColumn<'a> {
     elem_size: Option<usize>,
     elem_align: Option<usize>,
     validated_typed: bool,
+    flags: u32,
     _marker: PhantomData<&'a ()>,
 }
 
@@ -277,6 +279,7 @@ impl<'a> SpawnBatchColumn<'a> {
             elem_size: Some(core::mem::size_of::<T>()),
             elem_align: Some(core::mem::align_of::<T>()),
             validated_typed: false,
+            flags: 0,
             _marker: PhantomData,
         }
     }
@@ -299,6 +302,50 @@ impl<'a> SpawnBatchColumn<'a> {
             elem_size: Some(core::mem::size_of::<T>()),
             elem_align: Some(core::mem::align_of::<T>()),
             validated_typed: true,
+            flags: 0,
+            _marker: PhantomData,
+        }
+    }
+
+    /// Binds a single `value` (`T: AbiPod`) repeated (stride-0 splat,
+    /// `BAM_SPAWN_COL_FLAG_SPLAT`) across every entity spawned via
+    /// [`ValidatedCommands::spawn_batch_ex`] / [`ValidatedCommands::spawn_batch_columns`].
+    #[inline]
+    pub const fn splat<T: AbiPod>(component: BamComponent, value: &'a T) -> Self {
+        let ptr = if core::mem::size_of::<T>() == 0 {
+            core::ptr::NonNull::<u8>::dangling().as_ptr().cast_const()
+        } else {
+            core::ptr::from_ref(value).cast::<u8>()
+        };
+        Self {
+            component,
+            column_ptr: ptr,
+            entity_count: 1,
+            elem_size: Some(core::mem::size_of::<T>()),
+            elem_align: Some(core::mem::align_of::<T>()),
+            validated_typed: false,
+            flags: BAM_SPAWN_COL_FLAG_SPLAT,
+            _marker: PhantomData,
+        }
+    }
+
+    /// Init-validated [`TypedComponent<T>`] variant of [`Self::splat`] (`BAM_SPAWN_COL_FLAG_SPLAT`),
+    /// skipping the per-call `Host::component_layout_info` FFI round-trip.
+    #[inline]
+    pub const fn splat_typed<T: AbiPod>(component: TypedComponent<T>, value: &'a T) -> Self {
+        let ptr = if core::mem::size_of::<T>() == 0 {
+            core::ptr::NonNull::<u8>::dangling().as_ptr().cast_const()
+        } else {
+            core::ptr::from_ref(value).cast::<u8>()
+        };
+        Self {
+            component: component.handle(),
+            column_ptr: ptr,
+            entity_count: 1,
+            elem_size: Some(core::mem::size_of::<T>()),
+            elem_align: Some(core::mem::align_of::<T>()),
+            validated_typed: true,
+            flags: BAM_SPAWN_COL_FLAG_SPLAT,
             _marker: PhantomData,
         }
     }
@@ -313,6 +360,7 @@ impl<'a> SpawnBatchColumn<'a> {
             elem_size: Some(0),
             elem_align: None,
             validated_typed: false,
+            flags: 0,
             _marker: PhantomData,
         }
     }
@@ -335,8 +383,15 @@ impl<'a> SpawnBatchColumn<'a> {
             elem_size: None,
             elem_align: None,
             validated_typed: false,
+            flags: 0,
             _marker: PhantomData,
         }
+    }
+
+    /// Returns the `BAM_SPAWN_COL_FLAG_*` bitmask for this column (`0` or `BAM_SPAWN_COL_FLAG_SPLAT`).
+    #[inline]
+    pub const fn flags(&self) -> u32 {
+        self.flags
     }
 
     /// Returns the [`BamComponent`] handle for this column.
@@ -371,6 +426,10 @@ impl<'a> SpawnBatchColumn<'a> {
 
     /// Constructs a [`SpawnBatchColumn`] from raw parts for unit tests and Kani bounds harnesses so
     /// symbolic null pointers and `isize::MAX` byte-length overflows can be exercised directly.
+    ///
+    /// # Safety
+    /// Test and Kani proof-only raw constructor; the caller must ensure pointer/count/layout
+    /// invariants hold or invoke only failure-path validation on the resulting descriptor.
     #[cfg(any(test, kani))]
     #[inline]
     pub(crate) const unsafe fn from_parts_for_kani(
@@ -388,6 +447,7 @@ impl<'a> SpawnBatchColumn<'a> {
             elem_size,
             elem_align,
             validated_typed,
+            flags: 0,
             _marker: PhantomData,
         }
     }
@@ -395,8 +455,8 @@ impl<'a> SpawnBatchColumn<'a> {
 
 /// Validates a [`SpawnBatchColumn`] against `Host::component_layout_info_with_ctx` (unless
 /// already init-validated via [`SpawnBatchColumn::typed`]) and checks buffer bounds before passing
-/// columnar pointers to `BamHostApi::cmd_spawn_batch`, invoking `resolve_ctx` only when an FFI
-/// `component_layout_info` call is required.
+/// columnar pointers to `BamHostApi::cmd_spawn_batch` or `cmd_spawn_batch_ex`, invoking
+/// `resolve_ctx` only when an FFI `component_layout_info` call is required.
 ///
 /// # Safety
 /// `resolve_ctx` must return a valid active [`BamHostCtx`] matching `api` for the duration of this call.
@@ -409,7 +469,16 @@ pub(crate) unsafe fn validate_spawn_batch_column_with_ctx(
     if !col.component.is_valid() {
         return FfiResult::INVALID_COMPONENT;
     }
-    if col.entity_count < entity_count {
+    if (col.flags & !BAM_SPAWN_COL_KNOWN_FLAGS) != 0 {
+        return FfiResult::INVALID_ARGUMENT;
+    }
+    let is_splat = (col.flags & BAM_SPAWN_COL_FLAG_SPLAT) != 0;
+    let required_rows = if is_splat {
+        usize::from(entity_count > 0)
+    } else {
+        entity_count
+    };
+    if col.entity_count < required_rows {
         return FfiResult::INVALID_ARGUMENT;
     }
     if let Some(expected_size) = col.elem_size {
@@ -434,7 +503,7 @@ pub(crate) unsafe fn validate_spawn_batch_column_with_ctx(
             if col.column_ptr.is_null() {
                 return FfiResult::NULL_POINTER;
             }
-            if entity_count
+            if required_rows
                 .checked_mul(expected_size)
                 .is_none_or(|b| b > isize::MAX as usize)
             {
@@ -931,6 +1000,9 @@ impl<'a> ValidatedCommands<'a> {
                 return status;
             }
         }
+        if columns.iter().any(|col| col.flags != 0) {
+            return self.spawn_batch_ex_validated(columns, entity_count, out_entities);
+        }
         let out_ptr = match out_entities {
             Some(slice) if entity_count > 0 => slice.as_mut_ptr(),
             _ => core::ptr::null_mut(),
@@ -1188,29 +1260,16 @@ impl<'a> ValidatedCommands<'a> {
 
     /// Spawns a runtime read-only custom event observer via `BamHostApi::cmd_observe`, tracking
     /// its closure state inside the owning [`crate::GuestInstance`].
-    #[allow(clippy::too_many_arguments)]
     pub fn observe<E, F>(
         &mut self,
-        name: Option<&str>,
-        event: BamComponent,
-        target: FfiEntity,
-        flags: u32,
-        propagate_relationship: BamComponent,
+        config: &crate::trampoline::ObserverRegistrationConfig<'_>,
         callback: F,
     ) -> Result<FfiEntity, FfiResult>
     where
         E: AbiPod,
         F: FnMut(FfiEntity, &E, &mut ValidatedCommands<'_>) -> FfiResult + Send + 'static,
     {
-        let desc = allocate_runtime_observer_desc::<E, F>(
-            self.host,
-            name,
-            event,
-            target,
-            flags,
-            propagate_relationship,
-            callback,
-        )?;
+        let desc = allocate_runtime_observer_desc::<E, F>(self.host, config, callback)?;
         // SAFETY: `desc`'s closure state and optional `name` were pinned in `GuestInstance` via
         // `Host::track_runtime_allocation`.
         unsafe { self.observe_raw(&desc) }
@@ -1218,14 +1277,9 @@ impl<'a> ValidatedCommands<'a> {
 
     /// Spawns a runtime mutable custom event observer (`&mut E` + `&mut bool` propagate) via
     /// `BamHostApi::cmd_observe`, tracking its closure state inside the owning [`crate::GuestInstance`].
-    #[allow(clippy::too_many_arguments)]
     pub fn observe_mut<E, F>(
         &mut self,
-        name: Option<&str>,
-        event: BamComponent,
-        target: FfiEntity,
-        flags: u32,
-        propagate_relationship: BamComponent,
+        config: &crate::trampoline::ObserverRegistrationConfig<'_>,
         callback: F,
     ) -> Result<FfiEntity, FfiResult>
     where
@@ -1234,45 +1288,22 @@ impl<'a> ValidatedCommands<'a> {
             + Send
             + 'static,
     {
-        let desc = allocate_runtime_observer_mut_desc::<E, F>(
-            self.host,
-            name,
-            event,
-            target,
-            flags,
-            propagate_relationship,
-            callback,
-        )?;
+        let desc = allocate_runtime_observer_mut_desc::<E, F>(self.host, config, callback)?;
         // SAFETY: `desc`'s closure state and optional `name` were pinned in `GuestInstance`.
         unsafe { self.observe_raw(&desc) }
     }
 
     /// Spawns a runtime lifecycle or `Ready` observer via `BamHostApi::cmd_observe`, tracking its
     /// closure state and watched component list inside the owning [`crate::GuestInstance`].
-    #[allow(clippy::too_many_arguments)]
     pub fn observe_lifecycle<F>(
         &mut self,
-        name: Option<&str>,
-        event_kind: BamEventKind,
-        watched_components: &[BamComponent],
-        target: FfiEntity,
-        flags: u32,
-        propagate_relationship: BamComponent,
+        config: &crate::trampoline::ObserverRegistrationConfig<'_>,
         callback: F,
     ) -> Result<FfiEntity, FfiResult>
     where
         F: FnMut(FfiEntity, &mut ValidatedCommands<'_>) -> FfiResult + Send + 'static,
     {
-        let desc = allocate_runtime_lifecycle_observer_desc(
-            self.host,
-            name,
-            event_kind,
-            watched_components,
-            target,
-            flags,
-            propagate_relationship,
-            callback,
-        )?;
+        let desc = allocate_runtime_lifecycle_observer_desc(self.host, config, callback)?;
         // SAFETY: `desc`'s closure state, `name`, and `watched_components` were pinned in `GuestInstance`.
         unsafe { self.observe_raw(&desc) }
     }
@@ -1557,6 +1588,369 @@ impl<'a> ValidatedCommands<'a> {
         };
         // SAFETY: `self.raw` is active and `resource` was validated non-zero.
         unsafe { remove_res_fn(self.raw, resource) }
+    }
+
+    /// Queues deferred despawn of `entities` in one FFI call via `BamHostApi::cmd_despawn_batch`
+    /// (slot 85).
+    #[inline]
+    pub fn despawn_batch(&mut self, entities: &[FfiEntity]) -> FfiResult {
+        if self.raw.is_null() {
+            return FfiResult::NULL_POINTER;
+        }
+        if entities.iter().any(|e| e.is_null()) {
+            return FfiResult::INVALID_ENTITY;
+        }
+        let Some(despawn_fn) = host_slot!(self.host.api(), cmd_despawn_batch) else {
+            return FfiResult::UNSUPPORTED;
+        };
+        let ptr = if entities.is_empty() {
+            core::ptr::NonNull::<FfiEntity>::dangling()
+                .as_ptr()
+                .cast_const()
+        } else {
+            entities.as_ptr()
+        };
+        // SAFETY: `self.raw` is active and `ptr` is readable for `entities.len()` `FfiEntity` values.
+        unsafe { despawn_fn(self.raw, ptr, entities.len()) }
+    }
+
+    /// Queues deferred insertion of `component` (`T: AbiPod`) across `entities` in one FFI call
+    /// via `BamHostApi::cmd_insert_batch` (slot 86), validating layout against
+    /// `Host::component_layout_info`.
+    #[inline]
+    pub fn insert_batch<T: AbiPod>(
+        &mut self,
+        entities: &[FfiEntity],
+        component: BamComponent,
+        data: &[T],
+    ) -> FfiResult {
+        if self.raw.is_null() {
+            return FfiResult::NULL_POINTER;
+        }
+        if !component.is_valid() {
+            return FfiResult::INVALID_COMPONENT;
+        }
+        if data.len() < entities.len() {
+            return FfiResult::INVALID_ARGUMENT;
+        }
+        if entities.iter().any(|e| e.is_null()) {
+            return FfiResult::INVALID_ENTITY;
+        }
+        let Some(insert_fn) = host_slot!(self.host.api(), cmd_insert_batch) else {
+            return FfiResult::UNSUPPORTED;
+        };
+        // SAFETY: `self.resolve_ctx()` returns a valid active `BamHostCtx` matching `self.host.api()`.
+        let info = match unsafe {
+            Host::component_layout_info_with_ctx(self.host.api(), self.resolve_ctx(), component)
+        } {
+            Ok(info) => info,
+            Err(err) => return err,
+        };
+        if info.size != core::mem::size_of::<T>() || info.align != core::mem::align_of::<T>() {
+            return FfiResult::TYPE_MISMATCH;
+        }
+        let elem_size = core::mem::size_of::<T>();
+        let ent_ptr = if entities.is_empty() {
+            core::ptr::NonNull::<FfiEntity>::dangling()
+                .as_ptr()
+                .cast_const()
+        } else {
+            entities.as_ptr()
+        };
+        let data_ptr = if elem_size == 0 || entities.is_empty() {
+            core::ptr::NonNull::<u8>::dangling().as_ptr().cast_const()
+        } else {
+            data.as_ptr().cast::<u8>()
+        };
+        // SAFETY: `self.raw` is active, layout was verified, and `data_ptr` is readable for
+        // `entities.len() * elem_size` bytes.
+        unsafe {
+            insert_fn(
+                self.raw,
+                ent_ptr,
+                entities.len(),
+                component,
+                data_ptr,
+                elem_size,
+                0,
+            )
+        }
+    }
+
+    /// Init-validated [`TypedComponent<T>`] variant of [`Self::insert_batch`], skipping the
+    /// per-command `Host::component_layout_info` FFI round-trip.
+    #[inline]
+    pub fn insert_batch_typed<T: AbiPod>(
+        &mut self,
+        entities: &[FfiEntity],
+        component: TypedComponent<T>,
+        data: &[T],
+    ) -> FfiResult {
+        if self.raw.is_null() {
+            return FfiResult::NULL_POINTER;
+        }
+        let handle = component.handle();
+        if !handle.is_valid() {
+            return FfiResult::INVALID_COMPONENT;
+        }
+        if data.len() < entities.len() {
+            return FfiResult::INVALID_ARGUMENT;
+        }
+        if entities.iter().any(|e| e.is_null()) {
+            return FfiResult::INVALID_ENTITY;
+        }
+        let Some(insert_fn) = host_slot!(self.host.api(), cmd_insert_batch) else {
+            return FfiResult::UNSUPPORTED;
+        };
+        let elem_size = core::mem::size_of::<T>();
+        let ent_ptr = if entities.is_empty() {
+            core::ptr::NonNull::<FfiEntity>::dangling()
+                .as_ptr()
+                .cast_const()
+        } else {
+            entities.as_ptr()
+        };
+        let data_ptr = if elem_size == 0 || entities.is_empty() {
+            core::ptr::NonNull::<u8>::dangling().as_ptr().cast_const()
+        } else {
+            data.as_ptr().cast::<u8>()
+        };
+        // SAFETY: `self.raw` is active, `TypedComponent<T>` verified layout, and `data_ptr` is
+        // readable for `entities.len() * elem_size` bytes.
+        unsafe {
+            insert_fn(
+                self.raw,
+                ent_ptr,
+                entities.len(),
+                handle,
+                data_ptr,
+                elem_size,
+                0,
+            )
+        }
+    }
+
+    /// Queues deferred stride-0 splat insertion (`BAM_SPAWN_COL_FLAG_SPLAT`) of a single `value`
+    /// (`T: AbiPod`) onto every entity in `entities` via `BamHostApi::cmd_insert_batch` (slot 86).
+    #[inline]
+    pub fn insert_batch_splat<T: AbiPod>(
+        &mut self,
+        entities: &[FfiEntity],
+        component: BamComponent,
+        value: &T,
+    ) -> FfiResult {
+        if self.raw.is_null() {
+            return FfiResult::NULL_POINTER;
+        }
+        if !component.is_valid() {
+            return FfiResult::INVALID_COMPONENT;
+        }
+        if entities.iter().any(|e| e.is_null()) {
+            return FfiResult::INVALID_ENTITY;
+        }
+        let Some(insert_fn) = host_slot!(self.host.api(), cmd_insert_batch) else {
+            return FfiResult::UNSUPPORTED;
+        };
+        // SAFETY: `self.resolve_ctx()` returns a valid active `BamHostCtx` matching `self.host.api()`.
+        let info = match unsafe {
+            Host::component_layout_info_with_ctx(self.host.api(), self.resolve_ctx(), component)
+        } {
+            Ok(info) => info,
+            Err(err) => return err,
+        };
+        if info.size != core::mem::size_of::<T>() || info.align != core::mem::align_of::<T>() {
+            return FfiResult::TYPE_MISMATCH;
+        }
+        let elem_size = core::mem::size_of::<T>();
+        let ent_ptr = if entities.is_empty() {
+            core::ptr::NonNull::<FfiEntity>::dangling()
+                .as_ptr()
+                .cast_const()
+        } else {
+            entities.as_ptr()
+        };
+        let data_ptr = if elem_size == 0 {
+            core::ptr::NonNull::<u8>::dangling().as_ptr().cast_const()
+        } else {
+            core::ptr::from_ref(value).cast::<u8>()
+        };
+        // SAFETY: `self.raw` is active, layout was verified, and `value` is readable for `elem_size` bytes.
+        unsafe {
+            insert_fn(
+                self.raw,
+                ent_ptr,
+                entities.len(),
+                component,
+                data_ptr,
+                elem_size,
+                BAM_SPAWN_COL_FLAG_SPLAT,
+            )
+        }
+    }
+
+    /// Init-validated [`TypedComponent<T>`] variant of [`Self::insert_batch_splat`].
+    #[inline]
+    pub fn insert_batch_splat_typed<T: AbiPod>(
+        &mut self,
+        entities: &[FfiEntity],
+        component: TypedComponent<T>,
+        value: &T,
+    ) -> FfiResult {
+        if self.raw.is_null() {
+            return FfiResult::NULL_POINTER;
+        }
+        let handle = component.handle();
+        if !handle.is_valid() {
+            return FfiResult::INVALID_COMPONENT;
+        }
+        if entities.iter().any(|e| e.is_null()) {
+            return FfiResult::INVALID_ENTITY;
+        }
+        let Some(insert_fn) = host_slot!(self.host.api(), cmd_insert_batch) else {
+            return FfiResult::UNSUPPORTED;
+        };
+        let elem_size = core::mem::size_of::<T>();
+        let ent_ptr = if entities.is_empty() {
+            core::ptr::NonNull::<FfiEntity>::dangling()
+                .as_ptr()
+                .cast_const()
+        } else {
+            entities.as_ptr()
+        };
+        let data_ptr = if elem_size == 0 {
+            core::ptr::NonNull::<u8>::dangling().as_ptr().cast_const()
+        } else {
+            core::ptr::from_ref(value).cast::<u8>()
+        };
+        // SAFETY: `self.raw` is active, `TypedComponent<T>` verified layout, and `value` is readable.
+        unsafe {
+            insert_fn(
+                self.raw,
+                ent_ptr,
+                entities.len(),
+                handle,
+                data_ptr,
+                elem_size,
+                BAM_SPAWN_COL_FLAG_SPLAT,
+            )
+        }
+    }
+
+    /// Queues deferred removal of `component` from all `entities` in one FFI call via
+    /// `BamHostApi::cmd_remove_batch` (slot 87).
+    #[inline]
+    pub fn remove_batch(&mut self, entities: &[FfiEntity], component: BamComponent) -> FfiResult {
+        if self.raw.is_null() {
+            return FfiResult::NULL_POINTER;
+        }
+        if !component.is_valid() {
+            return FfiResult::INVALID_COMPONENT;
+        }
+        if entities.iter().any(|e| e.is_null()) {
+            return FfiResult::INVALID_ENTITY;
+        }
+        let Some(remove_fn) = host_slot!(self.host.api(), cmd_remove_batch) else {
+            return FfiResult::UNSUPPORTED;
+        };
+        let ent_ptr = if entities.is_empty() {
+            core::ptr::NonNull::<FfiEntity>::dangling()
+                .as_ptr()
+                .cast_const()
+        } else {
+            entities.as_ptr()
+        };
+        // SAFETY: `self.raw` is active and `ent_ptr` is readable for `entities.len()` entities.
+        unsafe { remove_fn(self.raw, ent_ptr, entities.len(), component) }
+    }
+
+    /// Spawns `entity_count` entities via `BamHostApi::cmd_spawn_batch_ex` (slot 89), supporting
+    /// both SoA columns and stride-0 splat (`BAM_SPAWN_COL_FLAG_SPLAT`) columns.
+    #[inline]
+    pub fn spawn_batch_ex(
+        &mut self,
+        columns: &[SpawnBatchColumn<'_>],
+        entity_count: usize,
+        out_entities: Option<&mut [FfiEntity]>,
+    ) -> FfiResult {
+        if self.raw.is_null() {
+            return FfiResult::NULL_POINTER;
+        }
+        if let Some(ref out_slice) = out_entities
+            && out_slice.len() < entity_count
+        {
+            return FfiResult::INVALID_ARGUMENT;
+        }
+        for col in columns {
+            // SAFETY: `self.resolve_ctx()` returns a valid active `BamHostCtx` matching `self.host.api()`.
+            let status = unsafe {
+                validate_spawn_batch_column_with_ctx(
+                    self.host.api(),
+                    || self.resolve_ctx(),
+                    col,
+                    entity_count,
+                )
+            };
+            if !status.is_ok() {
+                return status;
+            }
+        }
+        self.spawn_batch_ex_validated(columns, entity_count, out_entities)
+    }
+
+    /// Internal helper invoking `BamHostApi::cmd_spawn_batch_ex` (slot 89) after columns have been
+    /// validated.
+    fn spawn_batch_ex_validated(
+        &mut self,
+        columns: &[SpawnBatchColumn<'_>],
+        entity_count: usize,
+        out_entities: Option<&mut [FfiEntity]>,
+    ) -> FfiResult {
+        let Some(spawn_ex_fn) = host_slot!(self.host.api(), cmd_spawn_batch_ex) else {
+            return FfiResult::UNSUPPORTED;
+        };
+        let out_ptr = match out_entities {
+            Some(slice) if entity_count > 0 => slice.as_mut_ptr(),
+            _ => core::ptr::null_mut(),
+        };
+        let mut descs = Vec::with_capacity(columns.len());
+        for col in columns {
+            let elem_size = match col.elem_size {
+                Some(sz) => sz,
+                None => {
+                    // SAFETY: `self.resolve_ctx()` returns a valid active `BamHostCtx` matching `self.host.api()`.
+                    let info = match unsafe {
+                        Host::component_layout_info_with_ctx(
+                            self.host.api(),
+                            self.resolve_ctx(),
+                            col.component,
+                        )
+                    } {
+                        Ok(i) => i,
+                        Err(err) => return err,
+                    };
+                    info.size
+                }
+            };
+            if entity_count > 0 && elem_size > 0 && col.column_ptr.is_null() {
+                return FfiResult::NULL_POINTER;
+            }
+            descs.push(BamSpawnColumnDesc {
+                component: col.component,
+                flags: col.flags,
+                column_ptr: col.column_ptr,
+                elem_size,
+            });
+        }
+        let cols_ptr = if descs.is_empty() {
+            core::ptr::NonNull::<BamSpawnColumnDesc>::dangling()
+                .as_ptr()
+                .cast_const()
+        } else {
+            descs.as_ptr()
+        };
+        // SAFETY: `self.raw` is active, `descs` is valid for `descs.len()` entries, and every
+        // non-empty column buffer passed `validate_spawn_batch_column_with_ctx` for `entity_count`.
+        unsafe { spawn_ex_fn(self.raw, cols_ptr, descs.len(), entity_count, out_ptr) }
     }
 }
 

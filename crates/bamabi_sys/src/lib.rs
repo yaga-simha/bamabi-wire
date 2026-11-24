@@ -2,11 +2,11 @@
 #![warn(missing_docs)]
 #![deny(clippy::undocumented_unsafe_blocks, clippy::missing_safety_doc)]
 
-//! # `bamabi_sys`: Zero-Dependency C-ABI `0.3.0` Wire Contract for `bamabi`
+//! # `bamabi_sys`: C-ABI `0.4.0` Wire Contract for `bamabi`
 //!
-//! This crate defines the `#![no_std]`, zero-dependency C-ABI `0.3.0` (`0x0003_0000`) wire
-//! specification connecting Bevy ECS host applications to native dynamic guest mods (`.so`,
-//! `.dylib`, `.dll`) written in Rust, ISO C99, C++17/20, or Zig.
+//! This crate defines the `#![no_std]` C-ABI `0.4.0` (`0x0004_0000`) wire specification connecting
+//! Bevy ECS host applications to native dynamic guest mods (`.so`, `.dylib`, `.dll`) written in
+//! Rust, ISO C99, C++17/20, or Zig.
 //!
 //! Follow the six steps below in order to build a complete mental model of the crate.
 //!
@@ -61,7 +61,7 @@
 //!   Paired with [`BamSystem`], [`BamSystemSet`], and [`BamSymbol`] (`u32::MAX` = `INVALID`).
 //! - [`ComponentUuid`]: 16-byte (`align = 1`) deterministic component identity computed in `const`
 //!   via keyed SipHash-2-4-128 ([`ComponentUuid::from_parts`], [`ComponentUuid::from_canonical_name`],
-//!   [`ComponentUuid::hash_field_schema`], [`ComponentUuid::parse_hex`]).
+//!   [`ComponentUuid::hash_field_schema`], [`ComponentUuid::try_parse_hex`]).
 //! - Built-in entity, hierarchy, disabling, and asset primitives: [`FfiEntity`], [`FfiChildOf`],
 //!   [`FfiDisabled`], [`FfiAssetHandle`], and [`FfiAssetLoadState`].
 //!
@@ -160,7 +160,7 @@
 //! 6. `src/system.rs` & `src/commands.rs` — [`BamQueryDesc`], [`BamSystemDesc`], [`BamObserverDesc`],
 //!    [`BamTriggerDesc`], and deferred command prototypes.
 //! 7. `src/iter.rs` — [`BamIter`], [`BamChangeTicks`], [`BamColumnInfo`], and iteration callbacks.
-//! 8. `src/host_api.rs` — [`BamManifest`], 73-slot [`BamHostApi`], and [`offsets`].
+//! 8. `src/host_api.rs` — [`BamManifest`], 90-slot [`BamHostApi`], and [`offsets`].
 //! 9. `src/traits.rs` — [`RawInsertable`], [`AbiPod`], [`SymbolEntry`], and [`ModComponent`].
 //!
 //! For deep architectural notes and a complete test/proof inventory, see `ARCHITECTURE.md` and
@@ -190,6 +190,7 @@
 //! cargo kani -p bamabi_sys
 //! ```
 
+pub mod abi_meta;
 mod access;
 mod commands;
 mod component;
@@ -202,11 +203,15 @@ mod telemetry;
 mod traits;
 mod version;
 
+/// Re-export of [`bamabi_schema`], the canonical zero-dependency schema, hashing, layout, and
+/// ABI metadata SSOT crate.
+pub use bamabi_schema as schema;
+
 #[cfg(doc)]
 pub mod docs {
     //! Embedded architecture and testing documentation for `bamabi_sys`.
 
-    /// Crate architecture and C-ABI `0.3.0` wire specification internals (`crates/bamabi_sys/ARCHITECTURE.md`).
+    /// Crate architecture and C-ABI `0.4.0` wire specification internals (`crates/bamabi_sys/ARCHITECTURE.md`).
     pub mod architecture {
         #![doc = include_str!("../ARCHITECTURE.md")]
     }
@@ -228,11 +233,13 @@ pub use access::{
     MAX_QUERIES_PER_SYSTEM, MAX_TERMS_PER_QUERY, ScheduleId,
 };
 pub use commands::{
-    BAM_TRIGGER_FLAG_PROPAGATE, BAM_TRIGGER_KNOWN_FLAGS, BamCmdCloneEntityFn, BamCmdDespawnAllFn,
-    BamCmdDespawnFn, BamCmdInsertDefaultFn, BamCmdInsertFn, BamCmdInsertResourceFn,
-    BamCmdObserveFn, BamCmdRemoveFn, BamCmdRemoveResourceFn, BamCmdSpawnBatchFn,
-    BamCmdSpawnEmptyFn, BamCmdSpawnFn, BamCmdSpawnSceneFn, BamCmdTriggerExFn, BamCmdTriggerFn,
-    BamCommands, BamTriggerDesc,
+    BAM_SPAWN_COL_FLAG_SPLAT, BAM_SPAWN_COL_KNOWN_FLAGS, BAM_TRIGGER_FLAG_PROPAGATE,
+    BAM_TRIGGER_KNOWN_FLAGS, BamCmdCloneEntityFn, BamCmdDespawnAllFn, BamCmdDespawnBatchFn,
+    BamCmdDespawnFn, BamCmdInsertBatchFn, BamCmdInsertDefaultFn, BamCmdInsertFn,
+    BamCmdInsertResourceFn, BamCmdObserveFn, BamCmdRemoveBatchFn, BamCmdRemoveFn,
+    BamCmdRemoveResourceFn, BamCmdSpawnBatchExFn, BamCmdSpawnBatchFn, BamCmdSpawnEmptyFn,
+    BamCmdSpawnFn, BamCmdSpawnSceneFn, BamCmdTriggerExFn, BamCmdTriggerFn, BamCommands,
+    BamSpawnColumnDesc, BamTriggerDesc,
 };
 pub use component::{
     BAM_COMPONENT_FLAG_IMMUTABLE, BAM_COMPONENT_FLAG_SPARSE_SET, BAM_COMPONENT_FLAG_SUMMARY_TICK,
@@ -243,10 +250,10 @@ pub use component::{
     BAM_REQUIRED_KNOWN_FLAGS, BAM_SCHEDULE_SET_FLAG_AFTER_WEAK, BAM_SCHEDULE_SET_FLAG_BEFORE_WEAK,
     BAM_SCHEDULE_SET_FLAG_PARALLEL, BAM_SCHEDULE_SET_FLAG_SEQUENCE,
     BAM_SCHEDULE_SET_FLAG_SEQUENCE_WEAK, BAM_SCHEDULE_SET_KNOWN_FLAGS, BamFieldDesc, BamFieldKind,
-    BamLayoutInfo, BamRelationDesc, BamRequiredComponent, BamRequiredInitFn, BamRowMigrateFn,
-    BamScheduleSetDesc, ComponentCloneFn, ComponentDesc, ComponentDropFn, ComponentHookFn,
-    MappedStringGetFn, MappedStringSetFn, MappedStringVTable, MappedWireGetFn, MappedWireSetFn,
-    MappedWireVTable, VTableHeader,
+    BamFieldMeta, BamLayoutInfo, BamRelationDesc, BamRequiredComponent, BamRequiredInitFn,
+    BamRowMigrateFn, BamScheduleSetDesc, ComponentCloneFn, ComponentDesc, ComponentDropFn,
+    ComponentHookFn, MappedStringGetFn, MappedStringSetFn, MappedStringVTable, MappedWireGetFn,
+    MappedWireSetFn, MappedWireVTable, VTableHeader,
 };
 pub use extensible::{ExtensibleStruct, read_descriptor, read_extensible_struct};
 pub use host_api::{
@@ -258,21 +265,24 @@ pub use host_api::{
     BamIterUpCascadeFn, BamLastErrorFn, BamLoadHostCtxFn, BamLogDiagnosticFn, BamManifest,
     BamManifestFn, BamMigrateComponentColumnFn, BamMountSystemInScheduleFn, BamRegisterComponentFn,
     BamRegisterObserverFn, BamRegisterRelationFn, BamRegisterSystemFn, BamRegisterSystemHandleFn,
-    BamReportGuestFaultFn, BamResolveComponentByUuidFn, BamResolveComponentFn, BamRestoreStateFn,
-    BamSaveStateFn, BamShutdownFn, BamStateWriterFn, BamSysCommandsFn, BamSysEntityChildrenFn,
-    BamSysEntityGetFn, BamSysEntityGetMutFn, BamSysHostCtxFn, BamSysQueryFn, BamSysResMutPtrFn,
-    BamSysResPtrFn, offsets,
+    BamReportGuestFaultFn, BamResolveComponentByUuidFn, BamResolveComponentFn,
+    BamResolveNamedObjectFn, BamResolveSymbolStrFn, BamRestoreStateFn, BamSaveStateFn,
+    BamShutdownFn, BamStateWriterFn, BamSysCommandsFn, BamSysEntityChildrenFn, BamSysEntityGetFn,
+    BamSysEntityGetMutFn, BamSysHostCtxFn, BamSysQueryFn, BamSysResMutPtrFn, BamSysResPtrFn,
+    offsets,
 };
 pub use iter::{
     BAM_MAX_CHANGE_AGE, BAM_STORAGE_FLAG_ENTITY_EVENT, BAM_STORAGE_FLAG_EVENT,
     BAM_STORAGE_FLAG_IMMUTABLE, BAM_STORAGE_FLAG_MESSAGE, BAM_STORAGE_FLAG_RESOURCE,
-    BAM_STORAGE_FLAG_SPARSE_SET, BAM_STORAGE_FLAG_SUMMARY_TICK, BamChangeTicks, BamChunkTaskFn,
-    BamColumnInfo, BamIter, BamIterColumnInfoFn, BamIterColumnMutableFn,
+    BAM_STORAGE_FLAG_SPARSE_SET, BAM_STORAGE_FLAG_SUMMARY_TICK, BamChangeTicks, BamChunkTaskExFn,
+    BamChunkTaskFn, BamColumnInfo, BamIter, BamIterColumnInfoFn, BamIterColumnMutableFn,
     BamIterColumnMutableUntrackedFn, BamIterColumnReadonlyFn, BamIterColumnRowsMutableFn,
-    BamIterColumnRowsReadonlyFn, BamIterColumnTicksFn, BamIterEntitiesFn,
-    BamIterMarkChangedRangeFn, BamIterNextChunkBatchFn, BamIterNextChunkFn, BamIterReadRemovedFn,
-    BamIterResetFn, BamMsgReadBatchFn, BamMsgSendFn, BamMsgWriteBatchFn, BamParForEachChunkFn,
-    BamResMutPtrFn, BamResPtrFn, BamResTicksFn,
+    BamIterColumnRowsMutableUntrackedFn, BamIterColumnRowsReadonlyFn, BamIterColumnTicksFn,
+    BamIterEntitiesFn, BamIterMarkChangedRangeFn, BamIterMarkChangedRangesFn,
+    BamIterNextChunkBatchFn, BamIterNextChunkFn, BamIterReadRemovedFn, BamIterResetFn,
+    BamMsgReadBatchFn, BamMsgReadSliceFn, BamMsgSendFn, BamMsgWriteBatchFn, BamParForEachChunkExFn,
+    BamParForEachChunkFn, BamParOptions, BamResMutPtrFn, BamResPtrFn, BamResTicksFn, BamRowRange,
+    DirtyRunCoalescer,
 };
 pub use primitives::{
     BAM_CHILD_OF_NAME, BAM_CHILDREN_NAME, BAM_DISABLED_NAME, BamComponent, BamSymbol, BamSystem,
@@ -285,8 +295,10 @@ pub use system::{
     BAM_OBSERVER_FLAG_PROPAGATE, BAM_OBSERVER_KNOWN_FLAGS, BAM_QUERY_FLAG_PARAM_SET,
     BAM_QUERY_KNOWN_FLAGS, BAM_SYSTEM_FLAG_AMBIGUOUS_WITH_ALL, BAM_SYSTEM_FLAG_MAIN_THREAD,
     BAM_SYSTEM_KNOWN_FLAGS, BamEventKind, BamHostCtx, BamLoadCtx, BamObserverCtxFn,
-    BamObserverDesc, BamObserverFn, BamObserverMutFn, BamQueryDesc, BamRunIfFn, BamSystemCtx,
-    BamSystemDesc, BamSystemFn,
+    BamObserverCtxMutFn, BamObserverDesc, BamObserverFn, BamObserverMutFn, BamQueryDesc,
+    BamRunIfFn, BamSysCurrentTicksFn, BamSysRelationEdgeDataFn, BamSysRelationSourcesFn,
+    BamSysRelationTargetsFn, BamSysTimeInfoFn, BamSystemCtx, BamSystemDesc, BamSystemFn,
+    BamTimeInfo,
 };
 pub use telemetry::{
     BRP_METHOD_BAM_COMPONENT_SCHEMAS, BRP_METHOD_BAM_HOT_RELOAD, BRP_METHOD_BAM_LIST_MODS,
@@ -294,6 +306,10 @@ pub use telemetry::{
     SYSTEM_TELEMETRY_MAGIC, SystemTelemetryDigest64, TELEMETRY_FLAG_BUDGET_BREACHED,
     TELEMETRY_FLAG_FAULTED, TELEMETRY_FLAG_QUARANTINED, TELEMETRY_FLAG_SUMMARY_TICK_ACTIVE,
     TelemetryFrameError, TelemetrySliceError, fnv1a_64_hash_system,
+};
+#[cfg(feature = "serde")]
+pub use telemetry::{
+    BrpComponentSchema, BrpFieldSchema, BrpHotReloadRequest, BrpModInfo, BrpSystemMetrics,
 };
 pub use traits::{
     AbiPod, ModComponent, RawInsertable, SymbolEntry, assert_abi_pod, assert_raw_insertable,

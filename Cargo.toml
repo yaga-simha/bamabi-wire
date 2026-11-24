@@ -1,6 +1,7 @@
 [workspace]
 resolver = "2"
 members = [
+    "crates/bamabi_schema",
     "crates/bamabi_docs",
     "crates/bamabi_sys",
     "crates/bamabi_macros",
@@ -13,7 +14,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.3.0"
+version = "0.4.0"
 edition = "2024"
 rust-version = "1.95"
 license = "MIT OR Apache-2.0"
@@ -38,12 +39,14 @@ redundant_clone = "warn"
 match_same_arms = "warn"
 
 [workspace.dependencies]
-bamabi_sys = { version = "0.3.0", path = "crates/bamabi_sys" }
-bamabi_macros = { version = "0.3.0", path = "crates/bamabi_macros" }
-bamabi_guest_sys = { version = "0.3.0", path = "crates/bamabi_guest_sys" }
+bamabi_schema = { version = "0.4.0", path = "crates/bamabi_schema" }
+bamabi_sys = { version = "0.4.0", path = "crates/bamabi_sys" }
+bamabi_macros = { version = "0.4.0", path = "crates/bamabi_macros" }
+bamabi_guest_sys = { version = "0.4.0", path = "crates/bamabi_guest_sys" }
 syn = { version = "2.0", features = ["full"] }
 quote = "1.0"
 proc-macro2 = "1.0"
 proc-macro-crate = "3"
 trybuild = "1.0"
 proptest = "~1.11.0"
+serde = { version = "1.0", default-features = false, features = ["derive", "alloc"] }

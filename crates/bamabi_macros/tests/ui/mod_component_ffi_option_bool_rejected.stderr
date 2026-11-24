@@ -1,40 +1,40 @@
-error[E0277]: the trait bound `bool: AbiPod` is not satisfied
+error[E0277]: the trait bound `bool: RawInsertable` is not satisfied
  --> tests/ui/mod_component_ffi_option_bool_rejected.rs:7:24
   |
 7 |     pub bad: FfiOption<bool>,
-  |                        ^^^^ the trait `AbiPod` is not implemented for `bool`
+  |                        ^^^^ the trait `RawInsertable` is not implemented for `bool`
   |
-  = help: the following other types implement trait `AbiPod`:
+  = help: the following other types implement trait `RawInsertable`:
             BadFfiOptionBool
             BamChangeTicks
             BamComponent
             BamEventKind
             BamFieldKind
+            BamRowRange
             BamSymbol
             BamSystem
-            BamSystemSet
           and $N others
-note: required by a bound in `assert_abi_pod`
+note: required by a bound in `assert_raw_insertable`
  --> $WORKSPACE/crates/bamabi_sys/src/traits.rs
   |
-  | pub const fn assert_abi_pod<T: AbiPod>() {}
-  |                                ^^^^^^ required by this bound in `assert_abi_pod`
+  | pub const fn assert_raw_insertable<T: RawInsertable>() {}
+  |                                       ^^^^^^^^^^^^^ required by this bound in `assert_raw_insertable`
 
-error[E0277]: the trait bound `bool: AbiPod` is not satisfied
+error[E0277]: the trait bound `bool: RawInsertable` is not satisfied
  --> tests/ui/mod_component_ffi_option_bool_rejected.rs:7:24
   |
 7 |     pub bad: FfiOption<bool>,
-  |                        ^^^^ the trait `AbiPod` is not implemented for `bool`
+  |                        ^^^^ the trait `RawInsertable` is not implemented for `bool`
   |
-  = help: the following other types implement trait `AbiPod`:
+  = help: the following other types implement trait `RawInsertable`:
             BadFfiOptionBool
             BamChangeTicks
             BamComponent
             BamEventKind
             BamFieldKind
+            BamRowRange
             BamSymbol
             BamSystem
-            BamSystemSet
           and $N others
 note: required by a bound in `__bam_none_option`
  --> tests/ui/mod_component_ffi_option_bool_rejected.rs:5:23
@@ -43,21 +43,21 @@ note: required by a bound in `__bam_none_option`
   |                       ^^^^^^^^^^^^ required by this bound in `__bam_none_option`
   = note: this error originates in the derive macro `ModComponent` (in Nightly builds, run with -Z macro-backtrace for more info)
 
-error[E0277]: the trait bound `bool: AbiPod` is not satisfied
+error[E0277]: the trait bound `bool: RawInsertable` is not satisfied
  --> tests/ui/mod_component_ffi_option_bool_rejected.rs:7:24
   |
 7 |     pub bad: FfiOption<bool>,
-  |                        ^^^^ the trait `AbiPod` is not implemented for `bool`
+  |                        ^^^^ the trait `RawInsertable` is not implemented for `bool`
   |
-  = help: the following other types implement trait `AbiPod`:
+  = help: the following other types implement trait `RawInsertable`:
             BadFfiOptionBool
             BamChangeTicks
             BamComponent
             BamEventKind
             BamFieldKind
+            BamRowRange
             BamSymbol
             BamSystem
-            BamSystemSet
           and $N others
 note: required by a bound in `__bam_write_option`
  --> tests/ui/mod_component_ffi_option_bool_rejected.rs:5:23
@@ -66,21 +66,21 @@ note: required by a bound in `__bam_write_option`
   |                       ^^^^^^^^^^^^ required by this bound in `__bam_write_option`
   = note: this error originates in the derive macro `ModComponent` (in Nightly builds, run with -Z macro-backtrace for more info)
 
-error[E0277]: the trait bound `bool: AbiPod` is not satisfied
+error[E0277]: the trait bound `bool: RawInsertable` is not satisfied
  --> tests/ui/mod_component_ffi_option_bool_rejected.rs:7:24
   |
 7 |     pub bad: FfiOption<bool>,
-  |                        ^^^^ the trait `AbiPod` is not implemented for `bool`
+  |                        ^^^^ the trait `RawInsertable` is not implemented for `bool`
   |
-  = help: the following other types implement trait `AbiPod`:
+  = help: the following other types implement trait `RawInsertable`:
             BadFfiOptionBool
             BamChangeTicks
             BamComponent
             BamEventKind
             BamFieldKind
+            BamRowRange
             BamSymbol
             BamSystem
-            BamSystemSet
           and $N others
 note: required by a bound in `__bam_clear_option`
  --> tests/ui/mod_component_ffi_option_bool_rejected.rs:5:23
@@ -88,26 +88,3 @@ note: required by a bound in `__bam_clear_option`
 5 | #[derive(Copy, Clone, ModComponent)]
   |                       ^^^^^^^^^^^^ required by this bound in `__bam_clear_option`
   = note: this error originates in the derive macro `ModComponent` (in Nightly builds, run with -Z macro-backtrace for more info)
-
-error[E0277]: the trait bound `bool: AbiPod` is not satisfied
- --> tests/ui/mod_component_ffi_option_bool_rejected.rs:7:14
-  |
-7 |     pub bad: FfiOption<bool>,
-  |              ^^^^^^^^^^^^^^^ the trait `AbiPod` is not implemented for `bool`
-  |
-  = help: the following other types implement trait `AbiPod`:
-            BadFfiOptionBool
-            BamChangeTicks
-            BamComponent
-            BamEventKind
-            BamFieldKind
-            BamSymbol
-            BamSystem
-            BamSystemSet
-          and $N others
-  = note: required for `FfiOption<bool>` to implement `AbiPod`
-note: required by a bound in `assert_abi_pod`
- --> $WORKSPACE/crates/bamabi_sys/src/traits.rs
-  |
-  | pub const fn assert_abi_pod<T: AbiPod>() {}
-  |                                ^^^^^^ required by this bound in `assert_abi_pod`

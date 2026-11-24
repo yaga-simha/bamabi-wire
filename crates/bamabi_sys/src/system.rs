@@ -693,6 +693,25 @@ pub type BamObserverCtxFn = unsafe extern "C" fn(
     user_data: *mut c_void,
 ) -> FfiResult;
 
+/// Mutable [`BamSystemCtx`]-aware guest observer callback supporting in-place event mutation,
+/// propagation control, and query/command access
+/// (`typedef BamResult (*BamObserverCtxMutFn)(BamEntity entity, uint8_t* event_data, BamBool* propagate, BamSystemCtx* ctx, void* user_data);`).
+///
+/// # Safety
+/// - `event_data` points to writable event payload bytes valid strictly for the duration of the
+///   call (or null for zero-sized / lifecycle events).
+/// - `propagate` points to a valid writable [`FfiBool`] controlling upward relationship traversal.
+/// - `ctx` points to an active [`BamSystemCtx`] backed by this observer's declared
+///   `queries[0..query_count]` and per-observer deferred command queue.
+/// - Must never unwind across the `extern "C"` boundary.
+pub type BamObserverCtxMutFn = unsafe extern "C" fn(
+    entity: FfiEntity,
+    event_data: *mut u8,
+    propagate: *mut FfiBool,
+    ctx: *mut BamSystemCtx,
+    user_data: *mut c_void,
+) -> FfiResult;
+
 /// Enable relationship-hierarchy propagation control on [`BamObserverDesc::flags`].
 pub const BAM_OBSERVER_FLAG_PROPAGATE: u32 = 1 << 0;
 
@@ -702,8 +721,8 @@ pub const BAM_OBSERVER_KNOWN_FLAGS: u32 = BAM_OBSERVER_FLAG_PROPAGATE;
 /// Extensible dynamic observer registration descriptor (`typedef struct BamObserverDesc BamObserverDesc;`).
 ///
 /// Layout:
-/// - 64-bit: `MIN_V0_2_SIZE = 48` bytes (`size_of = 112` bytes with lifecycle/watched/mut/propagate/ctx fields), `8`-byte alignment, zero implicit padding.
-/// - 32-bit: `MIN_V0_2_SIZE = 36` bytes (`size_of = 76` bytes with lifecycle/watched/mut/propagate/ctx fields), `4`-byte alignment, zero implicit padding.
+/// - 64-bit: `MIN_V0_2_SIZE = 48` bytes (`MIN_V0_4_SIZE = 120` bytes with `ctx_mut_callback`), `8`-byte alignment, zero implicit padding.
+/// - 32-bit: `MIN_V0_2_SIZE = 36` bytes (`MIN_V0_4_SIZE = 80` bytes with `ctx_mut_callback`), `4`-byte alignment, zero implicit padding.
 #[repr(C)]
 #[derive(Debug, Copy, Clone)]
 pub struct BamObserverDesc {
@@ -721,9 +740,9 @@ pub struct BamObserverDesc {
     pub entity_hi: u32,
     /// Explicit zero-reserved field (`must be 0`, `offset 28` / `24`).
     pub reserved0: u32,
-    /// Read-only observer callback (`offset 32` / `28`; at least one of `callback`, `mut_callback`, or `ctx_callback` must be `Some`).
+    /// Read-only observer callback (`offset 32` / `28`).
     pub callback: Option<BamObserverFn>,
-    /// Opaque guest-owned state passed to `callback` / `mut_callback` / `ctx_callback` (`offset 40` / `32`).
+    /// Opaque guest-owned state passed to observer callbacks (`offset 40` / `32`).
     pub user_data: *mut c_void,
     /// Observed event kind (`CUSTOM` or lifecycle `ADD`..=`READY`, `offset 48` / `36`).
     pub event_kind: BamEventKind,
@@ -741,16 +760,21 @@ pub struct BamObserverDesc {
     pub reserved2: u32,
     /// Optional [`BamSystemCtx`]-aware observer callback (`offset 88` / `64`).
     pub ctx_callback: Option<BamObserverCtxFn>,
-    /// Optional array of [`BamQueryDesc`] clauses declared for `ctx_callback` (`offset 96` / `68`).
+    /// Optional array of [`BamQueryDesc`] clauses declared for `ctx_callback` / `ctx_mut_callback` (`offset 96` / `68`).
     pub queries: *const BamQueryDesc,
     /// Number of entries in `queries` (`0..=MAX_QUERIES_PER_SYSTEM`, `offset 104` / `72`).
     pub query_count: usize,
+    /// Optional mutable [`BamSystemCtx`]-aware observer callback (`offset 112` / `76`).
+    pub ctx_mut_callback: Option<BamObserverCtxMutFn>,
 }
 
 impl BamObserverDesc {
-    /// Frozen minimum valid `BamObserverDesc` size (`48` on 64-bit, `36` on 32-bit).
+    /// Frozen minimum valid `BamObserverDesc` size in ABI `0.2` (`48` on 64-bit, `36` on 32-bit).
     pub const MIN_V0_2_SIZE: usize =
         core::mem::offset_of!(Self, user_data) + core::mem::size_of::<*mut c_void>();
+
+    /// Full `BamObserverDesc` size in ABI `0.4` (`120` on 64-bit, `80` on 32-bit).
+    pub const MIN_V0_4_SIZE: usize = core::mem::size_of::<Self>();
 
     /// Constructs a global custom-event observer descriptor watching `event` with `callback`.
     #[inline]
@@ -775,6 +799,7 @@ impl BamObserverDesc {
             ctx_callback: None,
             queries: core::ptr::null(),
             query_count: 0,
+            ctx_mut_callback: None,
         }
     }
 
@@ -805,6 +830,7 @@ impl BamObserverDesc {
             ctx_callback: None,
             queries: core::ptr::null(),
             query_count: 0,
+            ctx_mut_callback: None,
         }
     }
 
@@ -838,6 +864,41 @@ impl BamObserverDesc {
             ctx_callback: Some(ctx_callback),
             queries,
             query_count,
+            ctx_mut_callback: None,
+        }
+    }
+
+    /// Constructs a global mutable custom-event observer descriptor watching `event` with a
+    /// [`BamSystemCtx`]-aware `ctx_mut_callback` and declared `queries[0..query_count]`.
+    #[inline]
+    pub const fn new_mut_with_ctx(
+        event: BamComponent,
+        ctx_mut_callback: BamObserverCtxMutFn,
+        queries: *const BamQueryDesc,
+        query_count: usize,
+        user_data: *mut c_void,
+    ) -> Self {
+        Self {
+            struct_size: core::mem::size_of::<Self>() as u32,
+            flags: 0,
+            name: core::ptr::null(),
+            event,
+            entity_lo: 0,
+            entity_hi: 0,
+            reserved0: 0,
+            callback: None,
+            user_data,
+            event_kind: BamEventKind::CUSTOM,
+            reserved1: 0,
+            watched_components: core::ptr::null(),
+            watched_component_count: 0,
+            mut_callback: None,
+            propagate_relationship: BamComponent::INVALID,
+            reserved2: 0,
+            ctx_callback: None,
+            queries,
+            query_count,
+            ctx_mut_callback: Some(ctx_mut_callback),
         }
     }
 
@@ -871,6 +932,7 @@ impl BamObserverDesc {
             ctx_callback: None,
             queries: core::ptr::null(),
             query_count: 0,
+            ctx_mut_callback: None,
         }
     }
 
@@ -939,6 +1001,13 @@ impl BamObserverDesc {
         self
     }
 
+    /// Attaches a mutable [`BamSystemCtx`]-aware [`BamObserverCtxMutFn`] callback.
+    #[inline]
+    pub const fn with_ctx_mut_callback(mut self, ctx_mut_callback: BamObserverCtxMutFn) -> Self {
+        self.ctx_mut_callback = Some(ctx_mut_callback);
+        self
+    }
+
     /// Attaches declared [`BamQueryDesc`] query clauses (`queries[0..query_count]`) for `ctx_callback`.
     #[inline]
     pub const fn with_queries(mut self, queries: *const BamQueryDesc, query_count: usize) -> Self {
@@ -1003,10 +1072,18 @@ impl BamObserverDesc {
         {
             return FfiResult::INVALID_COMPONENT;
         }
-        if self.callback.is_none() && self.mut_callback.is_none() && self.ctx_callback.is_none() {
+        let has_ctx_mut = self.covers_slot(
+            core::mem::offset_of!(Self, ctx_mut_callback),
+            core::mem::size_of::<Option<BamObserverCtxMutFn>>(),
+        ) && self.ctx_mut_callback.is_some();
+        if self.callback.is_none()
+            && self.mut_callback.is_none()
+            && self.ctx_callback.is_none()
+            && !has_ctx_mut
+        {
             return FfiResult::NULL_POINTER;
         }
-        if self.query_count > 0 && self.ctx_callback.is_none() {
+        if self.query_count > 0 && self.ctx_callback.is_none() && !has_ctx_mut {
             return FfiResult::INVALID_ARGUMENT;
         }
         FfiResult::OK
@@ -1015,10 +1092,12 @@ impl BamObserverDesc {
 
 const _: () = {
     assert!(BamObserverDesc::MIN_V0_2_SIZE <= core::mem::size_of::<BamObserverDesc>());
+    assert!(BamObserverDesc::MIN_V0_4_SIZE == core::mem::size_of::<BamObserverDesc>());
     #[cfg(target_pointer_width = "64")]
     {
         assert!(BamObserverDesc::MIN_V0_2_SIZE == 48);
-        assert!(core::mem::size_of::<BamObserverDesc>() == 112);
+        assert!(BamObserverDesc::MIN_V0_4_SIZE == 120);
+        assert!(core::mem::size_of::<BamObserverDesc>() == 120);
         assert!(core::mem::align_of::<BamObserverDesc>() == 8);
         assert!(core::mem::offset_of!(BamObserverDesc, struct_size) == 0);
         assert!(core::mem::offset_of!(BamObserverDesc, flags) == 4);
@@ -1039,11 +1118,13 @@ const _: () = {
         assert!(core::mem::offset_of!(BamObserverDesc, ctx_callback) == 88);
         assert!(core::mem::offset_of!(BamObserverDesc, queries) == 96);
         assert!(core::mem::offset_of!(BamObserverDesc, query_count) == 104);
+        assert!(core::mem::offset_of!(BamObserverDesc, ctx_mut_callback) == 112);
     }
     #[cfg(target_pointer_width = "32")]
     {
         assert!(BamObserverDesc::MIN_V0_2_SIZE == 36);
-        assert!(core::mem::size_of::<BamObserverDesc>() == 76);
+        assert!(BamObserverDesc::MIN_V0_4_SIZE == 80);
+        assert!(core::mem::size_of::<BamObserverDesc>() == 80);
         assert!(core::mem::align_of::<BamObserverDesc>() == 4);
         assert!(core::mem::offset_of!(BamObserverDesc, struct_size) == 0);
         assert!(core::mem::offset_of!(BamObserverDesc, flags) == 4);
@@ -1064,6 +1145,7 @@ const _: () = {
         assert!(core::mem::offset_of!(BamObserverDesc, ctx_callback) == 64);
         assert!(core::mem::offset_of!(BamObserverDesc, queries) == 68);
         assert!(core::mem::offset_of!(BamObserverDesc, query_count) == 72);
+        assert!(core::mem::offset_of!(BamObserverDesc, ctx_mut_callback) == 76);
     }
 };
 
@@ -1072,3 +1154,162 @@ const _: () = {
 unsafe impl ExtensibleStruct for BamObserverDesc {
     const MIN_V0_2_SIZE: usize = Self::MIN_V0_2_SIZE;
 }
+
+/// Extensible frame and fixed-timestep timing snapshot returned by `BamHostApi::sys_time_info`
+/// (`typedef struct BamTimeInfo BamTimeInfo;`).
+///
+/// Layout (`32` bytes, `align_of::<u64>()` — `8` on 64-bit/Wasm32, `4` on i686, zero implicit padding):
+/// - `0..4`: `struct_size` (`u32`)
+/// - `4..8`: `flags` (`u32`, must be `0` in `0.4`)
+/// - `8..12`: `delta_secs` (`f32`)
+/// - `12..16`: `fixed_delta_secs` (`f32`)
+/// - `16..24`: `elapsed_secs` (`f64`)
+/// - `24..28`: `elapsed_secs_wrapped` (`f32`)
+/// - `28..32`: `overstep_fraction` (`f32`)
+#[repr(C)]
+#[derive(Debug, Copy, Clone, PartialEq)]
+pub struct BamTimeInfo {
+    /// Size of this struct in bytes (`offset 0`).
+    pub struct_size: u32,
+    /// Bitflags (`must be 0` in ABI `0.4`, `offset 4`).
+    pub flags: u32,
+    /// Frame delta time in seconds (`offset 8`).
+    pub delta_secs: f32,
+    /// Fixed timestep period in seconds (`offset 12`).
+    pub fixed_delta_secs: f32,
+    /// Total elapsed simulation time in seconds (`offset 16`).
+    pub elapsed_secs: f64,
+    /// Wrapped elapsed time in seconds (`offset 24`).
+    pub elapsed_secs_wrapped: f32,
+    /// Remaining fixed-timestep overstep fraction `[0.0, 1.0)` (`offset 28`).
+    pub overstep_fraction: f32,
+}
+
+impl BamTimeInfo {
+    /// Frozen size of [`BamTimeInfo`] in ABI `0.4` (`32` bytes on all targets).
+    pub const MIN_V0_4_SIZE: usize = core::mem::size_of::<Self>();
+
+    /// Constructs a zeroed [`BamTimeInfo`] stamped with `struct_size = size_of::<Self>()`.
+    #[inline]
+    #[must_use]
+    pub const fn new() -> Self {
+        Self {
+            struct_size: core::mem::size_of::<Self>() as u32,
+            flags: 0,
+            delta_secs: 0.0,
+            fixed_delta_secs: 0.0,
+            elapsed_secs: 0.0,
+            elapsed_secs_wrapped: 0.0,
+            overstep_fraction: 0.0,
+        }
+    }
+
+    /// Validates `struct_size >= MIN_V0_4_SIZE` and unknown `flags`.
+    #[inline]
+    #[must_use]
+    pub const fn validate(&self) -> FfiResult {
+        if (self.struct_size as usize) < Self::MIN_V0_4_SIZE {
+            return FfiResult::INVALID_VERSION;
+        }
+        if self.flags != 0 {
+            return FfiResult::UNSUPPORTED;
+        }
+        FfiResult::OK
+    }
+}
+
+impl Default for BamTimeInfo {
+    #[inline]
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+// SAFETY: `BamTimeInfo` is `#[repr(C)]`, starts with `struct_size: u32` at offset 0, and every
+// scalar field is valid when zero-filled.
+unsafe impl ExtensibleStruct for BamTimeInfo {
+    const MIN_V0_2_SIZE: usize = Self::MIN_V0_4_SIZE;
+}
+
+// SAFETY: `BamTimeInfo` consists solely of fixed-width primitives (`u32`, `f32`, `f64`) with
+// zero drop glue and zero implicit padding.
+unsafe impl crate::traits::RawInsertable for BamTimeInfo {}
+// SAFETY: Layout is identical across C99 and Rust with zero implicit or trailing padding bytes.
+unsafe impl crate::traits::AbiPod for BamTimeInfo {}
+
+const _: () = {
+    assert!(BamTimeInfo::MIN_V0_4_SIZE == 32);
+    assert!(core::mem::size_of::<BamTimeInfo>() == 32);
+    assert!(core::mem::align_of::<BamTimeInfo>() == core::mem::align_of::<u64>());
+    assert!(core::mem::offset_of!(BamTimeInfo, struct_size) == 0);
+    assert!(core::mem::offset_of!(BamTimeInfo, flags) == 4);
+    assert!(core::mem::offset_of!(BamTimeInfo, delta_secs) == 8);
+    assert!(core::mem::offset_of!(BamTimeInfo, fixed_delta_secs) == 12);
+    assert!(core::mem::offset_of!(BamTimeInfo, elapsed_secs) == 16);
+    assert!(core::mem::offset_of!(BamTimeInfo, elapsed_secs_wrapped) == 24);
+    assert!(core::mem::offset_of!(BamTimeInfo, overstep_fraction) == 28);
+};
+
+/// Reads the running system's `(last_run, this_run)` change-detection tick window
+/// (`typedef BamResult (*BamSysCurrentTicksFn)(const BamSystemCtx*, uint32_t*, uint32_t*);`).
+///
+/// # Safety
+/// - `sys_ctx` must point to an active [`BamSystemCtx`].
+/// - Non-null `out_last_run` and `out_this_run` pointers must point to writable `u32` storage.
+pub type BamSysCurrentTicksFn = unsafe extern "C" fn(
+    sys_ctx: *const BamSystemCtx,
+    out_last_run: *mut u32,
+    out_this_run: *mut u32,
+) -> FfiResult;
+
+/// Reads frame and fixed-timestep timing info into `*out_info`
+/// (`typedef BamResult (*BamSysTimeInfoFn)(const BamSystemCtx*, BamTimeInfo*);`).
+///
+/// # Safety
+/// - `sys_ctx` must point to an active [`BamSystemCtx`].
+/// - `out_info` must point to writable [`BamTimeInfo`] storage with `out_info.struct_size` initialized.
+pub type BamSysTimeInfoFn =
+    unsafe extern "C" fn(sys_ctx: *const BamSystemCtx, out_info: *mut BamTimeInfo) -> FfiResult;
+
+/// Queries all outgoing target entities of `relation` from `entity`
+/// (`typedef BamResult (*BamSysRelationTargetsFn)(const BamSystemCtx*, BamEntity, BamComponent, const BamEntity**, size_t*);`).
+///
+/// # Safety
+/// - `sys_ctx` must point to an active [`BamSystemCtx`].
+/// - `out_targets` and `out_len` must point to valid writable storage.
+pub type BamSysRelationTargetsFn = unsafe extern "C" fn(
+    sys_ctx: *const BamSystemCtx,
+    entity: FfiEntity,
+    relation: BamComponent,
+    out_targets: *mut *const FfiEntity,
+    out_len: *mut usize,
+) -> FfiResult;
+
+/// Queries all incoming source entities targeting `target` via `relation`
+/// (`typedef BamResult (*BamSysRelationSourcesFn)(const BamSystemCtx*, BamEntity, BamComponent, const BamEntity**, size_t*);`).
+///
+/// # Safety
+/// - `sys_ctx` must point to an active [`BamSystemCtx`].
+/// - `out_sources` and `out_len` must point to valid writable storage.
+pub type BamSysRelationSourcesFn = unsafe extern "C" fn(
+    sys_ctx: *const BamSystemCtx,
+    target: FfiEntity,
+    relation: BamComponent,
+    out_sources: *mut *const FfiEntity,
+    out_len: *mut usize,
+) -> FfiResult;
+
+/// Queries optional edge payload bytes attached to `(entity, relation, target)`
+/// (`typedef BamResult (*BamSysRelationEdgeDataFn)(const BamSystemCtx*, BamEntity, BamComponent, BamEntity, const void**, size_t*);`).
+///
+/// # Safety
+/// - `sys_ctx` must point to an active [`BamSystemCtx`].
+/// - `out_ptr` and `out_size` must point to valid writable storage.
+pub type BamSysRelationEdgeDataFn = unsafe extern "C" fn(
+    sys_ctx: *const BamSystemCtx,
+    entity: FfiEntity,
+    relation: BamComponent,
+    target: FfiEntity,
+    out_ptr: *mut *const c_void,
+    out_size: *mut usize,
+) -> FfiResult;

@@ -28,17 +28,17 @@ pub(crate) fn spec(
     };
     let inner_assertion = quote_spanned! { inner_span =>
         const _: fn() = || {
-            #sys_crate::assert_abi_pod::<#inner_ty>();
+            #sys_crate::assert_raw_insertable::<#inner_ty>();
         };
     };
     let pod_assertion = Some(quote_spanned! { field_span =>
-        #sys_crate::assert_abi_pod::<#field_ty>();
+        #sys_crate::assert_raw_insertable::<#field_ty>();
     });
 
     AccessorSpec {
         collision_label: "accessor",
         allows_raw_insertable: true,
-        allows_abi_pod: true,
+        allows_abi_pod: false,
         assertions: vec![option_assertion, inner_assertion],
         pod_assertion,
         slots: vec![

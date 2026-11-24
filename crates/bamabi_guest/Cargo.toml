@@ -17,6 +17,7 @@ workspace = true
 [features]
 default = []
 derive = ["dep:bamabi_macros"]
+serde = ["bamabi_sys/serde"]
 
 [dependencies]
 bamabi_sys = { workspace = true }

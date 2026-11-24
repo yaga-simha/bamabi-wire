@@ -622,53 +622,93 @@ impl_wire_abi_pod!(
     ]
 );
 
-#[allow(missing_docs)]
 impl FfiUiNode {
+    /// Flexbox layout (`Display::Flex`).
     pub const DISPLAY_FLEX: u8 = 0;
+    /// CSS Grid layout (`Display::Grid`).
     pub const DISPLAY_GRID: u8 = 1;
+    /// Block layout (`Display::Block`).
     pub const DISPLAY_BLOCK: u8 = 2;
+    /// Hidden / non-laid-out node (`Display::None`).
     pub const DISPLAY_NONE: u8 = 3;
 
+    /// Normal flow relative positioning (`PositionType::Relative`).
     pub const POSITION_RELATIVE: u8 = 0;
+    /// Out-of-flow absolute positioning (`PositionType::Absolute`).
     pub const POSITION_ABSOLUTE: u8 = 1;
 
+    /// Horizontal left-to-right flex axis (`FlexDirection::Row`).
     pub const FLEX_ROW: u8 = 0;
+    /// Vertical top-to-bottom flex axis (`FlexDirection::Column`).
     pub const FLEX_COLUMN: u8 = 1;
+    /// Reversed horizontal flex axis (`FlexDirection::RowReverse`).
     pub const FLEX_ROW_REVERSE: u8 = 2;
+    /// Reversed vertical flex axis (`FlexDirection::ColumnReverse`).
     pub const FLEX_COLUMN_REVERSE: u8 = 3;
 
+    /// Single-line flex container (`FlexWrap::NoWrap`).
     pub const WRAP_NO_WRAP: u8 = 0;
+    /// Multi-line wrapping flex container (`FlexWrap::Wrap`).
     pub const WRAP_WRAP: u8 = 1;
+    /// Reversed multi-line wrapping flex container (`FlexWrap::WrapReverse`).
     pub const WRAP_WRAP_REVERSE: u8 = 2;
 
+    /// Default cross-axis item alignment (`AlignItems::Default`).
     pub const ALIGN_DEFAULT: u8 = 0;
+    /// Align items at cross-start (`AlignItems::Start`).
     pub const ALIGN_START: u8 = 1;
+    /// Safe start cross-axis alignment (`AlignItems::Start` with safe fallback).
     pub const ALIGN_START_SAFE: u8 = 2;
+    /// Align items at cross-end (`AlignItems::End`).
     pub const ALIGN_END: u8 = 3;
+    /// Safe end cross-axis alignment (`AlignItems::End` with safe fallback).
     pub const ALIGN_END_SAFE: u8 = 4;
+    /// Align items at flex-start (`AlignItems::FlexStart`).
     pub const ALIGN_FLEX_START: u8 = 5;
+    /// Safe flex-start cross-axis alignment.
     pub const ALIGN_FLEX_START_SAFE: u8 = 6;
+    /// Align items at flex-end (`AlignItems::FlexEnd`).
     pub const ALIGN_FLEX_END: u8 = 7;
+    /// Safe flex-end cross-axis alignment.
     pub const ALIGN_FLEX_END_SAFE: u8 = 8;
+    /// Center items along the cross axis (`AlignItems::Center`).
     pub const ALIGN_CENTER: u8 = 9;
+    /// Safe center cross-axis alignment.
     pub const ALIGN_CENTER_SAFE: u8 = 10;
+    /// Align items along text baseline (`AlignItems::Baseline`).
     pub const ALIGN_BASELINE: u8 = 11;
+    /// Stretch items across the cross axis (`AlignItems::Stretch`).
     pub const ALIGN_STRETCH: u8 = 12;
 
+    /// Default main-axis justification (`JustifyContent::Default`).
     pub const JUSTIFY_DEFAULT: u8 = 0;
+    /// Pack items toward main-start (`JustifyContent::Start`).
     pub const JUSTIFY_START: u8 = 1;
+    /// Safe main-start justification.
     pub const JUSTIFY_START_SAFE: u8 = 2;
+    /// Pack items toward main-end (`JustifyContent::End`).
     pub const JUSTIFY_END: u8 = 3;
+    /// Safe main-end justification.
     pub const JUSTIFY_END_SAFE: u8 = 4;
+    /// Pack items toward flex-start (`JustifyContent::FlexStart`).
     pub const JUSTIFY_FLEX_START: u8 = 5;
+    /// Safe flex-start main-axis justification.
     pub const JUSTIFY_FLEX_START_SAFE: u8 = 6;
+    /// Pack items toward flex-end (`JustifyContent::FlexEnd`).
     pub const JUSTIFY_FLEX_END: u8 = 7;
+    /// Safe flex-end main-axis justification.
     pub const JUSTIFY_FLEX_END_SAFE: u8 = 8;
+    /// Center items along the main axis (`JustifyContent::Center`).
     pub const JUSTIFY_CENTER: u8 = 9;
+    /// Safe center main-axis justification.
     pub const JUSTIFY_CENTER_SAFE: u8 = 10;
+    /// Stretch items along the main axis (`JustifyContent::Stretch`).
     pub const JUSTIFY_STRETCH: u8 = 11;
+    /// Distribute remaining space between items (`JustifyContent::SpaceBetween`).
     pub const JUSTIFY_SPACE_BETWEEN: u8 = 12;
+    /// Distribute equal space between and around items (`JustifyContent::SpaceEvenly`).
     pub const JUSTIFY_SPACE_EVENLY: u8 = 13;
+    /// Distribute equal half-space around each item (`JustifyContent::SpaceAround`).
     pub const JUSTIFY_SPACE_AROUND: u8 = 14;
 }
 
@@ -860,25 +900,39 @@ impl_wire_abi_pod!(
     ]
 );
 
-#[allow(missing_docs)]
 impl FfiUiTextStyle {
+    /// Left-aligned text (`Justify::Left`).
     pub const JUSTIFY_LEFT: u8 = 0;
+    /// Center-aligned text (`Justify::Center`).
     pub const JUSTIFY_CENTER: u8 = 1;
+    /// Right-aligned text (`Justify::Right`).
     pub const JUSTIFY_RIGHT: u8 = 2;
+    /// Full-width justified text (`Justify::Justified`).
     pub const JUSTIFY_JUSTIFIED: u8 = 3;
+    /// Locale start-aligned text (`Justify::Start`).
     pub const JUSTIFY_START: u8 = 4;
+    /// Locale end-aligned text (`Justify::End`).
     pub const JUSTIFY_END: u8 = 5;
 
+    /// Break lines at word boundaries (`LineBreak::WordBoundary`).
     pub const LINEBREAK_WORD_BOUNDARY: u8 = 0;
+    /// Break lines between any characters (`LineBreak::AnyCharacter`).
     pub const LINEBREAK_ANY_CHARACTER: u8 = 1;
+    /// Break at word boundaries or mid-word if wider (`LineBreak::WordOrCharacter`).
     pub const LINEBREAK_WORD_OR_CHARACTER: u8 = 2;
+    /// Disable automatic line wrapping (`LineBreak::NoWrap`).
     pub const LINEBREAK_NO_WRAP: u8 = 3;
 
+    /// Antialiased glyph rasterization (`FontSmoothing::AntiAliased`).
     pub const SMOOTHING_ANTI_ALIASED: u8 = 0;
+    /// Crisp non-antialiased glyph rasterization (`FontSmoothing::None`).
     pub const SMOOTHING_NONE: u8 = 1;
 
+    /// Upright regular font style (`FontStyle::Normal`).
     pub const STYLE_NORMAL: u8 = 0;
+    /// True italic font style (`FontStyle::Italic`).
     pub const STYLE_ITALIC: u8 = 1;
+    /// Slanted oblique font style (`FontStyle::Oblique`).
     pub const STYLE_OBLIQUE: u8 = 2;
 }
 
@@ -955,10 +1009,12 @@ impl_wire_abi_pod!(
     ]
 );
 
-#[allow(missing_docs)]
 impl FfiEditableTextConfig {
+    /// Editable text mode (`TextReadWriteMode::Editable`).
     pub const MODE_EDITABLE: u8 = 0;
+    /// Selectable read-only text mode (`TextReadWriteMode::ReadOnly`).
     pub const MODE_READ_ONLY: u8 = 1;
+    /// Non-interactive static text mode (`TextReadWriteMode::Static`).
     pub const MODE_STATIC: u8 = 2;
 }
 
@@ -1124,11 +1180,14 @@ impl_wire_abi_pod!(
     ]
 );
 
-#[allow(missing_docs)]
 impl FfiTabList {
+    /// Horizontal tab strip orientation.
     pub const ORIENTATION_HORIZONTAL: u8 = 0;
+    /// Vertical tab strip orientation.
     pub const ORIENTATION_VERTICAL: u8 = 1;
+    /// Require explicit activation after focusing a tab.
     pub const ACTIVATION_MANUAL: u8 = 0;
+    /// Activate tabs immediately when focused.
     pub const ACTIVATION_AUTOMATIC: u8 = 1;
 }
 
@@ -1243,15 +1302,22 @@ impl_wire_abi_pod!(
     ]
 );
 
-#[allow(missing_docs)]
 impl FfiValueChange {
+    /// `ValueChange<Entity>` payload discriminant.
     pub const KIND_ENTITY: u8 = 0;
+    /// `ValueChange<Option<Entity>>` payload discriminant.
     pub const KIND_OPTIONAL_ENTITY: u8 = 1;
+    /// `ValueChange<f32>` payload discriminant.
     pub const KIND_F32: u8 = 2;
+    /// `ValueChange<bool>` payload discriminant.
     pub const KIND_BOOL: u8 = 3;
+    /// `ValueChange<f64>` payload discriminant.
     pub const KIND_F64: u8 = 4;
+    /// `ValueChange<i32>` payload discriminant.
     pub const KIND_I32: u8 = 5;
+    /// `ValueChange<i64>` payload discriminant.
     pub const KIND_I64: u8 = 6;
+    /// `ValueChange<Color>` payload discriminant.
     pub const KIND_COLOR: u8 = 7;
 
     /// Constructs a [`FfiValueChange`] carrying an `Entity` payload (`KIND_ENTITY`).
@@ -1493,10 +1559,12 @@ impl_wire_abi_pod!(
     ]
 );
 
-#[allow(missing_docs)]
 impl FfiFeathersColorInput {
+    /// Color wheel picker mode.
     pub const MODE_WHEEL: u8 = 0;
+    /// Red-green color plane picker mode.
     pub const MODE_RG_PLANE: u8 = 1;
+    /// Hue-saturation color plane picker mode.
     pub const MODE_HS_PLANE: u8 = 2;
 }
 
@@ -1550,17 +1618,26 @@ impl_wire_abi_pod!(
     ]
 );
 
-#[allow(missing_docs)]
 impl FfiFeathersDropdown {
+    /// Square corners (`RoundedCorners::None`).
     pub const CORNERS_NONE: u8 = 0;
+    /// All four corners rounded (`RoundedCorners::All`).
     pub const CORNERS_ALL: u8 = 1;
+    /// Top-left corner rounded (`RoundedCorners::TopLeft`).
     pub const CORNERS_TOP_LEFT: u8 = 2;
+    /// Top-right corner rounded (`RoundedCorners::TopRight`).
     pub const CORNERS_TOP_RIGHT: u8 = 3;
+    /// Bottom-right corner rounded (`RoundedCorners::BottomRight`).
     pub const CORNERS_BOTTOM_RIGHT: u8 = 4;
+    /// Bottom-left corner rounded (`RoundedCorners::BottomLeft`).
     pub const CORNERS_BOTTOM_LEFT: u8 = 5;
+    /// Top two corners rounded (`RoundedCorners::Top`).
     pub const CORNERS_TOP: u8 = 6;
+    /// Right two corners rounded (`RoundedCorners::Right`).
     pub const CORNERS_RIGHT: u8 = 7;
+    /// Bottom two corners rounded (`RoundedCorners::Bottom`).
     pub const CORNERS_BOTTOM: u8 = 8;
+    /// Left two corners rounded (`RoundedCorners::Left`).
     pub const CORNERS_LEFT: u8 = 9;
 }
 
@@ -1612,9 +1689,10 @@ impl_wire_abi_pod!(
     ]
 );
 
-#[allow(missing_docs)]
 impl FfiFeathersScrollableList {
+    /// Horizontal scrollable list orientation.
     pub const ORIENTATION_HORIZONTAL: u8 = 0;
+    /// Vertical scrollable list orientation.
     pub const ORIENTATION_VERTICAL: u8 = 1;
 }
 
@@ -1721,11 +1799,14 @@ impl_wire_abi_pod!(
     ]
 );
 
-#[allow(missing_docs)]
 impl FfiFeathersNumberInput {
+    /// Display/parse value as `f32`.
     pub const FORMAT_F32: u8 = 0;
+    /// Display/parse value as `f64`.
     pub const FORMAT_F64: u8 = 1;
+    /// Display/parse value as `i32`.
     pub const FORMAT_I32: u8 = 2;
+    /// Display/parse value as `i64`.
     pub const FORMAT_I64: u8 = 3;
 
     /// Constructs an `f32` scrubbable number-input descriptor matching `bamabi_bridges::ui`.

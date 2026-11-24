@@ -1,0 +1,16 @@
+[package]
+name = "bamabi_schema"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "Single source of truth for bamabi canonical wire types, #[repr(C)] layout solving, component UUIDs, schema fingerprints, and ABI metadata"
+
+[features]
+default = []
+alloc = []
+
+[lints]
+workspace = true

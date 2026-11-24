@@ -220,7 +220,6 @@ mod tests {
 
     /// Compile-time signature fixture exercising all safe hierarchy and custom-relationship SDK
     /// methods under `#![forbid(unsafe_code)]`.
-    #[allow(dead_code)]
     fn _verify_hierarchy_sdk_signatures<'a>(
         ctx: &'a SystemContext<'a>,
         qb: QueryBuilder<'a>,

@@ -123,9 +123,9 @@ unsafe extern "C" fn dyn_export_fields(
     sink: Option<
         unsafe extern "C" fn(
             sink_ctx: *mut c_void,
-            field_name: StrView,
-            type_tag: StrView,
-            payload: FfiSlice<u8>,
+            field_name: *const StrView,
+            type_tag: *const StrView,
+            payload: *const FfiSlice<u8>,
         ) -> FfiResult,
     >,
     sink_ctx: *mut c_void,
@@ -136,31 +136,37 @@ unsafe extern "C" fn dyn_export_fields(
         return FfiResult::NULL_POINTER;
     };
     let bytes = msg.code.to_le_bytes();
+    let fname = StrView::from_str("code");
+    let ftag = StrView::from_str("u32");
+    let payload = FfiSlice::from_slice(&bytes);
     // SAFETY: `bytes` is a stack slice valid for the synchronous callback.
     unsafe {
         sink_fn(
             sink_ctx,
-            StrView::from_str("code"),
-            StrView::from_str("u32"),
-            FfiSlice::from_slice(&bytes),
+            &raw const fname,
+            &raw const ftag,
+            &raw const payload,
         )
     }
 }
 
 unsafe extern "C" fn dyn_import_field(
     dst_ptr: *mut c_void,
-    field_name: StrView,
-    _type_tag: StrView,
-    payload: FfiSlice<u8>,
+    field_name: *const StrView,
+    _type_tag: *const StrView,
+    payload: *const FfiSlice<u8>,
 ) -> FfiResult {
+    if field_name.is_null() || payload.is_null() {
+        return FfiResult::NULL_POINTER;
+    }
     // SAFETY: `dst_ptr` points to a live `DynMsg`.
     let dst = unsafe { &mut *dst_ptr.cast::<DynMsg>() };
     // SAFETY: Synchronous slice from `forward_field`.
-    let Ok(name) = (unsafe { field_name.try_as_str() }) else {
+    let Ok(name) = (unsafe { (*field_name).try_as_str() }) else {
         return FfiResult::INVALID_UTF8;
     };
     // SAFETY: Synchronous slice from `forward_field`.
-    let Ok(bytes) = (unsafe { payload.try_as_slice() }) else {
+    let Ok(bytes) = (unsafe { (*payload).try_as_slice() }) else {
         return FfiResult::NULL_POINTER;
     };
     if name == "code" && bytes.len() == 4 {

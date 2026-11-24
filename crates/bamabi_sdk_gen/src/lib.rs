@@ -2,7 +2,7 @@
 #![warn(missing_docs)]
 
 //! Deterministic, `#![forbid(unsafe_code)]`, zero-Bevy polyglot SDK and component header generator
-//! for `bamabi` (`ABI 0.3.0`, `0x0003_0000`).
+//! for `bamabi` (`ABI 0.4.0`, `0x0004_0000`).
 //!
 //! `bamabi_sdk_gen` sits in Layer 0 (`bamabi-wire`) and translates the Rust ABI definitions in
 //! [`bamabi_sys`] into byte-identical C99, C++17, Zig, and component declaration headers without
@@ -36,17 +36,15 @@
 //! ## Step 2: How `bamabi_sys::offsets` Drives Zero-Drift Header Generation
 //!
 //! Rather than duplicating wire constants by hand, [`header_gen`] reads ABI constants, flags,
-//! error discriminants, and the [`bamabi_sys::offsets`] table (`OFF64_*`, `OFF32_*`,
-//! `SIZE_64 = 592`, `SIZE_32 = 300`, `SLOT_COUNT = 73`) directly from [`bamabi_sys`].
+//! error discriminants, and the [`bamabi_sys::abi_meta`] table directly from [`bamabi_sys`] (`SLOT_COUNT = 90`, `SIZE_64 = 728`, `SIZE_32 = 368`).
 //!
-//! Before emitting C99 source text, [`render_c99_header`] constructs a unified 20-struct layout
-//! specification table (`wire_struct_specs`) and runs two pre-emission checks:
+//! Before emitting C99 source text, [`render_c99_header`] verifies [`bamabi_sys::abi_meta::WIRE_STRUCT_SPECS`] via two pre-emission checks:
 //!
 //! 1. **Rust layout verification (`verify_host_rust_layouts`):** Compares `size_of`, `align_of`,
-//!    and `offset_of!` of every primitive newtype and all 20 wire structs on the current host
-//!    (`64`-bit or `32`-bit) against the frozen ABI `0.3.0` layout table.
+//!    and `offset_of!` of every primitive newtype and all 24 wire structs on the current host
+//!    (`64`-bit or `32`-bit) against the frozen ABI `0.4.0` layout table.
 //! 2. **VTable slot count check:** Asserts that `BamHostApi` declares exactly
-//!    `BAM_HOST_API_SLOT_COUNT` (`73`) function-pointer slots after `(struct_size, abi_version)`.
+//!    `BAM_HOST_API_SLOT_COUNT` (`90`) function-pointer slots after `(struct_size, abi_version)`.
 //!
 //! The generated C99 header then emits `BAM_STATIC_ASSERT` guards for both `64`-bit
 //! (`UINTPTR_MAX == 0xffffffffffffffffULL`) and `32`-bit (`UINTPTR_MAX == 0xffffffffUL`) targets,
@@ -56,8 +54,8 @@
 //! ## Step 3: Generating Core Headers & Language SDKs
 //!
 //! - [`render_c99_header`] synthesizes the 6-section ISO C99 header (`BAM_EXPORT`, `BAM_UNUSED`,
-//!   `BAM_RESTRICT`, `BAM_ALIGNOF`, `BAM_STATIC_ASSERT`, all 73 `BAM_HOST_API_OFFSET_*` macros,
-//!   prefix-extensibility `BAM_*_MIN_V0_2_SIZE` / `BAM_*_MIN_V0_3_SIZE` bounds, and `bam_*`
+//!   `BAM_RESTRICT`, `BAM_ALIGNOF`, `BAM_STATIC_ASSERT`, all 90 `BAM_HOST_API_OFFSET_*` macros,
+//!   prefix-extensibility `BAM_*_MIN_V0_2_SIZE` / `BAM_*_MIN_V0_3_SIZE` / `BAM_*_MIN_V0_4_SIZE` bounds, and `bam_*`
 //!   inline helpers including `SipHash-2-4-128` `bam_uuid_from_parts`, `bam_host_api_covers_slot`,
 //!   and `bam_host_api_copy_bounded`).
 //! - [`write_or_check_header`] powers `cargo xtask header` and `cargo xtask header --check`,
@@ -65,12 +63,12 @@
 //! - [`export_sdk`] writes `bamabi.h`, `bamabi.hpp` ([`CPP17_HEADER`]), and `bamabi.zig`
 //!   ([`ZIG_SDK`]) into an output directory for `cargo bam export-sdk` and polyglot consumers:
 //!   - [`CPP17_HEADER`] adds `bam::offsets::*` compile-time constants, `copy_column_restricted`
-//!     using `BAM_RESTRICT`, `guard_boundary`, 73-slot views (`HostContextView`, `LoadContextView`,
+//!     using `BAM_RESTRICT`, `guard_boundary`, 90-slot views (`HostContextView`, `LoadContextView`,
 //!     `ChunkView`, `CommandsView`, `SystemContextView`), and RAII [`ScopedTransaction`][cpp_tx].
 //!   - [`ZIG_SDK`] targets Zig `0.16` `b.addTranslateC` (`@import("bam_c")`), providing
 //!     `BAM_RESTRICT_QUALIFIER = "noalias"`, `copyColumnNoAlias`, `offsets.*` /
 //!     `BAM_HOST_API_OFFSET_*`, lossless 18-code `BamError` (`checkResult` / `mapError`), and
-//!     73-slot view structs.
+//!     90-slot view structs.
 //!
 //! [cpp_tx]: sdk::CPP17_HEADER
 //!
@@ -78,8 +76,8 @@
 //! use bamabi_sdk_gen::{export_sdk, render_c99_header};
 //!
 //! let c99 = render_c99_header().expect("bamabi_sys layouts must be valid");
-//! assert!(c99.contains("#define BAM_ABI_VERSION 0x00030000u"));
-//! assert!(c99.contains("#define BAM_HOST_API_SLOT_COUNT    73u"));
+//! assert!(c99.contains("#define BAM_ABI_VERSION 0x00040000u"));
+//! assert!(c99.contains("#define BAM_HOST_API_SLOT_COUNT    90u"));
 //! assert!(c99.contains("#define BAM_HOST_API_OFFSET_MIGRATE_COMPONENT_COLUMN"));
 //!
 //! let out_dir = std::env::temp_dir().join(format!("bamabi_sdk_doctest_{}", std::process::id()));
@@ -162,6 +160,9 @@ pub mod docs {
 pub mod header_gen;
 pub mod sdk;
 
-pub use component_header::{render_component_header, section_for};
+pub use component_header::{
+    ComponentFieldMeta, ComponentSection, component_section_for, render_component_header,
+    render_component_header_with_metadata, render_zig_component_header, section_for,
+};
 pub use header_gen::{render_c99_header, write_or_check_header};
 pub use sdk::{CPP17_HEADER, ZIG_SDK, cpp17_header, export_sdk, zig_sdk};

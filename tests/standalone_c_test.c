@@ -678,14 +678,14 @@ static void mock_guest_shutdown(BamInstance* instance) {
  * - `bam_result_name` handles known codes and returns `"UNKNOWN"` for out-of-range codes.
  * - `bam_str_view(NULL)` returns `{ NULL, 0 }` without invoking `strlen(NULL)` (no UB). */
 static void test_versions_and_result_names(void) {
-    assert(BAM_ABI_VERSION == 0x00030000u);
+    assert(BAM_ABI_VERSION == 0x00040000u);
     assert(bam_version_major(BAM_ABI_VERSION) == 0u);
-    assert(bam_version_minor(BAM_ABI_VERSION) == 3u);
+    assert(bam_version_minor(BAM_ABI_VERSION) == 4u);
     assert(bam_version_patch(BAM_ABI_VERSION) == 0u);
 
-    assert(bam_version_is_compatible(bam_pack_abi_version(0u, 3u, 0u), bam_pack_abi_version(0u, 3u, 7u)));
-    assert(!bam_version_is_compatible(bam_pack_abi_version(0u, 3u, 0u), bam_pack_abi_version(0u, 2u, 0u)));
+    assert(bam_version_is_compatible(bam_pack_abi_version(0u, 4u, 0u), bam_pack_abi_version(0u, 4u, 7u)));
     assert(!bam_version_is_compatible(bam_pack_abi_version(0u, 4u, 0u), bam_pack_abi_version(0u, 3u, 0u)));
+    assert(!bam_version_is_compatible(bam_pack_abi_version(0u, 5u, 0u), bam_pack_abi_version(0u, 4u, 0u)));
     assert(bam_version_is_compatible(bam_pack_abi_version(1u, 2u, 0u), bam_pack_abi_version(1u, 1u, 0u)));
     assert(!bam_version_is_compatible(bam_pack_abi_version(1u, 1u, 0u), bam_pack_abi_version(1u, 2u, 0u)));
 
@@ -1212,8 +1212,8 @@ static void test_extended_wire_descriptors(void) {
         assert(sys_desc.run_if_query == &param_set_q);
         assert(sys_desc.run_if_ctx_user_data == NULL);
     }
-    assert(BAM_HOST_API_SLOT_COUNT == 73u);
-    assert(api.struct_size >= (uint32_t)(offsetof(BamHostApi, cmd_remove_resource) + sizeof(BamCmdRemoveResourceFn)));
+    assert(BAM_HOST_API_SLOT_COUNT == 90u);
+    assert(api.struct_size >= (uint32_t)(offsetof(BamHostApi, cmd_spawn_batch_ex) + sizeof(BamCmdSpawnBatchExFn)));
     assert(bam_host_api_covers_slot(&api, BAM_HOST_API_OFFSET_LOG_DIAGNOSTIC, sizeof(BamLogDiagnosticFn)));
     assert(bam_host_api_covers_slot(&api, BAM_HOST_API_OFFSET_MIGRATE_COMPONENT_COLUMN, sizeof(BamMigrateComponentColumnFn)));
     assert(bam_host_api_covers_slot(&api, BAM_HOST_API_OFFSET_ITER_NEXT_CHUNK_BATCH, sizeof(BamIterNextChunkBatchFn)));
@@ -1221,11 +1221,32 @@ static void test_extended_wire_descriptors(void) {
     assert(bam_host_api_covers_slot(&api, BAM_HOST_API_OFFSET_CMD_CLONE_ENTITY, sizeof(BamCmdCloneEntityFn)));
     assert(bam_host_api_covers_slot(&api, BAM_HOST_API_OFFSET_CMD_INSERT_RESOURCE, sizeof(BamCmdInsertResourceFn)));
     assert(bam_host_api_covers_slot(&api, BAM_HOST_API_OFFSET_CMD_REMOVE_RESOURCE, sizeof(BamCmdRemoveResourceFn)));
+    assert(bam_host_api_covers_slot(&api, BAM_HOST_API_OFFSET_REGISTER_RESOURCE, sizeof(BamRegisterComponentFn)));
+    assert(bam_host_api_covers_slot(&api, BAM_HOST_API_OFFSET_ITER_MARK_CHANGED_RANGES, sizeof(BamIterMarkChangedRangesFn)));
+    assert(bam_host_api_covers_slot(&api, BAM_HOST_API_OFFSET_SYS_TIME_INFO, sizeof(BamSysTimeInfoFn)));
+    assert(bam_host_api_covers_slot(&api, BAM_HOST_API_OFFSET_CMD_SPAWN_BATCH_EX, sizeof(BamCmdSpawnBatchExFn)));
     assert(api.iter_next_chunk_batch == NULL);
     assert(api.iter_column_ticks == NULL);
     assert(api.cmd_clone_entity == NULL);
     assert(api.cmd_insert_resource == NULL);
     assert(api.cmd_remove_resource == NULL);
+    assert(api.register_resource == NULL);
+    assert(api.register_message == NULL);
+    assert(api.resolve_named_object == NULL);
+    assert(api.resolve_symbol_str == NULL);
+    assert(api.iter_column_rows_mutable_untracked == NULL);
+    assert(api.iter_mark_changed_ranges == NULL);
+    assert(api.sys_current_ticks == NULL);
+    assert(api.sys_time_info == NULL);
+    assert(api.par_for_each_chunk_ex == NULL);
+    assert(api.sys_relation_targets == NULL);
+    assert(api.sys_relation_sources == NULL);
+    assert(api.sys_relation_edge_data == NULL);
+    assert(api.cmd_despawn_batch == NULL);
+    assert(api.cmd_insert_batch == NULL);
+    assert(api.cmd_remove_batch == NULL);
+    assert(api.msg_read_slice == NULL);
+    assert(api.cmd_spawn_batch_ex == NULL);
     assert(api.cmd_spawn_persistent == NULL);
     assert(api.cmd_spawn_batch == NULL);
     assert(api.cmd_despawn_all == NULL);
@@ -1256,6 +1277,49 @@ static void test_extended_wire_descriptors(void) {
     assert(api.cmd_insert_relation == NULL);
     assert(api.cmd_remove_relation == NULL);
     assert(api.migrate_component_column == NULL);
+
+    /* 7. ABI 0.4.0 inline constructors, telemetry FNV-1a, schema hash, extended schedules */
+    {
+        BamManifest cm = bam_manifest("c_mod", "0.4.0");
+        BamTermDesc term = bam_term_desc(1u, BAM_ACCESS_READ, 0u);
+        BamQueryDesc qd = bam_query_desc(&term, 1u);
+        BamSystemDesc sd = bam_system_desc("tick", &qd, 1u, mock_guest_system, NULL);
+        BamFieldDesc fd = bam_field_desc(BAM_FIELD_KIND_F32, bam_str_view("x"), bam_str_view("f32"), 0u, 4u, 4u);
+        BamRequiredComponent rc = bam_required_component(2u);
+        BamRelationDesc rd = bam_relation_desc("game::Likes", 4u, 4u, 8u);
+        BamScheduleSetDesc ssd = bam_schedule_set_desc("Physics", BAM_SCHEDULE_FIXED_UPDATE);
+        BamRowRange rr = bam_row_range(3u, 5u);
+        BamTimeInfo ti = bam_time_info();
+        BamParOptions po = bam_par_options();
+        BamSpawnColumnDesc scd = bam_spawn_column_desc(1u, BAM_SPAWN_COL_FLAG_SPLAT, NULL, 4u);
+        BamSystemTelemetryDigest64 td;
+        memset(&td, 0, sizeof(td));
+        td.magic[0] = BAM_SYSTEM_TELEMETRY_MAGIC_0;
+        td.magic[1] = BAM_SYSTEM_TELEMETRY_MAGIC_1;
+        td.magic[2] = BAM_SYSTEM_TELEMETRY_MAGIC_2;
+        td.magic[3] = BAM_SYSTEM_TELEMETRY_MAGIC_3;
+        td.version = BAM_SYSTEM_TELEMETRY_DIGEST_VERSION;
+        td.flags = BAM_TELEMETRY_FLAG_BUDGET_BREACHED;
+        td.system_hash = bam_fnv1a_64_hash_system("c_mod", "tick");
+
+        assert(cm.struct_size == (uint32_t)sizeof(BamManifest) && cm.abi_version == BAM_ABI_VERSION);
+        assert(qd.struct_size == (uint32_t)sizeof(BamQueryDesc) && qd.term_count == 1u);
+        assert(sd.struct_size == (uint32_t)sizeof(BamSystemDesc) && sd.schedule == BAM_SCHEDULE_UPDATE);
+        assert(fd.struct_size == (uint32_t)sizeof(BamFieldDesc) && fd.kind == BAM_FIELD_KIND_F32);
+        assert(rc.struct_size == (uint32_t)sizeof(BamRequiredComponent) && rc.component == 2u);
+        assert(rd.struct_size == (uint32_t)sizeof(BamRelationDesc) && rd.max_degree == 8u);
+        assert(ssd.struct_size == (uint32_t)sizeof(BamScheduleSetDesc) && ssd.schedule == BAM_SCHEDULE_FIXED_UPDATE);
+        assert(rr.start_row == 3u && rr.row_count == 5u);
+        assert(ti.struct_size == (uint32_t)sizeof(BamTimeInfo));
+        assert(po.struct_size == (uint32_t)sizeof(BamParOptions));
+        assert(scd.flags == BAM_SPAWN_COL_FLAG_SPLAT && scd.elem_size == 4u);
+        assert(td.system_hash == bam_fnv1a_64_str("c_mod::tick"));
+        assert(bam_hash_field_schema(0ull, "x", "f32", 0ull) != 0ull);
+        assert(bam_schedule_is_valid(BAM_SCHEDULE_PRE_STARTUP));
+        assert(bam_schedule_is_valid(BAM_SCHEDULE_SPAWN_SCENE));
+        assert(BAM_SCHEDULE_PRE_STARTUP == BAM_SCHEDULE_CUSTOM_BASE);
+        assert(BAM_SCHEDULE_SPAWN_SCENE == BAM_SCHEDULE_CUSTOM_BASE + 9u);
+    }
 }
 
 int main(void) {
@@ -1266,6 +1330,6 @@ int main(void) {
     test_hierarchy_ticks_layout_and_observer_descriptors();
     test_extended_wire_descriptors();
 
-    printf("All ABI v0.3.0 ISO C99 conformance & layout checks passed.\n");
+    printf("All ABI v0.4.0 ISO C99 conformance & layout checks passed.\n");
     return 0;
 }

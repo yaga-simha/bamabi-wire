@@ -1,10 +1,10 @@
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
 
-//! # `bamabi_guest`: Safe Idiomatic Rust Guest SDK (`ABI 0.3.0`)
+//! # `bamabi_guest`: Safe Idiomatic Rust Guest SDK (`ABI 0.4.0`)
 //!
 //! Safe (`#![forbid(unsafe_code)]`), **zero-Bevy-dependency** Rust SDK for authoring native
-//! `.cdylib` mods targeting `bamabi` (`ABI 0.3.0`, `v0.3.0`, Layer 0 of `bamabi-wire`).
+//! `.cdylib` mods targeting `bamabi` (`ABI 0.4.0`, `v0.4.0`, Layer 0 of `bamabi-wire`).
 //!
 //! Follow the eight incremental steps below to go from the core mental model to a tested,
 //! hot-reloadable native mod.
@@ -22,7 +22,7 @@
 //! - **Zero `unsafe` in Guest Code:** This crate enforces `#![forbid(unsafe_code)]` at the crate
 //!   root. Every raw FFI pointer check, [`BamHostApi`](raw::BamHostApi) slot bounds check,
 //!   [`VTableHeader`] verification, and `extern "C"` panic trampoline is isolated inside
-//!   `bamabi_guest_sys` over the [`bamabi_sys`] `ABI 0.3.0` (`0x0003_0000`) wire contract.
+//!   `bamabi_guest_sys` over the [`bamabi_sys`] `ABI 0.4.0` (`0x0004_0000`) wire contract.
 //! - **Zero Bevy Dependencies:** `bamabi_guest` depends only on `bamabi_sys`, `bamabi_guest_sys`,
 //!   and optionally `bamabi_macros` (`feature = "derive"`, `default = []`). Guest mods compile
 //!   independently of Bevy and across mismatched Rust compiler toolchains.
@@ -60,7 +60,7 @@
 //!
 //! impl GuestPlugin for HelloMod {
 //!     const NAME: &'static CStr = c"hello_mod";
-//!     const VERSION: &'static CStr = c"0.3.0";
+//!     const VERSION: &'static CStr = c"0.4.0";
 //!
 //!     fn build(&mut self, app: &mut GuestApp<'_>) -> FfiResult {
 //!         app.system(c"hello_tick")
@@ -93,7 +93,7 @@
 //! via [`GuestApp::register_dynamic_component`].
 //!
 //! Systems are built with [`GuestApp::system`]:
-//! - **Typed Queries (`1..=16` terms):** [`SystemBuilder::query_typed`] accepts any [`QueryTuple`]
+//! - **Typed Queries (flat `1..=32` terms):** [`SystemBuilder::query_typed`] accepts any [`QueryTuple`]
 //!   over `&T`, `&mut T`, `Option<&T>`, `Option<&mut T>`, [`With<T>`], [`Without<T>`],
 //!   [`Changed<T>`], [`Added<T>`], [`Allow<T>`], [`Has<T>`], [`Or<(T0, T1, ...)>`] (2..=8
 //!   branches, plus [`Or2`] / [`Or3`] aliases), and [`FfiEntity`]. Up to [`MAX_QUERIES_PER_SYSTEM`]
@@ -187,7 +187,7 @@
 //!   `.with_children(...)`, `.disable()` / `.enable()`, `.observe(...)`, and `.trigger(...)`.
 //!   Read hierarchy children via [`SystemContext::children`] and cycle-safe
 //!   [`SystemContext::iter_descendants`] (paired with [`QueryBuilder::read_children`]).
-//! - **Typed Relationships:** Register ABI `0.3.0` relationships via [`RelationDescBuilder`] +
+//! - **Typed Relationships:** Register ABI `0.3.0+` relationships via [`RelationDescBuilder`] +
 //!   [`GuestApp::register_relation`] (or dynamic hook pairs via
 //!   [`GuestApp::register_relationship_pair`]) and mutate edges with
 //!   [`GuestCommands::insert_relation`] / [`GuestCommands::remove_relation`].
@@ -331,7 +331,7 @@ pub mod macros;
 pub mod prelude;
 pub mod raw;
 
-pub use bamabi_guest_sys::{SpawnEntry, TypedComponent};
+pub use bamabi_guest_sys::{SpawnBatchColumn, SpawnEntry, TypedComponent};
 pub use bamabi_sys::{
     ABI_VERSION, ABI_VERSION_MAJOR, ABI_VERSION_MINOR, ABI_VERSION_PATCH, AbiPod, AccessMode,
     BAM_COMPONENT_FLAG_IMMUTABLE, BAM_COMPONENT_FLAG_SPARSE_SET, BAM_COMPONENT_FLAG_SUMMARY_TICK,
@@ -340,17 +340,18 @@ pub use bamabi_sys::{
     BAM_RELATION_FLAG_CASCADE_DESPAWN, BAM_RELATION_FLAG_CLEANUP_REMOVE,
     BAM_RELATION_FLAG_EXCLUSIVE, BAM_RELATION_FLAG_SYMMETRIC, BAM_SCHEDULE_SET_FLAG_AFTER_WEAK,
     BAM_SCHEDULE_SET_FLAG_BEFORE_WEAK, BAM_SCHEDULE_SET_FLAG_PARALLEL,
-    BAM_SCHEDULE_SET_FLAG_SEQUENCE, BAM_SCHEDULE_SET_FLAG_SEQUENCE_WEAK,
-    BAM_STORAGE_FLAG_IMMUTABLE, BAM_STORAGE_FLAG_MESSAGE, BAM_STORAGE_FLAG_RESOURCE,
-    BAM_STORAGE_FLAG_SPARSE_SET, BAM_STORAGE_FLAG_SUMMARY_TICK, BAM_SYSTEM_FLAG_AMBIGUOUS_WITH_ALL,
-    BAM_SYSTEM_FLAG_MAIN_THREAD, BAM_TRIGGER_FLAG_PROPAGATE, BamChangeTicks, BamColumnInfo,
-    BamComponent, BamEventKind, BamFieldDesc, BamFieldKind, BamLayoutInfo, BamManifest,
-    BamObserverDesc, BamObserverFn, BamObserverMutFn, BamRelationDesc, BamRequiredComponent,
-    BamRowMigrateFn, BamScheduleSetDesc, BamSymbol, BamSystem, BamSystemSet, BamTermDesc,
-    BamTriggerDesc, ComponentDesc, ComponentUuid, FfiAssetHandle, FfiAssetLoadState, FfiBool,
-    FfiChildOf, FfiDisabled, FfiEntity, FfiOption, FfiResult, FfiSlice, MAX_QUERIES_PER_SYSTEM,
-    MAX_TERMS_PER_QUERY, ModComponent, RawInsertable, ScheduleId, StrView, SymbolEntry,
-    VTableHeader,
+    BAM_SCHEDULE_SET_FLAG_SEQUENCE, BAM_SCHEDULE_SET_FLAG_SEQUENCE_WEAK, BAM_SPAWN_COL_FLAG_SPLAT,
+    BAM_SPAWN_COL_KNOWN_FLAGS, BAM_STORAGE_FLAG_IMMUTABLE, BAM_STORAGE_FLAG_MESSAGE,
+    BAM_STORAGE_FLAG_RESOURCE, BAM_STORAGE_FLAG_SPARSE_SET, BAM_STORAGE_FLAG_SUMMARY_TICK,
+    BAM_SYSTEM_FLAG_AMBIGUOUS_WITH_ALL, BAM_SYSTEM_FLAG_MAIN_THREAD, BAM_TRIGGER_FLAG_PROPAGATE,
+    BamChangeTicks, BamColumnInfo, BamComponent, BamEventKind, BamFieldDesc, BamFieldKind,
+    BamLayoutInfo, BamManifest, BamObserverCtxMutFn, BamObserverDesc, BamObserverFn,
+    BamObserverMutFn, BamParOptions, BamRelationDesc, BamRequiredComponent, BamRowMigrateFn,
+    BamRowRange, BamScheduleSetDesc, BamSpawnColumnDesc, BamSymbol, BamSystem, BamSystemSet,
+    BamTermDesc, BamTimeInfo, BamTriggerDesc, ComponentDesc, ComponentUuid, FfiAssetHandle,
+    FfiAssetLoadState, FfiBool, FfiChildOf, FfiDisabled, FfiEntity, FfiOption, FfiResult, FfiSlice,
+    MAX_QUERIES_PER_SYSTEM, MAX_TERMS_PER_QUERY, ModComponent, RawInsertable, ScheduleId, StrView,
+    SymbolEntry, VTableHeader,
 };
 
 #[cfg(feature = "derive")]
@@ -359,8 +360,8 @@ pub use bamabi_macros::{AbiPod, GuestComponent, ModComponent};
 pub use app::{
     BevySchedules, EcsRunCondition, GuestApp, GuestComponentOptions, GuestRes, GuestResMut,
     IntoSystemResult, ObserverBuilder, ParamSetBuilder, QueryBuilder, RelationDescBuilder,
-    RunConditionContext, RunConditionSystemContext, ScheduleSetBuilder, SystemBuilder,
-    SystemContext, TypedObserverBuilder, conditions,
+    RunConditionContext, RunConditionSystemContext, ScheduleSetBuilder, SplitSystemContext,
+    SystemBuilder, SystemContext, TypedObserverBuilder, conditions,
 };
 pub use bridges::{
     ACTIVATE_EVENT_UUID, APPLY_EAR_POSITIONS, APPLY_EMITTER_POS, APPLY_SPEED, APPLY_VOLUME,
@@ -429,11 +430,12 @@ pub use commands::{GuestCommands, GuestTransaction};
 pub use component::{GuestComponent, GuestComponentHooks, guest_component_uuid};
 pub use entity_commands::{GuestChildSpawner, GuestEntityCommands};
 pub use iter::{
-    Added, AddedMut, Allow, Changed, ChangedMut, Chunk, ChunkIter, ChunkSlice, ChunkSliceMut,
-    CopyableQueryTerm, CopyableQueryTuple, DrainOptions, Has, Mut, MutSlice, Or, Or2, Or3,
-    OrFilterTerm, OrFilterTuple, PairwiseQueryTerm, PairwiseQueryTuple, QuerySingleError,
-    QueryTerm, QueryTuple, Ref, RefSlice, SparseRows, SparseRowsIter, SparseRowsMut,
-    TypedChunkIter, With, WithAdded, WithChanged, Without,
+    Added, AddedMut, Allow, BatchColCache, Changed, ChangedMut, Chunk, ChunkColumnDispenser,
+    ChunkIter, ChunkSlice, ChunkSliceMut, CopyableQueryTerm, CopyableQueryTuple, DrainOptions, Has,
+    Mut, MutSlice, Or, Or2, Or3, OrFilterTerm, OrFilterTuple, PairwiseQueryTerm,
+    PairwiseQueryTuple, QuerySingleError, QueryTerm, QueryTuple, Ref, RefSlice, SelectiveMut,
+    SelectiveMutSlice, Sparse, SparseRows, SparseRowsIter, SparseRowsMut, TypedChunkIter,
+    UntrackedMut, With, WithAdded, WithChanged, Without,
 };
 pub use lifecycle::{GuestPlugin, build_guest_fn, build_guest_plugin};
 

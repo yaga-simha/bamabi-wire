@@ -55,7 +55,7 @@ const g_manifest: c.BamManifest = .{
     .struct_size = @sizeOf(c.BamManifest),
     .abi_version = c.BAM_ABI_VERSION,
     .name = "bench_guest_zig",
-    .version = "0.3.0",
+    .version = "0.4.0",
     .flags = 0,
     .reserved0 = 0,
     .save_state = null,
@@ -307,7 +307,7 @@ fn sysHostApiRoundtrip(sys_ctx_opt: ?*c.BamSystemCtx, user_data: ?*anyopaque) ca
             return ticks_rc;
         }
         var sym: c.BamSymbol = c.BAM_SYMBOL_INVALID;
-        const sym_rc = intern_fn(hview.ctx, sym_name, &sym);
+        const sym_rc = intern_fn(hview.ctx, &sym_name, &sym);
         if (sym_rc != c.BAM_RESULT_OK) {
             return sym_rc;
         }

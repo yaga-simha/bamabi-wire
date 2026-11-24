@@ -10,16 +10,22 @@ use bamabi_guest_sys::{
     ValidatedSystemInvocation, ValidatedSystemRef, ValidatedSystemSlice, resolve_component,
 };
 use bamabi_sys::{
-    AbiPod, BamChangeTicks, BamComponent, BamHostApi, BamSystemCtx, ComponentUuid, FfiEntity,
-    FfiResult, ModComponent,
+    AbiPod, AccessMode, BamChangeTicks, BamComponent, BamHostApi, BamSymbol, BamSystemCtx,
+    BamTimeInfo, ComponentUuid, FfiEntity, FfiResult, MAX_TERMS_PER_QUERY, ModComponent,
 };
 
 use crate::{
     app::builder::IntoSystemResult,
     commands::GuestCommands,
-    component::{GuestComponent, guest_uuid_filter, resolve_guest_component},
+    component::{
+        GuestComponent, guest_uuid_filter, qualify_component_identity, resolve_guest_component,
+    },
     iter::{Chunk, ChunkIter, QueryTuple, TypedChunkIter},
 };
+
+/// Type alias for a boxed ECS-aware `.run_if_with` / `EcsRunCondition` predicate.
+pub(crate) type RunIfCtxPredicateFn =
+    Box<dyn FnMut(&mut RunConditionSystemContext<'_>, usize) -> bool + Send + 'static>;
 
 /// Safe context passed to `.run_if(...)` condition closures.
 ///
@@ -90,6 +96,12 @@ pub struct RunConditionSystemContext<'a> {
 }
 
 impl<'a> RunConditionSystemContext<'a> {
+    /// Builds a [`RunConditionSystemContext`] from an active [`Host`] and optional [`ChunkIter`].
+    #[inline]
+    pub(crate) fn from_parts(host: &'a Host, query: Option<ChunkIter<'a>>) -> Self {
+        Self { host, query }
+    }
+
     /// Builds a [`RunConditionSystemContext`] from a trampoline [`ValidatedSystemInvocation`],
     /// taking slot 0 (`run_if_query`) if present.
     #[inline]
@@ -476,6 +488,20 @@ pub struct SystemContext<'a> {
     lazy_commands: Option<LazyCommands<'a>>,
 }
 
+/// Disjoint split view returned by [`SystemContext::split`] enabling simultaneous mutable access
+/// to declared user queries, the resource/message stream iterator, [`GuestCommands`], and
+/// [`ValidatedSystemRef`] without borrow-checker conflicts.
+pub struct SplitSystemContext<'b, 'a> {
+    /// Mutable slice of declared user queries `0..query_count`.
+    pub queries: &'b mut [Option<ChunkIter<'a>>],
+    /// Optional resource/message/removed-stream iterator slot (disjoint from `queries`).
+    pub resource_iter: Option<&'b mut ChunkIter<'a>>,
+    /// Deferred [`GuestCommands`] buffer (disjoint from `queries` and `sys`).
+    pub commands: &'b mut GuestCommands<'a>,
+    /// Shared [`ValidatedSystemRef`] for host diagnostics, ticks, time, symbols, and relations.
+    pub sys: &'b ValidatedSystemRef<'a>,
+}
+
 /// Lazily resolves `commands` from `lazy_commands` on first access so systems that never touch
 /// deferred commands avoid the `BamHostApi::sys_commands` FFI call.
 #[inline]
@@ -518,19 +544,36 @@ fn split_queries_2_mut<'b, 'a>(
     }
 }
 
+/// Borrowed triple of three distinct mutable [`ChunkIter`] slots.
+type QueryTripleMut<'b, 'a> = (
+    &'b mut ChunkIter<'a>,
+    &'b mut ChunkIter<'a>,
+    &'b mut ChunkIter<'a>,
+);
+
+/// Borrowed triple of three distinct mutable [`ChunkIter`] slots paired with [`GuestCommands`].
+pub type QueryTripleAndCommands<'b, 'a> = (
+    &'b mut ChunkIter<'a>,
+    &'b mut ChunkIter<'a>,
+    &'b mut ChunkIter<'a>,
+    &'b mut GuestCommands<'a>,
+);
+
+/// Borrowed triple of three distinct typed [`TypedChunkIter`] slots.
+pub type TypedQueryTriple<'b, 'a, Q1, Q2, Q3> = (
+    TypedChunkIter<'b, 'a, Q1>,
+    TypedChunkIter<'b, 'a, Q2>,
+    TypedChunkIter<'b, 'a, Q3>,
+);
+
 /// Splits three distinct mutable query slots (`idx_a`, `idx_b`, `idx_c`) out of `queries`.
-#[allow(clippy::type_complexity)]
 fn split_queries_3_mut<'b, 'a>(
     queries: &'b mut [Option<ChunkIter<'a>>],
     user_query_count: usize,
     idx_a: usize,
     idx_b: usize,
     idx_c: usize,
-) -> Option<(
-    &'b mut ChunkIter<'a>,
-    &'b mut ChunkIter<'a>,
-    &'b mut ChunkIter<'a>,
-)> {
+) -> Option<QueryTripleMut<'b, 'a>> {
     if idx_a == idx_b
         || idx_b == idx_c
         || idx_a == idx_c
@@ -707,6 +750,29 @@ impl<'a> SystemContext<'a> {
         self.queries.get(index)?.as_ref()
     }
 
+    /// Evaluates trailing `run_if_with` / `run_if_condition` predicates attached to a context-aware
+    /// observer using the hidden trailing query slot `cond_query_index` and hides that trailing
+    /// slot from `self.query_count()` for the subsequent user observer callback.
+    #[inline]
+    pub(crate) fn eval_observer_run_if_with(
+        &mut self,
+        cond_query_index: usize,
+        preds: &mut [(usize, RunIfCtxPredicateFn)],
+    ) -> bool {
+        let host = self.sys_ref.host();
+        let cond_iter = self
+            .queries
+            .get_mut(cond_query_index)
+            .and_then(Option::take);
+        if cond_query_index < self.user_query_count {
+            self.user_query_count = cond_query_index;
+        }
+        let mut cond_ctx = RunConditionSystemContext::from_parts(host, cond_iter);
+        preds
+            .iter_mut()
+            .all(|(offset, pred)| pred(&mut cond_ctx, *offset))
+    }
+
     /// Borrows query slot `index` mutably.
     #[inline]
     fn query_slot_mut(&mut self, index: usize) -> Option<&mut ChunkIter<'a>> {
@@ -845,18 +911,12 @@ impl<'a> SystemContext<'a> {
 
     /// Simultaneously borrows three distinct queries `idx_a`, `idx_b`, and `idx_c` alongside
     /// [`GuestCommands`].
-    #[allow(clippy::type_complexity)]
     pub fn queries_3_and_commands(
         &mut self,
         idx_a: usize,
         idx_b: usize,
         idx_c: usize,
-    ) -> Option<(
-        &mut ChunkIter<'a>,
-        &mut ChunkIter<'a>,
-        &mut ChunkIter<'a>,
-        &mut GuestCommands<'a>,
-    )> {
+    ) -> Option<QueryTripleAndCommands<'_, 'a>> {
         let (a, b, c) =
             split_queries_3_mut(self.queries, self.user_query_count, idx_a, idx_b, idx_c)?;
         let cmds = resolve_commands_slot(
@@ -1074,17 +1134,12 @@ impl<'a> SystemContext<'a> {
 
     /// Simultaneously borrows three distinct queries as [`TypedChunkIter`]s.
     #[inline]
-    #[allow(clippy::type_complexity)]
     pub fn queries_3_typed<Q1: QueryTuple, Q2: QueryTuple, Q3: QueryTuple>(
         &mut self,
         idx_a: usize,
         idx_b: usize,
         idx_c: usize,
-    ) -> Option<(
-        TypedChunkIter<'_, 'a, Q1>,
-        TypedChunkIter<'_, 'a, Q2>,
-        TypedChunkIter<'_, 'a, Q3>,
-    )> {
+    ) -> Option<TypedQueryTriple<'_, 'a, Q1, Q2, Q3>> {
         let (qa, qb, qc) = self.queries_3_mut(idx_a, idx_b, idx_c)?;
         Some((qa.typed::<Q1>(), qb.typed::<Q2>(), qc.typed::<Q3>()))
     }
@@ -1581,5 +1636,292 @@ impl<'a> SystemContext<'a> {
             Some(q) => q.send_non_pod_message::<M>(decl_index, msg),
             None => FfiResult::OUT_OF_RANGE,
         }
+    }
+
+    /// Splits `&mut self` into disjoint mutable handles for declared queries, the resource/message
+    /// stream iterator, [`GuestCommands`], and [`ValidatedSystemRef`].
+    #[inline]
+    pub fn split(&mut self) -> SplitSystemContext<'_, 'a> {
+        let commands = resolve_commands_slot(
+            &mut self.commands,
+            &mut self.lazy_commands,
+            self.sys_ref.base_host(),
+        );
+        let user_count = self.user_query_count.min(self.queries.len());
+        let (user_queries, resource_iter) = match self.resource_query_index {
+            Some(res_idx) if res_idx >= user_count && res_idx < self.queries.len() => {
+                let (left, right) = self.queries.split_at_mut(user_count);
+                let res_offset = res_idx - user_count;
+                (left, right[res_offset].as_mut())
+            }
+            _ => (&mut self.queries[..user_count], None),
+        };
+        SplitSystemContext {
+            queries: user_queries,
+            resource_iter,
+            commands,
+            sys: &self.sys_ref,
+        }
+    }
+
+    /// Resolves and layout-validates `T: GuestComponent` into a cached [`TypedComponent<T>`]
+    /// stored inside the owning [`bamabi_guest_sys::GuestInstance`] (subsequent calls hit the
+    /// in-memory cache with zero FFI round-trips).
+    #[inline]
+    pub fn cached_component<T: GuestComponent>(&self) -> Result<TypedComponent<T>, FfiResult> {
+        let base_host = self.sys_ref.base_host();
+        let (_, uuid) = qualify_component_identity::<T>(base_host.manifest_name())?;
+        base_host.cached_typed_component::<T>(uuid, || {
+            resolve_guest_component::<T>(self.sys_ref.host(), base_host.manifest_name())
+        })
+    }
+
+    /// Returns `(last_run, this_run)` Bevy change-detection ticks for the active system invocation
+    /// via `BamHostApi::sys_current_ticks` (slot 79).
+    #[inline]
+    pub fn current_ticks(&self) -> Result<(u32, u32), FfiResult> {
+        self.sys_ref.current_ticks()
+    }
+
+    /// Returns frame/fixed-step timing metadata ([`BamTimeInfo`]) for the active system invocation
+    /// via `BamHostApi::sys_time_info` (slot 80).
+    #[inline]
+    pub fn time_info(&self) -> Result<BamTimeInfo, FfiResult> {
+        self.sys_ref.time_info()
+    }
+
+    /// Resolves a canonical non-empty UTF-8 lookup `name` to its bound [`FfiEntity`] via
+    /// `BamHostApi::resolve_named_object` (slot 75).
+    #[inline]
+    pub fn resolve_named_object(&self, name: &str) -> Result<FfiEntity, FfiResult> {
+        self.sys_ref.resolve_named_object(name)
+    }
+
+    /// Resolves an interned [`BamSymbol`] handle back to its owned UTF-8 string via
+    /// `BamHostApi::resolve_symbol_str` (slot 76).
+    #[inline]
+    pub fn resolve_symbol_str(&self, symbol: BamSymbol) -> Result<String, FfiResult> {
+        self.sys_ref.resolve_symbol_str(symbol)
+    }
+
+    /// Queries all outgoing target entities linked to `entity` via relationship handle `relation`
+    /// using `BamHostApi::sys_relation_targets` (slot 82).
+    #[inline]
+    pub fn relation_targets(
+        &self,
+        entity: FfiEntity,
+        relation: BamComponent,
+    ) -> Result<&[FfiEntity], FfiResult> {
+        self.sys_ref.relation_targets(entity, relation)
+    }
+
+    /// Typed convenience variant of [`Self::relation_targets`] resolving `Rel: GuestComponent` via
+    /// the per-instance component handle cache.
+    #[inline]
+    pub fn relation_targets_of<Rel: GuestComponent>(
+        &self,
+        entity: FfiEntity,
+    ) -> Result<&[FfiEntity], FfiResult> {
+        let rel = self.cached_component::<Rel>()?.handle();
+        self.sys_ref.relation_targets(entity, rel)
+    }
+
+    /// Queries all incoming source entities targeting `target` via relationship handle `relation`
+    /// using `BamHostApi::sys_relation_sources` (slot 83).
+    #[inline]
+    pub fn relation_sources(
+        &self,
+        target: FfiEntity,
+        relation: BamComponent,
+    ) -> Result<&[FfiEntity], FfiResult> {
+        self.sys_ref.relation_sources(target, relation)
+    }
+
+    /// Typed convenience variant of [`Self::relation_sources`] resolving `Rel: GuestComponent` via
+    /// the per-instance component handle cache.
+    #[inline]
+    pub fn relation_sources_of<Rel: GuestComponent>(
+        &self,
+        target: FfiEntity,
+    ) -> Result<&[FfiEntity], FfiResult> {
+        let rel = self.cached_component::<Rel>()?.handle();
+        self.sys_ref.relation_sources(target, rel)
+    }
+
+    /// Borrows raw payload bytes for relationship edge `(entity, relation, target)` via
+    /// `BamHostApi::sys_relation_edge_data` (slot 84).
+    #[inline]
+    pub fn relation_edge_bytes(
+        &self,
+        entity: FfiEntity,
+        relation: BamComponent,
+        target: FfiEntity,
+    ) -> Result<&[u8], FfiResult> {
+        self.sys_ref.relation_edge_bytes(entity, relation, target)
+    }
+
+    /// Borrows typed POD payload `&T` for relationship edge `(entity, relation, target)` via
+    /// `BamHostApi::sys_relation_edge_data` (slot 84).
+    #[inline]
+    pub fn relation_edge_data<T: AbiPod>(
+        &self,
+        entity: FfiEntity,
+        relation: BamComponent,
+        target: FfiEntity,
+    ) -> Result<&T, FfiResult> {
+        self.sys_ref
+            .relation_edge_data::<T>(entity, relation, target)
+    }
+
+    /// Borrows a contiguous `&[M]` slice of unread messages (`M: GuestComponent`) declared at
+    /// `decl_index` with zero allocations and zero copies via `BamHostApi::msg_read_slice` (slot 88).
+    #[inline]
+    pub fn read_messages_slice<M: GuestComponent>(
+        &mut self,
+        decl_index: usize,
+    ) -> Result<&[M], FfiResult> {
+        self.resource_iter_mut()
+            .ok_or(FfiResult::OUT_OF_RANGE)?
+            .read_messages_slice::<M>(decl_index)
+    }
+
+    /// Borrows a contiguous `&[M]` slice of unread POD messages (`M: AbiPod`) declared at
+    /// `decl_index` via `BamHostApi::msg_read_slice` (slot 88).
+    #[inline]
+    pub fn read_pod_messages_slice<M: AbiPod>(
+        &mut self,
+        decl_index: usize,
+    ) -> Result<&[M], FfiResult> {
+        self.resource_iter_mut()
+            .ok_or(FfiResult::OUT_OF_RANGE)?
+            .read_pod_messages_slice::<M>(decl_index)
+    }
+
+    /// Resolves the `decl_index` inside `resource_iter` corresponding to pre-resolved message
+    /// stream handle `handle`.
+    fn find_message_term_index(
+        &self,
+        handle: BamComponent,
+        write_required: bool,
+    ) -> Result<usize, FfiResult> {
+        if !handle.is_valid() {
+            return Err(FfiResult::INVALID_COMPONENT);
+        }
+        let res_iter = self.resource_iter().ok_or(FfiResult::NOT_FOUND)?;
+        for idx in 0..MAX_TERMS_PER_QUERY {
+            let Ok(info) = res_iter.column_info(idx) else {
+                break;
+            };
+            if info.component == handle {
+                if write_required {
+                    if info.mode == AccessMode::MESSAGE_WRITE {
+                        return Ok(idx);
+                    }
+                } else if matches!(
+                    info.mode,
+                    AccessMode::MESSAGE_READ | AccessMode::MESSAGE_WRITE
+                ) {
+                    return Ok(idx);
+                }
+            }
+        }
+        Err(FfiResult::NOT_FOUND)
+    }
+
+    /// Drains unread messages (`M: GuestComponent`) for pre-resolved handle `handle`, locating its
+    /// declared message stream term automatically.
+    #[inline]
+    pub fn read_messages_by_handle<M: GuestComponent>(
+        &mut self,
+        handle: BamComponent,
+    ) -> Result<Vec<M>, FfiResult> {
+        let decl_index = self.find_message_term_index(handle, false)?;
+        self.read_messages::<M>(decl_index)
+    }
+
+    /// Drains unread POD messages (`M: AbiPod`) for pre-resolved handle `handle`.
+    #[inline]
+    pub fn read_pod_messages_by_handle<M: AbiPod>(
+        &mut self,
+        handle: BamComponent,
+    ) -> Result<Vec<M>, FfiResult> {
+        let decl_index = self.find_message_term_index(handle, false)?;
+        self.read_pod_messages::<M>(decl_index)
+    }
+
+    /// Borrows a zero-copy `&[M]` slice of unread messages (`M: GuestComponent`) for pre-resolved
+    /// handle `handle` via `BamHostApi::msg_read_slice` (slot 88).
+    #[inline]
+    pub fn read_messages_slice_by_handle<M: GuestComponent>(
+        &mut self,
+        handle: BamComponent,
+    ) -> Result<&[M], FfiResult> {
+        let decl_index = self.find_message_term_index(handle, false)?;
+        self.read_messages_slice::<M>(decl_index)
+    }
+
+    /// Borrows a zero-copy `&[M]` slice of unread POD messages (`M: AbiPod`) for pre-resolved
+    /// handle `handle` via `BamHostApi::msg_read_slice` (slot 88).
+    #[inline]
+    pub fn read_pod_messages_slice_by_handle<M: AbiPod>(
+        &mut self,
+        handle: BamComponent,
+    ) -> Result<&[M], FfiResult> {
+        let decl_index = self.find_message_term_index(handle, false)?;
+        self.read_pod_messages_slice::<M>(decl_index)
+    }
+
+    /// Appends a message (`M: GuestComponent`) into the declared `MESSAGE_WRITE` stream matching
+    /// pre-resolved handle `handle`.
+    #[inline]
+    pub fn send_message_by_handle<M: GuestComponent>(
+        &mut self,
+        handle: BamComponent,
+        msg: &M,
+    ) -> FfiResult {
+        let decl_index = match self.find_message_term_index(handle, true) {
+            Ok(idx) => idx,
+            Err(err) => return err,
+        };
+        self.send_message::<M>(decl_index, msg)
+    }
+
+    /// Appends a POD message (`M: AbiPod`) into the declared `MESSAGE_WRITE` stream matching
+    /// pre-resolved handle `handle`.
+    #[inline]
+    pub fn send_pod_message_by_handle<M: AbiPod>(
+        &mut self,
+        handle: BamComponent,
+        msg: &M,
+    ) -> FfiResult {
+        let decl_index = match self.find_message_term_index(handle, true) {
+            Ok(idx) => idx,
+            Err(err) => return err,
+        };
+        self.send_pod_message::<M>(decl_index, msg)
+    }
+
+    /// Batch-appends `messages` (`M: GuestComponent`) into the declared `MESSAGE_WRITE` stream
+    /// matching pre-resolved handle `handle`.
+    #[inline]
+    pub fn send_messages_by_handle<M: GuestComponent>(
+        &mut self,
+        handle: BamComponent,
+        messages: &[M],
+    ) -> Result<(), FfiResult> {
+        let decl_index = self.find_message_term_index(handle, true)?;
+        self.send_messages::<M>(decl_index, messages)
+    }
+
+    /// Batch-appends POD `messages` (`M: AbiPod`) into the declared `MESSAGE_WRITE` stream
+    /// matching pre-resolved handle `handle`.
+    #[inline]
+    pub fn send_pod_messages_by_handle<M: AbiPod>(
+        &mut self,
+        handle: BamComponent,
+        messages: &[M],
+    ) -> Result<(), FfiResult> {
+        let decl_index = self.find_message_term_index(handle, true)?;
+        self.send_pod_messages::<M>(decl_index, messages)
     }
 }

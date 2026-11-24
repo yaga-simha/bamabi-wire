@@ -484,7 +484,7 @@ impl InProcessGuest {
     where
         F: FnOnce(&mut GuestApp<'_>) -> FfiResult,
     {
-        let manifest = bamabi_guest::BamManifest::new(mod_name.as_ptr(), c"0.3.0".as_ptr());
+        let manifest = bamabi_guest::BamManifest::new(mod_name.as_ptr(), c"0.4.0".as_ptr());
         let mut instance: *mut bamabi_guest::raw::BamInstance = core::ptr::null_mut();
         // SAFETY: `world.api_ptr()` points to a valid 73-slot `BamHostApi`, `world.load_ctx_ptr()`
         // points to an exclusively held `HostWorld` during initialization, `instance` is writable

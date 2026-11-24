@@ -478,7 +478,7 @@ fn unqualified_guest_component_sparse_resource_and_cross_mod_rejection() {
                         let ro_rows = chunk
                             .component_rows::<LocalCounter>(0)
                             .expect("auto-prefixed readonly sparse rows");
-                        assert_eq!(ro_rows[0], LocalCounter { ticks: 17 });
+                        assert_eq!(ro_rows.get(0).copied(), Some(LocalCounter { ticks: 17 }));
 
                         // Cross-mod rejection: col 1 is `other_mod::LocalCounter`, which MUST NOT
                         // match `my_mod`'s unqualified `LocalCounter`!

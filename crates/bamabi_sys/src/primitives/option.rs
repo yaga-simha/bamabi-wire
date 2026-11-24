@@ -6,7 +6,7 @@ use core::{
     mem::MaybeUninit,
 };
 
-use crate::{primitives::FfiBool, traits::AbiPod};
+use crate::primitives::FfiBool;
 
 /// Cross-language `#[repr(C)]` optional value (`is_some: FfiBool` + `value: T`).
 ///
@@ -39,6 +39,10 @@ pub struct FfiOption<T> {
 }
 
 impl<T> FfiOption<T> {
+    /// `true` iff `#[repr(C)]` layout inserts implicit alignment padding between `is_some` and `value`.
+    pub const HAS_IMPLICIT_PADDING: bool = core::mem::size_of::<Self>()
+        != (core::mem::size_of::<FfiBool>() + core::mem::size_of::<T>());
+
     /// Constructs an engaged `FfiOption::Some(value)` (`is_some = FfiBool::TRUE`).
     #[inline]
     pub const fn some(value: T) -> Self {
@@ -48,13 +52,73 @@ impl<T> FfiOption<T> {
         }
     }
 
-    /// Constructs a disengaged `FfiOption::None` for `T: AbiPod` by zero-filling `value`.
+    /// Writes a disengaged `FfiOption::None` into `dst` with every byte—including any implicit
+    /// alignment padding between `is_some` and `value`—explicitly zero-initialized.
+    ///
+    /// Because moving `FfiOption<T>` by value in Rust can leave alignment padding bytes
+    /// uninitialized, callers that require deterministic zeroed padding in memory (for raw byte
+    /// hashing or C-ABI wire buffers) must initialize in place via [`Self::write_none_zeroed`]
+    /// or serialize via [`Self::write_zeroed_bytes`], rather than passing `Self` by value.
+    #[inline]
+    pub fn write_none_zeroed(dst: &mut MaybeUninit<Self>) -> *mut Self
+    where
+        T: crate::traits::RawInsertable,
+    {
+        // SAFETY: `dst.as_mut_ptr()` points to `size_of::<Self>()` writable bytes of
+        // `MaybeUninit<Self>`. Filling all bytes with `0` sets `is_some = FfiBool::FALSE`,
+        // zero-initializes `value: T` (valid for `T: RawInsertable`), and initializes every
+        // alignment padding byte to `0`.
+        unsafe {
+            core::ptr::write_bytes(
+                dst.as_mut_ptr().cast::<u8>(),
+                0,
+                core::mem::size_of::<Self>(),
+            );
+        }
+        dst.as_mut_ptr()
+    }
+
+    /// Serializes `self` into `dst` with every implicit alignment padding byte explicitly zero-filled,
+    /// returning `Some(size_of::<Self>())` on success or `None` if `dst.len() < size_of::<Self>()`.
+    #[inline]
+    pub fn write_zeroed_bytes(&self, dst: &mut [u8]) -> Option<usize>
+    where
+        T: crate::traits::AbiPod,
+    {
+        let total = core::mem::size_of::<Self>();
+        if dst.len() < total {
+            return None;
+        }
+        let target = dst.get_mut(..total)?;
+        target.fill(0);
+        target[0] = self.is_some.0;
+        if self.is_some.get() {
+            let val_off = core::mem::offset_of!(Self, value);
+            let val_bytes = self.value.as_bytes();
+            let val_dst = target.get_mut(val_off..val_off + val_bytes.len())?;
+            val_dst.copy_from_slice(val_bytes);
+        }
+        Some(total)
+    }
+
+    /// Validates that `is_some` holds a well-formed `FfiBool` (`0` = `None`, non-zero = `Some`).
+    #[inline]
+    pub const fn validate(&self) -> crate::FfiResult {
+        let _ = self.is_some.0;
+        crate::FfiResult::OK
+    }
+
+    /// Constructs a disengaged `FfiOption::None` for `T: RawInsertable` by zero-filling `value`.
+    ///
+    /// Note: returning `FfiOption<T>` by value does not guarantee initialized alignment padding
+    /// bytes across moves; use [`Self::write_none_zeroed`] or [`Self::write_zeroed_bytes`] when
+    /// reading raw struct bytes.
     #[inline]
     pub const fn none() -> Self
     where
-        T: AbiPod,
+        T: crate::traits::RawInsertable,
     {
-        // SAFETY: `T: AbiPod` guarantees every field is valid when all-bits-zero and has no drop glue.
+        // SAFETY: `T: RawInsertable` guarantees zero drop glue and valid all-bits-zero representation.
         let value = unsafe { MaybeUninit::<T>::zeroed().assume_init() };
         Self {
             is_some: FfiBool::FALSE,
@@ -96,11 +160,11 @@ impl<T> FfiOption<T> {
         }
     }
 
-    /// Converts a standard Rust `Option<T>` (`T: AbiPod`) into an `FfiOption<T>`.
+    /// Converts a standard Rust `Option<T>` (`T: RawInsertable`) into an `FfiOption<T>`.
     #[inline]
     pub fn from_option(opt: Option<T>) -> Self
     where
-        T: AbiPod,
+        T: crate::traits::RawInsertable,
     {
         match opt {
             Some(v) => Self::some(v),
@@ -148,7 +212,7 @@ impl<T: Default> Default for FfiOption<T> {
     }
 }
 
-impl<T: AbiPod> From<Option<T>> for FfiOption<T> {
+impl<T: crate::traits::RawInsertable> From<Option<T>> for FfiOption<T> {
     #[inline]
     fn from(opt: Option<T>) -> Self {
         Self::from_option(opt)

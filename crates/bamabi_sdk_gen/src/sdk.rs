@@ -46,19 +46,18 @@ fn screaming_snake_to_pascal(name: &str) -> String {
 
 /// Generates the canonical strict ISO C99 header directly from `bamabi_sys`.
 ///
-/// Intended purpose: provides an infallible-for-valid-builds convenience wrapper for CLI and test
-/// callers that need the rendered `bamabi.h` text without handling layout-assertion errors.
+/// Intended purpose: provides a convenience wrapper for CLI and test callers that need the
+/// rendered `bamabi.h` text without handling layout-assertion errors.
 ///
-/// What it does: delegates to [`crate::render_c99_header`] and unwraps the result.
-///
-/// # Panics
-/// Panics only if internal `bamabi_sys` wire layout invariants are violated.
+/// What it does: delegates to [`crate::render_c99_header`] and returns an inline C comment error
+/// sentinel if layout validation fails.
 #[must_use]
 pub fn c99_header() -> String {
-    crate::render_c99_header().expect("valid bamabi_sys wire layouts")
+    crate::render_c99_header()
+        .unwrap_or_else(|err| format!("/* render_c99_header error: {err} */\n"))
 }
 
-/// Synthesizes the ergonomic ISO C++17 RAII wrapper header over `bamabi.h` (`ABI 0.3.0`).
+/// Synthesizes the ergonomic ISO C++17 RAII wrapper header over `bamabi.h` (`ABI 0.4.0`).
 ///
 /// Programmatically emits all `bam::offsets::*` compile-time constants directly from
 /// `header_gen::host_api_slot_names` so C++17 offset definitions cannot drift from
@@ -66,10 +65,7 @@ pub fn c99_header() -> String {
 #[must_use]
 pub fn cpp17_header() -> String {
     let slots = crate::header_gen::host_api_slot_names();
-    let last_slot = slots
-        .last()
-        .copied()
-        .expect("BamHostApi must have at least one slot");
+    let last_slot = slots.last().copied().unwrap_or("cmd_spawn_batch_ex");
     let last_upper = last_slot.to_ascii_uppercase();
 
     let mut out = String::with_capacity(32 * 1024);
@@ -96,7 +92,7 @@ static_assert(\n\
     out
 }
 
-/// Synthesizes the Zig SDK wrapper over `bamabi.h` (`ABI 0.3.0` `b.addTranslateC` `"bam_c"` module).
+/// Synthesizes the Zig SDK wrapper over `bamabi.h` (`ABI 0.4.0` `b.addTranslateC` `"bam_c"` module).
 ///
 /// Programmatically emits all `offsets.*` / `BAM_HOST_API_OFFSET_*` constants directly from
 /// `header_gen::host_api_slot_names` and the 18-code `BamError` / `checkResult` /
@@ -105,16 +101,13 @@ static_assert(\n\
 pub fn zig_sdk() -> String {
     let slots = crate::header_gen::host_api_slot_names();
     let slot_count = slots.len();
-    let last_slot = slots
-        .last()
-        .copied()
-        .expect("BamHostApi must have at least one slot");
+    let last_slot = slots.last().copied().unwrap_or("cmd_spawn_batch_ex");
     let last_upper = last_slot.to_ascii_uppercase();
 
     let mut out = String::with_capacity(36 * 1024);
     let _ = write!(
         out,
-        r#"//! Zig SDK bindings for `bamabi` (`ABI 0.3.0`).
+        r#"//! Zig SDK bindings for `bamabi` (`ABI 0.4.0`).
 //!
 //! Expects `build.zig` to translate `bamabi.h` via `b.addTranslateC(...)`
 //! and attach the resulting module as `"bam_c"` (`mod.addImport("bam_c", bam_c_mod)`).
@@ -237,11 +230,11 @@ pub const BamError = error{{
     out
 }
 
-/// Ergonomic ISO C++17 RAII wrapper header over `bamabi.h` (`ABI 0.3.0`), lazily synthesized via
+/// Ergonomic ISO C++17 RAII wrapper header over `bamabi.h` (`ABI 0.4.0`), lazily synthesized via
 /// [`cpp17_header`].
 pub static CPP17_HEADER: LazyLock<String> = LazyLock::new(cpp17_header);
 
-/// Zig SDK wrapper over `bamabi.h` (`ABI 0.3.0` `b.addTranslateC` `"bam_c"` module), lazily
+/// Zig SDK wrapper over `bamabi.h` (`ABI 0.4.0` `b.addTranslateC` `"bam_c"` module), lazily
 /// synthesized via [`zig_sdk`].
 pub static ZIG_SDK: LazyLock<String> = LazyLock::new(zig_sdk);
 
@@ -279,6 +272,35 @@ const CPP17_HEADER_BODY: &str = r#"
 
 inline bool is_ok(BamResult res) noexcept {
     return res == BAM_RESULT_OK;
+}
+
+inline uint64_t fnv1a_64_init() noexcept {
+    return bam_fnv1a_64_init();
+}
+
+inline uint64_t fnv1a_64_update_bytes(uint64_t hash, const uint8_t* bytes, std::size_t len) noexcept {
+    return bam_fnv1a_64_update_bytes(hash, bytes, len);
+}
+
+inline uint64_t fnv1a_64_update_u64(uint64_t hash, uint64_t value) noexcept {
+    return bam_fnv1a_64_update_u64(hash, value);
+}
+
+inline uint64_t fnv1a_64_str(const char* s) noexcept {
+    return bam_fnv1a_64_str(s);
+}
+
+inline uint64_t fnv1a_64_hash_system(const char* mod_name, const char* system_name) noexcept {
+    return bam_fnv1a_64_hash_system(mod_name, system_name);
+}
+
+inline uint64_t hash_field_schema(
+    uint64_t prev_hash,
+    const char* field_name,
+    const char* field_type_tag,
+    uint64_t field_offset
+) noexcept {
+    return bam_hash_field_schema(prev_hash, field_name, field_type_tag, field_offset);
 }
 
 inline bool host_api_covers_slot(
@@ -357,7 +379,7 @@ public:
             api_.asset_load == nullptr) {
             return BAM_RESULT_UNSUPPORTED;
         }
-        return api_.asset_load(ctx_, asset_type, path, &out_handle);
+        return api_.asset_load(ctx_, asset_type, &path, &out_handle);
     }
 
     BamResult asset_load(
@@ -395,7 +417,7 @@ public:
             api_.log_diagnostic == nullptr) {
             return BAM_RESULT_UNSUPPORTED;
         }
-        return api_.log_diagnostic(ctx_, level, msg);
+        return api_.log_diagnostic(ctx_, level, &msg);
     }
 
     BamResult log_diagnostic(uint32_t level, const char* msg) const noexcept {
@@ -408,7 +430,7 @@ public:
             api_.report_guest_fault == nullptr) {
             return BAM_RESULT_UNSUPPORTED;
         }
-        return api_.report_guest_fault(ctx_, msg);
+        return api_.report_guest_fault(ctx_, &msg);
     }
 
     BamResult report_guest_fault(const char* msg) const noexcept {
@@ -439,7 +461,7 @@ public:
             api_.intern_symbol == nullptr) {
             return BAM_RESULT_UNSUPPORTED;
         }
-        return api_.intern_symbol(ctx_, symbol, &out);
+        return api_.intern_symbol(ctx_, &symbol, &out);
     }
 
     BamResult intern_symbol(const char* symbol, BamSymbol& out) const noexcept {
@@ -452,11 +474,33 @@ public:
             api_.bind_named_object == nullptr) {
             return BAM_RESULT_UNSUPPORTED;
         }
-        return api_.bind_named_object(ctx_, name, entity);
+        return api_.bind_named_object(ctx_, &name, entity);
     }
 
     BamResult bind_named_object(const char* name, BamEntity entity) const noexcept {
         return bind_named_object(bam_str_view(name), entity);
+    }
+
+    BamResult resolve_named_object(BamStrView name, BamEntity& out_entity) const noexcept {
+        if (ctx_ == nullptr ||
+            !bam_host_api_covers_slot(&api_, BAM_HOST_API_OFFSET_RESOLVE_NAMED_OBJECT, sizeof(BamResolveNamedObjectFn)) ||
+            api_.resolve_named_object == nullptr) {
+            return BAM_RESULT_UNSUPPORTED;
+        }
+        return api_.resolve_named_object(ctx_, &name, &out_entity);
+    }
+
+    BamResult resolve_named_object(const char* name, BamEntity& out_entity) const noexcept {
+        return resolve_named_object(bam_str_view(name), out_entity);
+    }
+
+    BamResult resolve_symbol_str(BamSymbol symbol, BamStrView& out_str) const noexcept {
+        if (ctx_ == nullptr ||
+            !bam_host_api_covers_slot(&api_, BAM_HOST_API_OFFSET_RESOLVE_SYMBOL_STR, sizeof(BamResolveSymbolStrFn)) ||
+            api_.resolve_symbol_str == nullptr) {
+            return BAM_RESULT_UNSUPPORTED;
+        }
+        return api_.resolve_symbol_str(ctx_, symbol, &out_str);
     }
 
 private:
@@ -555,6 +599,24 @@ public:
             return BAM_RESULT_UNSUPPORTED;
         }
         return api_.migrate_component_column(ctx_, component, old_fingerprint, &new_desc, migrate_fn, user_data);
+    }
+
+    BamResult register_resource(const BamComponentDesc& desc, BamComponent& out) const noexcept {
+        if (ctx_ == nullptr ||
+            !bam_host_api_covers_slot(&api_, BAM_HOST_API_OFFSET_REGISTER_RESOURCE, sizeof(BamRegisterComponentFn)) ||
+            api_.register_resource == nullptr) {
+            return BAM_RESULT_UNSUPPORTED;
+        }
+        return api_.register_resource(ctx_, &desc, &out);
+    }
+
+    BamResult register_message(const BamComponentDesc& desc, BamComponent& out) const noexcept {
+        if (ctx_ == nullptr ||
+            !bam_host_api_covers_slot(&api_, BAM_HOST_API_OFFSET_REGISTER_MESSAGE, sizeof(BamRegisterComponentFn)) ||
+            api_.register_message == nullptr) {
+            return BAM_RESULT_UNSUPPORTED;
+        }
+        return api_.register_message(ctx_, &desc, &out);
     }
 
 private:
@@ -705,6 +767,28 @@ public:
         return api_->iter_column_rows_mutable(iter_, term_index);
     }
 
+    uint8_t* const* column_rows_mutable_untracked(size_t term_index) const noexcept {
+        if (api_ == nullptr || iter_ == nullptr ||
+            !bam_host_api_covers_slot(api_, BAM_HOST_API_OFFSET_ITER_COLUMN_ROWS_MUTABLE_UNTRACKED, sizeof(BamIterColumnRowsMutableUntrackedFn)) ||
+            api_->iter_column_rows_mutable_untracked == nullptr) {
+            return nullptr;
+        }
+        return api_->iter_column_rows_mutable_untracked(iter_, term_index);
+    }
+
+    BamResult mark_changed_ranges(
+        size_t term_index,
+        const BamRowRange* ranges_ptr,
+        size_t range_count
+    ) const noexcept {
+        if (api_ == nullptr || iter_ == nullptr ||
+            !bam_host_api_covers_slot(api_, BAM_HOST_API_OFFSET_ITER_MARK_CHANGED_RANGES, sizeof(BamIterMarkChangedRangesFn)) ||
+            api_->iter_mark_changed_ranges == nullptr) {
+            return BAM_RESULT_UNSUPPORTED;
+        }
+        return api_->iter_mark_changed_ranges(iter_, term_index, ranges_ptr, range_count);
+    }
+
     BamResult column_info(size_t term_index, BamColumnInfo& out_info) const noexcept {
         if (api_ == nullptr || iter_ == nullptr || api_->iter_column_info == nullptr) {
             return BAM_RESULT_NULL_POINTER;
@@ -753,6 +837,36 @@ public:
             return BAM_RESULT_UNSUPPORTED;
         }
         return api_->par_for_each_chunk_readonly(iter_, chunk_fn, user_data);
+    }
+
+    BamResult par_for_each_chunk_ex(
+        BamChunkTaskExFn chunk_fn,
+        void* user_data = nullptr,
+        const BamParOptions* options = nullptr
+    ) const noexcept {
+        if (api_ == nullptr || iter_ == nullptr ||
+            !bam_host_api_covers_slot(api_, BAM_HOST_API_OFFSET_PAR_FOR_EACH_CHUNK_EX, sizeof(BamParForEachChunkExFn)) ||
+            api_->par_for_each_chunk_ex == nullptr) {
+            return BAM_RESULT_UNSUPPORTED;
+        }
+        return api_->par_for_each_chunk_ex(iter_, chunk_fn, user_data, options);
+    }
+
+    template <typename T>
+    BamResult msg_read_slice(
+        size_t term_index,
+        const T*& out_ptr,
+        size_t& out_count
+    ) const noexcept {
+        if (api_ == nullptr || iter_ == nullptr ||
+            !bam_host_api_covers_slot(api_, BAM_HOST_API_OFFSET_MSG_READ_SLICE, sizeof(BamMsgReadSliceFn)) ||
+            api_->msg_read_slice == nullptr) {
+            return BAM_RESULT_UNSUPPORTED;
+        }
+        const uint8_t* raw_ptr = nullptr;
+        BamResult res = api_->msg_read_slice(iter_, term_index, &raw_ptr, &out_count);
+        out_ptr = reinterpret_cast<const T*>(raw_ptr);
+        return res;
     }
 
     template <typename T>
@@ -1122,6 +1236,58 @@ public:
         return api_->cmd_remove_resource(cmds_, resource);
     }
 
+    BamResult despawn_batch(const BamEntity* entities, size_t count) const noexcept {
+        if (api_ == nullptr || cmds_ == nullptr ||
+            !bam_host_api_covers_slot(api_, BAM_HOST_API_OFFSET_CMD_DESPAWN_BATCH, sizeof(BamCmdDespawnBatchFn)) ||
+            api_->cmd_despawn_batch == nullptr) {
+            return BAM_RESULT_UNSUPPORTED;
+        }
+        return api_->cmd_despawn_batch(cmds_, entities, count);
+    }
+
+    BamResult insert_batch(
+        const BamEntity* entities,
+        size_t entity_count,
+        BamComponent component,
+        const uint8_t* data_ptr,
+        size_t elem_size,
+        uint32_t flags = 0u
+    ) const noexcept {
+        if (api_ == nullptr || cmds_ == nullptr ||
+            !bam_host_api_covers_slot(api_, BAM_HOST_API_OFFSET_CMD_INSERT_BATCH, sizeof(BamCmdInsertBatchFn)) ||
+            api_->cmd_insert_batch == nullptr) {
+            return BAM_RESULT_UNSUPPORTED;
+        }
+        return api_->cmd_insert_batch(cmds_, entities, entity_count, component, data_ptr, elem_size, flags);
+    }
+
+    BamResult remove_batch(
+        const BamEntity* entities,
+        size_t entity_count,
+        BamComponent component
+    ) const noexcept {
+        if (api_ == nullptr || cmds_ == nullptr ||
+            !bam_host_api_covers_slot(api_, BAM_HOST_API_OFFSET_CMD_REMOVE_BATCH, sizeof(BamCmdRemoveBatchFn)) ||
+            api_->cmd_remove_batch == nullptr) {
+            return BAM_RESULT_UNSUPPORTED;
+        }
+        return api_->cmd_remove_batch(cmds_, entities, entity_count, component);
+    }
+
+    BamResult spawn_batch_ex(
+        const BamSpawnColumnDesc* columns,
+        size_t column_count,
+        size_t entity_count,
+        BamEntity* out_entities
+    ) const noexcept {
+        if (api_ == nullptr || cmds_ == nullptr ||
+            !bam_host_api_covers_slot(api_, BAM_HOST_API_OFFSET_CMD_SPAWN_BATCH_EX, sizeof(BamCmdSpawnBatchExFn)) ||
+            api_->cmd_spawn_batch_ex == nullptr) {
+            return BAM_RESULT_UNSUPPORTED;
+        }
+        return api_->cmd_spawn_batch_ex(cmds_, columns, column_count, entity_count, out_entities);
+    }
+
 private:
     const BamHostApi* api_ = nullptr;
     BamCommands* cmds_ = nullptr;
@@ -1279,6 +1445,68 @@ public:
         return BAM_RESULT_OK;
     }
 
+    BamResult current_ticks(uint32_t& out_last_run, uint32_t& out_this_run) const noexcept {
+        if (ctx_ == nullptr ||
+            !bam_host_api_covers_slot(&api_, BAM_HOST_API_OFFSET_SYS_CURRENT_TICKS, sizeof(BamSysCurrentTicksFn)) ||
+            api_.sys_current_ticks == nullptr) {
+            return BAM_RESULT_UNSUPPORTED;
+        }
+        return api_.sys_current_ticks(ctx_, &out_last_run, &out_this_run);
+    }
+
+    BamResult time_info(BamTimeInfo& out_info) const noexcept {
+        if (ctx_ == nullptr ||
+            !bam_host_api_covers_slot(&api_, BAM_HOST_API_OFFSET_SYS_TIME_INFO, sizeof(BamSysTimeInfoFn)) ||
+            api_.sys_time_info == nullptr) {
+            return BAM_RESULT_UNSUPPORTED;
+        }
+        out_info = bam_time_info();
+        return api_.sys_time_info(ctx_, &out_info);
+    }
+
+    BamResult relation_targets(
+        BamEntity entity,
+        BamComponent relation,
+        const BamEntity*& out_targets,
+        size_t& out_len
+    ) const noexcept {
+        if (ctx_ == nullptr ||
+            !bam_host_api_covers_slot(&api_, BAM_HOST_API_OFFSET_SYS_RELATION_TARGETS, sizeof(BamSysRelationTargetsFn)) ||
+            api_.sys_relation_targets == nullptr) {
+            return BAM_RESULT_UNSUPPORTED;
+        }
+        return api_.sys_relation_targets(ctx_, entity, relation, &out_targets, &out_len);
+    }
+
+    BamResult relation_sources(
+        BamEntity target,
+        BamComponent relation,
+        const BamEntity*& out_sources,
+        size_t& out_len
+    ) const noexcept {
+        if (ctx_ == nullptr ||
+            !bam_host_api_covers_slot(&api_, BAM_HOST_API_OFFSET_SYS_RELATION_SOURCES, sizeof(BamSysRelationSourcesFn)) ||
+            api_.sys_relation_sources == nullptr) {
+            return BAM_RESULT_UNSUPPORTED;
+        }
+        return api_.sys_relation_sources(ctx_, target, relation, &out_sources, &out_len);
+    }
+
+    BamResult relation_edge_data(
+        BamEntity entity,
+        BamComponent relation,
+        BamEntity target,
+        const void*& out_ptr,
+        size_t& out_size
+    ) const noexcept {
+        if (ctx_ == nullptr ||
+            !bam_host_api_covers_slot(&api_, BAM_HOST_API_OFFSET_SYS_RELATION_EDGE_DATA, sizeof(BamSysRelationEdgeDataFn)) ||
+            api_.sys_relation_edge_data == nullptr) {
+            return BAM_RESULT_UNSUPPORTED;
+        }
+        return api_.sys_relation_edge_data(ctx_, entity, relation, target, &out_ptr, &out_size);
+    }
+
 private:
     const BamHostApi& api_;
     BamSystemCtx* ctx_;
@@ -1290,8 +1518,379 @@ private:
 "#;
 
 const ZIG_SDK_BODY: &str = r#"
+pub const BamAccessMode = c.BamAccessMode;
+pub const BamAssetGetLoadStateFn = c.BamAssetGetLoadStateFn;
+pub const BamAssetHandle = c.BamAssetHandle;
+pub const BamAssetLoadFn = c.BamAssetLoadFn;
+pub const BamAssetLoadState = c.BamAssetLoadState;
+pub const BamAssetReleaseFn = c.BamAssetReleaseFn;
+pub const BamBindNamedObjectFn = c.BamBindNamedObjectFn;
+pub const BamBool = c.BamBool;
+pub const BamByteSlice = c.BamByteSlice;
+pub const BamChangeTicks = c.BamChangeTicks;
+pub const BamChildOf = c.BamChildOf;
+pub const BamChunkTaskExFn = c.BamChunkTaskExFn;
+pub const BamChunkTaskFn = c.BamChunkTaskFn;
+pub const BamCmdCheckpointFn = c.BamCmdCheckpointFn;
+pub const BamCmdCloneEntityFn = c.BamCmdCloneEntityFn;
+pub const BamCmdDespawnAllFn = c.BamCmdDespawnAllFn;
+pub const BamCmdDespawnBatchFn = c.BamCmdDespawnBatchFn;
+pub const BamCmdDespawnFn = c.BamCmdDespawnFn;
+pub const BamCmdInsertBatchFn = c.BamCmdInsertBatchFn;
+pub const BamCmdInsertDefaultFn = c.BamCmdInsertDefaultFn;
+pub const BamCmdInsertFn = c.BamCmdInsertFn;
+pub const BamCmdInsertRelationFn = c.BamCmdInsertRelationFn;
+pub const BamCmdInsertResourceFn = c.BamCmdInsertResourceFn;
+pub const BamCmdObserveFn = c.BamCmdObserveFn;
+pub const BamCmdRemoveBatchFn = c.BamCmdRemoveBatchFn;
+pub const BamCmdRemoveFn = c.BamCmdRemoveFn;
+pub const BamCmdRemoveRelationFn = c.BamCmdRemoveRelationFn;
+pub const BamCmdRemoveResourceFn = c.BamCmdRemoveResourceFn;
+pub const BamCmdRollbackFn = c.BamCmdRollbackFn;
+pub const BamCmdSpawnBatchExFn = c.BamCmdSpawnBatchExFn;
+pub const BamCmdSpawnBatchFn = c.BamCmdSpawnBatchFn;
+pub const BamCmdSpawnEmptyFn = c.BamCmdSpawnEmptyFn;
+pub const BamCmdSpawnFn = c.BamCmdSpawnFn;
+pub const BamCmdSpawnSceneFn = c.BamCmdSpawnSceneFn;
+pub const BamCmdTriggerExFn = c.BamCmdTriggerExFn;
+pub const BamCmdTriggerFn = c.BamCmdTriggerFn;
+pub const BamColumnInfo = c.BamColumnInfo;
+pub const BamCommands = c.BamCommands;
+pub const BamComponent = c.BamComponent;
+pub const BamComponentCloneFn = c.BamComponentCloneFn;
+pub const BamComponentDesc = c.BamComponentDesc;
+pub const BamComponentDropFn = c.BamComponentDropFn;
+pub const BamComponentHookFn = c.BamComponentHookFn;
+pub const BamComponentLayoutInfoFn = c.BamComponentLayoutInfoFn;
+pub const BamComponentUuid = c.BamComponentUuid;
+pub const BamConfigureScheduleSetFn = c.BamConfigureScheduleSetFn;
+pub const BamEntity = c.BamEntity;
+pub const BamEventKind = c.BamEventKind;
+pub const BamFieldDesc = c.BamFieldDesc;
+pub const BamFieldKind = c.BamFieldKind;
+pub const BamGetProcAddressFn = c.BamGetProcAddressFn;
+pub const BamHostApi = c.BamHostApi;
+pub const BamHostCtx = c.BamHostCtx;
+pub const BamInitFn = c.BamInitFn;
+pub const BamInstance = c.BamInstance;
+pub const BamInternSymbolFn = c.BamInternSymbolFn;
+pub const BamIter = c.BamIter;
+pub const BamIterColumnInfoFn = c.BamIterColumnInfoFn;
+pub const BamIterColumnMutableFn = c.BamIterColumnMutableFn;
+pub const BamIterColumnMutableUntrackedFn = c.BamIterColumnMutableUntrackedFn;
+pub const BamIterColumnReadonlyFn = c.BamIterColumnReadonlyFn;
+pub const BamIterColumnRowsMutableFn = c.BamIterColumnRowsMutableFn;
+pub const BamIterColumnRowsMutableUntrackedFn = c.BamIterColumnRowsMutableUntrackedFn;
+pub const BamIterColumnRowsReadonlyFn = c.BamIterColumnRowsReadonlyFn;
+pub const BamIterColumnTicksFn = c.BamIterColumnTicksFn;
+pub const BamIterCountFn = c.BamIterCountFn;
+pub const BamIterEntitiesFn = c.BamIterEntitiesFn;
+pub const BamIterMarkChangedRangeFn = c.BamIterMarkChangedRangeFn;
+pub const BamIterMarkChangedRangesFn = c.BamIterMarkChangedRangesFn;
+pub const BamIterNextChunkBatchFn = c.BamIterNextChunkBatchFn;
+pub const BamIterNextChunkFn = c.BamIterNextChunkFn;
+pub const BamIterReadRemovedFn = c.BamIterReadRemovedFn;
+pub const BamIterResetFn = c.BamIterResetFn;
+pub const BamIterUpCascadeFn = c.BamIterUpCascadeFn;
+pub const BamLastErrorFn = c.BamLastErrorFn;
+pub const BamLayoutInfo = c.BamLayoutInfo;
+pub const BamLoadCtx = c.BamLoadCtx;
+pub const BamLoadHostCtxFn = c.BamLoadHostCtxFn;
+pub const BamLogDiagnosticFn = c.BamLogDiagnosticFn;
+pub const BamManifest = c.BamManifest;
+pub const BamManifestFn = c.BamManifestFn;
+pub const BamMappedStringGetFn = c.BamMappedStringGetFn;
+pub const BamMappedStringSetFn = c.BamMappedStringSetFn;
+pub const BamMappedStringVTable = c.BamMappedStringVTable;
+pub const BamMigrateComponentColumnFn = c.BamMigrateComponentColumnFn;
+pub const BamMountSystemInScheduleFn = c.BamMountSystemInScheduleFn;
+pub const BamMsgReadBatchFn = c.BamMsgReadBatchFn;
+pub const BamMsgReadSliceFn = c.BamMsgReadSliceFn;
+pub const BamMsgSendFn = c.BamMsgSendFn;
+pub const BamMsgWriteBatchFn = c.BamMsgWriteBatchFn;
+pub const BamObserverCtxFn = c.BamObserverCtxFn;
+pub const BamObserverCtxMutFn = c.BamObserverCtxMutFn;
+pub const BamObserverDesc = c.BamObserverDesc;
+pub const BamObserverFn = c.BamObserverFn;
+pub const BamObserverMutFn = c.BamObserverMutFn;
+pub const BamParForEachChunkExFn = c.BamParForEachChunkExFn;
+pub const BamParForEachChunkFn = c.BamParForEachChunkFn;
+pub const BamParOptions = c.BamParOptions;
+pub const BamQueryDesc = c.BamQueryDesc;
+pub const BamRegisterComponentFn = c.BamRegisterComponentFn;
+pub const BamRegisterObserverFn = c.BamRegisterObserverFn;
+pub const BamRegisterRelationFn = c.BamRegisterRelationFn;
+pub const BamRegisterSystemFn = c.BamRegisterSystemFn;
+pub const BamRegisterSystemHandleFn = c.BamRegisterSystemHandleFn;
+pub const BamRelationDesc = c.BamRelationDesc;
+pub const BamReportGuestFaultFn = c.BamReportGuestFaultFn;
+pub const BamRequiredComponent = c.BamRequiredComponent;
+pub const BamRequiredInitFn = c.BamRequiredInitFn;
+pub const BamResMutPtrFn = c.BamResMutPtrFn;
+pub const BamResPtrFn = c.BamResPtrFn;
+pub const BamResTicksFn = c.BamResTicksFn;
+pub const BamResolveComponentByUuidFn = c.BamResolveComponentByUuidFn;
+pub const BamResolveComponentFn = c.BamResolveComponentFn;
+pub const BamResolveNamedObjectFn = c.BamResolveNamedObjectFn;
+pub const BamResolveSymbolStrFn = c.BamResolveSymbolStrFn;
+pub const BamRestoreStateFn = c.BamRestoreStateFn;
+pub const BamResult = c.BamResult;
+pub const BamRowMigrateFn = c.BamRowMigrateFn;
+pub const BamRowRange = c.BamRowRange;
+pub const BamRunIfFn = c.BamRunIfFn;
+pub const BamSaveStateFn = c.BamSaveStateFn;
+pub const BamScheduleId = c.BamScheduleId;
+pub const BamScheduleSetDesc = c.BamScheduleSetDesc;
+pub const BamShutdownFn = c.BamShutdownFn;
+pub const BamSipHasher128 = c.BamSipHasher128;
+pub const BamSpawnColumnDesc = c.BamSpawnColumnDesc;
+pub const BamStateWriterFn = c.BamStateWriterFn;
+pub const BamStrView = c.BamStrView;
+pub const BamSymbol = c.BamSymbol;
+pub const BamSysCommandsFn = c.BamSysCommandsFn;
+pub const BamSysCurrentTicksFn = c.BamSysCurrentTicksFn;
+pub const BamSysEntityChildrenFn = c.BamSysEntityChildrenFn;
+pub const BamSysEntityGetFn = c.BamSysEntityGetFn;
+pub const BamSysEntityGetMutFn = c.BamSysEntityGetMutFn;
+pub const BamSysHostCtxFn = c.BamSysHostCtxFn;
+pub const BamSysQueryFn = c.BamSysQueryFn;
+pub const BamSysRelationEdgeDataFn = c.BamSysRelationEdgeDataFn;
+pub const BamSysRelationSourcesFn = c.BamSysRelationSourcesFn;
+pub const BamSysRelationTargetsFn = c.BamSysRelationTargetsFn;
+pub const BamSysResMutPtrFn = c.BamSysResMutPtrFn;
+pub const BamSysResPtrFn = c.BamSysResPtrFn;
+pub const BamSysTimeInfoFn = c.BamSysTimeInfoFn;
+pub const BamSystem = c.BamSystem;
+pub const BamSystemCtx = c.BamSystemCtx;
+pub const BamSystemDesc = c.BamSystemDesc;
+pub const BamSystemFn = c.BamSystemFn;
+pub const BamSystemSet = c.BamSystemSet;
+pub const BamSystemTelemetryDigest64 = c.BamSystemTelemetryDigest64;
+pub const BamTermDesc = c.BamTermDesc;
+pub const BamTimeInfo = c.BamTimeInfo;
+pub const BamTriggerDesc = c.BamTriggerDesc;
+pub const BamVTableHeader = c.BamVTableHeader;
+
+pub const BAM_ABI_VERSION = c.BAM_ABI_VERSION;
+pub const BAM_ABI_VERSION_MAJOR = c.BAM_ABI_VERSION_MAJOR;
+pub const BAM_ABI_VERSION_MINOR = c.BAM_ABI_VERSION_MINOR;
+pub const BAM_ABI_VERSION_PATCH = c.BAM_ABI_VERSION_PATCH;
+pub const BAM_ACCESS_ADDED = c.BAM_ACCESS_ADDED;
+pub const BAM_ACCESS_ALLOW = c.BAM_ACCESS_ALLOW;
+pub const BAM_ACCESS_CHANGED = c.BAM_ACCESS_CHANGED;
+pub const BAM_ACCESS_FILTER_ONLY = c.BAM_ACCESS_FILTER_ONLY;
+pub const BAM_ACCESS_HAS = c.BAM_ACCESS_HAS;
+pub const BAM_ACCESS_MESSAGE_READ = c.BAM_ACCESS_MESSAGE_READ;
+pub const BAM_ACCESS_MESSAGE_WRITE = c.BAM_ACCESS_MESSAGE_WRITE;
+pub const BAM_ACCESS_OPTIONAL_READ = c.BAM_ACCESS_OPTIONAL_READ;
+pub const BAM_ACCESS_OPTIONAL_WRITE = c.BAM_ACCESS_OPTIONAL_WRITE;
+pub const BAM_ACCESS_READ = c.BAM_ACCESS_READ;
+pub const BAM_ACCESS_REMOVED_READ = c.BAM_ACCESS_REMOVED_READ;
+pub const BAM_ACCESS_RESOURCE_READ = c.BAM_ACCESS_RESOURCE_READ;
+pub const BAM_ACCESS_RESOURCE_WRITE = c.BAM_ACCESS_RESOURCE_WRITE;
+pub const BAM_ACCESS_WITHOUT = c.BAM_ACCESS_WITHOUT;
+pub const BAM_ACCESS_WRITE = c.BAM_ACCESS_WRITE;
+pub const BAM_ASSET_HANDLE_KIND_INDEX = c.BAM_ASSET_HANDLE_KIND_INDEX;
+pub const BAM_ASSET_HANDLE_KIND_NONE = c.BAM_ASSET_HANDLE_KIND_NONE;
+pub const BAM_ASSET_HANDLE_KIND_UUID = c.BAM_ASSET_HANDLE_KIND_UUID;
+pub const BAM_ASSET_LOAD_STATE_FAILED = c.BAM_ASSET_LOAD_STATE_FAILED;
+pub const BAM_ASSET_LOAD_STATE_LOADED = c.BAM_ASSET_LOAD_STATE_LOADED;
+pub const BAM_ASSET_LOAD_STATE_LOADING = c.BAM_ASSET_LOAD_STATE_LOADING;
+pub const BAM_ASSET_LOAD_STATE_NOT_LOADED = c.BAM_ASSET_LOAD_STATE_NOT_LOADED;
+pub const BAM_CHILDREN_NAME = c.BAM_CHILDREN_NAME;
+pub const BAM_CHILD_OF_NAME = c.BAM_CHILD_OF_NAME;
+pub const BAM_COMPONENT_DESC_MIN_V0_2_SIZE = c.BAM_COMPONENT_DESC_MIN_V0_2_SIZE;
+pub const BAM_COMPONENT_DESC_MIN_V0_3_SIZE = c.BAM_COMPONENT_DESC_MIN_V0_3_SIZE;
+pub const BAM_COMPONENT_FLAG_IMMUTABLE = c.BAM_COMPONENT_FLAG_IMMUTABLE;
+pub const BAM_COMPONENT_FLAG_SPARSE_SET = c.BAM_COMPONENT_FLAG_SPARSE_SET;
+pub const BAM_COMPONENT_FLAG_SUMMARY_TICK = c.BAM_COMPONENT_FLAG_SUMMARY_TICK;
+pub const BAM_COMPONENT_INVALID = c.BAM_COMPONENT_INVALID;
+pub const BAM_COMPONENT_KNOWN_FLAGS = c.BAM_COMPONENT_KNOWN_FLAGS;
+pub const BAM_DISABLED_NAME = c.BAM_DISABLED_NAME;
+pub const BAM_ENTITY_NULL = c.BAM_ENTITY_NULL;
+pub const BAM_EVENT_KIND_ADD = c.BAM_EVENT_KIND_ADD;
+pub const BAM_EVENT_KIND_CUSTOM = c.BAM_EVENT_KIND_CUSTOM;
+pub const BAM_EVENT_KIND_DESPAWN = c.BAM_EVENT_KIND_DESPAWN;
+pub const BAM_EVENT_KIND_DISCARD = c.BAM_EVENT_KIND_DISCARD;
+pub const BAM_EVENT_KIND_INSERT = c.BAM_EVENT_KIND_INSERT;
+pub const BAM_EVENT_KIND_READY = c.BAM_EVENT_KIND_READY;
+pub const BAM_EVENT_KIND_REMOVE = c.BAM_EVENT_KIND_REMOVE;
+pub const BAM_FALSE = c.BAM_FALSE;
+pub const BAM_FIELD_DESC_MIN_V0_3_SIZE = c.BAM_FIELD_DESC_MIN_V0_3_SIZE;
+pub const BAM_FIELD_KIND_BOOL = c.BAM_FIELD_KIND_BOOL;
+pub const BAM_FIELD_KIND_F32 = c.BAM_FIELD_KIND_F32;
+pub const BAM_FIELD_KIND_F64 = c.BAM_FIELD_KIND_F64;
+pub const BAM_FIELD_KIND_FFI_OPTION = c.BAM_FIELD_KIND_FFI_OPTION;
+pub const BAM_FIELD_KIND_I16 = c.BAM_FIELD_KIND_I16;
+pub const BAM_FIELD_KIND_I32 = c.BAM_FIELD_KIND_I32;
+pub const BAM_FIELD_KIND_I64 = c.BAM_FIELD_KIND_I64;
+pub const BAM_FIELD_KIND_I8 = c.BAM_FIELD_KIND_I8;
+pub const BAM_FIELD_KIND_ISIZE = c.BAM_FIELD_KIND_ISIZE;
+pub const BAM_FIELD_KIND_NESTED = c.BAM_FIELD_KIND_NESTED;
+pub const BAM_FIELD_KIND_OPAQUE = c.BAM_FIELD_KIND_OPAQUE;
+pub const BAM_FIELD_KIND_STRING = c.BAM_FIELD_KIND_STRING;
+pub const BAM_FIELD_KIND_U16 = c.BAM_FIELD_KIND_U16;
+pub const BAM_FIELD_KIND_U32 = c.BAM_FIELD_KIND_U32;
+pub const BAM_FIELD_KIND_U64 = c.BAM_FIELD_KIND_U64;
+pub const BAM_FIELD_KIND_U8 = c.BAM_FIELD_KIND_U8;
+pub const BAM_FIELD_KIND_UNKNOWN = c.BAM_FIELD_KIND_UNKNOWN;
+pub const BAM_FIELD_KIND_USIZE = c.BAM_FIELD_KIND_USIZE;
+pub const BAM_FIELD_KIND_VEC = c.BAM_FIELD_KIND_VEC;
+pub const BAM_FNV1A_64_OFFSET_BASIS = c.BAM_FNV1A_64_OFFSET_BASIS;
+pub const BAM_FNV1A_64_PRIME = c.BAM_FNV1A_64_PRIME;
+pub const BAM_HOST_API_MIN_V0_2_SIZE = c.BAM_HOST_API_MIN_V0_2_SIZE;
+pub const BAM_HOST_API_MIN_V0_3_SIZE = c.BAM_HOST_API_MIN_V0_3_SIZE;
+pub const BAM_HOST_API_MIN_V0_4_SIZE = c.BAM_HOST_API_MIN_V0_4_SIZE;
+pub const BAM_HOST_API_SLOT_COUNT = c.BAM_HOST_API_SLOT_COUNT;
+pub const BAM_LAYOUT_INFO_MIN_V0_3_SIZE = c.BAM_LAYOUT_INFO_MIN_V0_3_SIZE;
+pub const BAM_LOG_DEBUG = c.BAM_LOG_DEBUG;
+pub const BAM_LOG_ERROR = c.BAM_LOG_ERROR;
+pub const BAM_LOG_INFO = c.BAM_LOG_INFO;
+pub const BAM_LOG_TRACE = c.BAM_LOG_TRACE;
+pub const BAM_LOG_WARN = c.BAM_LOG_WARN;
+pub const BAM_MANIFEST_KNOWN_FLAGS = c.BAM_MANIFEST_KNOWN_FLAGS;
+pub const BAM_MANIFEST_MIN_V0_2_SIZE = c.BAM_MANIFEST_MIN_V0_2_SIZE;
+pub const BAM_MAX_CHANGE_AGE = c.BAM_MAX_CHANGE_AGE;
+pub const BAM_MAX_QUERIES_PER_SYSTEM = c.BAM_MAX_QUERIES_PER_SYSTEM;
+pub const BAM_MAX_TERMS_PER_QUERY = c.BAM_MAX_TERMS_PER_QUERY;
+pub const BAM_OBSERVER_DESC_MIN_V0_2_SIZE = c.BAM_OBSERVER_DESC_MIN_V0_2_SIZE;
+pub const BAM_OBSERVER_DESC_MIN_V0_4_SIZE = c.BAM_OBSERVER_DESC_MIN_V0_4_SIZE;
+pub const BAM_OBSERVER_FLAG_PROPAGATE = c.BAM_OBSERVER_FLAG_PROPAGATE;
+pub const BAM_OBSERVER_KNOWN_FLAGS = c.BAM_OBSERVER_KNOWN_FLAGS;
+pub const BAM_PAR_OPTIONS_MIN_V0_4_SIZE = c.BAM_PAR_OPTIONS_MIN_V0_4_SIZE;
+pub const BAM_QUERY_DESC_MIN_V0_2_SIZE = c.BAM_QUERY_DESC_MIN_V0_2_SIZE;
+pub const BAM_QUERY_FLAG_PARAM_SET = c.BAM_QUERY_FLAG_PARAM_SET;
+pub const BAM_QUERY_KNOWN_FLAGS = c.BAM_QUERY_KNOWN_FLAGS;
+pub const BAM_RELATION_DESC_MIN_V0_3_SIZE = c.BAM_RELATION_DESC_MIN_V0_3_SIZE;
+pub const BAM_RELATION_FLAG_ACYCLIC = c.BAM_RELATION_FLAG_ACYCLIC;
+pub const BAM_RELATION_FLAG_CASCADE_DELETE = c.BAM_RELATION_FLAG_CASCADE_DELETE;
+pub const BAM_RELATION_FLAG_CASCADE_DESPAWN = c.BAM_RELATION_FLAG_CASCADE_DESPAWN;
+pub const BAM_RELATION_FLAG_CLEANUP_REMOVE = c.BAM_RELATION_FLAG_CLEANUP_REMOVE;
+pub const BAM_RELATION_FLAG_EXCLUSIVE = c.BAM_RELATION_FLAG_EXCLUSIVE;
+pub const BAM_RELATION_FLAG_SYMMETRIC = c.BAM_RELATION_FLAG_SYMMETRIC;
+pub const BAM_RELATION_KNOWN_FLAGS = c.BAM_RELATION_KNOWN_FLAGS;
+pub const BAM_REQUIRED_COMPONENT_MIN_V0_3_SIZE = c.BAM_REQUIRED_COMPONENT_MIN_V0_3_SIZE;
+pub const BAM_REQUIRED_FLAG_CUSTOM_BYTES = c.BAM_REQUIRED_FLAG_CUSTOM_BYTES;
+pub const BAM_REQUIRED_FLAG_INIT_FN = c.BAM_REQUIRED_FLAG_INIT_FN;
+pub const BAM_REQUIRED_FLAG_RESOLVE_BY_UUID = c.BAM_REQUIRED_FLAG_RESOLVE_BY_UUID;
+pub const BAM_REQUIRED_KNOWN_FLAGS = c.BAM_REQUIRED_KNOWN_FLAGS;
+pub const BAM_RESULT_ACCESS_CONFLICT = c.BAM_RESULT_ACCESS_CONFLICT;
+pub const BAM_RESULT_CAPACITY_EXCEEDED = c.BAM_RESULT_CAPACITY_EXCEEDED;
+pub const BAM_RESULT_CYCLE_DETECTED = c.BAM_RESULT_CYCLE_DETECTED;
+pub const BAM_RESULT_INTERNAL_ERROR = c.BAM_RESULT_INTERNAL_ERROR;
+pub const BAM_RESULT_INVALID_ARGUMENT = c.BAM_RESULT_INVALID_ARGUMENT;
+pub const BAM_RESULT_INVALID_COMPONENT = c.BAM_RESULT_INVALID_COMPONENT;
+pub const BAM_RESULT_INVALID_ENTITY = c.BAM_RESULT_INVALID_ENTITY;
+pub const BAM_RESULT_INVALID_STATE = c.BAM_RESULT_INVALID_STATE;
+pub const BAM_RESULT_INVALID_UTF8 = c.BAM_RESULT_INVALID_UTF8;
+pub const BAM_RESULT_INVALID_VERSION = c.BAM_RESULT_INVALID_VERSION;
+pub const BAM_RESULT_NOT_FOUND = c.BAM_RESULT_NOT_FOUND;
+pub const BAM_RESULT_NULL_POINTER = c.BAM_RESULT_NULL_POINTER;
+pub const BAM_RESULT_OK = c.BAM_RESULT_OK;
+pub const BAM_RESULT_OUT_OF_RANGE = c.BAM_RESULT_OUT_OF_RANGE;
+pub const BAM_RESULT_PANIC_CAUGHT = c.BAM_RESULT_PANIC_CAUGHT;
+pub const BAM_RESULT_PERMISSION_DENIED = c.BAM_RESULT_PERMISSION_DENIED;
+pub const BAM_RESULT_TYPE_MISMATCH = c.BAM_RESULT_TYPE_MISMATCH;
+pub const BAM_RESULT_UNSUPPORTED = c.BAM_RESULT_UNSUPPORTED;
+pub const BAM_SCHEDULE_CUSTOM_BASE = c.BAM_SCHEDULE_CUSTOM_BASE;
+pub const BAM_SCHEDULE_FIRST = c.BAM_SCHEDULE_FIRST;
+pub const BAM_SCHEDULE_FIXED_FIRST = c.BAM_SCHEDULE_FIXED_FIRST;
+pub const BAM_SCHEDULE_FIXED_LAST = c.BAM_SCHEDULE_FIXED_LAST;
+pub const BAM_SCHEDULE_FIXED_POST_UPDATE = c.BAM_SCHEDULE_FIXED_POST_UPDATE;
+pub const BAM_SCHEDULE_FIXED_PRE_UPDATE = c.BAM_SCHEDULE_FIXED_PRE_UPDATE;
+pub const BAM_SCHEDULE_FIXED_UPDATE = c.BAM_SCHEDULE_FIXED_UPDATE;
+pub const BAM_SCHEDULE_LAST = c.BAM_SCHEDULE_LAST;
+pub const BAM_SCHEDULE_POST_STARTUP = c.BAM_SCHEDULE_POST_STARTUP;
+pub const BAM_SCHEDULE_POST_UPDATE = c.BAM_SCHEDULE_POST_UPDATE;
+pub const BAM_SCHEDULE_PRE_STARTUP = c.BAM_SCHEDULE_PRE_STARTUP;
+pub const BAM_SCHEDULE_PRE_UPDATE = c.BAM_SCHEDULE_PRE_UPDATE;
+pub const BAM_SCHEDULE_RUN_FIXED_MAIN_LOOP = c.BAM_SCHEDULE_RUN_FIXED_MAIN_LOOP;
+pub const BAM_SCHEDULE_SET_DESC_MIN_V0_3_SIZE = c.BAM_SCHEDULE_SET_DESC_MIN_V0_3_SIZE;
+pub const BAM_SCHEDULE_SET_DESC_MIN_V0_4_SIZE = c.BAM_SCHEDULE_SET_DESC_MIN_V0_4_SIZE;
+pub const BAM_SCHEDULE_SET_FLAG_AFTER_WEAK = c.BAM_SCHEDULE_SET_FLAG_AFTER_WEAK;
+pub const BAM_SCHEDULE_SET_FLAG_BEFORE_WEAK = c.BAM_SCHEDULE_SET_FLAG_BEFORE_WEAK;
+pub const BAM_SCHEDULE_SET_FLAG_PARALLEL = c.BAM_SCHEDULE_SET_FLAG_PARALLEL;
+pub const BAM_SCHEDULE_SET_FLAG_SEQUENCE = c.BAM_SCHEDULE_SET_FLAG_SEQUENCE;
+pub const BAM_SCHEDULE_SET_FLAG_SEQUENCE_WEAK = c.BAM_SCHEDULE_SET_FLAG_SEQUENCE_WEAK;
+pub const BAM_SCHEDULE_SET_KNOWN_FLAGS = c.BAM_SCHEDULE_SET_KNOWN_FLAGS;
+pub const BAM_SCHEDULE_SPAWN_SCENE = c.BAM_SCHEDULE_SPAWN_SCENE;
+pub const BAM_SCHEDULE_STARTUP = c.BAM_SCHEDULE_STARTUP;
+pub const BAM_SCHEDULE_STATE_TRANSITION = c.BAM_SCHEDULE_STATE_TRANSITION;
+pub const BAM_SCHEDULE_UPDATE = c.BAM_SCHEDULE_UPDATE;
+pub const BAM_SIPHASH_KEY_0 = c.BAM_SIPHASH_KEY_0;
+pub const BAM_SIPHASH_KEY_1 = c.BAM_SIPHASH_KEY_1;
+pub const BAM_SPAWN_COL_FLAG_SPLAT = c.BAM_SPAWN_COL_FLAG_SPLAT;
+pub const BAM_SPAWN_COL_KNOWN_FLAGS = c.BAM_SPAWN_COL_KNOWN_FLAGS;
+pub const BAM_STORAGE_FLAG_ENTITY_EVENT = c.BAM_STORAGE_FLAG_ENTITY_EVENT;
+pub const BAM_STORAGE_FLAG_EVENT = c.BAM_STORAGE_FLAG_EVENT;
+pub const BAM_STORAGE_FLAG_IMMUTABLE = c.BAM_STORAGE_FLAG_IMMUTABLE;
+pub const BAM_STORAGE_FLAG_MESSAGE = c.BAM_STORAGE_FLAG_MESSAGE;
+pub const BAM_STORAGE_FLAG_RESOURCE = c.BAM_STORAGE_FLAG_RESOURCE;
+pub const BAM_STORAGE_FLAG_SPARSE_SET = c.BAM_STORAGE_FLAG_SPARSE_SET;
+pub const BAM_STORAGE_FLAG_SUMMARY_TICK = c.BAM_STORAGE_FLAG_SUMMARY_TICK;
+pub const BAM_SYMBOL_INVALID = c.BAM_SYMBOL_INVALID;
+pub const BAM_SYSTEM_DESC_MIN_V0_2_SIZE = c.BAM_SYSTEM_DESC_MIN_V0_2_SIZE;
+pub const BAM_SYSTEM_FLAG_AMBIGUOUS_WITH_ALL = c.BAM_SYSTEM_FLAG_AMBIGUOUS_WITH_ALL;
+pub const BAM_SYSTEM_FLAG_MAIN_THREAD = c.BAM_SYSTEM_FLAG_MAIN_THREAD;
+pub const BAM_SYSTEM_INVALID = c.BAM_SYSTEM_INVALID;
+pub const BAM_SYSTEM_KNOWN_FLAGS = c.BAM_SYSTEM_KNOWN_FLAGS;
+pub const BAM_SYSTEM_SET_INVALID = c.BAM_SYSTEM_SET_INVALID;
+pub const BAM_SYSTEM_TELEMETRY_DIGEST_SIZE = c.BAM_SYSTEM_TELEMETRY_DIGEST_SIZE;
+pub const BAM_SYSTEM_TELEMETRY_DIGEST_VERSION = c.BAM_SYSTEM_TELEMETRY_DIGEST_VERSION;
+pub const BAM_SYSTEM_TELEMETRY_MAGIC_0 = c.BAM_SYSTEM_TELEMETRY_MAGIC_0;
+pub const BAM_SYSTEM_TELEMETRY_MAGIC_1 = c.BAM_SYSTEM_TELEMETRY_MAGIC_1;
+pub const BAM_SYSTEM_TELEMETRY_MAGIC_2 = c.BAM_SYSTEM_TELEMETRY_MAGIC_2;
+pub const BAM_SYSTEM_TELEMETRY_MAGIC_3 = c.BAM_SYSTEM_TELEMETRY_MAGIC_3;
+pub const BAM_TELEMETRY_FLAG_BUDGET_BREACHED = c.BAM_TELEMETRY_FLAG_BUDGET_BREACHED;
+pub const BAM_TELEMETRY_FLAG_FAULTED = c.BAM_TELEMETRY_FLAG_FAULTED;
+pub const BAM_TELEMETRY_FLAG_QUARANTINED = c.BAM_TELEMETRY_FLAG_QUARANTINED;
+pub const BAM_TELEMETRY_FLAG_SUMMARY_TICK_ACTIVE = c.BAM_TELEMETRY_FLAG_SUMMARY_TICK_ACTIVE;
+pub const BAM_TERM_FLAG_ADDED = c.BAM_TERM_FLAG_ADDED;
+pub const BAM_TERM_FLAG_CHANGED = c.BAM_TERM_FLAG_CHANGED;
+pub const BAM_TERM_KNOWN_FLAGS = c.BAM_TERM_KNOWN_FLAGS;
+pub const BAM_TIME_INFO_MIN_V0_4_SIZE = c.BAM_TIME_INFO_MIN_V0_4_SIZE;
+pub const BAM_TRIGGER_DESC_MIN_V0_2_SIZE = c.BAM_TRIGGER_DESC_MIN_V0_2_SIZE;
+pub const BAM_TRIGGER_FLAG_PROPAGATE = c.BAM_TRIGGER_FLAG_PROPAGATE;
+pub const BAM_TRIGGER_KNOWN_FLAGS = c.BAM_TRIGGER_KNOWN_FLAGS;
+pub const BAM_TRUE = c.BAM_TRUE;
+pub const BAM_VTABLE_HEADER_MIN_V0_2_SIZE = c.BAM_VTABLE_HEADER_MIN_V0_2_SIZE;
+
+pub const bam_version_is_compatible = c.bam_version_is_compatible;
+pub const SystemTelemetryDigest64 = c.BamSystemTelemetryDigest64;
+
 pub inline fn strView(slice: []const u8) c.BamStrView {
     return .{ .ptr = slice.ptr, .len = slice.len };
+}
+
+pub inline fn fnv1a64Init() u64 {
+    return c.bam_fnv1a_64_init();
+}
+
+pub inline fn fnv1a64UpdateBytes(hash: u64, bytes: []const u8) u64 {
+    return c.bam_fnv1a_64_update_bytes(hash, bytes.ptr, bytes.len);
+}
+
+pub inline fn fnv1a64UpdateU64(hash: u64, value: u64) u64 {
+    return c.bam_fnv1a_64_update_u64(hash, value);
+}
+
+pub inline fn fnv1a64Str(s: []const u8) u64 {
+    return fnv1a64UpdateBytes(fnv1a64Init(), s);
+}
+
+pub inline fn fnv1a64HashSystem(mod_name: []const u8, system_name: []const u8) u64 {
+    var h = fnv1a64UpdateBytes(fnv1a64Init(), mod_name);
+    h = fnv1a64UpdateBytes(h, "::");
+    return fnv1a64UpdateBytes(h, system_name);
+}
+
+pub inline fn hashFieldSchema(
+    prev_hash: u64,
+    field_name: [*:0]const u8,
+    field_type_tag: [*:0]const u8,
+    field_offset: u64,
+) u64 {
+    return c.bam_hash_field_schema(prev_hash, field_name, field_type_tag, field_offset);
 }
 
 pub const HostContextView = struct {
@@ -1328,8 +1927,9 @@ pub const HostContextView = struct {
             return error.Unsupported;
         }
         const f = self.api.asset_load orelse return error.Unsupported;
+        const sv = strView(path);
         var out: c.BamAssetHandle = undefined;
-        try checkResult(f(self.ctx, asset_type, strView(path), &out));
+        try checkResult(f(self.ctx, asset_type, &sv, &out));
         return out;
     }
 
@@ -1359,7 +1959,8 @@ pub const HostContextView = struct {
             return error.Unsupported;
         }
         const f = self.api.log_diagnostic orelse return error.Unsupported;
-        try checkResult(f(self.ctx, level, strView(msg)));
+        const sv = strView(msg);
+        try checkResult(f(self.ctx, level, &sv));
     }
 
     pub fn reportGuestFault(self: HostContextView, msg: []const u8) BamError!void {
@@ -1367,7 +1968,8 @@ pub const HostContextView = struct {
             return error.Unsupported;
         }
         const f = self.api.report_guest_fault orelse return error.Unsupported;
-        try checkResult(f(self.ctx, strView(msg)));
+        const sv = strView(msg);
+        try checkResult(f(self.ctx, &sv));
     }
 
     pub fn resolveComponentByUuid(
@@ -1401,8 +2003,9 @@ pub const HostContextView = struct {
             return error.Unsupported;
         }
         const f = self.api.intern_symbol orelse return error.Unsupported;
+        const sv = strView(symbol);
         var out: c.BamSymbol = c.BAM_SYMBOL_INVALID;
-        try checkResult(f(self.ctx, strView(symbol), &out));
+        try checkResult(f(self.ctx, &sv, &out));
         return out;
     }
 
@@ -1415,7 +2018,29 @@ pub const HostContextView = struct {
             return error.Unsupported;
         }
         const f = self.api.bind_named_object orelse return error.Unsupported;
-        try checkResult(f(self.ctx, strView(name), entity));
+        const sv = strView(name);
+        try checkResult(f(self.ctx, &sv, entity));
+    }
+
+    pub fn resolveNamedObject(self: HostContextView, name: []const u8) BamError!c.BamEntity {
+        if (!coversHostApiSlot(self.api, offsets.RESOLVE_NAMED_OBJECT, @sizeOf(c.BamResolveNamedObjectFn))) {
+            return error.Unsupported;
+        }
+        const f = self.api.resolve_named_object orelse return error.Unsupported;
+        const sv = strView(name);
+        var out: c.BamEntity = c.BAM_ENTITY_NULL;
+        try checkResult(f(self.ctx, &sv, &out));
+        return out;
+    }
+
+    pub fn resolveSymbolStr(self: HostContextView, symbol: c.BamSymbol) BamError!c.BamStrView {
+        if (!coversHostApiSlot(self.api, offsets.RESOLVE_SYMBOL_STR, @sizeOf(c.BamResolveSymbolStrFn))) {
+            return error.Unsupported;
+        }
+        const f = self.api.resolve_symbol_str orelse return error.Unsupported;
+        var out: c.BamStrView = .{ .ptr = null, .len = 0 };
+        try checkResult(f(self.ctx, symbol, &out));
+        return out;
     }
 };
 
@@ -1517,6 +2142,32 @@ pub const LoadContextView = struct {
         }
         const f = self.api.migrate_component_column orelse return error.Unsupported;
         try checkResult(f(self.ctx, component, old_fingerprint, new_desc, migrate_fn, user_data));
+    }
+
+    pub fn registerResource(
+        self: LoadContextView,
+        desc: *const c.BamComponentDesc,
+    ) BamError!c.BamComponent {
+        if (!coversHostApiSlot(self.api, offsets.REGISTER_RESOURCE, @sizeOf(c.BamRegisterComponentFn))) {
+            return error.Unsupported;
+        }
+        const f = self.api.register_resource orelse return error.Unsupported;
+        var out: c.BamComponent = c.BAM_COMPONENT_INVALID;
+        try checkResult(f(self.ctx, desc, &out));
+        return out;
+    }
+
+    pub fn registerMessage(
+        self: LoadContextView,
+        desc: *const c.BamComponentDesc,
+    ) BamError!c.BamComponent {
+        if (!coversHostApiSlot(self.api, offsets.REGISTER_MESSAGE, @sizeOf(c.BamRegisterComponentFn))) {
+            return error.Unsupported;
+        }
+        const f = self.api.register_message orelse return error.Unsupported;
+        var out: c.BamComponent = c.BAM_COMPONENT_INVALID;
+        try checkResult(f(self.ctx, desc, &out));
+        return out;
     }
 };
 
@@ -1636,6 +2287,26 @@ pub const ChunkView = struct {
         return @ptrCast(f(self.iter, term_index));
     }
 
+    pub fn columnRowsMutableUntracked(self: ChunkView, term_index: usize) ?[*]const ?[*]u8 {
+        if (!coversHostApiSlot(self.api, offsets.ITER_COLUMN_ROWS_MUTABLE_UNTRACKED, @sizeOf(c.BamIterColumnRowsMutableUntrackedFn))) {
+            return null;
+        }
+        const f = self.api.iter_column_rows_mutable_untracked orelse return null;
+        return @ptrCast(f(self.iter, term_index));
+    }
+
+    pub fn markChangedRanges(
+        self: ChunkView,
+        term_index: usize,
+        ranges: []const c.BamRowRange,
+    ) BamError!void {
+        if (!coversHostApiSlot(self.api, offsets.ITER_MARK_CHANGED_RANGES, @sizeOf(c.BamIterMarkChangedRangesFn))) {
+            return error.Unsupported;
+        }
+        const f = self.api.iter_mark_changed_ranges orelse return error.Unsupported;
+        try checkResult(f(self.iter, term_index, ranges.ptr, ranges.len));
+    }
+
     pub fn columnInfo(self: ChunkView, term_index: usize) BamError!c.BamColumnInfo {
         const f = self.api.iter_column_info orelse return error.NullPointer;
         var out: c.BamColumnInfo = undefined;
@@ -1687,6 +2358,36 @@ pub const ChunkView = struct {
         }
         const f = self.api.par_for_each_chunk_readonly orelse return error.Unsupported;
         try checkResult(f(self.iter, chunk_fn, user_data));
+    }
+
+    pub fn parForEachChunkEx(
+        self: ChunkView,
+        chunk_fn: c.BamChunkTaskExFn,
+        user_data: ?*anyopaque,
+        options: ?*const c.BamParOptions,
+    ) BamError!void {
+        if (!coversHostApiSlot(self.api, offsets.PAR_FOR_EACH_CHUNK_EX, @sizeOf(c.BamParForEachChunkExFn))) {
+            return error.Unsupported;
+        }
+        const f = self.api.par_for_each_chunk_ex orelse return error.Unsupported;
+        try checkResult(f(self.iter, chunk_fn, user_data, options));
+    }
+
+    pub fn msgReadSlice(
+        self: ChunkView,
+        comptime T: type,
+        term_index: usize,
+    ) BamError![]const T {
+        if (!coversHostApiSlot(self.api, offsets.MSG_READ_SLICE, @sizeOf(c.BamMsgReadSliceFn))) {
+            return error.Unsupported;
+        }
+        const f = self.api.msg_read_slice orelse return error.Unsupported;
+        var ptr: ?[*]const u8 = null;
+        var count: usize = 0;
+        try checkResult(f(self.iter, term_index, @ptrCast(&ptr), &count));
+        if (count == 0) return &.{};
+        const typed: [*]const T = @ptrCast(@alignCast(ptr orelse return error.NullPointer));
+        return typed[0..count];
     }
 
     pub fn msgReadBatch(
@@ -2011,6 +2712,53 @@ pub const CommandsView = struct {
         const f = self.api.cmd_remove_resource orelse return error.Unsupported;
         try checkResult(f(self.cmds, resource));
     }
+
+    pub fn despawnBatch(self: CommandsView, entities: []const c.BamEntity) BamError!void {
+        if (!coversHostApiSlot(self.api, offsets.CMD_DESPAWN_BATCH, @sizeOf(c.BamCmdDespawnBatchFn))) {
+            return error.Unsupported;
+        }
+        const f = self.api.cmd_despawn_batch orelse return error.Unsupported;
+        try checkResult(f(self.cmds, entities.ptr, entities.len));
+    }
+
+    pub fn insertBatch(
+        self: CommandsView,
+        entities: []const c.BamEntity,
+        component: c.BamComponent,
+        data_ptr: ?[*]const u8,
+        elem_size: usize,
+        flags: u32,
+    ) BamError!void {
+        if (!coversHostApiSlot(self.api, offsets.CMD_INSERT_BATCH, @sizeOf(c.BamCmdInsertBatchFn))) {
+            return error.Unsupported;
+        }
+        const f = self.api.cmd_insert_batch orelse return error.Unsupported;
+        try checkResult(f(self.cmds, entities.ptr, entities.len, component, data_ptr, elem_size, flags));
+    }
+
+    pub fn removeBatch(
+        self: CommandsView,
+        entities: []const c.BamEntity,
+        component: c.BamComponent,
+    ) BamError!void {
+        if (!coversHostApiSlot(self.api, offsets.CMD_REMOVE_BATCH, @sizeOf(c.BamCmdRemoveBatchFn))) {
+            return error.Unsupported;
+        }
+        const f = self.api.cmd_remove_batch orelse return error.Unsupported;
+        try checkResult(f(self.cmds, entities.ptr, entities.len, component));
+    }
+
+    pub fn spawnBatchEx(
+        self: CommandsView,
+        columns: []const c.BamSpawnColumnDesc,
+        out_entities: []c.BamEntity,
+    ) BamError!void {
+        if (!coversHostApiSlot(self.api, offsets.CMD_SPAWN_BATCH_EX, @sizeOf(c.BamCmdSpawnBatchExFn))) {
+            return error.Unsupported;
+        }
+        const f = self.api.cmd_spawn_batch_ex orelse return error.Unsupported;
+        try checkResult(f(self.cmds, columns.ptr, columns.len, out_entities.len, out_entities.ptr));
+    }
 };
 
 /// RAII-style command-buffer transaction guard for Zig `defer tx.deinit()`.
@@ -2146,13 +2894,84 @@ pub const SystemContextView = struct {
         if (len == 0) return &.{};
         return (ptr orelse return error.NullPointer)[0..len];
     }
+
+    pub fn currentTicks(self: SystemContextView) BamError!struct { last_run: u32, this_run: u32 } {
+        if (!coversHostApiSlot(self.api, offsets.SYS_CURRENT_TICKS, @sizeOf(c.BamSysCurrentTicksFn))) {
+            return error.Unsupported;
+        }
+        const f = self.api.sys_current_ticks orelse return error.Unsupported;
+        var last_run: u32 = 0;
+        var this_run: u32 = 0;
+        try checkResult(f(self.ctx, &last_run, &this_run));
+        return .{ .last_run = last_run, .this_run = this_run };
+    }
+
+    pub fn timeInfo(self: SystemContextView) BamError!c.BamTimeInfo {
+        if (!coversHostApiSlot(self.api, offsets.SYS_TIME_INFO, @sizeOf(c.BamSysTimeInfoFn))) {
+            return error.Unsupported;
+        }
+        const f = self.api.sys_time_info orelse return error.Unsupported;
+        var info = c.bam_time_info();
+        try checkResult(f(self.ctx, &info));
+        return info;
+    }
+
+    pub fn relationTargets(
+        self: SystemContextView,
+        entity: c.BamEntity,
+        relation: c.BamComponent,
+    ) BamError![]const c.BamEntity {
+        if (!coversHostApiSlot(self.api, offsets.SYS_RELATION_TARGETS, @sizeOf(c.BamSysRelationTargetsFn))) {
+            return error.Unsupported;
+        }
+        const f = self.api.sys_relation_targets orelse return error.Unsupported;
+        var ptr: ?[*]const c.BamEntity = null;
+        var len: usize = 0;
+        try checkResult(f(self.ctx, entity, relation, &ptr, &len));
+        if (len == 0) return &.{};
+        return (ptr orelse return error.NullPointer)[0..len];
+    }
+
+    pub fn relationSources(
+        self: SystemContextView,
+        target: c.BamEntity,
+        relation: c.BamComponent,
+    ) BamError![]const c.BamEntity {
+        if (!coversHostApiSlot(self.api, offsets.SYS_RELATION_SOURCES, @sizeOf(c.BamSysRelationSourcesFn))) {
+            return error.Unsupported;
+        }
+        const f = self.api.sys_relation_sources orelse return error.Unsupported;
+        var ptr: ?[*]const c.BamEntity = null;
+        var len: usize = 0;
+        try checkResult(f(self.ctx, target, relation, &ptr, &len));
+        if (len == 0) return &.{};
+        return (ptr orelse return error.NullPointer)[0..len];
+    }
+
+    pub fn relationEdgeData(
+        self: SystemContextView,
+        entity: c.BamEntity,
+        relation: c.BamComponent,
+        target: c.BamEntity,
+    ) BamError![]const u8 {
+        if (!coversHostApiSlot(self.api, offsets.SYS_RELATION_EDGE_DATA, @sizeOf(c.BamSysRelationEdgeDataFn))) {
+            return error.Unsupported;
+        }
+        const f = self.api.sys_relation_edge_data orelse return error.Unsupported;
+        var ptr: ?*const anyopaque = null;
+        var len: usize = 0;
+        try checkResult(f(self.ctx, entity, relation, target, &ptr, &len));
+        if (len == 0) return &.{};
+        const bytes: [*]const u8 = @ptrCast(ptr orelse return error.NullPointer);
+        return bytes[0..len];
+    }
 };
 "#;
 
 /// Exports `bamabi.h`, `bamabi.hpp`, and `bamabi.zig` into `out_dir`.
 ///
 /// Intended purpose: equips polyglot C99, C++17, and Zig 0.16.0 guest projects (via `cargo-bam
-/// export-sdk`) with a synchronized, version-matched ABI `0.3.0` binding bundle in one step.
+/// export-sdk`) with a synchronized, version-matched ABI `0.4.0` binding bundle in one step.
 ///
 /// What it does: creates `out_dir` recursively, renders `bamabi.h` via [`crate::render_c99_header`],
 /// writes `bamabi.h`, [`CPP17_HEADER`] (`bamabi.hpp`), and [`ZIG_SDK`] (`bamabi.zig`), and
@@ -2186,12 +3005,12 @@ mod tests {
     use super::*;
 
     /// Test scenario: invokes [`export_sdk`] into a temporary directory and verifies that all
-    /// three ABI `0.3.0` SDK files (`bamabi.h`, `bamabi.hpp`, `bamabi.zig`) are written and
-    /// contain required `0.3.0` symbols (`BAM_ABI_VERSION`, `BAM_RESTRICT`, `CYCLE_DETECTED`,
-    /// relation/schedule-set flags, checkpoint offset macros, and Zig `addTranslateC` `"bam_c"`
+    /// three ABI `0.4.0` SDK files (`bamabi.h`, `bamabi.hpp`, `bamabi.zig`) are written and
+    /// contain required `0.4.0` symbols (`BAM_ABI_VERSION`, `BAM_RESTRICT`, `CYCLE_DETECTED`,
+    /// relation/schedule-set/splat flags, batch/telemetry macros, and Zig `addTranslateC` `"bam_c"`
     /// import without legacy `@cImport`/`@cInclude`).
     #[test]
-    fn export_sdk_writes_all_three_abi_0_3_headers() {
+    fn export_sdk_writes_all_three_abi_0_4_headers() {
         let tmp = std::env::temp_dir().join(format!("bam_sdk_gen_test_{}", std::process::id()));
         let _ = fs::remove_dir_all(&tmp);
         let written = export_sdk(&tmp).expect("export_sdk must succeed");
@@ -2199,7 +3018,7 @@ mod tests {
         let h_content = fs::read_to_string(tmp.join("bamabi.h")).unwrap();
         let hpp_content = fs::read_to_string(tmp.join("bamabi.hpp")).unwrap();
         let zig_content = fs::read_to_string(tmp.join("bamabi.zig")).unwrap();
-        assert!(h_content.contains("#define BAM_ABI_VERSION 0x00030000u"));
+        assert!(h_content.contains("#define BAM_ABI_VERSION 0x00040000u"));
         assert!(h_content.contains("#  define BAM_RESTRICT restrict"));
         assert!(h_content.contains("#define BAM_RESULT_CYCLE_DETECTED    ((BamResult)16u)"));
         assert!(h_content.contains("#define BAM_RELATION_FLAG_CASCADE_DELETE    0x00000002u"));
@@ -2210,24 +3029,31 @@ mod tests {
         assert!(h_content.contains("#define BAM_SCHEDULE_SET_FLAG_PARALLEL      0x00000004u"));
         assert!(h_content.contains("#define BAM_SCHEDULE_SET_FLAG_BEFORE_WEAK   0x00000008u"));
         assert!(h_content.contains("#define BAM_SCHEDULE_SET_FLAG_AFTER_WEAK    0x00000010u"));
+        assert!(h_content.contains("#define BAM_SPAWN_COL_FLAG_SPLAT            0x00000001u"));
+        assert!(h_content.contains("bam_hash_field_schema("));
+        assert!(h_content.contains("bam_fnv1a_64_hash_system("));
         assert!(hpp_content.contains("BAM_HOST_API_OFFSET_CMD_CHECKPOINT"));
+        assert!(hpp_content.contains("BAM_HOST_API_OFFSET_CMD_SPAWN_BATCH_EX"));
+        assert!(hpp_content.contains("hash_field_schema("));
         assert!(hpp_content.contains("BAM_RESTRICT"));
-        assert!(zig_content.contains("ABI 0.3.0"));
+        assert!(zig_content.contains("ABI 0.4.0"));
         assert!(zig_content.contains("addTranslateC"));
         assert!(zig_content.contains("@import(\"bam_c\")"));
         assert!(!zig_content.contains(concat!("@", "cImport")));
         assert!(!zig_content.contains(concat!("@", "cInclude")));
         assert!(zig_content.contains("BAM_RESTRICT_QUALIFIER"));
         assert!(zig_content.contains("BAM_RESULT_CYCLE_DETECTED"));
+        assert!(zig_content.contains("SystemTelemetryDigest64"));
+        assert!(zig_content.contains("fnv1a64HashSystem"));
         let _ = fs::remove_dir_all(&tmp);
     }
 
     /// Test scenario: verifies cross-language offset and aliasing-qualifier parity across C99,
-    /// C++17, and Zig by checking that `BAM_RESTRICT` / `noalias` and every single one of the 73
+    /// C++17, and Zig by checking that `BAM_RESTRICT` / `noalias` and every single one of the 90
     /// `BamHostApi` vtable slot offsets (plus header offsets) are mirrored identically in
     /// `c99_header()`, [`CPP17_HEADER`], and [`ZIG_SDK`].
     #[test]
-    fn all_68_host_api_offsets_and_restrict_mirrored_across_c_cpp_and_zig() {
+    fn all_90_host_api_offsets_and_restrict_mirrored_across_c_cpp_and_zig() {
         let h_content = c99_header();
         let slots = crate::header_gen::host_api_slot_names();
         assert_eq!(slots.len(), BAM_HOST_API_SLOT_COUNT);
@@ -2289,19 +3115,19 @@ mod tests {
         }
     }
 
-    /// Test scenario: verifies that all 73 `BamHostApi` function-pointer slots are wrapped by
+    /// Test scenario: verifies that all 90 `BamHostApi` function-pointer slots are wrapped by
     /// ergonomic view methods in both [`CPP17_HEADER`] (`HostContextView`, `LoadContextView`,
     /// `ChunkView`, `CommandsView`, `ScopedTransaction`, `SystemContextView`) and [`ZIG_SDK`],
     /// and that [`ZIG_SDK`] maps all 18 `BamResult` status codes losslessly in `checkResult` and
     /// `mapError`.
     #[test]
-    fn cpp17_and_zig_views_wrap_all_68_slots_and_all_18_result_codes() {
+    fn cpp17_and_zig_views_wrap_all_90_slots_and_all_18_result_codes() {
         let slots = crate::header_gen::host_api_slot_names();
         assert_eq!(slots.len(), BAM_HOST_API_SLOT_COUNT);
 
         assert!(CPP17_HEADER.contains("class ScopedTransaction"));
         assert!(ZIG_SDK.contains("pub const ScopedTransaction = struct"));
-        assert!(ZIG_SDK.contains("pub const SLOT_COUNT: usize = 73;"));
+        assert!(ZIG_SDK.contains("pub const SLOT_COUNT: usize = 90;"));
         for slot in &slots {
             let cpp_dot = format!("api_.{slot}(");
             let cpp_arrow = format!("api_->{slot}(");

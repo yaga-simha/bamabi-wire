@@ -1081,6 +1081,7 @@ fn verify_forbid_unsafe(root: &Path) -> Result<(), String> {
         "crates/bamabi_docs/src/lib.rs",
         "crates/bamabi_guest/src/lib.rs",
         "crates/bamabi_macros/src/lib.rs",
+        "crates/bamabi_schema/src/lib.rs",
         "crates/bamabi_sdk_gen/src/lib.rs",
         "xtask/src/main.rs",
     ];

@@ -1270,15 +1270,15 @@ unsafe extern "C" fn host_cmd_spawn_batch(
 unsafe extern "C" fn host_log_diagnostic(
     ctx: *const BamHostCtx,
     level: u32,
-    message: StrView,
+    message: *const StrView,
 ) -> FfiResult {
-    if ctx.is_null() {
+    if ctx.is_null() || message.is_null() {
         return FfiResult::NULL_POINTER;
     }
     if level > BAM_LOG_ERROR {
         return FfiResult::INVALID_ARGUMENT;
     }
-    let Ok(text) = (unsafe { message.as_str() }) else {
+    let Ok(text) = (unsafe { (*message).as_str() }) else {
         return FfiResult::INVALID_UTF8;
     };
     // NOTE: Must NOT overwrite `world.last_error`.
@@ -1290,12 +1290,12 @@ unsafe extern "C" fn host_log_diagnostic(
 /// Mock `BamHostApi::report_guest_fault` (slot 51) recording fault messages and updating `last_error`.
 unsafe extern "C" fn host_report_guest_fault(
     ctx: *const BamHostCtx,
-    message: StrView,
+    message: *const StrView,
 ) -> FfiResult {
-    if ctx.is_null() {
+    if ctx.is_null() || message.is_null() {
         return FfiResult::NULL_POINTER;
     }
-    let Ok(text) = (unsafe { message.as_str() }) else {
+    let Ok(text) = (unsafe { (*message).as_str() }) else {
         return FfiResult::INVALID_UTF8;
     };
     if text.is_empty() {
@@ -1419,13 +1419,13 @@ unsafe extern "C" fn host_register_relation(
 /// Mock `BamHostApi::intern_symbol` (slot 55) deduplicating UTF-8 strings into `BamSymbol` IDs.
 unsafe extern "C" fn host_intern_symbol(
     ctx: *const BamHostCtx,
-    symbol: StrView,
+    symbol: *const StrView,
     out_symbol: *mut BamSymbol,
 ) -> FfiResult {
-    if ctx.is_null() || out_symbol.is_null() {
+    if ctx.is_null() || symbol.is_null() || out_symbol.is_null() {
         return FfiResult::NULL_POINTER;
     }
-    let Ok(text) = (unsafe { symbol.as_str() }) else {
+    let Ok(text) = (unsafe { (*symbol).as_str() }) else {
         return FfiResult::INVALID_UTF8;
     };
     if text.is_empty() {
@@ -1446,16 +1446,16 @@ unsafe extern "C" fn host_intern_symbol(
 /// Mock `BamHostApi::bind_named_object` (slot 56) binding a canonical name to an `FfiEntity`.
 unsafe extern "C" fn host_bind_named_object(
     ctx: *const BamHostCtx,
-    name: StrView,
+    name: *const StrView,
     entity: FfiEntity,
 ) -> FfiResult {
-    if ctx.is_null() {
+    if ctx.is_null() || name.is_null() {
         return FfiResult::NULL_POINTER;
     }
     if entity.is_null() {
         return FfiResult::INVALID_ARGUMENT;
     }
-    let Ok(text) = (unsafe { name.as_str() }) else {
+    let Ok(text) = (unsafe { (*name).as_str() }) else {
         return FfiResult::INVALID_UTF8;
     };
     if text.is_empty() {
@@ -1931,6 +1931,23 @@ fn make_v02_only_host_api(truncated_struct_size: bool) -> BamHostApi {
         cmd_clone_entity: None,
         cmd_insert_resource: None,
         cmd_remove_resource: None,
+        register_resource: None,
+        register_message: None,
+        resolve_named_object: None,
+        resolve_symbol_str: None,
+        iter_column_rows_mutable_untracked: None,
+        iter_mark_changed_ranges: None,
+        sys_current_ticks: None,
+        sys_time_info: None,
+        par_for_each_chunk_ex: None,
+        sys_relation_targets: None,
+        sys_relation_sources: None,
+        sys_relation_edge_data: None,
+        cmd_despawn_batch: None,
+        cmd_insert_batch: None,
+        cmd_remove_batch: None,
+        msg_read_slice: None,
+        cmd_spawn_batch_ex: None,
     }
 }
 

@@ -1,5 +1,5 @@
 /*
- * ISO C++17 Benchmark Guest Mod (`ABI 0.3.0`)
+ * ISO C++17 Benchmark Guest Mod (`ABI 0.4.0`)
  * Compiled with: `-std=c++17 -Wall -Wextra -Werror -Wpedantic` (`-O3` and `-O0 -g`).
  */
 
@@ -44,7 +44,7 @@ const BamManifest g_manifest = {
     static_cast<uint32_t>(sizeof(BamManifest)),
     BAM_ABI_VERSION,
     "bench_guest_cpp17",
-    "0.3.0",
+    "0.4.0",
     0u,
     0u,
     nullptr,
@@ -233,7 +233,7 @@ extern "C" BamResult sys_host_api_roundtrip(BamSystemCtx* sys_ctx, void* user_da
                 return rc;
             }
             BamSymbol sym = BAM_SYMBOL_INVALID;
-            rc = inst->api.intern_symbol(hview.raw(), sym_name, &sym);
+            rc = inst->api.intern_symbol(hview.raw(), &sym_name, &sym);
             if (!bam::is_ok(rc)) {
                 return rc;
             }

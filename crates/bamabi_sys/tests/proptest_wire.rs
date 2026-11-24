@@ -305,7 +305,6 @@ proptest! {
         let parsed = ComponentUuid::try_parse_hex(&formatted);
         let expected = ComponentUuid::from_bytes(bytes);
         prop_assert_eq!(parsed, Some(expected));
-        prop_assert_eq!(ComponentUuid::parse_hex(&formatted), expected);
         prop_assert_eq!(ComponentUuid::from_u128(expected.to_u128()), expected);
     }
 

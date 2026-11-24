@@ -16,7 +16,8 @@ use crate::attrs::{
     resolve_sys_crate_path, sanitize_symbol_segment,
 };
 use crate::classify::{
-    FieldKind, canonical_field_type_tag, canonical_kind_type_tag, classify_type,
+    FieldKind, canonical_bam_field_kind_ident, canonical_field_type_tag, canonical_kind_type_tag,
+    classify_type,
 };
 use proc_macro2::{Span, TokenStream};
 use quote::{format_ident, quote};
@@ -43,17 +44,36 @@ impl CanonicalNameSpec {
         }
     }
 
-    /// Emits a `const`-compatible `&'static [u8]` NUL-terminated byte-slice expression for
+    /// Emits a `const`-compatible `&'static ::core::ffi::CStr` expression for
     /// `ModComponent::COMPONENT_CSTR`.
-    pub(crate) fn as_nul_bytes_expr(&self) -> TokenStream {
+    pub(crate) fn as_cstr_expr(&self, span: Span) -> syn::Result<TokenStream> {
         match self {
             Self::Literal(s) => {
-                let with_nul = format!("{s}\0");
-                quote! { #with_nul.as_bytes() }
+                let cstr = std::ffi::CString::new(s.as_str()).map_err(|_| {
+                    syn::Error::new(
+                        span,
+                        "component canonical name must not contain interior NUL bytes",
+                    )
+                })?;
+                let lit = syn::LitCStr::new(&cstr, span);
+                Ok(quote! { #lit })
             }
             Self::ModulePathPrefixed { short_name } => {
+                if short_name.as_bytes().contains(&0) {
+                    return Err(syn::Error::new(
+                        span,
+                        "component name must not contain interior NUL bytes",
+                    ));
+                }
                 let suffix = format!("::{short_name}\0");
-                quote! { ::core::concat!(::core::module_path!(), #suffix).as_bytes() }
+                Ok(quote! {
+                    match ::core::ffi::CStr::from_bytes_with_nul(
+                        ::core::concat!(::core::module_path!(), #suffix).as_bytes(),
+                    ) {
+                        ::core::result::Result::Ok(s) => s,
+                        ::core::result::Result::Err(_) => c"",
+                    }
+                })
             }
         }
     }
@@ -135,77 +155,10 @@ pub(crate) struct BamFieldMeta {
     pub(crate) field_ty: syn::Type,
 }
 
-/// Returns `true` if `ty` spells primitive `target` either unqualified or under `core/std::primitive`.
-fn match_prim_ident(ty: &syn::Type, target: &str) -> bool {
-    if let syn::Type::Path(tp) = ty
-        && tp.qself.is_none()
-    {
-        if tp.path.is_ident(target) {
-            return true;
-        }
-        let segs = &tp.path.segments;
-        if segs.len() == 3
-            && (segs[0].ident == "core" || segs[0].ident == "std")
-            && segs[1].ident == "primitive"
-            && segs[2].ident == target
-            && segs[2].arguments.is_empty()
-        {
-            return true;
-        }
-    }
-    false
-}
-
-/// Maps a classified [`FieldKind`] and field type to its `bamabi_sys::BamFieldKind` constant name.
+/// Maps a classified [`FieldKind`] and original Rust `syn::Type` to the matching
+/// `bamabi_sys::BamFieldKind` constant identifier string via `bamabi_schema`.
 fn infer_bam_field_kind_ident(kind: &FieldKind, ty: &syn::Type) -> &'static str {
-    match kind {
-        FieldKind::Skip => "OPAQUE",
-        FieldKind::Bool(_) => "BOOL",
-        FieldKind::HostString(_) => "STRING",
-        FieldKind::HostVec { .. } => "VEC",
-        FieldKind::FfiOption { .. } => "FFI_OPTION",
-        FieldKind::Nested { .. } => "NESTED",
-        FieldKind::Primitive { ty: prim_ty, .. } => {
-            if match_prim_ident(prim_ty, "u8") {
-                "U8"
-            } else if match_prim_ident(prim_ty, "i8") {
-                "I8"
-            } else if match_prim_ident(prim_ty, "u16") {
-                "U16"
-            } else if match_prim_ident(prim_ty, "i16") {
-                "I16"
-            } else if match_prim_ident(prim_ty, "u32") {
-                "U32"
-            } else if match_prim_ident(prim_ty, "i32") {
-                "I32"
-            } else if match_prim_ident(prim_ty, "u64") {
-                "U64"
-            } else if match_prim_ident(prim_ty, "i64") {
-                "I64"
-            } else if match_prim_ident(prim_ty, "f32") {
-                "F32"
-            } else if match_prim_ident(prim_ty, "f64") {
-                "F64"
-            } else if match_prim_ident(prim_ty, "usize") {
-                "USIZE"
-            } else if match_prim_ident(prim_ty, "isize") {
-                "ISIZE"
-            } else if let syn::Type::Path(tp) = ty
-                && tp.qself.is_none()
-                && let Some(last) = tp.path.segments.last()
-            {
-                match last.ident.to_string().as_str() {
-                    "FfiBool" => "BOOL",
-                    "FfiEntity" | "TargetEntity" => "U64",
-                    "BamComponent" | "BamSystem" | "BamSystemSet" | "BamSymbol"
-                    | "FfiAssetLoadState" | "BamEventKind" | "BamFieldKind" => "U32",
-                    _ => "UNKNOWN",
-                }
-            } else {
-                "UNKNOWN"
-            }
-        }
-    }
+    canonical_bam_field_kind_ident(kind, ty)
 }
 
 /// Accumulator holding all generated tokens, metadata, and collision-tracking sets during
@@ -218,6 +171,7 @@ pub(crate) struct CodegenState {
     pub(crate) canonical_name: CanonicalNameSpec,
     pub(crate) export_fn_prefix: String,
     pub(crate) export_symbols: bool,
+    pub(crate) pod_only: bool,
     pub(crate) opaque: bool,
     pub(crate) can_impl_raw_insertable: bool,
     pub(crate) can_impl_abi_pod: bool,
@@ -225,6 +179,7 @@ pub(crate) struct CodegenState {
     pub(crate) summary_tick: bool,
     pub(crate) required_components: Vec<crate::attrs::RequiredComponentAttr>,
     pub(crate) custom_uuid: Option<String>,
+    pub(crate) custom_schema_fingerprint: Option<u64>,
     pub(crate) schema_fields: Vec<(String, String, TokenStream)>,
     pub(crate) bam_fields: Vec<BamFieldMeta>,
     pub(crate) pod_field_types: Vec<syn::Type>,
@@ -258,6 +213,10 @@ impl CodegenState {
             self.nested_pod_assertions.push(pod_assert);
         }
 
+        if self.pod_only {
+            return Ok(());
+        }
+
         let sys_crate = self.sys_crate.clone();
         let struct_ident = self.struct_ident.clone();
 
@@ -278,7 +237,8 @@ impl CodegenState {
             }
 
             let vt_slot_ident = Ident::new(&vt_slot_str, Span::call_site());
-            let fn_ident = format_ident!("__bam_{}_{}", struct_ident, vt_slot_str);
+            let struct_snake = crate::attrs::to_snake_case(&struct_ident.to_string());
+            let fn_ident = format_ident!("__bam_{}_{}", struct_snake, vt_slot_str);
 
             let export_attr = if self.export_symbols {
                 quote! {
@@ -333,11 +293,7 @@ impl CodegenState {
             };
 
             self.extern_fns.push(quote! {
-                #[allow(
-                    non_snake_case,
-                    clippy::undocumented_unsafe_blocks,
-                    clippy::ptr_as_ptr
-                )]
+                #[allow(clippy::undocumented_unsafe_blocks)]
                 #export_attr
                 unsafe extern "C" fn #fn_ident(
                     #recv_param_fn
@@ -495,6 +451,7 @@ pub(crate) fn expand_mod_component_with_crate(
         canonical_name,
         export_fn_prefix,
         export_symbols: comp_attrs.export_symbols,
+        pod_only: comp_attrs.pod_only,
         opaque: comp_attrs.opaque,
         can_impl_raw_insertable: !comp_attrs.opaque,
         can_impl_abi_pod: !comp_attrs.opaque
@@ -504,6 +461,7 @@ pub(crate) fn expand_mod_component_with_crate(
         summary_tick: comp_attrs.summary_tick,
         required_components: comp_attrs.required_components,
         custom_uuid: comp_attrs.custom_uuid,
+        custom_schema_fingerprint: comp_attrs.custom_schema_fingerprint,
         schema_fields: Vec::new(),
         bam_fields: Vec::new(),
         pod_field_types: Vec::new(),
@@ -556,10 +514,12 @@ pub(crate) fn expand_mod_component_with_crate(
             .named
             .iter()
             .map(|f| {
-                let ident = f.ident.as_ref().expect("named field must have ident");
-                (ident.to_string(), quote! { #ident }, f)
+                let ident = f.ident.as_ref().ok_or_else(|| {
+                    syn::Error::new_spanned(f, "internal error: named struct field missing ident")
+                })?;
+                Ok((ident.to_string(), quote! { #ident }, f))
             })
-            .collect(),
+            .collect::<syn::Result<Vec<_>>>()?,
         Fields::Unnamed(unnamed) => unnamed
             .unnamed
             .iter()
@@ -603,32 +563,48 @@ pub(crate) fn expand_mod_component_with_crate(
             {
                 state.decl_fields.push(decl_info);
             }
-            let witness_kind = match &kind {
-                FieldKind::Skip => unreachable!(),
-                FieldKind::Bool(_) => witness::WitnessFieldKind::Bool,
-                FieldKind::Primitive { .. } => witness::WitnessFieldKind::Primitive,
-                FieldKind::HostString(_) => witness::WitnessFieldKind::HostString,
-                FieldKind::HostVec { elem_ty, .. } => witness::WitnessFieldKind::HostVec {
-                    elem_ty: elem_ty.clone(),
-                },
-                FieldKind::FfiOption { inner_ty, .. } => witness::WitnessFieldKind::FfiOption {
-                    inner_ty: inner_ty.clone(),
-                },
-                FieldKind::Nested { .. } => witness::WitnessFieldKind::Nested,
-            };
-            state.witness_fields.push(witness::WitnessFieldInfo {
-                field_name: field_name.clone(),
-                type_tag: bam_type_tag,
-                member_tokens: member_tokens.clone(),
-                kind: witness_kind,
-                raw_ty: field.ty.clone(),
-            });
+            if !matches!(kind, FieldKind::Pad(_)) {
+                let witness_kind = match &kind {
+                    FieldKind::Skip | FieldKind::Pad(_) => {
+                        return Err(syn::Error::new_spanned(
+                            &field.ty,
+                            "internal error: unexpected skipped or padding field in witness emission",
+                        ));
+                    }
+                    FieldKind::Bool(_) => witness::WitnessFieldKind::Bool,
+                    FieldKind::Primitive { .. } => witness::WitnessFieldKind::Primitive,
+                    FieldKind::HostString(_) => witness::WitnessFieldKind::HostString,
+                    FieldKind::HostVec { elem_ty, .. } => witness::WitnessFieldKind::HostVec {
+                        elem_ty: elem_ty.clone(),
+                    },
+                    FieldKind::FfiOption { inner_ty, .. } => witness::WitnessFieldKind::FfiOption {
+                        inner_ty: inner_ty.clone(),
+                    },
+                    FieldKind::Nested { .. } => witness::WitnessFieldKind::Nested,
+                };
+                state.witness_fields.push(witness::WitnessFieldInfo {
+                    field_name: field_name.clone(),
+                    type_tag: bam_type_tag,
+                    member_tokens: member_tokens.clone(),
+                    kind: witness_kind,
+                    raw_ty: field.ty.clone(),
+                });
+            }
         }
 
         let spec = match kind {
             FieldKind::Skip => {
                 state.can_impl_raw_insertable = false;
                 state.can_impl_abi_pod = false;
+                continue;
+            }
+            FieldKind::Pad(pad_ty) => {
+                let pad_span = pad_ty.span();
+                state
+                    .nested_pod_assertions
+                    .push(quote::quote_spanned! { pad_span =>
+                        #sys_crate::assert_abi_pod::<#pad_ty>();
+                    });
                 continue;
             }
             FieldKind::Bool(bool_ty) => {
@@ -670,5 +646,5 @@ pub(crate) fn expand_mod_component_with_crate(
     }
 
     witness::emit_struct_witnesses(&mut state);
-    Ok(vtable::emit_vtable_and_impls(&state, &vtable_ident))
+    vtable::emit_vtable_and_impls(&state, &vtable_ident)
 }

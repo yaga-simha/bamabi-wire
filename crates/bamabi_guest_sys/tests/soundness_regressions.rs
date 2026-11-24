@@ -642,22 +642,25 @@ fn s5_and_s6_non_pod_message_uuid_enforced_and_callbacks_panic_and_null_safe() {
         sink: Option<
             unsafe extern "C" fn(
                 sink_ctx: *mut c_void,
-                field_name: StrView,
-                type_tag: StrView,
-                payload: FfiSlice<u8>,
+                field_name: *const StrView,
+                type_tag: *const StrView,
+                payload: *const FfiSlice<u8>,
             ) -> FfiResult,
         >,
         sink_ctx: *mut c_void,
     ) -> FfiResult {
         let sink_fn = sink.unwrap();
+        let name_a = StrView::from_str("a");
+        let tag_u32 = StrView::from_str("u32");
+        let payload = FfiSlice::from_slice(&[1, 2, 3, 4]);
         // 1. Passing null `ctx` must return INVALID_ARGUMENT (not UB deref!).
         // SAFETY: Testing null-pointer guard inside `forward_field` / `append_field`.
         let null_rc = unsafe {
             sink_fn(
                 core::ptr::null_mut(),
-                StrView::from_str("a"),
-                StrView::from_str("u32"),
-                FfiSlice::from_slice(&[1, 2, 3, 4]),
+                &raw const name_a,
+                &raw const tag_u32,
+                &raw const payload,
             )
         };
         assert_eq!(null_rc, FfiResult::INVALID_ARGUMENT);
@@ -669,9 +672,9 @@ fn s5_and_s6_non_pod_message_uuid_enforced_and_callbacks_panic_and_null_safe() {
         let misaligned_rc = unsafe {
             sink_fn(
                 misaligned,
-                StrView::from_str("a"),
-                StrView::from_str("u32"),
-                FfiSlice::from_slice(&[1, 2, 3, 4]),
+                &raw const name_a,
+                &raw const tag_u32,
+                &raw const payload,
             )
         };
         assert_eq!(misaligned_rc, FfiResult::INVALID_ARGUMENT);
@@ -680,9 +683,9 @@ fn s5_and_s6_non_pod_message_uuid_enforced_and_callbacks_panic_and_null_safe() {
         unsafe {
             sink_fn(
                 sink_ctx,
-                StrView::from_str("a"),
-                StrView::from_str("u32"),
-                FfiSlice::from_slice(&[1, 2, 3, 4]),
+                &raw const name_a,
+                &raw const tag_u32,
+                &raw const payload,
             )
         }
     }
@@ -690,9 +693,9 @@ fn s5_and_s6_non_pod_message_uuid_enforced_and_callbacks_panic_and_null_safe() {
     /// No-op `import_field` stub returning `OK`.
     unsafe extern "C" fn import_ok(
         _dst: *mut c_void,
-        _name: StrView,
-        _tag: StrView,
-        _payload: FfiSlice<u8>,
+        _name: *const StrView,
+        _tag: *const StrView,
+        _payload: *const FfiSlice<u8>,
     ) -> FfiResult {
         FfiResult::OK
     }
@@ -959,15 +962,12 @@ fn s7_owned_runtime_allocs_and_system_descriptor_pointers_sound_under_miri() {
     // SAFETY: `dummy` acts as `BamCommands`.
     let mut cmds =
         unsafe { ValidatedCommands::from_raw((&raw mut dummy).cast(), &host_after_move) };
+    let obs_cfg = ObserverRegistrationConfig::custom(
+        Some("post_move_runtime_obs"),
+        BamComponent::from_raw(1),
+    );
     let obs_e = cmds
-        .observe::<u32, _>(
-            Some("post_move_runtime_obs"),
-            BamComponent::from_raw(1),
-            FfiEntity::NULL,
-            0,
-            BamComponent::INVALID,
-            |_, _, _| FfiResult::OK,
-        )
+        .observe::<u32, _>(&obs_cfg, |_, _, _| FfiResult::OK)
         .unwrap();
     assert_eq!(obs_e.to_bits(), 123);
 
@@ -1499,16 +1499,14 @@ fn s10_restore_state_observer_mut_reentrancy_pod_clone_overlap_and_bridged_bound
         *ev += 23;
         FfiResult::OK
     });
+    let reg_cfg2 =
+        ObserverRegistrationConfig::custom(Some("s10_mut_obs_reenter"), BamComponent::from_raw(1));
     // SAFETY: `cap2` acts as `BamLoadCtx`.
     let reg_rc2 = unsafe {
         register_observer_mut_closure::<u64, _>(
             &mut obs_inst,
             (&raw mut cap2).cast::<BamLoadCtx>(),
-            "s10_mut_obs_reenter",
-            BamComponent::from_raw(1),
-            FfiEntity::NULL,
-            0,
-            BamComponent::INVALID,
+            &reg_cfg2,
             mut_obs_closure,
         )
     };

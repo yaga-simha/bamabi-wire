@@ -1,4 +1,4 @@
-//! Raw ABI `0.3.0` descriptors, `BamHostApi` table, and low-level `bamabi_guest_sys` escape
+//! Raw ABI `0.4.0` descriptors, `BamHostApi` table, and low-level `bamabi_guest_sys` escape
 //! hatches.
 //!
 //! Exposes the entirety of [`bamabi_sys`] (`bamabi_guest::raw::*`) alongside
@@ -9,7 +9,8 @@ pub use bamabi_sys::*;
 
 pub use bamabi_guest_sys::{
     CUSTOM_SYMBOL_PREFIX, ChunkColumnDispenser, DrainOptions, GuestInstance, Host,
-    ObserverCtxRegistrationConfig, PodComponentHooks, PreparedRunIf, ReentrantCell, SparseRows,
+    ObserverCtxRegistrationConfig, ObserverRegistrationConfig, PodComponentHooks,
+    PodMigrationConfig, PreparedRunIf, ReentrantCell, RelationRegistrationConfig, SparseRows,
     SparseRowsIter, SparseRowsMut, SpawnEntry, SystemRegistrationConfig, UuidFilter,
     ValidatedCommands, ValidatedIter, ValidatedLoadCtx, ValidatedSlice, ValidatedSliceMut,
     ValidatedSystemInvocation, ValidatedSystemRef, ValidatedSystemSlice,

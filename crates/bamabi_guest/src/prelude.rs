@@ -1,6 +1,6 @@
 //! Idiomatic prelude for Rust guest mods (`use bamabi_guest::prelude::*;`).
 
-pub use bamabi_guest_sys::{SpawnEntry, TypedComponent};
+pub use bamabi_guest_sys::{SpawnBatchColumn, SpawnEntry, TypedComponent};
 pub use bamabi_sys::{
     ABI_VERSION, AbiPod, AccessMode, BAM_COMPONENT_FLAG_IMMUTABLE, BAM_COMPONENT_FLAG_SPARSE_SET,
     BAM_COMPONENT_FLAG_SUMMARY_TICK, BAM_DISABLED_NAME, BAM_LOG_DEBUG, BAM_LOG_ERROR, BAM_LOG_INFO,
@@ -9,14 +9,15 @@ pub use bamabi_sys::{
     BAM_RELATION_FLAG_CLEANUP_REMOVE, BAM_RELATION_FLAG_EXCLUSIVE, BAM_RELATION_FLAG_SYMMETRIC,
     BAM_SCHEDULE_SET_FLAG_AFTER_WEAK, BAM_SCHEDULE_SET_FLAG_BEFORE_WEAK,
     BAM_SCHEDULE_SET_FLAG_PARALLEL, BAM_SCHEDULE_SET_FLAG_SEQUENCE,
-    BAM_SCHEDULE_SET_FLAG_SEQUENCE_WEAK, BAM_SYSTEM_FLAG_AMBIGUOUS_WITH_ALL,
-    BAM_SYSTEM_FLAG_MAIN_THREAD, BAM_TRIGGER_FLAG_PROPAGATE, BamChangeTicks, BamColumnInfo,
-    BamComponent, BamEventKind, BamFieldDesc, BamFieldKind, BamLayoutInfo, BamManifest,
-    BamObserverDesc, BamObserverFn, BamObserverMutFn, BamRelationDesc, BamRequiredComponent,
-    BamRowMigrateFn, BamScheduleSetDesc, BamSymbol, BamSystem, BamSystemSet, BamTriggerDesc,
-    ComponentUuid, FfiAssetHandle, FfiAssetLoadState, FfiBool, FfiChildOf, FfiDisabled, FfiEntity,
-    FfiOption, FfiResult, FfiSlice, MAX_QUERIES_PER_SYSTEM, MAX_TERMS_PER_QUERY, ModComponent,
-    RawInsertable, ScheduleId, StrView, VTableHeader,
+    BAM_SCHEDULE_SET_FLAG_SEQUENCE_WEAK, BAM_SPAWN_COL_FLAG_SPLAT, BAM_SPAWN_COL_KNOWN_FLAGS,
+    BAM_SYSTEM_FLAG_AMBIGUOUS_WITH_ALL, BAM_SYSTEM_FLAG_MAIN_THREAD, BAM_TRIGGER_FLAG_PROPAGATE,
+    BamChangeTicks, BamColumnInfo, BamComponent, BamEventKind, BamFieldDesc, BamFieldKind,
+    BamLayoutInfo, BamManifest, BamObserverCtxMutFn, BamObserverDesc, BamObserverFn,
+    BamObserverMutFn, BamParOptions, BamRelationDesc, BamRequiredComponent, BamRowMigrateFn,
+    BamRowRange, BamScheduleSetDesc, BamSpawnColumnDesc, BamSymbol, BamSystem, BamSystemSet,
+    BamTimeInfo, BamTriggerDesc, ComponentUuid, FfiAssetHandle, FfiAssetLoadState, FfiBool,
+    FfiChildOf, FfiDisabled, FfiEntity, FfiOption, FfiResult, FfiSlice, MAX_QUERIES_PER_SYSTEM,
+    MAX_TERMS_PER_QUERY, ModComponent, RawInsertable, ScheduleId, StrView, VTableHeader,
 };
 
 #[cfg(feature = "derive")]
@@ -27,7 +28,7 @@ pub use crate::{
         BevySchedules, EcsRunCondition, GuestApp, GuestComponentOptions, GuestRes, GuestResMut,
         ObserverBuilder, ObserverParamSetBuilder, ParamSetBuilder, QueryBuilder,
         RelationDescBuilder, RunConditionContext, RunConditionSystemContext, ScheduleSetBuilder,
-        SystemBuilder, SystemContext, TypedObserverBuilder, conditions,
+        SplitSystemContext, SystemBuilder, SystemContext, TypedObserverBuilder, conditions,
     },
     bridges::{
         ACTIVATE_EVENT_UUID, APPLY_EAR_POSITIONS, APPLY_EMITTER_POS, APPLY_SPEED, APPLY_VOLUME,
@@ -101,11 +102,12 @@ pub use crate::{
     entity_commands::{GuestChildSpawner, GuestEntityCommands},
     export_mod, guest_log,
     iter::{
-        Added, AddedMut, Allow, Changed, ChangedMut, Chunk, ChunkIter, ChunkSlice, ChunkSliceMut,
-        CopyableQueryTerm, CopyableQueryTuple, DrainOptions, Has, Mut, MutSlice, Or, Or2, Or3,
-        OrFilterTerm, OrFilterTuple, PairwiseQueryTerm, PairwiseQueryTuple, QuerySingleError,
-        QueryTerm, QueryTuple, Ref, RefSlice, SparseRows, SparseRowsIter, SparseRowsMut,
-        TypedChunkIter, With, WithAdded, WithChanged, Without,
+        Added, AddedMut, Allow, BatchColCache, Changed, ChangedMut, Chunk, ChunkColumnDispenser,
+        ChunkIter, ChunkSlice, ChunkSliceMut, CopyableQueryTerm, CopyableQueryTuple, DrainOptions,
+        Has, Mut, MutSlice, Or, Or2, Or3, OrFilterTerm, OrFilterTuple, PairwiseQueryTerm,
+        PairwiseQueryTuple, QuerySingleError, QueryTerm, QueryTuple, Ref, RefSlice, SelectiveMut,
+        SelectiveMutSlice, Sparse, SparseRows, SparseRowsIter, SparseRowsMut, TypedChunkIter,
+        UntrackedMut, With, WithAdded, WithChanged, Without,
     },
     lifecycle::GuestPlugin,
 };

@@ -1,7 +1,7 @@
 //! Layer-0 (zero-Bevy, zero-external-dependency) polyglot benchmark host for `bamabi-wire`.
 //!
-//! Dynamically loads compiled guest `.dylib` / `.so` / `.dll` modules targeting `ABI 0.3.0`
-//! (`0x0003_0000`), verifies strict functional correctness against an in-process `native` Rust
+//! Dynamically loads compiled guest `.dylib` / `.so` / `.dll` modules targeting `ABI 0.4.0`
+//! (`0x0004_0000`), verifies strict functional correctness against an in-process `native` Rust
 //! baseline, measures latency and throughput, and prints an aligned Markdown table plus an
 //! optional JSON report.
 
@@ -139,7 +139,7 @@ struct ParsedCli {
 fn print_help() {
     println!(
         "\
-bamabi_bench — Layer-0 C-ABI 0.3.0 polyglot benchmark host
+bamabi_bench — Layer-0 C-ABI 0.4.0 polyglot benchmark host
 
 USAGE:
     bamabi_bench [OPTIONS]
@@ -413,7 +413,7 @@ fn format_workload_label(
 fn render_markdown_report(report: &BenchReport) -> String {
     let mut out = String::new();
     out.push_str(&format!(
-        "### bamabi-wire ABI 0.3.0 Polyglot Benchmark Report ({mode}, warmup={w}, samples={s})\n\n",
+        "### bamabi-wire ABI 0.4.0 Polyglot Benchmark Report ({mode}, warmup={w}, samples={s})\n\n",
         mode = if report.quick { "quick" } else { "full" },
         w = report.warmup_samples,
         s = report.timed_samples,
@@ -422,7 +422,7 @@ fn render_markdown_report(report: &BenchReport) -> String {
     if !report.guest_manifests.is_empty() {
         out.push_str("#### Verified Guests\n\n");
         for (subject, name, ver) in &report.guest_manifests {
-            out.push_str(&format!("- `{subject}`: `{name}` v{ver} (ABI 0.3.0)\n"));
+            out.push_str(&format!("- `{subject}`: `{name}` v{ver} (ABI 0.4.0)\n"));
         }
         out.push('\n');
     }
@@ -591,7 +591,7 @@ fn json_opt_usize(v: Option<usize>) -> String {
 fn render_json_report(report: &BenchReport) -> String {
     let mut out = String::new();
     out.push_str("{\n");
-    out.push_str("  \"abi_version\": \"0.3.0\",\n");
+    out.push_str("  \"abi_version\": \"0.4.0\",\n");
     out.push_str(&format!("  \"quick\": {},\n", report.quick));
     out.push_str(&format!(
         "  \"warmup_samples\": {},\n",
@@ -989,10 +989,10 @@ mod tests {
             assert_eq!(ticks.this_run, 1);
 
             let mut sym = BamSymbol::INVALID;
+            let sym_name = StrView::from_str("bench.sym");
             // SAFETY: `host_ctx` is valid and `"bench.sym"` is `'static`.
-            let intern_res = unsafe {
-                (api.intern_symbol.unwrap())(host_ctx, StrView::from_str("bench.sym"), &mut sym)
-            };
+            let intern_res =
+                unsafe { (api.intern_symbol.unwrap())(host_ctx, &raw const sym_name, &mut sym) };
             assert_eq!(intern_res, FfiResult::OK);
             assert!(sym.is_valid());
 
@@ -1188,7 +1188,7 @@ mod tests {
         with_guest.guest_manifests.push((
             "rust:release".to_owned(),
             "bench_guest_rust".to_owned(),
-            "0.3.0".to_owned(),
+            "0.4.0".to_owned(),
         ));
         let mut guest_row = with_guest.rows[0].clone();
         guest_row.subject = "rust:release".to_owned();
@@ -1202,7 +1202,7 @@ mod tests {
         assert!(guest_md.contains("`rust:release`"));
 
         let json = render_json_report(&report);
-        assert!(json.contains("\"abi_version\": \"0.3.0\""));
+        assert!(json.contains("\"abi_version\": \"0.4.0\""));
         assert!(json.contains("\"verified\": true"));
 
         let csum = position_checksum(&[Position {
@@ -1834,49 +1834,42 @@ mod tests {
         let invalid_utf8 = [0xffu8, 0xfeu8];
         // SAFETY: Testing explicit invalid arguments and pointers against FFI guards.
         unsafe {
+            let x_str = StrView::from_str("x");
+            let empty_str = StrView::from_str("");
+            let null_empty_str = StrView {
+                ptr: core::ptr::null(),
+                len: 0,
+            };
+            let null_nonempty_str = StrView {
+                ptr: core::ptr::null(),
+                len: 4,
+            };
+            let bad_utf8_str = StrView {
+                ptr: invalid_utf8.as_ptr(),
+                len: invalid_utf8.len(),
+            };
             assert_eq!(
-                intern_fn(core::ptr::null(), StrView::from_str("x"), &mut sym_out),
+                intern_fn(core::ptr::null(), &raw const x_str, &mut sym_out),
                 FfiResult::NULL_POINTER
             );
             assert_eq!(
-                intern_fn(host_ctx, StrView::from_str("x"), core::ptr::null_mut()),
+                intern_fn(host_ctx, &raw const x_str, core::ptr::null_mut()),
                 FfiResult::NULL_POINTER
             );
             assert_eq!(
-                intern_fn(host_ctx, StrView::from_str(""), &mut sym_out),
+                intern_fn(host_ctx, &raw const empty_str, &mut sym_out),
                 FfiResult::INVALID_ARGUMENT
             );
             assert_eq!(
-                intern_fn(
-                    host_ctx,
-                    StrView {
-                        ptr: core::ptr::null(),
-                        len: 0,
-                    },
-                    &mut sym_out
-                ),
+                intern_fn(host_ctx, &raw const null_empty_str, &mut sym_out),
                 FfiResult::INVALID_ARGUMENT
             );
             assert_eq!(
-                intern_fn(
-                    host_ctx,
-                    StrView {
-                        ptr: core::ptr::null(),
-                        len: 4,
-                    },
-                    &mut sym_out
-                ),
+                intern_fn(host_ctx, &raw const null_nonempty_str, &mut sym_out),
                 FfiResult::NULL_POINTER
             );
             assert_eq!(
-                intern_fn(
-                    host_ctx,
-                    StrView {
-                        ptr: invalid_utf8.as_ptr(),
-                        len: invalid_utf8.len(),
-                    },
-                    &mut sym_out
-                ),
+                intern_fn(host_ctx, &raw const bad_utf8_str, &mut sym_out),
                 FfiResult::INVALID_UTF8
             );
         }

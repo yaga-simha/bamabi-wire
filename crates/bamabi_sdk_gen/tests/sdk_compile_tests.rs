@@ -331,6 +331,41 @@ int main() {
     bam::copy_column_restricted(dst_col, src_col, 2u);
     assert(dst_col[0] == 1.25f && dst_col[1] == 2.5f);
 
+    // ABI 0.4.0 C++17 helpers, constructors & slot guards
+    assert(bam::fnv1a_64_hash_system("mod_a", "sys_b") == bam::fnv1a_64_str("mod_a::sys_b"));
+    assert(bam::hash_field_schema(0ull, "hp", "i32", 0ull) != 0ull);
+    BamEntity resolved_obj = BAM_ENTITY_NULL;
+    assert(hview.resolve_named_object("hero", resolved_obj) == BAM_RESULT_UNSUPPORTED);
+    BamStrView sym_str = bam_str_view(nullptr);
+    assert(hview.resolve_symbol_str(1u, sym_str) == BAM_RESULT_UNSUPPORTED);
+    BamTimeInfo tinfo = bam_time_info();
+    assert(sview.time_info(tinfo) == BAM_RESULT_UNSUPPORTED);
+    uint32_t lr = 0u, tr = 0u;
+    assert(sview.current_ticks(lr, tr) == BAM_RESULT_UNSUPPORTED);
+    const BamEntity* rel_ents = nullptr;
+    size_t rel_len = 0u;
+    assert(sview.relation_targets(1ull, 2u, rel_ents, rel_len) == BAM_RESULT_UNSUPPORTED);
+    assert(sview.relation_sources(1ull, 2u, rel_ents, rel_len) == BAM_RESULT_UNSUPPORTED);
+    const void* edge_ptr = nullptr;
+    size_t edge_sz = 0u;
+    assert(sview.relation_edge_data(1ull, 2u, 3ull, edge_ptr, edge_sz) == BAM_RESULT_UNSUPPORTED);
+    assert(cmd_view.despawn_batch(nullptr, 0u) == BAM_RESULT_UNSUPPORTED);
+    assert(cmd_view.insert_batch(nullptr, 0u, 1u, nullptr, 0u, 0u) == BAM_RESULT_UNSUPPORTED);
+    assert(cmd_view.remove_batch(nullptr, 0u, 1u) == BAM_RESULT_UNSUPPORTED);
+    assert(cmd_view.spawn_batch_ex(nullptr, 0u, 0u, nullptr) == BAM_RESULT_UNSUPPORTED);
+    const float* msg_slice_ptr = nullptr;
+    size_t msg_slice_cnt = 0u;
+    assert(cview.msg_read_slice<float>(0u, msg_slice_ptr, msg_slice_cnt) == BAM_RESULT_UNSUPPORTED);
+    assert(cview.column_rows_mutable_untracked(0u) == nullptr);
+    BamRowRange rr = bam_row_range(0u, 2u);
+    assert(cview.mark_changed_ranges(0u, &rr, 1u) == BAM_RESULT_UNSUPPORTED);
+    BamParOptions par_opts = bam_par_options();
+    assert(cview.par_for_each_chunk_ex(nullptr, nullptr, &par_opts) == BAM_RESULT_UNSUPPORTED);
+    BamComponent reg_out = BAM_COMPONENT_INVALID;
+    BamComponentDesc rdesc = bam_desc_component_with_layout("cpp::Res", 4u, 4u, nullptr);
+    assert(lview.register_resource(rdesc, reg_out) == BAM_RESULT_UNSUPPORTED);
+    assert(lview.register_message(rdesc, reg_out) == BAM_RESULT_UNSUPPORTED);
+
     return 0;
 }
 "#,
@@ -488,6 +523,8 @@ test "all Zig views compile and enforce unsupported/null guards" {
     _ = &bam.HostContextView.componentLayoutInfo;
     _ = &bam.HostContextView.internSymbol;
     _ = &bam.HostContextView.bindNamedObject;
+    _ = &bam.HostContextView.resolveNamedObject;
+    _ = &bam.HostContextView.resolveSymbolStr;
 
     _ = &bam.LoadContextView.hostCtx;
     _ = &bam.LoadContextView.registerComponent;
@@ -498,6 +535,8 @@ test "all Zig views compile and enforce unsupported/null guards" {
     _ = &bam.LoadContextView.configureScheduleSet;
     _ = &bam.LoadContextView.mountSystemInSchedule;
     _ = &bam.LoadContextView.migrateComponentColumn;
+    _ = &bam.LoadContextView.registerResource;
+    _ = &bam.LoadContextView.registerMessage;
 
     _ = &bam.ChunkView.nextChunk;
     _ = &bam.ChunkView.supportsNextChunkBatch;
@@ -508,11 +547,15 @@ test "all Zig views compile and enforce unsupported/null guards" {
     _ = &bam.ChunkView.markChangedRange;
     _ = &bam.ChunkView.columnRowsReadonly;
     _ = &bam.ChunkView.columnRowsMutable;
+    _ = &bam.ChunkView.columnRowsMutableUntracked;
+    _ = &bam.ChunkView.markChangedRanges;
     _ = &bam.ChunkView.columnInfo;
     _ = &bam.ChunkView.resTicks;
     _ = &bam.ChunkView.parForEachChunk;
     _ = &bam.ChunkView.parForEachChunkReadonly;
+    _ = &bam.ChunkView.parForEachChunkEx;
     _ = &bam.ChunkView.msgSend;
+    _ = &bam.ChunkView.msgReadSlice;
     _ = &bam.ChunkView.readRemoved;
     _ = &bam.ChunkView.totalCount;
     _ = &bam.ChunkView.upCascade;
@@ -539,6 +582,10 @@ test "all Zig views compile and enforce unsupported/null guards" {
     _ = &bam.CommandsView.cloneEntity;
     _ = &bam.CommandsView.insertResource;
     _ = &bam.CommandsView.removeResource;
+    _ = &bam.CommandsView.despawnBatch;
+    _ = &bam.CommandsView.insertBatch;
+    _ = &bam.CommandsView.removeBatch;
+    _ = &bam.CommandsView.spawnBatchEx;
 
     _ = &bam.ScopedTransaction.init;
     _ = &bam.ScopedTransaction.commit;
@@ -549,6 +596,17 @@ test "all Zig views compile and enforce unsupported/null guards" {
     _ = &bam.SystemContextView.query;
     _ = &bam.SystemContextView.commands;
     _ = &bam.SystemContextView.entityChildren;
+    _ = &bam.SystemContextView.currentTicks;
+    _ = &bam.SystemContextView.timeInfo;
+    _ = &bam.SystemContextView.relationTargets;
+    _ = &bam.SystemContextView.relationSources;
+    _ = &bam.SystemContextView.relationEdgeData;
+
+    try std.testing.expectEqual(
+        bam.fnv1a64Str("mod_a::sys_b"),
+        bam.fnv1a64HashSystem("mod_a", "sys_b"),
+    );
+    try std.testing.expect(bam.hashFieldSchema(0, "hp", "i32", 0) != 0);
 
     var dummy_byte: u8 = 0;
     const hctx: *const c.BamHostCtx = @ptrCast(&dummy_byte);
@@ -818,6 +876,217 @@ test "Zig ChunkView.nextChunkBatch handles supported, col_count=0, exhaustion, a
     assert!(
         zig_out.status.success(),
         "Zig SDK build/test failed:\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&zig_out.stdout),
+        String::from_utf8_lossy(&zig_out.stderr),
+    );
+}
+
+/// Verifies `bamabi.h` compiles cleanly under strict 32-bit `i686` ISO C99 (`-std=c99 -pedantic -Werror`),
+/// proving `BAM_ALIGNOF(uint64_t)` matches C target ABI alignment (`4` on `i686`) rather than GCC's
+/// preferred `__alignof__(uint64_t) == 8`.
+#[test]
+fn bamabi_h_compiles_for_32bit_i686_c99_pedantic() {
+    let Ok(ver_out) = Command::new("zig").arg("version").output() else {
+        return;
+    };
+    if !ver_out.status.success() {
+        return;
+    }
+
+    let tmp = TempDirGuard::new("bamabi_i686_c99_test");
+    bamabi_sdk_gen::export_sdk(tmp.path()).expect("export_sdk must succeed");
+    let zig_cache = tmp.path().join("zig-global-cache");
+    fs::create_dir_all(&zig_cache).expect("create zig cache dir");
+
+    let c_src = tmp.path().join("verify_i686.c");
+    let obj_out = tmp.path().join("verify_i686.o");
+    fs::write(
+        &c_src,
+        r#"#include "bamabi.h"
+#include <stdint.h>
+
+BAM_STATIC_ASSERT(sizeof(uintptr_t) == 4u, i686_ptr_size);
+BAM_STATIC_ASSERT(BAM_ALIGNOF(uint64_t) == 4u, i686_u64_abi_align);
+BAM_STATIC_ASSERT(sizeof(BamHostApi) == 368u, i686_host_api_size);
+
+int bamabi_i686_c99_smoke(void) {
+    return (int)bam_version_is_compatible(BAM_ABI_VERSION, BAM_ABI_VERSION);
+}
+"#,
+    )
+    .expect("write verify_i686.c");
+
+    let cc_out = Command::new("zig")
+        .args([
+            "cc",
+            "-target",
+            "x86-linux-gnu",
+            "-std=c99",
+            "-Wall",
+            "-Wextra",
+            "-Wpedantic",
+            "-Werror",
+            "-I",
+            tmp.path().to_str().expect("utf8 path"),
+            "-c",
+            c_src.to_str().expect("utf8 path"),
+            "-o",
+            obj_out.to_str().expect("utf8 path"),
+        ])
+        .env("ZIG_GLOBAL_CACHE_DIR", &zig_cache)
+        .output()
+        .expect("invoke zig cc");
+    assert!(
+        cc_out.status.success(),
+        "i686 C99 pedantic compile failed:\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&cc_out.stdout),
+        String::from_utf8_lossy(&cc_out.stderr),
+    );
+}
+
+/// Verifies `component_section_for::<T>()`, `ModComponent::BAM_FIELD_META`, `render_zig_component_header`,
+/// `FfiDisabled` ZST exclusion, `BamRowRange`/`BamTimeInfo` mapping, `#[repr(u8)]` enum ZIG_DECL,
+/// and `bamabi.zig` `Bam*`/`BAM_*`/`bam_version_is_compatible` re-exports against Zig `0.16`.
+#[test]
+fn rendered_zig_component_header_and_enum_decls_compile_and_pass_zig_0_16() {
+    let Ok(ver_out) = Command::new("zig").arg("version").output() else {
+        return;
+    };
+    if !ver_out.status.success() {
+        return;
+    }
+
+    #[derive(bamabi_macros::ModComponent)]
+    #[mod_component(name = "zig_test::V04Widget")]
+    #[repr(C)]
+    #[derive(Clone, Copy, Default)]
+    struct V04Widget {
+        disabled: bamabi_sys::FfiDisabled,
+        rows: bamabi_sys::BamRowRange,
+        timing: bamabi_sys::BamTimeInfo,
+        count: u32,
+        reserved0: u32,
+    }
+
+    #[derive(bamabi_macros::ModComponent)]
+    #[mod_component(name = "zig_test::WidgetMode")]
+    #[repr(u8)]
+    #[derive(Clone, Copy, Default, PartialEq, Eq)]
+    enum WidgetMode {
+        #[default]
+        Idle = 0,
+        Active = 1,
+    }
+
+    let sections = [
+        bamabi_sdk_gen::component_section_for::<V04Widget>(),
+        bamabi_sdk_gen::component_section_for::<WidgetMode>(),
+    ];
+    assert!(
+        !sections[0].fields.is_empty(),
+        "component_section_for must populate fields from T::BAM_FIELD_META"
+    );
+    let zig_comp = bamabi_sdk_gen::render_zig_component_header("bamabi", &sections);
+    assert!(zig_comp.contains("const std = @import(\"std\");"));
+    assert!(zig_comp.contains("bam.BamRowRange"));
+    assert!(zig_comp.contains("bam.BamTimeInfo"));
+    assert!(zig_comp.contains(".@\"align\" = "));
+    assert!(!zig_comp.contains("    disabled:"));
+
+    let tmp = TempDirGuard::new("bamabi_zig_comp_test");
+    bamabi_sdk_gen::export_sdk(tmp.path()).expect("export_sdk must succeed");
+    fs::write(tmp.path().join("components.zig"), &zig_comp).expect("write components.zig");
+    let zig_cache = tmp.path().join("zig-global-cache");
+    fs::create_dir_all(&zig_cache).expect("create zig cache dir");
+
+    fs::write(
+        tmp.path().join("build.zig"),
+        r#"const std = @import("std");
+
+pub fn build(b: *std.Build) void {
+    const target = b.standardTargetOptions(.{});
+    const optimize = b.standardOptimizeOption(.{});
+
+    const tc = b.addTranslateC(.{
+        .root_source_file = b.path("bamabi.h"),
+        .target = target,
+        .optimize = optimize,
+    });
+    const bam_c_mod = tc.createModule();
+
+    const bam_mod = b.createModule(.{
+        .root_source_file = b.path("bamabi.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "bam_c", .module = bam_c_mod },
+        },
+    });
+
+    const comp_mod = b.createModule(.{
+        .root_source_file = b.path("components.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "bamabi", .module = bam_mod },
+        },
+    });
+
+    const test_mod = b.createModule(.{
+        .root_source_file = b.path("test_comp.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "bamabi", .module = bam_mod },
+            .{ .name = "components", .module = comp_mod },
+        },
+    });
+
+    const tests = b.addTest(.{ .root_module = test_mod });
+    const run_tests = b.addRunArtifact(tests);
+    const test_step = b.step("test", "Run Zig component header tests");
+    test_step.dependOn(&run_tests.step);
+}
+"#,
+    )
+    .expect("write build.zig");
+
+    fs::write(
+        tmp.path().join("test_comp.zig"),
+        r#"const std = @import("std");
+const bam = @import("bamabi");
+const comp = @import("components");
+
+test "re-exported bamabi.zig symbols and rendered component headers compile on Zig 0.16" {
+    try std.testing.expectEqual(@as(u32, 90), bam.BAM_HOST_API_SLOT_COUNT);
+    try std.testing.expect(bam.bam_version_is_compatible(bam.BAM_ABI_VERSION, bam.BAM_ABI_VERSION) != 0);
+    const rr = bam.BamRowRange{ .start_row = 1, .row_count = 3 };
+    const ti = std.mem.zeroes(bam.BamTimeInfo);
+    const w = comp.V04Widget{
+        .rows = rr,
+        .timing = ti,
+        .count = 7,
+        .reserved0 = 0,
+    };
+    try std.testing.expectEqual(@as(u32, 7), w.count);
+    try std.testing.expectEqual(@as(usize, comp.ZigTestV04WidgetMeta.field_count), comp.ZigTestV04WidgetMeta.fields.len);
+    try std.testing.expect(comp.ZigTestV04WidgetMeta.fields.len == 5);
+    try std.testing.expectEqual(comp.WidgetMode.Idle, @as(comp.WidgetMode, @enumFromInt(0)));
+    try std.testing.expectEqual(comp.WidgetMode.Active, @as(comp.WidgetMode, @enumFromInt(1)));
+}
+"#,
+    )
+    .expect("write test_comp.zig");
+
+    let zig_out = Command::new("zig")
+        .args(["build", "test"])
+        .current_dir(tmp.path())
+        .env("ZIG_GLOBAL_CACHE_DIR", &zig_cache)
+        .output()
+        .expect("invoke zig build test");
+    assert!(
+        zig_out.status.success(),
+        "Zig component header build/test failed:\nstdout:\n{}\nstderr:\n{}",
         String::from_utf8_lossy(&zig_out.stdout),
         String::from_utf8_lossy(&zig_out.stderr),
     );

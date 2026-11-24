@@ -6,10 +6,20 @@ use bamabi_sys::{FfiOption, FfiResult, FfiSlice, ModComponent, StrView};
 use core::ffi::c_void;
 use proptest::prelude::*;
 
-type ExportSinkFn = unsafe extern "C" fn(*mut c_void, StrView, StrView, FfiSlice<u8>) -> FfiResult;
+type ExportSinkFn = unsafe extern "C" fn(
+    *mut c_void,
+    *const StrView,
+    *const StrView,
+    *const FfiSlice<u8>,
+) -> FfiResult;
 type ExportFieldsFn =
     unsafe extern "C" fn(*const c_void, Option<ExportSinkFn>, *mut c_void) -> FfiResult;
-type ImportFieldFn = unsafe extern "C" fn(*mut c_void, StrView, StrView, FfiSlice<u8>) -> FfiResult;
+type ImportFieldFn = unsafe extern "C" fn(
+    *mut c_void,
+    *const StrView,
+    *const StrView,
+    *const FfiSlice<u8>,
+) -> FfiResult;
 
 /// Collects exported `(field_name, type_tag, payload_bytes)` tuples from `export_fields`.
 ///
@@ -18,12 +28,19 @@ type ImportFieldFn = unsafe extern "C" fn(*mut c_void, StrView, StrView, FfiSlic
 /// `field_name` / `type_tag` / `payload` must uphold the witness `StrView` / `FfiSlice` contract.
 unsafe extern "C" fn collect_sink(
     ctx: *mut c_void,
-    field_name: StrView,
-    type_tag: StrView,
-    payload: FfiSlice<u8>,
+    field_name: *const StrView,
+    type_tag: *const StrView,
+    payload: *const FfiSlice<u8>,
 ) -> FfiResult {
-    // SAFETY: Caller passes `&raw mut captured` pointing to `Vec<(String, String, Vec<u8>)>`.
+    // SAFETY: Caller passes `&raw mut captured` pointing to `Vec<(String, String, Vec<u8>)>`,
+    // and valid non-null aligned witness view pointers.
     let out = unsafe { &mut *ctx.cast::<Vec<(String, String, Vec<u8>)>>() };
+    // SAFETY: Witness exporter always passes valid non-null aligned `*const StrView`.
+    let field_name = unsafe { *field_name };
+    // SAFETY: Witness exporter always passes valid non-null aligned `*const StrView`.
+    let type_tag = unsafe { *type_tag };
+    // SAFETY: Witness exporter always passes valid non-null aligned `*const FfiSlice<u8>`.
+    let payload = unsafe { *payload };
     let bytes = if payload.len == 0 {
         Vec::new()
     } else {
@@ -78,13 +95,16 @@ fn export_all<T: ModComponent>(val: &T) -> Vec<(String, String, Vec<u8>)> {
 fn import_all<T: ModComponent>(dst: &mut T, fields: &[(String, String, Vec<u8>)]) {
     let import_fn = resolve_import_fn::<T>();
     for (name, tag, bytes) in fields {
-        // SAFETY: `dst` is a valid `T` mutable reference and `StrView`/`FfiSlice` borrow `name`/`tag`/`bytes`.
+        let name_view = StrView::from_str(name);
+        let tag_view = StrView::from_str(tag);
+        let pay_slice = FfiSlice::from_slice(bytes);
+        // SAFETY: `dst` is a valid `T` mutable reference and view pointers point to valid locals.
         let rc = unsafe {
             import_fn(
                 (&raw mut *dst).cast::<c_void>(),
-                StrView::from_str(name),
-                StrView::from_str(tag),
-                FfiSlice::from_slice(bytes),
+                &raw const name_view,
+                &raw const tag_view,
+                &raw const pay_slice,
             )
         };
         assert_eq!(rc, FfiResult::OK, "import_field failed for {name} ({tag})");
@@ -287,13 +307,16 @@ proptest! {
         };
 
         for (name, tag, bytes) in &exported {
-            // SAFETY: `dst` is valid and `StrView`/`FfiSlice` borrow `name`/`tag`/`bytes`.
+            let name_view = StrView::from_str(name);
+            let tag_view = StrView::from_str(tag);
+            let pay_slice = FfiSlice::from_slice(bytes);
+            // SAFETY: `dst` is valid and view pointers point to valid locals.
             let rc = unsafe {
                 import_v2(
                     (&raw mut dst).cast::<c_void>(),
-                    StrView::from_str(name),
-                    StrView::from_str(tag),
-                    FfiSlice::from_slice(bytes),
+                    &raw const name_view,
+                    &raw const tag_view,
+                    &raw const pay_slice,
                 )
             };
             if name == "dropped_field" {

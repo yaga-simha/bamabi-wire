@@ -7,7 +7,7 @@ use core::{
 };
 
 use crate::{
-    ABI_VERSION, ABI_VERSION_MAJOR, ABI_VERSION_MINOR, ABI_VERSION_PATCH, AccessMode,
+    ABI_VERSION, ABI_VERSION_MAJOR, ABI_VERSION_MINOR, ABI_VERSION_PATCH, AbiPod, AccessMode,
     BAM_COMPONENT_FLAG_IMMUTABLE, BAM_COMPONENT_FLAG_SPARSE_SET, BAM_COMPONENT_FLAG_SUMMARY_TICK,
     BAM_DISABLED_NAME, BAM_LOG_DEBUG, BAM_LOG_ERROR, BAM_LOG_INFO, BAM_LOG_TRACE, BAM_LOG_WARN,
     BAM_OBSERVER_FLAG_PROPAGATE, BAM_QUERY_FLAG_PARAM_SET, BAM_RELATION_FLAG_ACYCLIC,
@@ -33,21 +33,22 @@ use crate::{
     BamIterMarkChangedRangeFn, BamIterNextChunkFn, BamIterReadRemovedFn, BamIterResetFn,
     BamLastErrorFn, BamLayoutInfo, BamLoadCtx, BamLoadHostCtxFn, BamManifest, BamManifestFn,
     BamMsgReadBatchFn, BamMsgSendFn, BamMsgWriteBatchFn, BamObserverCtxFn, BamObserverDesc,
-    BamObserverFn, BamObserverMutFn, BamParForEachChunkFn, BamQueryDesc, BamRegisterComponentFn,
-    BamRegisterObserverFn, BamRegisterSystemFn, BamRelationDesc, BamRequiredComponent,
-    BamResMutPtrFn, BamResPtrFn, BamResTicksFn, BamResolveComponentFn, BamRestoreStateFn,
-    BamRunIfFn, BamSaveStateFn, BamScheduleSetDesc, BamShutdownFn, BamStateWriterFn, BamSymbol,
-    BamSysCommandsFn, BamSysEntityChildrenFn, BamSysEntityGetFn, BamSysEntityGetMutFn,
-    BamSysHostCtxFn, BamSysQueryFn, BamSysResMutPtrFn, BamSysResPtrFn, BamSystem, BamSystemCtx,
-    BamSystemDesc, BamSystemFn, BamSystemSet, BamTermDesc, BamTriggerDesc, ComponentCloneFn,
-    ComponentDesc, ComponentHookFn, ComponentUuid, ExtensibleStruct, FfiAssetHandle,
-    FfiAssetLoadState, FfiBool, FfiChildOf, FfiDisabled, FfiEntity, FfiOption, FfiResult, FfiSlice,
-    MAX_QUERIES_PER_SYSTEM, MAX_TERMS_PER_QUERY, ModComponent, SIPHASH_KEY_0, SIPHASH_KEY_1,
-    SYSTEM_TELEMETRY_DIGEST_SIZE, SYSTEM_TELEMETRY_DIGEST_VERSION, SYSTEM_TELEMETRY_MAGIC,
-    ScheduleId, StrView, SymbolEntry, SystemTelemetryDigest64, TELEMETRY_FLAG_BUDGET_BREACHED,
-    TELEMETRY_FLAG_FAULTED, TELEMETRY_FLAG_QUARANTINED, TELEMETRY_FLAG_SUMMARY_TICK_ACTIVE,
-    TelemetryFrameError, TelemetrySliceError, VTableHeader, abi_version_is_compatible,
-    abi_version_major, abi_version_minor, abi_version_patch, assert_abi_pod, assert_raw_insertable,
+    BamObserverFn, BamObserverMutFn, BamParForEachChunkFn, BamParOptions, BamQueryDesc,
+    BamRegisterComponentFn, BamRegisterObserverFn, BamRegisterSystemFn, BamRelationDesc,
+    BamRequiredComponent, BamResMutPtrFn, BamResPtrFn, BamResTicksFn, BamResolveComponentFn,
+    BamRestoreStateFn, BamRowRange, BamRunIfFn, BamSaveStateFn, BamScheduleSetDesc, BamShutdownFn,
+    BamSpawnColumnDesc, BamStateWriterFn, BamSymbol, BamSysCommandsFn, BamSysEntityChildrenFn,
+    BamSysEntityGetFn, BamSysEntityGetMutFn, BamSysHostCtxFn, BamSysQueryFn, BamSysResMutPtrFn,
+    BamSysResPtrFn, BamSystem, BamSystemCtx, BamSystemDesc, BamSystemFn, BamSystemSet, BamTermDesc,
+    BamTimeInfo, BamTriggerDesc, ComponentCloneFn, ComponentDesc, ComponentHookFn, ComponentUuid,
+    DirtyRunCoalescer, ExtensibleStruct, FfiAssetHandle, FfiAssetLoadState, FfiBool, FfiChildOf,
+    FfiDisabled, FfiEntity, FfiOption, FfiResult, FfiSlice, MAX_QUERIES_PER_SYSTEM,
+    MAX_TERMS_PER_QUERY, ModComponent, SIPHASH_KEY_0, SIPHASH_KEY_1, SYSTEM_TELEMETRY_DIGEST_SIZE,
+    SYSTEM_TELEMETRY_DIGEST_VERSION, SYSTEM_TELEMETRY_MAGIC, ScheduleId, StrView, SymbolEntry,
+    SystemTelemetryDigest64, TELEMETRY_FLAG_BUDGET_BREACHED, TELEMETRY_FLAG_FAULTED,
+    TELEMETRY_FLAG_QUARANTINED, TELEMETRY_FLAG_SUMMARY_TICK_ACTIVE, TelemetryFrameError,
+    TelemetrySliceError, VTableHeader, abi_version_is_compatible, abi_version_major,
+    abi_version_minor, abi_version_patch, assert_abi_pod, assert_raw_insertable,
     fnv1a_64_hash_system, fnv1a_64_init, fnv1a_64_str, fnv1a_64_update_bytes, pack_abi_version,
     read_descriptor, read_extensible_struct, siphash24_128, unpack_abi_version,
 };
@@ -408,6 +409,23 @@ fn populated_host_api() -> BamHostApi {
         cmd_clone_entity: None,
         cmd_insert_resource: None,
         cmd_remove_resource: None,
+        register_resource: None,
+        register_message: None,
+        resolve_named_object: None,
+        resolve_symbol_str: None,
+        iter_column_rows_mutable_untracked: None,
+        iter_mark_changed_ranges: None,
+        sys_current_ticks: None,
+        sys_time_info: None,
+        par_for_each_chunk_ex: None,
+        sys_relation_targets: None,
+        sys_relation_sources: None,
+        sys_relation_edge_data: None,
+        cmd_despawn_batch: None,
+        cmd_insert_batch: None,
+        cmd_remove_batch: None,
+        msg_read_slice: None,
+        cmd_spawn_batch_ex: None,
     }
 }
 
@@ -533,8 +551,9 @@ fn abi_v0_2_exact_sizes_alignments_and_offsets() {
         assert_eq!(BamQueryDesc::MIN_V0_2_SIZE, 24);
         assert_eq!(size_of::<BamSystemDesc>(), 192);
         assert_eq!(BamSystemDesc::MIN_V0_2_SIZE, 104);
-        assert_eq!(size_of::<BamObserverDesc>(), 112);
+        assert_eq!(size_of::<BamObserverDesc>(), 120);
         assert_eq!(BamObserverDesc::MIN_V0_2_SIZE, 48);
+        assert_eq!(BamObserverDesc::MIN_V0_4_SIZE, 120);
         assert_eq!(size_of::<BamTriggerDesc>(), 64);
         assert_eq!(BamTriggerDesc::MIN_V0_2_SIZE, 64);
         assert_eq!(size_of::<ComponentDesc>(), 176);
@@ -543,9 +562,10 @@ fn abi_v0_2_exact_sizes_alignments_and_offsets() {
         assert_eq!(size_of::<BamColumnInfo>(), 48);
         assert_eq!(size_of::<VTableHeader>(), 40);
         assert_eq!(VTableHeader::MIN_V0_2_SIZE, 40);
-        assert_eq!(size_of::<BamHostApi>(), 592);
+        assert_eq!(size_of::<BamHostApi>(), 728);
         assert_eq!(BamHostApi::MIN_V0_2_SIZE, 224);
         assert_eq!(BamHostApi::MIN_V0_3_SIZE, 552);
+        assert_eq!(BamHostApi::MIN_V0_4_SIZE, 728);
     }
 
     #[cfg(target_pointer_width = "32")]
@@ -558,8 +578,9 @@ fn abi_v0_2_exact_sizes_alignments_and_offsets() {
         assert_eq!(BamQueryDesc::MIN_V0_2_SIZE, 16);
         assert_eq!(size_of::<BamSystemDesc>(), 104);
         assert_eq!(BamSystemDesc::MIN_V0_2_SIZE, 60);
-        assert_eq!(size_of::<BamObserverDesc>(), 76);
+        assert_eq!(size_of::<BamObserverDesc>(), 80);
         assert_eq!(BamObserverDesc::MIN_V0_2_SIZE, 36);
+        assert_eq!(BamObserverDesc::MIN_V0_4_SIZE, 80);
         assert_eq!(size_of::<BamTriggerDesc>(), 48);
         assert_eq!(BamTriggerDesc::MIN_V0_2_SIZE, 48);
         assert_eq!(size_of::<ComponentDesc>(), 104);
@@ -568,22 +589,23 @@ fn abi_v0_2_exact_sizes_alignments_and_offsets() {
         assert_eq!(size_of::<BamColumnInfo>(), 40);
         assert_eq!(size_of::<VTableHeader>(), 32);
         assert_eq!(VTableHeader::MIN_V0_2_SIZE, 32);
-        assert_eq!(size_of::<BamHostApi>(), 300);
+        assert_eq!(size_of::<BamHostApi>(), 368);
         assert_eq!(BamHostApi::MIN_V0_2_SIZE, 116);
         assert_eq!(BamHostApi::MIN_V0_3_SIZE, 280);
+        assert_eq!(BamHostApi::MIN_V0_4_SIZE, 368);
     }
 }
 
-/// Test scenario (PO-W1, PO-W2): verifies ABI version packing/unpacking (`0x0003_0000` for
-/// `0.3.0`) and Cargo-SemVer compatibility rules for both pre-1.0 (exact minor match, patch
+/// Test scenario (PO-W1, PO-W2): verifies ABI version packing/unpacking (`0x0004_0000` for
+/// `0.4.0`) and Cargo-SemVer compatibility rules for both pre-1.0 (exact minor match, patch
 /// ignored) and post-1.0 (same major, `guest_minor <= host_minor`).
 #[test]
 fn zero_major_and_post_one_semver_handshake() {
     assert_eq!(ABI_VERSION_MAJOR, 0);
-    assert_eq!(ABI_VERSION_MINOR, 3);
+    assert_eq!(ABI_VERSION_MINOR, 4);
     assert_eq!(ABI_VERSION_PATCH, 0);
-    assert_eq!(ABI_VERSION, 0x0003_0000);
-    assert_eq!(unpack_abi_version(ABI_VERSION), (0, 3, 0));
+    assert_eq!(ABI_VERSION, 0x0004_0000);
+    assert_eq!(unpack_abi_version(ABI_VERSION), (0, 4, 0));
     assert_eq!(abi_version_major(0x0102_0003), 1);
     assert_eq!(abi_version_minor(0x0102_0003), 2);
     assert_eq!(abi_version_patch(0x0102_0003), 3);
@@ -1044,8 +1066,9 @@ fn siphash24_128_vectors_and_component_uuid() {
     );
 
     // Explicit UUID hex parsing & `u128` round-trip:
-    let parsed_hyphen = ComponentUuid::parse_hex("01234567-89ab-cdef-FEDC-9876543210CD");
-    let parsed_compact = ComponentUuid::parse_hex("0123456789abcdefFEDC9876543210CD");
+    let parsed_hyphen =
+        ComponentUuid::try_parse_hex("01234567-89ab-cdef-FEDC-9876543210CD").unwrap();
+    let parsed_compact = ComponentUuid::try_parse_hex("0123456789abcdefFEDC9876543210CD").unwrap();
     assert_eq!(parsed_hyphen, parsed_compact);
     assert_eq!(
         parsed_hyphen.to_u128(),
@@ -1379,10 +1402,14 @@ fn ffi_slice_and_str_view_null_zero_and_alignment_safety() {
 /// `BamTriggerDesc`, and extended `BamSystemDesc`/`BamColumnInfo` `summary_tick` flags.
 #[test]
 fn ffi_option_asset_handles_triggers_lifecycle_observers_and_modes() {
-    // 1. FfiOption<T>
-    assert_abi_pod::<FfiOption<u32>>();
-    assert_abi_pod::<FfiOption<FfiEntity>>();
+    // 1. FfiOption<T> (RawInsertable only; intentionally NOT AbiPod due to alignment padding)
+    assert_raw_insertable::<FfiOption<u32>>();
+    assert_raw_insertable::<FfiOption<FfiEntity>>();
     assert_raw_insertable::<FfiOption<usize>>();
+    const {
+        assert!(FfiOption::<u32>::HAS_IMPLICIT_PADDING);
+        assert!(!FfiOption::<u8>::HAS_IMPLICIT_PADDING);
+    }
 
     let mut opt_some = FfiOption::some(77u32);
     assert!(opt_some.is_some());
@@ -1419,7 +1446,7 @@ fn ffi_option_asset_handles_triggers_lifecycle_observers_and_modes() {
 
     let h_uuid = FfiAssetHandle::from_uuid(
         asset_ty,
-        ComponentUuid::parse_hex("00112233-4455-6677-8899-aabbccddeeff"),
+        ComponentUuid::try_parse_hex("00112233-4455-6677-8899-aabbccddeeff").unwrap(),
     );
     assert!(h_uuid.is_some());
     assert_eq!(h_uuid.validate(), FfiResult::OK);
@@ -1709,7 +1736,9 @@ fn abi_v0_3_extension_layouts_and_validation() {
         assert_eq!(size_of::<BamRequiredComponent>(), 64);
         assert_eq!(size_of::<BamRelationDesc>(), 56);
         assert_eq!(size_of::<BamLayoutInfo>(), 64);
-        assert_eq!(size_of::<BamScheduleSetDesc>(), 48);
+        assert_eq!(size_of::<BamScheduleSetDesc>(), 88);
+        assert_eq!(BamScheduleSetDesc::MIN_V0_3_SIZE, 48);
+        assert_eq!(BamScheduleSetDesc::MIN_V0_4_SIZE, 88);
         assert_eq!(offset_of!(ComponentDesc, schema_fingerprint), 136);
         assert_eq!(offset_of!(BamLayoutInfo, schema_fingerprint), 24);
     }
@@ -1719,7 +1748,9 @@ fn abi_v0_3_extension_layouts_and_validation() {
         assert_eq!(size_of::<BamRequiredComponent>(), 48);
         assert_eq!(size_of::<BamRelationDesc>(), 44);
         assert_eq!(size_of::<BamLayoutInfo>(), 48);
-        assert_eq!(size_of::<BamScheduleSetDesc>(), 36);
+        assert_eq!(size_of::<BamScheduleSetDesc>(), 60);
+        assert_eq!(BamScheduleSetDesc::MIN_V0_3_SIZE, 36);
+        assert_eq!(BamScheduleSetDesc::MIN_V0_4_SIZE, 60);
         assert_eq!(offset_of!(ComponentDesc, schema_fingerprint), 80);
         assert_eq!(offset_of!(BamLayoutInfo, schema_fingerprint), 24);
     }
@@ -2229,4 +2260,371 @@ fn system_telemetry_digest64_layout_roundtrip_and_errors() {
         core::fmt::write(&mut len_buf, format_args!("{err}")).unwrap();
         assert!(len_buf.as_str().contains("64"));
     }
+}
+
+/// Test scenario: verifies ABI `0.4.0` additions—`AbiPod::as_bytes`/`from_bytes`/`read_from_bytes`,
+/// `FfiOption::write_zeroed_bytes`, `DirtyRunCoalescer`, `BamRowRange`, `BamTimeInfo`,
+/// `BamParOptions`, `BamSpawnColumnDesc`, extended `BamScheduleSetDesc`/`BamObserverDesc`,
+/// `ComponentUuid::format_hex`/`Display`, and `BamHostApi::has_all_v0_4_slots`.
+#[test]
+fn abi_v0_4_types_coalescer_bytes_and_validators() {
+    // 1. AbiPod::as_bytes / from_bytes / read_from_bytes
+    let range = BamRowRange::new(10, 4);
+    assert_eq!(range.end_row(), Some(14));
+    assert!(!range.is_empty());
+    let bytes = range.as_bytes();
+    assert_eq!(bytes.len(), size_of::<BamRowRange>());
+    let decoded = BamRowRange::from_bytes(bytes).expect("aligned slice must decode");
+    assert_eq!(*decoded, range);
+    assert_eq!(BamRowRange::from_bytes(&bytes[..bytes.len() - 1]), None);
+    #[repr(align(16))]
+    struct AlignedBuf([u8; 32]);
+    let mut unaligned = AlignedBuf([0u8; 32]);
+    unaligned.0[1..1 + bytes.len()].copy_from_slice(bytes);
+    assert_eq!(
+        BamRowRange::from_bytes(&unaligned.0[1..1 + bytes.len()]),
+        None
+    );
+    assert_eq!(
+        BamRowRange::read_from_bytes(&unaligned.0[1..1 + bytes.len()]),
+        Some(range)
+    );
+
+    // 2. FfiOption::write_zeroed_bytes & write_none_zeroed (no uninitialized padding leak)
+    let opt = FfiOption::some(0x1122_3344u32);
+    assert_eq!(opt.validate(), FfiResult::OK);
+    let mut opt_buf = [0xAAu8; 16];
+    let written = opt.write_zeroed_bytes(&mut opt_buf).unwrap();
+    assert_eq!(written, size_of::<FfiOption<u32>>());
+    assert_eq!(opt_buf[0], 1);
+    assert_eq!(&opt_buf[1..4], &[0, 0, 0]);
+    assert_eq!(&opt_buf[4..8], &0x1122_3344u32.to_le_bytes());
+    let mut none_slot = core::mem::MaybeUninit::<FfiOption<u32>>::new(opt);
+    let none_ptr = FfiOption::<u32>::write_none_zeroed(&mut none_slot);
+    // SAFETY: `write_none_zeroed` initialized all `size_of::<FfiOption<u32>>()` bytes including padding.
+    let none_bytes =
+        unsafe { core::slice::from_raw_parts(none_ptr.cast::<u8>(), size_of::<FfiOption<u32>>()) };
+    assert_eq!(none_bytes, &[0u8; size_of::<FfiOption<u32>>()]);
+
+    // 3. DirtyRunCoalescer (#![no_std] zero-alloc)
+    let mut out = [BamRowRange::default(); 4];
+    let n = DirtyRunCoalescer::coalesce_into(&[1, 2, 2, 3, 7, 8, 12], &mut out)
+        .expect("capacity sufficient");
+    assert_eq!(n, 3);
+    assert_eq!(out[0], BamRowRange::new(1, 3));
+    assert_eq!(out[1], BamRowRange::new(7, 2));
+    assert_eq!(out[2], BamRowRange::new(12, 1));
+    assert_eq!(
+        DirtyRunCoalescer::coalesce_into(&[1, 3, 5], &mut out[..2]),
+        Err(3)
+    );
+    let mut coalescer = DirtyRunCoalescer::new();
+    assert_eq!(coalescer.push_range(BamRowRange::new(5, 0)), None);
+    assert_eq!(coalescer.push_range(BamRowRange::new(2, 3)), None);
+    assert_eq!(coalescer.push_range(BamRowRange::new(4, 3)), None);
+    assert_eq!(coalescer.finish(), Some(BamRowRange::new(2, 5)));
+    let mut max_coalescer = DirtyRunCoalescer::new();
+    assert_eq!(
+        max_coalescer.push_range(BamRowRange::new(0, usize::MAX)),
+        None
+    );
+    assert_eq!(
+        max_coalescer.push_row(usize::MAX),
+        Some(BamRowRange::new(0, usize::MAX))
+    );
+    assert_eq!(
+        max_coalescer.finish(),
+        Some(BamRowRange::new(usize::MAX, 1))
+    );
+
+    // 4. BamTimeInfo / BamParOptions / BamSpawnColumnDesc / BamScheduleSetDesc / BamObserverDesc
+    let time = BamTimeInfo::new();
+    assert_abi_pod::<BamTimeInfo>();
+    assert_eq!(time.validate(), FfiResult::OK);
+    let mut bad_time = time;
+    bad_time.flags = 1;
+    assert_eq!(bad_time.validate(), FfiResult::UNSUPPORTED);
+
+    let par = BamParOptions::new()
+        .with_chunk_size(64)
+        .with_max_partitions(4);
+    assert_eq!(par.validate(), FfiResult::OK);
+
+    let dummy: u32 = 1;
+    let col = BamSpawnColumnDesc::splat(BamComponent::from_raw(3), (&raw const dummy).cast(), 4);
+    assert!(col.is_splat());
+    assert_eq!(col.validate(10), FfiResult::OK);
+    let null_col = BamSpawnColumnDesc::dense(BamComponent::from_raw(3), core::ptr::null(), 4);
+    assert_eq!(null_col.validate(2), FfiResult::NULL_POINTER);
+    assert_eq!(null_col.validate(0), FfiResult::OK);
+
+    unsafe extern "C" fn stub_obs_ctx_mut(
+        _e: FfiEntity,
+        _d: *mut u8,
+        _p: *mut FfiBool,
+        _ctx: *mut BamSystemCtx,
+        _ud: *mut c_void,
+    ) -> FfiResult {
+        FfiResult::OK
+    }
+    let query = BamQueryDesc::empty();
+    let obs = BamObserverDesc::new_mut_with_ctx(
+        BamComponent::from_raw(9),
+        stub_obs_ctx_mut,
+        &raw const query,
+        1,
+        core::ptr::null_mut(),
+    );
+    assert_eq!(obs.validate(), FfiResult::OK);
+
+    unsafe extern "C" fn stub_run_if_ctx(_ctx: *mut BamSystemCtx, _ud: *mut c_void) -> FfiResult {
+        FfiResult::OK
+    }
+    let parent = BamSystemSet::from_raw(2);
+    let sset = BamScheduleSetDesc::new(c"game::Set".as_ptr())
+        .with_run_if_ctx(stub_run_if_ctx, &raw const query, core::ptr::null_mut())
+        .with_parent_sets(&raw const parent, 1);
+    assert_eq!(sset.validate(), FfiResult::OK);
+
+    // 5. ComponentUuid::format_hex + Display
+    let uuid = ComponentUuid::try_parse_hex("00112233-4455-6677-8899-aabbccddeeff").unwrap();
+    let mut uuid_buf = StackFmtBuf::<64>::new();
+    core::fmt::write(&mut uuid_buf, format_args!("{uuid}")).unwrap();
+    assert_eq!(uuid_buf.as_str(), "00112233-4455-6677-8899-aabbccddeeff");
+    assert_eq!(
+        core::str::from_utf8(&uuid.format_hex()).unwrap(),
+        "00112233-4455-6677-8899-aabbccddeeff"
+    );
+
+    // 6. BamHostApi v0.4 slots completeness
+    let api = populated_host_api();
+    assert!(!api.has_all_v0_4_slots());
+    assert!(!api.has_all_slots());
+}
+
+#[cfg(feature = "serde")]
+#[test]
+fn serde_component_uuid_canonical_hyphenated_and_brp_dtos() {
+    extern crate alloc;
+    use alloc::{format, string::String};
+    use serde::{Deserialize, Serialize};
+
+    struct CaptureStrSerializer;
+    #[derive(Debug)]
+    struct CaptureErr;
+    impl core::fmt::Display for CaptureErr {
+        fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+            f.write_str("capture error")
+        }
+    }
+    impl core::error::Error for CaptureErr {}
+    impl serde::ser::Error for CaptureErr {
+        fn custom<T: core::fmt::Display>(_msg: T) -> Self {
+            Self
+        }
+    }
+    impl serde::Serializer for CaptureStrSerializer {
+        type Ok = String;
+        type Error = CaptureErr;
+        type SerializeSeq = serde::ser::Impossible<String, CaptureErr>;
+        type SerializeTuple = serde::ser::Impossible<String, CaptureErr>;
+        type SerializeTupleStruct = serde::ser::Impossible<String, CaptureErr>;
+        type SerializeTupleVariant = serde::ser::Impossible<String, CaptureErr>;
+        type SerializeMap = serde::ser::Impossible<String, CaptureErr>;
+        type SerializeStruct = serde::ser::Impossible<String, CaptureErr>;
+        type SerializeStructVariant = serde::ser::Impossible<String, CaptureErr>;
+        fn serialize_bool(self, _v: bool) -> Result<String, CaptureErr> {
+            Err(CaptureErr)
+        }
+        fn serialize_i8(self, _v: i8) -> Result<String, CaptureErr> {
+            Err(CaptureErr)
+        }
+        fn serialize_i16(self, _v: i16) -> Result<String, CaptureErr> {
+            Err(CaptureErr)
+        }
+        fn serialize_i32(self, _v: i32) -> Result<String, CaptureErr> {
+            Err(CaptureErr)
+        }
+        fn serialize_i64(self, _v: i64) -> Result<String, CaptureErr> {
+            Err(CaptureErr)
+        }
+        fn serialize_u8(self, _v: u8) -> Result<String, CaptureErr> {
+            Err(CaptureErr)
+        }
+        fn serialize_u16(self, _v: u16) -> Result<String, CaptureErr> {
+            Err(CaptureErr)
+        }
+        fn serialize_u32(self, _v: u32) -> Result<String, CaptureErr> {
+            Err(CaptureErr)
+        }
+        fn serialize_u64(self, _v: u64) -> Result<String, CaptureErr> {
+            Err(CaptureErr)
+        }
+        fn serialize_f32(self, _v: f32) -> Result<String, CaptureErr> {
+            Err(CaptureErr)
+        }
+        fn serialize_f64(self, _v: f64) -> Result<String, CaptureErr> {
+            Err(CaptureErr)
+        }
+        fn serialize_char(self, _v: char) -> Result<String, CaptureErr> {
+            Err(CaptureErr)
+        }
+        fn serialize_str(self, v: &str) -> Result<String, CaptureErr> {
+            Ok(String::from(v))
+        }
+        fn serialize_bytes(self, _v: &[u8]) -> Result<String, CaptureErr> {
+            Err(CaptureErr)
+        }
+        fn serialize_none(self) -> Result<String, CaptureErr> {
+            Err(CaptureErr)
+        }
+        fn serialize_some<T: ?Sized + Serialize>(self, _v: &T) -> Result<String, CaptureErr> {
+            Err(CaptureErr)
+        }
+        fn serialize_unit(self) -> Result<String, CaptureErr> {
+            Err(CaptureErr)
+        }
+        fn serialize_unit_struct(self, _name: &'static str) -> Result<String, CaptureErr> {
+            Err(CaptureErr)
+        }
+        fn serialize_unit_variant(
+            self,
+            _n: &'static str,
+            _i: u32,
+            _v: &'static str,
+        ) -> Result<String, CaptureErr> {
+            Err(CaptureErr)
+        }
+        fn serialize_newtype_struct<T: ?Sized + Serialize>(
+            self,
+            _n: &'static str,
+            _v: &T,
+        ) -> Result<String, CaptureErr> {
+            Err(CaptureErr)
+        }
+        fn serialize_newtype_variant<T: ?Sized + Serialize>(
+            self,
+            _n: &'static str,
+            _i: u32,
+            _v: &'static str,
+            _val: &T,
+        ) -> Result<String, CaptureErr> {
+            Err(CaptureErr)
+        }
+        fn serialize_seq(self, _len: Option<usize>) -> Result<Self::SerializeSeq, CaptureErr> {
+            Err(CaptureErr)
+        }
+        fn serialize_tuple(self, _len: usize) -> Result<Self::SerializeTuple, CaptureErr> {
+            Err(CaptureErr)
+        }
+        fn serialize_tuple_struct(
+            self,
+            _n: &'static str,
+            _len: usize,
+        ) -> Result<Self::SerializeTupleStruct, CaptureErr> {
+            Err(CaptureErr)
+        }
+        fn serialize_tuple_variant(
+            self,
+            _n: &'static str,
+            _i: u32,
+            _v: &'static str,
+            _len: usize,
+        ) -> Result<Self::SerializeTupleVariant, CaptureErr> {
+            Err(CaptureErr)
+        }
+        fn serialize_map(self, _len: Option<usize>) -> Result<Self::SerializeMap, CaptureErr> {
+            Err(CaptureErr)
+        }
+        fn serialize_struct(
+            self,
+            _n: &'static str,
+            _len: usize,
+        ) -> Result<Self::SerializeStruct, CaptureErr> {
+            Err(CaptureErr)
+        }
+        fn serialize_struct_variant(
+            self,
+            _n: &'static str,
+            _i: u32,
+            _v: &'static str,
+            _len: usize,
+        ) -> Result<Self::SerializeStructVariant, CaptureErr> {
+            Err(CaptureErr)
+        }
+        fn collect_str<T: ?Sized + core::fmt::Display>(
+            self,
+            value: &T,
+        ) -> Result<String, CaptureErr> {
+            Ok(format!("{value}"))
+        }
+    }
+
+    fn assert_serde<'de, T: Serialize + Deserialize<'de>>() {}
+    assert_serde::<ComponentUuid>();
+    assert_serde::<SystemTelemetryDigest64>();
+    assert_serde::<crate::BrpModInfo>();
+    assert_serde::<crate::BrpSystemMetrics>();
+    assert_serde::<crate::BrpFieldSchema>();
+    assert_serde::<crate::BrpComponentSchema>();
+    assert_serde::<crate::BrpHotReloadRequest>();
+
+    let uuid = ComponentUuid::try_parse_hex("00112233-4455-6677-8899-aabbccddeeff").unwrap();
+    let serialized = uuid
+        .serialize(CaptureStrSerializer)
+        .expect("must serialize as str");
+    assert_eq!(serialized, "00112233-4455-6677-8899-aabbccddeeff");
+    let roundtrip = ComponentUuid::deserialize(serde::de::IntoDeserializer::<
+        serde::de::value::Error,
+    >::into_deserializer(serialized.as_str()))
+    .expect("must deserialize from str");
+    assert_eq!(roundtrip, uuid);
+
+    struct OptU64(u64);
+    impl<'de> serde::Deserializer<'de> for OptU64 {
+        type Error = serde::de::value::Error;
+        fn deserialize_any<V: serde::de::Visitor<'de>>(
+            self,
+            visitor: V,
+        ) -> Result<V::Value, Self::Error> {
+            visitor.visit_u64(self.0)
+        }
+        fn deserialize_option<V: serde::de::Visitor<'de>>(
+            self,
+            visitor: V,
+        ) -> Result<V::Value, Self::Error> {
+            visitor.visit_some(serde::de::IntoDeserializer::into_deserializer(self.0))
+        }
+        serde::forward_to_deserialize_any! {
+            bool i8 i16 i32 i64 i128 u8 u16 u32 u64 u128 f32 f64 char str string
+            bytes byte_buf unit unit_struct newtype_struct seq tuple tuple_struct
+            map struct enum identifier ignored_any
+        }
+    }
+    impl<'de> serde::de::IntoDeserializer<'de, serde::de::value::Error> for OptU64 {
+        type Deserializer = Self;
+        fn into_deserializer(self) -> Self::Deserializer {
+            self
+        }
+    }
+
+    let req_omitted_force =
+        crate::BrpHotReloadRequest::deserialize(serde::de::value::MapDeserializer::<
+            _,
+            serde::de::value::Error,
+        >::new(
+            [("mod_id", OptU64(99))].into_iter()
+        ))
+        .expect("BrpHotReloadRequest must deserialize when `force` is omitted");
+    assert_eq!(req_omitted_force.mod_id, Some(99));
+    assert!(req_omitted_force.mod_name.is_none());
+    assert!(req_omitted_force.path.is_none());
+    assert!(!req_omitted_force.force);
+
+    let req_empty = crate::BrpHotReloadRequest::deserialize(serde::de::value::MapDeserializer::<
+        core::iter::Empty<(&str, OptU64)>,
+        serde::de::value::Error,
+    >::new(core::iter::empty()))
+    .expect("BrpHotReloadRequest must deserialize from empty map with defaults");
+    assert_eq!(req_empty, crate::BrpHotReloadRequest::default());
 }

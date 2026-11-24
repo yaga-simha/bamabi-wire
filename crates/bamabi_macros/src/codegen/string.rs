@@ -35,17 +35,25 @@ pub(crate) fn spec(
             SlotSpec {
                 prefix: "get",
                 receiver: ReceiverKind::Const {
-                    on_invalid: quote! { #sys_crate::StrView::empty() },
+                    on_invalid: quote! { #sys_crate::FfiResult::NULL_POINTER },
                 },
-                extra_params_fn: quote! {},
-                extra_params_vt: quote! {},
-                ret_ty: quote! { #sys_crate::StrView },
+                extra_params_fn: quote! { , out_view: *mut #sys_crate::StrView },
+                extra_params_vt: quote! { , *mut #sys_crate::StrView },
+                ret_ty: quote! { #sys_crate::FfiResult },
                 valid_body: quote! {
-                    unsafe {
+                    if out_view.is_null() {
+                        return #sys_crate::FfiResult::NULL_POINTER;
+                    }
+                    if !out_view.is_aligned() {
+                        return #sys_crate::FfiResult::INVALID_ARGUMENT;
+                    }
+                    let view = unsafe {
                         __bam_read_string::<#str_ty>(
                             ::core::ptr::addr_of!((*typed_ptr).#member_tokens),
                         )
-                    }
+                    };
+                    unsafe { ::core::ptr::write(out_view, view) };
+                    #sys_crate::FfiResult::OK
                 },
             },
             SlotSpec {
@@ -53,20 +61,24 @@ pub(crate) fn spec(
                 receiver: ReceiverKind::Mut {
                     on_null: quote! { #sys_crate::FfiResult::NULL_POINTER },
                     pre_align_check: Some(quote! {
-                        if view.len > 0 && view.ptr.is_null() {
+                        if view.is_null() {
                             return #sys_crate::FfiResult::NULL_POINTER;
+                        }
+                        if !view.is_aligned() {
+                            return #sys_crate::FfiResult::INVALID_ARGUMENT;
                         }
                     }),
                     on_unaligned: quote! { #sys_crate::FfiResult::INVALID_ARGUMENT },
                 },
-                extra_params_fn: quote! { , view: #sys_crate::StrView },
-                extra_params_vt: quote! { , #sys_crate::StrView },
+                extra_params_fn: quote! { , view: *const #sys_crate::StrView },
+                extra_params_vt: quote! { , *const #sys_crate::StrView },
                 ret_ty: quote! { #sys_crate::FfiResult },
                 valid_body: quote! {
+                    let view_val = unsafe { ::core::ptr::read(view) };
                     unsafe {
                         __bam_write_string::<#str_ty>(
                             ::core::ptr::addr_of_mut!((*typed_ptr).#member_tokens),
-                            view,
+                            view_val,
                         )
                     }
                 },

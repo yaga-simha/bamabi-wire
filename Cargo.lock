@@ -25,7 +25,7 @@ checksum = "f2032f911046de80f0a198e0901378627c33f59ea0ac00e363d481118bd70a53"
 
 [[package]]
 name = "bamabi_bench"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "bamabi_guest",
  "bamabi_sys",
@@ -34,7 +34,7 @@ dependencies = [
 
 [[package]]
 name = "bamabi_bench_guest_rust"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "bamabi_guest",
  "bamabi_sys",
@@ -42,11 +42,11 @@ dependencies = [
 
 [[package]]
 name = "bamabi_docs"
-version = "0.3.0"
+version = "0.4.0"
 
 [[package]]
 name = "bamabi_guest"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "bamabi_guest_sys",
  "bamabi_macros",
@@ -55,7 +55,7 @@ dependencies = [
 
 [[package]]
 name = "bamabi_guest_sys"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "bamabi_sys",
  "proptest",
@@ -63,8 +63,9 @@ dependencies = [
 
 [[package]]
 name = "bamabi_macros"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
+ "bamabi_schema",
  "bamabi_sys",
  "proc-macro-crate",
  "proc-macro2",
@@ -75,17 +76,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "bamabi_schema"
+version = "0.4.0"
+
+[[package]]
 name = "bamabi_sdk_gen"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
+ "bamabi_macros",
  "bamabi_sys",
 ]
 
 [[package]]
 name = "bamabi_sys"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
+ "bamabi_schema",
  "proptest",
+ "serde",
 ]
 
 [[package]]
@@ -931,7 +939,7 @@ checksum = "1ebf944e87a7c253233ad6766e082e3cd714b5d03812acc24c318f549614536e"
 
 [[package]]
 name = "xtask"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "bamabi_macros",
  "bamabi_sdk_gen",
